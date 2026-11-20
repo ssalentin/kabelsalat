@@ -163,6 +163,45 @@ impl AuxSend {
     }
 }
 
+/// A PipeWire sink's node name (`alsa_output.usb-…HiFi__Line__sink`), held
+/// in fixed bytes so the engine can keep and publish it without the heap.
+/// Saved as a string.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SinkName(ClapId);
+
+impl SinkName {
+    /// Longest name the type holds; a longer one would be cut and never
+    /// match its sink again.
+    pub const MAX_LEN: usize = 127;
+    pub const NONE: Self = Self(ClapId([0; 128]));
+    pub fn new(s: &str) -> Self {
+        Self(ClapId::new(s))
+    }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+    pub fn is_none(&self) -> bool {
+        self.as_str().is_empty()
+    }
+}
+
+impl std::fmt::Debug for SinkName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SinkName({})", self.as_str())
+    }
+}
+
+/// One bus that leaves the main mix (#147): the rig bus or aux bus `bus`
+/// (an aux bus is `SendSource::Node` of its node) plays to `sink` and is no
+/// longer part of what the master plays. A bus without an entry plays into
+/// the master.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BusOut {
+    pub bus: SendSource,
+    pub sink: SinkName,
+}
+
 /// Which device channels an `AudioIn` node turns into its stereo OUT. A guitar
 /// or vocal mic is usually mono on one input of a stereo interface, so the
 /// node picks the left or right channel (centered to both); `Stereo` passes the
@@ -1033,6 +1072,11 @@ pub enum Command {
         level: Option<f32>,
         pre: Option<bool>,
     },
+    /// Play one rig bus or aux bus (`SendSource::Node` of the bus node) to
+    /// its own output (#147): a PipeWire sink by node name, or `None` for the
+    /// master's. The engine serves `engine::MAX_OUTS` such outputs at once;
+    /// one more distinct sink is refused. Resets on graph loads.
+    SetBusOutput { bus: SendSource, sink: Option<SinkName> },
     /// Bypass one effect node (#74): a bypassed FX passes its input through
     /// unchanged (its knob values are kept). Resets on graph loads.
     SetStripBypass { node: NodeId, bypass: bool },
@@ -1231,7 +1275,7 @@ impl Command {
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
-            | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::RenameNode { .. }
+            | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::SetBusOutput { .. } | Command::RenameNode { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. }
             | Command::SetKeysScale { .. })

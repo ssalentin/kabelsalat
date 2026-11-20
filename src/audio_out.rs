@@ -168,7 +168,8 @@ pub fn parse_app_streams(json: &str, ours: Option<u64>) -> Vec<AppStream> {
         let props = i.get("properties")?;
         let app = props.get("application.name").and_then(Value::as_str)?.to_string();
         let corked = i.get("corked").and_then(Value::as_bool).unwrap_or(false);
-        if Some(index) == ours || corked || app.contains("[kabelsalat]") { return None; }
+        let bus_out = props.get("node.name").and_then(Value::as_str).is_some_and(|n| n.starts_with(BUS_OUT_NODE));
+        if Some(index) == ours || corked || bus_out || app.contains("[kabelsalat]") { return None; }
         let title = props.get("media.name").and_then(Value::as_str).unwrap_or("").to_string();
         let vols: Vec<f32> = i.get("volume").and_then(Value::as_object).map(|m| m.values()
             .filter_map(|c| c.get("value_percent").and_then(Value::as_str))
@@ -314,6 +315,195 @@ pub fn scan_and_apply(target: Target) -> OutputState {
         }
     }
     OutputState { outputs, current, streams }
+}
+
+// -- buses on their own output (#147) -----------------------------------
+
+use crate::engine::{GraphPub, OutSlot, OutTaps, MAX_OUTS};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Node name prefix of the playback streams of routed buses; the slot
+/// number follows. `parse_app_streams` leaves them out by it.
+pub const BUS_OUT_NODE: &str = "kabelsalat-bus-out-";
+
+/// Most stereo samples a bus stream lets wait in its ring before it cuts to
+/// the newest: the sink runs on its own clock, and a slower one would
+/// otherwise let the bus fall further and further behind the master.
+fn max_backlog(rate: u32) -> usize {
+    (rate as usize / 25) * 2
+}
+
+/// Whole frames to throw away so that at most `max` samples wait.
+pub fn backlog_cut(waiting: usize, max: usize) -> usize {
+    if waiting > max { (waiting - max / 2) & !1 } else { 0 }
+}
+
+/// One playing bus stream: `pw-cat` into one sink and the thread that feeds
+/// it from the slot's ring.
+struct BusStream {
+    epoch: u32,
+    stop: Arc<AtomicBool>,
+    child: std::process::Child,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BusStream {
+    /// Has it ended (sink gone, slot handed on)?
+    fn ended(&mut self) -> bool {
+        self.thread.as_ref().is_none_or(|t| t.is_finished()) || !matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for BusStream {
+    fn drop(&mut self) {
+        // Signal stop before killing `pw-cat`, so a feeder parked on an empty
+        // ring exits right away and a feeder blocked in `write_all` gets EPIPE.
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(t) = self.thread.take() { let _ = t.join(); }
+    }
+}
+
+/// Start `pw-cat` on `sink` and feed it slot `k`'s ring while the slot's
+/// epoch stays `epoch`. The stream never follows to another sink: when its
+/// own goes, PipeWire ends it (`node.dont-reconnect`), and a bus routed to
+/// headphones never lands on the PA.
+fn start_bus_stream(taps: &OutTaps, k: usize, slot: OutSlot, rate: u32, buffer: u32) -> Option<BusStream> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let sink = slot.sink.as_str().to_string();
+    let mut child = std::process::Command::new("pw-cat")
+        .args(["--playback", "--raw", "--format", "f32", "--channels", "2"])
+        .args(["--rate", &rate.to_string()])
+        .args(["--latency", &buffer.max(64).to_string()])
+        .args(["--target", &sink])
+        .args(["-P", &format!("{{ node.name = {BUS_OUT_NODE}{k} media.name = \"kabelsalat bus\" node.dont-reconnect = true }}")])
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| eprintln!("bus out: cannot start pw-cat: {e}"))
+        .ok()?;
+    let mut pipe = child.stdin.take()?;
+    // The smallest pipe the kernel gives (one page): what waits in it is
+    // delay the backlog cut cannot see.
+    unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+    let ring = taps.rings[k].clone();
+    let epochs = taps.epochs.clone();
+    let epoch = slot.epoch;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_t = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name(format!("kabelsalat-bus-out-{k}"))
+        .spawn(move || {
+            // Feeds a sound card: at normal priority a busy desktop delays
+            // it past the stream's buffer (rule 29; one promotion, rule 38).
+            let _rt = if std::env::var_os("KABELSALAT_NO_RT").is_none() {
+                audio_thread_priority::promote_current_thread_to_real_time(rate, rate).ok()
+            } else {
+                None
+            };
+            let Ok(mut rx) = ring.lock() else { return };
+            let live = || !stop_t.load(Ordering::SeqCst) && epochs[k].load(Ordering::SeqCst) == epoch;
+            // What waited in the ring was meant for nobody, or for the sink
+            // this slot played before. Whole frames only, here and below:
+            // the ring holds L and R in turn.
+            let stale = rx.slots() & !1;
+            if let Ok(c) = rx.read_chunk(stale) { c.commit_all(); }
+            let max = max_backlog(rate);
+            let mut bytes: Vec<u8> = Vec::with_capacity(max * 4);
+            while live() {
+                let waiting = rx.slots() & !1;
+                let cut = backlog_cut(waiting, max);
+                if cut > 0 {
+                    if let Ok(c) = rx.read_chunk(cut) { c.commit_all(); }
+                }
+                let n = waiting - cut;
+                if n == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                let Ok(chunk) = rx.read_chunk(n) else { continue };
+                bytes.clear();
+                let (a, b) = chunk.as_slices();
+                for x in a.iter().chain(b) { bytes.extend_from_slice(&x.to_le_bytes()); }
+                chunk.commit_all();
+                // Read after the samples left the ring: an unchanged epoch
+                // means none of them was pushed for the slot's next sink.
+                if !live() || pipe.write_all(&bytes).is_err() { break; }
+            }
+        })
+        .ok()?;
+    eprintln!("bus out: output {k} plays to {sink}");
+    Some(BusStream { epoch, stop, child, thread: Some(thread) })
+}
+
+/// Names of the sinks that exist now. `None` if `pactl` failed. Blocking I/O.
+fn sink_names() -> Option<Vec<String>> {
+    Some(pactl(&["list", "short", "sinks"])?.lines()
+        .filter_map(|l| l.split('\t').nth(1).map(str::to_string)).collect())
+}
+
+/// Plays the engine's extra outputs (#147): a thread that keeps one
+/// `BusStream` per slot a bus is routed to, for exactly the sink the engine
+/// published. A sink that is not there gets no stream (its bus is silent,
+/// never on another output); the thread looks again twice a second and
+/// starts the stream when the device is back. Dropping it stops everything.
+pub struct BusOutputs {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BusOutputs {
+    pub fn spawn(taps: OutTaps, graph_pub: Arc<Mutex<GraphPub>>, rate: u32) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("kabelsalat-bus-outs".into())
+            .spawn(move || {
+                let mut streams: [Option<BusStream>; MAX_OUTS] = std::array::from_fn(|_| None);
+                let mut looked = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                while !stop_t.load(Ordering::Relaxed) {
+                    let slots = graph_pub.lock().map(|g| g.out_slots).unwrap_or([OutSlot::FREE; MAX_OUTS]);
+                    for k in 0..MAX_OUTS {
+                        let keep = streams[k].as_mut().is_some_and(|s| s.epoch == slots[k].epoch && !s.ended());
+                        if !keep { streams[k] = None; }
+                    }
+                    let active = (0..MAX_OUTS).any(|k| !slots[k].sink.is_none());
+                    // pactl only while a bus is routed away, and not in a tight loop:
+                    // opens streams whose sink is present and tears down streams whose
+                    // sink disappeared (pw-cat with node.dont-reconnect pauses instead
+                    // of exiting when its target sink is removed).
+                    if active && looked.elapsed() >= std::time::Duration::from_millis(500) {
+                        looked = std::time::Instant::now();
+                        if let Some(sinks) = sink_names() {
+                            for k in 0..MAX_OUTS {
+                                if slots[k].sink.is_none() { continue; }
+                                let present = sinks.iter().any(|s| s == slots[k].sink.as_str());
+                                if !present {
+                                    streams[k] = None;
+                                } else if streams[k].is_none() {
+                                    streams[k] = start_bus_stream(&taps, k, slots[k], rate, crate::bridge::configured_buffer_frames());
+                                }
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for BusOutputs {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() { let _ = t.join(); }
+    }
 }
 
 /// `kabelsalat audio-out-test`: the whole of this module against the
@@ -480,7 +670,238 @@ pub fn run_test() -> anyhow::Result<()> {
     println!("ok: the app stopped, its strip and meter are gone");
 
     drop(stream);
+    bus_output_check(home, other, &mut cleanup.modules)?;
     println!("audio-out-test: PASS");
+    Ok(())
+}
+
+/// Amplitude of the `hz` component of mono 48 kHz samples (Goertzel).
+fn tone_amp(buf: &[f32], hz: f32) -> f32 {
+    let w = std::f32::consts::TAU * hz / 48000.0;
+    let (mut re, mut im) = (0.0f64, 0.0f64);
+    for (i, x) in buf.iter().enumerate() {
+        let p = (w * i as f32) as f64;
+        re += *x as f64 * p.cos();
+        im += *x as f64 * p.sin();
+    }
+    (2.0 * (re * re + im * im).sqrt() / buf.len().max(1) as f64) as f32
+}
+
+/// One second of what a sink plays, read from its monitor (mono, 48 kHz).
+fn capture_sink(sink: &str, secs: f32) -> anyhow::Result<Vec<f32>> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("parec")
+        .args([&format!("--device={sink}.monitor"), "--format=float32le", "--rate=48000", "--channels=1",
+            "--latency-msec=20", "--client-name=kabelsalat-test-probe"])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+        .spawn().map_err(|e| anyhow::anyhow!("parec: {e}"))?;
+    let mut out = child.stdout.take().expect("piped stdout");
+    // The first 0.3 s are the probe starting up.
+    let (skip, want) = (14400usize, (secs * 48000.0) as usize);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = vec![0u8; (skip + want) * 4];
+        let _ = tx.send(out.read_exact(&mut bytes).map(|_| bytes));
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(12));
+    let _ = child.kill();
+    let _ = child.wait();
+    let bytes = got.map_err(|_| anyhow::anyhow!("no audio from {sink}.monitor within 12 s"))??;
+    Ok(bytes[skip * 4..].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+}
+
+/// `audio-out-test`, second half (#147): a real engine on a real output
+/// stream, two rigs that play one tone each (440 Hz and 1130 Hz) and an aux
+/// bus, and three null sinks read back through their monitors. A bus routed
+/// to its own output must arrive there and nowhere else, stay silent while
+/// its device is gone, come back with it, and return to the master.
+fn bus_output_check(home: &str, other: &str, modules: &mut Vec<String>) -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, AudioInChannel, Command, DspKind, Graph, NodeKind, PortKind, PortRef, SendSource, SinkName};
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::time::{Duration, Instant};
+    const A_HZ: f32 = 440.0;
+    const B_HZ: f32 = 1130.0;
+    const PHONES: &str = "kabelsalat_test_phones";
+
+    let load_phones = || pactl(&["load-module", "module-null-sink", &format!("sink_name={PHONES}"),
+        "sink_properties=device.description=Test-Phones"]).map(|id| id.trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!("could not load a null sink"));
+    let mut phones_module = load_phones()?;
+    modules.push(phones_module.clone());
+
+    // Two rigs, each an Audio In fed its tone in the output callback, wired
+    // to its own master; the aux bus comes in by command, as in the app.
+    let mut g = Graph::default();
+    g.reserve(32, 32);
+    let mut ins = [0u32; 2];
+    for rig in 0..2u8 {
+        let a = g.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes("IN"));
+        let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.set_rig(a, rig);
+        g.set_rig(m, rig);
+        g.connect_with_id(1 + rig as u32, PortRef { node: a, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        ins[rig as usize] = a;
+    }
+    let device = cpal::default_host().default_output_device().ok_or_else(|| anyhow::anyhow!("no default output device"))?;
+    let config: cpal::StreamConfig = device.default_output_config()?.into();
+    let (rate, ch) = (config.sample_rate as f32, config.channels as usize);
+    let (mut bus, drain) = command_bus();
+    let mut engine = crate::engine::GraphEngine::new(g, drain, rate as f64, vec![]);
+    let graph_pub = Arc::new(Mutex::new(GraphPub::default()));
+    engine.set_graph_pub(graph_pub.clone());
+    let (mut side_tx, side_rx) = rtrb::RingBuffer::new(8);
+    engine.set_audio_in_channel(side_rx);
+    let mut feeds = Vec::new();
+    for (i, (hz, amp)) in [(A_HZ, 0.3f32), (B_HZ, 0.2)].into_iter().enumerate() {
+        let (tx, rx) = rtrb::RingBuffer::<f32>::new(16384);
+        let _ = side_tx.push((ins[i], rx));
+        feeds.push((tx, hz, amp));
+    }
+    let taps = engine.take_out_taps().expect("the engine's extra outputs");
+    let _player = BusOutputs::spawn(taps, graph_pub.clone(), rate as u32);
+    // Rig 1 can play noise bursts instead of its tone (the delay measurement).
+    let bursts = Arc::new(AtomicBool::new(false));
+    let bursts_cb = bursts.clone();
+    let (mut frame_no, mut seed) = (0u64, 0x2545_F491u32);
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let burst = bursts_cb.load(Ordering::Relaxed);
+            for _ in 0..data.len() / ch {
+                for (i, (tx, hz, amp)) in feeds.iter_mut().enumerate() {
+                    let mut v = (std::f32::consts::TAU * *hz * frame_no as f32 / rate).sin() * *amp;
+                    if burst && i == 0 {
+                        // 10 ms of noise four times a second.
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                        let noise = (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0;
+                        v = if (frame_no % (rate as u64 / 4)) < (rate as u64 / 100) { noise * 0.3 } else { 0.0 };
+                    }
+                    let _ = tx.push(v);
+                    let _ = tx.push(v);
+                }
+                frame_no += 1;
+            }
+            engine.render(data, ch);
+        },
+        |_err: cpal::Error| {},
+        None,
+    )?;
+    stream.play()?;
+
+    fn poll<T>(what: &str, mut f: impl FnMut() -> anyhow::Result<Option<T>>) -> anyhow::Result<T> {
+        let end = Instant::now() + Duration::from_secs(25);
+        loop {
+            if let Some(v) = f()? { return Ok(v); }
+            anyhow::ensure!(Instant::now() < end, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    // (440 Hz, 1130 Hz) amplitude on each of home, other, phones.
+    let hear = || -> anyhow::Result<[(f32, f32); 3]> {
+        let mut out = [(0.0, 0.0); 3];
+        for (i, sink) in [home, other, PHONES].into_iter().enumerate() {
+            let buf = capture_sink(sink, 1.0)?;
+            out[i] = (tone_amp(&buf, A_HZ), tone_amp(&buf, B_HZ));
+        }
+        Ok(out)
+    };
+    const HEARD: f32 = 0.05;
+    const SILENT: f32 = 0.002; // -54 dBFS
+    let show = |h: &[(f32, f32); 3]| format!("home {:.3}/{:.3}, other {:.3}/{:.3}, phones {:.3}/{:.3} (440 Hz/1130 Hz)",
+        h[0].0, h[0].1, h[1].0, h[1].1, h[2].0, h[2].1);
+    let bus_streams = || pactl(&["-f", "json", "list", "sink-inputs"]).unwrap_or_default().matches(BUS_OUT_NODE).count();
+
+    // The master stream belongs on `home` for the whole check.
+    poll("the engine's stream on the home sink", || Ok((scan_and_apply(Target::Sink(home)).current.as_deref() == Some(home)).then_some(())))?;
+
+    // 9. Nothing routed: both rigs in the master, the other sinks silent.
+    let h = poll("both rigs on the home sink", || { let h = hear()?; Ok((h[0].0 > HEARD && h[0].1 > HEARD).then_some(h)) })?;
+    anyhow::ensure!(h[1].0 < SILENT && h[1].1 < SILENT && h[2].0 < SILENT && h[2].1 < SILENT, "unrouted: only the home sink plays: {}", show(&h));
+    anyhow::ensure!(bus_streams() == 0, "no bus stream without a routed bus");
+    println!("ok: nothing routed: {}", show(&h));
+
+    // 10. Rig 2's bus to `other`: it arrives there and leaves the master.
+    anyhow::ensure!(bus.send(Command::SetBusOutput { bus: SendSource::Rig(1), sink: Some(SinkName::new(other)) }));
+    let h = poll("rig 2 on the other sink only", || { let h = hear()?; Ok((h[1].1 > HEARD && h[0].1 < SILENT).then_some(h)) })?;
+    anyhow::ensure!(h[0].0 > HEARD && h[1].0 < SILENT && h[2].0 < SILENT && h[2].1 < SILENT,
+        "rig 1 stays in the master and reaches no other sink: {}", show(&h));
+    println!("ok: rig 2 routed to {other}: {}", show(&h));
+
+    // 11. An aux bus fed by rig 1 (pre fader) to `phones`: a monitor mix.
+    anyhow::ensure!(bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Bus), name: name_bytes("MON"), rig: 0, wire: true }));
+    let aux = poll("the aux bus in the engine", || Ok(graph_pub.lock().unwrap().graph.nodes.iter()
+        .find(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).map(|n| n.id)))?;
+    bus.send(Command::SetSend { from: SendSource::Rig(0), bus: aux, level: Some(0.5), pre: Some(true) });
+    bus.send(Command::SetBusOutput { bus: SendSource::Node(aux), sink: Some(SinkName::new(PHONES)) });
+    let h = poll("the aux bus on the phones sink", || { let h = hear()?; Ok((h[2].0 > HEARD).then_some(h)) })?;
+    anyhow::ensure!(h[2].1 < SILENT && h[1].0 < SILENT && h[1].1 > HEARD && h[0].0 > HEARD && h[0].1 < SILENT,
+        "each bus plays on its own sink only: {}", show(&h));
+    let dry = h[0].0;
+    anyhow::ensure!(bus_streams() == 2, "one stream per routed sink, got {}", bus_streams());
+    println!("ok: aux bus routed to {PHONES}: {}", show(&h));
+
+    // 12. The phones go away: their bus is silent, and nobody else gets it.
+    anyhow::ensure!(pactl(&["unload-module", &phones_module]).is_some(), "unload the phones sink");
+    modules.retain(|m| *m != phones_module);
+    poll("the phones stream ending", || Ok((bus_streams() == 1).then_some(())))?;
+    std::thread::sleep(Duration::from_millis(1200));
+    anyhow::ensure!(bus_streams() == 1, "the stream of a missing output is not reopened elsewhere");
+    let (h0, h1) = (capture_sink(home, 1.0)?, capture_sink(other, 1.0)?);
+    let (home_a, other_a) = (tone_amp(&h0, A_HZ), tone_amp(&h1, A_HZ));
+    anyhow::ensure!((home_a - dry).abs() < dry * 0.1 && other_a < SILENT,
+        "the bus of a missing output lands nowhere: home 440 Hz {home_a:.3} (dry {dry:.3}), other {other_a:.3}");
+    println!("ok: {PHONES} unplugged: its bus is silent (home 440 Hz {home_a:.3} = the dry rig, other {other_a:.3})");
+
+    // 13. They come back: the bus plays there again by itself.
+    phones_module = load_phones()?;
+    modules.push(phones_module.clone());
+    let t0 = Instant::now();
+    let h = poll("the aux bus back on the phones sink", || { let h = hear()?; Ok((h[2].0 > HEARD).then_some(h)) })?;
+    println!("ok: {PHONES} re-plugged: heard again within {:.1} s: {}", t0.elapsed().as_secs_f32(), show(&h));
+
+    // 14. How far apart master and bus arrive. Both on one sink: rig 1 plays
+    // noise bursts, dry through the master and through the bus into `home`,
+    // so the monitor holds two copies and their distance is the peak of its
+    // autocorrelation.
+    bus.send(Command::SetRigMix { rig: 1, vol: None, pan: None, mute: Some(true), solo: None });
+    bus.send(Command::SetBusOutput { bus: SendSource::Node(aux), sink: Some(SinkName::new(home)) });
+    bus.send(Command::SetSend { from: SendSource::Rig(0), bus: aux, level: Some(1.0), pre: Some(true) });
+    bursts.store(true, Ordering::Relaxed);
+    poll("the bus stream on the home sink", || Ok((bus_streams() == 2).then_some(())))?;
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut gaps = Vec::new();
+    for _ in 0..5 {
+        let buf = capture_sink(home, 2.0)?;
+        let r0: f64 = buf.iter().map(|x| (*x as f64).powi(2)).sum();
+        let (mut best, mut best_r) = (0usize, 0.0f64);
+        for lag in 12..4800 {
+            let r: f64 = buf[lag..].iter().zip(&buf).map(|(a, b)| *a as f64 * *b as f64).sum();
+            if r > best_r { (best, best_r) = (lag, r); }
+        }
+        anyhow::ensure!(r0 > 0.0, "the bursts are not heard on {home}");
+        gaps.push((best as f32 / 48.0, (best_r / r0) as f32));
+    }
+    bursts.store(false, Ordering::Relaxed);
+    let clear: Vec<f32> = gaps.iter().filter(|g| g.1 > 0.15).map(|g| g.0).collect();
+    if clear.is_empty() {
+        println!("note: master and bus arrive less than 0.25 ms apart, or the copies did not correlate: {gaps:?}");
+    } else {
+        let mut sorted = clear.clone();
+        sorted.sort_by(f32::total_cmp);
+        println!("measured: master and bus copies arrive {:.1} ms apart on one sink (median of {}; min {:.1}, max {:.1})",
+            sorted[sorted.len() / 2], sorted.len(), sorted[0], sorted[sorted.len() - 1]);
+    }
+
+    // 15. Everything back into the master: no bus stream is left.
+    bus.send(Command::SetRigMix { rig: 1, vol: None, pan: None, mute: Some(false), solo: None });
+    bus.send(Command::SetSend { from: SendSource::Rig(0), bus: aux, level: Some(0.0), pre: Some(false) });
+    bus.send(Command::SetBusOutput { bus: SendSource::Node(aux), sink: None });
+    bus.send(Command::SetBusOutput { bus: SendSource::Rig(1), sink: None });
+    let h = poll("both rigs back in the master", || { let h = hear()?; Ok((h[0].1 > HEARD && h[1].1 < SILENT).then_some(h)) })?;
+    poll("the bus streams ending", || Ok((bus_streams() == 0).then_some(())))?;
+    anyhow::ensure!(h[0].0 > HEARD && h[2].0 < SILENT, "back in the master: {}", show(&h));
+    println!("ok: back in the master: {}", show(&h));
+    drop(stream);
     Ok(())
 }
 
@@ -571,5 +992,19 @@ mod tests {
         assert_eq!(find_our_stream(inputs, clients, 1868741), Some((26713, 25144)), "the other kabelsalat process is not us");
         assert_eq!(find_our_stream(inputs, clients, 4242), None);
         assert_eq!(find_our_stream("x", clients, 1868741), None);
+    }
+
+    #[test]
+    fn bus_output_streams_stay_out_of_app_streams_and_backlog_cuts_whole_frames() {
+        let json = r#"[
+          {"index":31000,"corked":false,"mute":false,"volume":{"front-left":{"value_percent":"100%"}},"properties":{"application.name":"pw-cat","node.name":"kabelsalat-bus-out-0","media.name":"kabelsalat bus"}},
+          {"index":31001,"corked":false,"mute":false,"volume":{"front-left":{"value_percent":"100%"}},"properties":{"application.name":"Spotify","media.name":"Song"}}
+        ]"#;
+        let s = parse_app_streams(json, None);
+        assert_eq!(s.iter().map(|x| x.index).collect::<Vec<_>>(), vec![31001]);
+        assert_eq!(backlog_cut(100, 200), 0);
+        assert_eq!(backlog_cut(200, 200), 0);
+        assert_eq!(backlog_cut(205, 200), 104, "cuts whole stereo frames down to half max");
+        assert_eq!(backlog_cut(205, 200) % 2, 0);
     }
 }

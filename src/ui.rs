@@ -30,8 +30,8 @@ use eframe::egui::{
 
 use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
-    name_bytes, name_str, split_port, AudioInChannel, AuxSend, Command, CommandBus, DspKind, Graph, Lv2Uri,
-    SendSource,
+    name_bytes, name_str, split_port, AudioInChannel, AuxSend, BusOut, Command, CommandBus, DspKind, Graph, Lv2Uri,
+    SendSource, SinkName,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
 };
 use crate::engine::{
@@ -1046,7 +1046,16 @@ fn remap_session(
         };
         Some(AuxSend { from, bus: remap(x.bus)?, ..*x })
     }).collect();
+    // Bus outputs (#147) follow their rig or their aux bus the same way.
+    let outs: Vec<BusOut> = s.bus_outs().iter().filter_map(|o| {
+        let bus = match o.bus {
+            SendSource::Rig(r) => SendSource::Rig(rig_of(r)?),
+            SendSource::Node(n) => SendSource::Node(remap(n)?),
+        };
+        Some(BusOut { bus, ..*o })
+    }).collect();
     ns.set_sends(sends);
+    ns.set_bus_outs(outs);
     ns
 }
 
@@ -2682,7 +2691,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
     "get_engine_info", "reset_engine_peaks", "set_buffer_size",
     "get_strip_knobs", "set_strip_knob",
-    "add_bus", "remove_bus", "set_send", "get_sends",
+    "add_bus", "remove_bus", "set_send", "get_sends", "set_bus_output", "get_bus_outputs",
     "list_channels",
     "get_midi_clock", "set_midi_clock",
     "get_master_target", "set_master_target",
@@ -3210,12 +3219,17 @@ struct DemoApp {
     strips: Vec<StripUiRow>,
     /// Sends into aux buses (issue #5): the mirror of the engine's table.
     sends: Vec<AuxSend>,
+    /// Buses that play to their own output (#147): the mirror of the
+    /// engine's table (shares the sends' grace).
+    bus_outs: Vec<BusOut>,
     /// A local send edit is on its way: the engine's older table waits.
     ui_send_grace: f32,
     /// A send knob being dragged: its send and the fader position so far.
     send_drag: Option<((SendSource, u32), f32)>,
     /// This frame's send rows: (source, bus, level knob, PRE tag).
     mixer_send_rects: Vec<(SendSource, u32, Rect, Rect)>,
+    /// The output menus of the bus strips drawn this frame (#147).
+    mixer_bus_out_rects: Vec<(SendSource, Rect)>,
     /// A bus edit asked for during a mixer frame, applied after its layout
     /// (rule 32).
     pending_bus_edit: Option<BusEdit>,
@@ -3737,9 +3751,11 @@ impl DemoApp {
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
             strips: Vec::new(),
             sends: Vec::new(),
+            bus_outs: Vec::new(),
             ui_send_grace: -1.0,
             send_drag: None,
             mixer_send_rects: Vec::new(),
+            mixer_bus_out_rects: Vec::new(),
             pending_bus_edit: None,
             strip_order: Vec::new(),
             strip_knobs: std::collections::BTreeMap::new(),
@@ -4997,6 +5013,7 @@ impl DemoApp {
             // once a local edit's echo is back.
             if now >= self.ui_send_grace {
                 self.sends = g.sends.iter().copied().filter(|x| x.bus != u32::MAX).collect();
+                self.bus_outs = g.bus_outs.iter().copied().filter(|o| !o.sink.is_none()).collect();
             }
             // Strip mirror (#73/#74): adopt the engine's per-node table the
             // same way (rule 33) — a remote SetStripMix/SetStripBypass shows
@@ -5588,6 +5605,8 @@ impl DemoApp {
             "add_bus" => "Add aux bus".into(),
             "remove_bus" => "Remove aux bus".into(),
             "get_sends" => "Read sends".into(),
+            "get_bus_outputs" => "Read bus outputs".into(),
+            "set_bus_output" => "Bus output".into(),
             "set_send" => {
                 let bus = args.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 format!("Send → {}", self.unit_display_name(bus))
@@ -6241,6 +6260,7 @@ impl DemoApp {
             }
         }
         s.set_sends(self.sends.clone());
+        s.set_bus_outs(self.bus_outs.clone());
         Ok(s)
     }
 
@@ -6455,6 +6475,7 @@ impl DemoApp {
         self.strip_order = s.strip_order().to_vec();
         self.strip_knobs = s.strip_knobs().clone();
         self.sends = s.sends().to_vec();
+        self.bus_outs = s.bus_outs().to_vec();
         self.mixer_knob_drag = None;
         self.send_all_strip_state();
         // The loudness target the session was saved with (#12). A session
@@ -6619,6 +6640,7 @@ impl DemoApp {
         self.build_rack(&merged, &[]);
         self.strips.clear();
         self.sends.clear();
+        self.bus_outs.clear();
         self.strip_order.clear();
         self.strip_knobs.clear();
         self.mixer_knob_drag = None;
@@ -7521,6 +7543,37 @@ impl DemoApp {
                 }
             }
             "get_sends" => self.sends_json().to_string(),
+            "get_bus_outputs" => self.bus_outputs_json().to_string(),
+            "set_bus_output" => {
+                // One rig bus or aux bus to its own output (#147).
+                let bus = match (args.get("rig").and_then(|v| v.as_u64()), args.get("bus").and_then(|v| v.as_u64())) {
+                    (Some(r), None) => SendSource::Rig(r.min(255) as u8),
+                    (None, Some(n)) => SendSource::Node(n as u32),
+                    _ => return "set_bus_output needs exactly one bus: rig (0-based index, that rig's bus) or bus (an aux bus's node id)".into(),
+                };
+                let out = args.get("output").and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty());
+                let known = self.audio_out.lock().map(|s| s.outputs.clone()).unwrap_or_default();
+                if let Some(o) = &out {
+                    if !known.iter().any(|k| &k.raw == o) {
+                        return format!("no output named '{o}' (see list_audio_outputs)");
+                    }
+                }
+                let who = match bus {
+                    SendSource::Rig(r) => format!("{}'s rig bus", self.rig_name(r as usize)),
+                    SendSource::Node(n) => self.unit_display_name(n),
+                };
+                match self.set_bus_output(bus, out.as_deref()) {
+                    Ok(()) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.record(origin, format!("Output of {who}"), Vec::new(), now);
+                        match out {
+                            Some(o) => format!("{who} plays to {o} only and has left the master mix (saved with the session)"),
+                            None => format!("{who} plays into the master again"),
+                        }
+                    }
+                    Err(e) => format!("set_bus_output NOT applied: {e}"),
+                }
+            }
             "set_node_bypass" => {
                 // Insert bypass (#74): the FX passes its input through.
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
@@ -10155,12 +10208,134 @@ impl DemoApp {
                 SendSource::Node(n) => has(n),
             }
         });
+        // And the buses on their own output (#147).
+        self.bus_outs.retain(|o| match o.bus {
+            SendSource::Rig(r) => self.units.iter().any(|u| u.rig == r),
+            SendSource::Node(n) => self.units.iter().any(|u| u.node_id == n && matches!(u.node_kind, UnitKind::Dsp(DspKind::Bus))),
+        });
         self.ui_send_grace = self.ui_time + 0.6;
         if let Some(bus) = &self.bus {
             let mut bus = bus.lock().unwrap();
             for x in &self.sends {
                 let _ = bus.send(Command::SetSend { from: x.from, bus: x.bus, level: Some(x.level), pre: Some(x.pre) });
             }
+            for o in &self.bus_outs {
+                let _ = bus.send(Command::SetBusOutput { bus: o.bus, sink: Some(o.sink) });
+            }
+        }
+    }
+
+    // -- buses on their own output (#147) -----------------------------------
+
+    /// The sink a rig bus or aux bus plays to; `None` = the master's output.
+    fn bus_output_of(&self, bus: SendSource) -> Option<SinkName> {
+        self.bus_outs.iter().find(|o| o.bus == bus).map(|o| o.sink)
+    }
+
+    /// Route one rig bus or aux bus to `sink` (a PipeWire sink name), or
+    /// back into the master for `None`; in the mirror and in the engine
+    /// (rule 25). Refuses what the engine would ignore.
+    fn set_bus_output(&mut self, bus: SendSource, sink: Option<&str>) -> Result<(), String> {
+        match bus {
+            SendSource::Rig(r) if r as usize >= self.rig_count() => {
+                return Err(format!("no rig {r} (rigs are 0..{})", self.rig_count().saturating_sub(1)));
+            }
+            SendSource::Node(n) if !self.bus_units().iter().any(|&u| self.units[u].node_id == n) => {
+                return Err(format!("node {n} is not an aux bus (get_bus_outputs lists the buses; a rig bus is rig=)"));
+            }
+            _ => {}
+        }
+        let sink = sink.filter(|s| !s.is_empty());
+        if let Some(s) = sink {
+            if s.len() > SinkName::MAX_LEN {
+                return Err(format!("the output name is longer than {} bytes", SinkName::MAX_LEN));
+            }
+            let name = SinkName::new(s);
+            let mut others: Vec<SinkName> = self.bus_outs.iter().filter(|o| o.bus != bus).map(|o| o.sink).collect();
+            others.dedup();
+            others.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            others.dedup();
+            if !others.contains(&name) && others.len() >= crate::engine::MAX_OUTS {
+                return Err(format!("buses already play to {} outputs besides the master's, the most kabelsalat serves at once: route to one of those, or bring a bus back to the master first", crate::engine::MAX_OUTS));
+            }
+        }
+        self.bus_outs.retain(|o| o.bus != bus);
+        if let Some(s) = sink { self.bus_outs.push(BusOut { bus, sink: SinkName::new(s) }); }
+        self.ui_send_grace = self.ui_time + 0.6;
+        if let Some(b) = &self.bus {
+            let _ = b.lock().unwrap().send(Command::SetBusOutput { bus, sink: sink.map(SinkName::new) });
+        }
+        Ok(())
+    }
+
+    /// Every rig bus and aux bus with the output it plays to, for agents.
+    fn bus_outputs_json(&self) -> serde_json::Value {
+        let known = self.audio_out.lock().map(|s| s.outputs.clone()).unwrap_or_default();
+        let out = |bus: SendSource| match self.bus_output_of(bus) {
+            None => serde_json::json!({"output": null, "plays_to": "master out"}),
+            Some(s) => {
+                let dev = known.iter().find(|o| o.raw == s.as_str());
+                serde_json::json!({
+                    "output": s.as_str(), "label": dev.map(|d| d.name.clone()),
+                    "available": dev.is_some(),
+                    "plays_to": if dev.is_some() { "its own output; it is not in the master mix" } else { "nothing: this output is not there now (silent until it returns)" },
+                })
+            }
+        };
+        let mut buses: Vec<serde_json::Value> = (0..self.rig_count()).map(|r| {
+            let mut v = out(SendSource::Rig(r as u8));
+            v["rig"] = serde_json::json!(r);
+            v["name"] = serde_json::json!(self.rig_name(r));
+            v
+        }).collect();
+        for &u in &self.bus_units() {
+            let mut v = out(SendSource::Node(self.units[u].node_id));
+            v["bus"] = serde_json::json!(self.units[u].node_id);
+            v["name"] = serde_json::json!(sentence_case(&self.units[u].name));
+            buses.push(v);
+        }
+        serde_json::json!({"buses": buses, "max_outputs": crate::engine::MAX_OUTS})
+    }
+
+    /// The output menu of a rig bus or aux bus strip (#147): Master out or
+    /// one of the sound cards, like the menu at Master out. A chosen card
+    /// that is unplugged stays chosen and says so.
+    fn bus_output_ui(&mut self, ui: &mut egui::Ui, bus: SendSource, width: f32) {
+        let outputs = self.audio_out.lock().map(|s| s.outputs.clone()).unwrap_or_default();
+        let now = self.bus_output_of(bus);
+        let raw = now.map(|s| s.as_str().to_string());
+        let dev = raw.as_ref().and_then(|r| outputs.iter().find(|o| &o.raw == r));
+        let selected = match (&raw, dev) {
+            (None, _) => "→ Master out".to_string(),
+            (Some(_), Some(d)) => format!("→ {}", d.name),
+            (Some(_), None) => "→ not available".to_string(),
+        };
+        let key = match bus {
+            SendSource::Rig(r) => (0u8, r as u32),
+            SendSource::Node(n) => (1u8, n),
+        };
+        let mut pick: Option<Option<String>> = None;
+        let resp = theme::Dropdown::new(("dd_bus_output", key), &selected)
+            .width(width)
+            .popup_min_width(240.0)
+            .text_size(10.5)
+            .show_ui(ui, |menu| {
+                if menu.item(raw.is_none(), "Master out") { pick = Some(None); }
+                for o in &outputs {
+                    if menu.item(raw.as_deref() == Some(o.raw.as_str()), &o.name) { pick = Some(Some(o.raw.clone())); }
+                }
+                if let (Some(r), None) = (&raw, dev) {
+                    menu.note(&format!("{r} is not there now: this bus is silent until it returns"));
+                }
+            });
+        self.mixer_bus_out_rects.push((bus, resp.rect));
+        resp.on_hover_text(match (&raw, dev) {
+            (None, _) => "where this bus plays: the master, or a sound card of its own (it then leaves the main mix)".to_string(),
+            (Some(_), Some(d)) => format!("plays to {} only, past the master", d.name),
+            (Some(r), None) => format!("{r} is not there now: this bus is silent until it returns"),
+        });
+        if let Some(p) = pick {
+            if let Err(e) = self.set_bus_output(bus, p.as_deref()) { self.session_msg = e; }
         }
     }
 
@@ -19520,6 +19695,7 @@ impl DemoApp {
         self.mixer_quick_knob_rects.clear();
         self.mixer_learn_rects.clear();
         self.mixer_send_rects.clear();
+        self.mixer_bus_out_rects.clear();
         let buses = self.bus_units();
         let mut switch: Option<usize> = None;
         // System audio (#31): other apps' streams + the output choice.
@@ -19969,6 +20145,9 @@ impl DemoApp {
                     if plate.clicked() { self.pending_bus_edit = Some(BusEdit::Remove(node)); }
                 }
                 plate.on_hover_text(tip);
+                if is_bus {
+                    self.bus_output_ui(ui, SendSource::Node(node), w - 8.0);
+                }
                 // Insert slots (#74/#107): a view of the cable chain.
                 let chain = self.strip_chain(unit);
                 self.insert_rows_ui(ui, Some(node), chain.as_deref(), edits);
@@ -20066,7 +20245,7 @@ impl DemoApp {
         let bus_resp = ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.set_width(STRIP_W);
             ui.label(egui::RichText::new("Rig bus").size(13.0).strong().color(theme::INK));
-            theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.12, theme::INK_2);
+            self.bus_output_ui(ui, SendSource::Rig(rig as u8), STRIP_W - 8.0);
             ui.add_space(8.0);
             let fr = self.strip_fader_ui(ui, rig_strip_key(rig), &mut vol, level, fader_h, vol_dest);
             self.mixer_fader_rects.push(fr);
@@ -24670,6 +24849,8 @@ fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Ve
 /// output stream can be reopened live at a new buffer size without losing
 /// voices, patches, or rack state.
 struct AudioStreamHost {
+    /// Plays buses routed to their own output (#147); stops when dropped.
+    _bus_outs: Option<crate::audio_out::BusOutputs>,
     stream: Option<cpal::Stream>,
     engine: Arc<Mutex<GraphEngine>>,
     clock_pos: Arc<crate::clocksend::ClockPos>,
@@ -24872,6 +25053,8 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     engine.set_audio_in_channel(audio_in_rx);
     let audio_in_levels = engine.audio_in_levels_handle();
     engine.spawn_lv2_loader();
+    let bus_outs = engine.take_out_taps()
+        .map(|taps| crate::audio_out::BusOutputs::spawn(taps, graph_pub.clone(), sample_rate as u32));
     let engine = Arc::new(Mutex::new(engine));
     let (stream, active_buffer) = match open_output_stream(engine.clone(), clock_pos.clone(), Some(sample_rate), wanted_buffer) {
         Ok((s, _)) => (s, wanted_buffer),
@@ -24884,6 +25067,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     };
     crate::bridge::set_configured_buffer_frames(active_buffer);
     let audio_host = AudioStreamHost {
+        _bus_outs: bus_outs,
         stream: Some(stream),
         engine,
         clock_pos: clock_pos.clone(),
@@ -33125,7 +33309,224 @@ mod settings_and_dropdown_tests {
         let (texts, _, _) = warm(&mut app, &ctx, size);
         assert!(texts.iter().any(|(t, _)| t == "512 frames (10.7 ms)"));
     }
+
+    // ---- #147: a bus on its own output ------------------------------------
+
+    const M2: &str = "alsa_output.m2";
+    const PHONES: &str = "alsa_output.phones";
+
+    /// Two rigs and an aux bus in the SECOND rig, three sound cards, the
+    /// mixer open. Returns the bus's node id.
+    fn app_with_buses_and_cards() -> (DemoApp, u32) {
+        let (mut app, _rx) = app_with_system_audio();
+        app.audio_out.lock().unwrap().outputs.push(crate::audio_out::OutputDevice {
+            raw: PHONES.into(), name: "Headphones".into(), default: false,
+        });
+        app.load_multi_rig_demo();
+        let out = app.exec_tool("add_bus", &serde_json::json!({ "rig": 1, "name": "Mon" }));
+        assert!(out.starts_with("added aux bus"), "{out}");
+        app.stage_view = StageView::Mixer;
+        let bus = app.bus_units().first().map(|&u| app.units[u].node_id).expect("a bus unit");
+        (app, bus)
+    }
+
+    fn sorted_outs(app: &DemoApp) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = app.bus_outs.iter().map(|o| (format!("{:?}", o.bus), o.sink.as_str().to_string())).collect();
+        v.sort();
+        v
+    }
+
+    fn sink_of(app: &DemoApp, bus: SendSource) -> Option<String> {
+        app.bus_output_of(bus).map(|s| s.as_str().to_string())
+    }
+
+    #[test]
+    fn the_bus_output_tools_set_list_and_refuse() {
+        let (mut app, bus) = app_with_buses_and_cards();
+        let out = app.exec_tool("set_bus_output", &serde_json::json!({ "rig": 1, "output": M2 }));
+        assert!(out.contains("plays to alsa_output.m2 only") && out.contains("left the master mix"), "{out}");
+        let out = app.exec_tool("set_bus_output", &serde_json::json!({ "bus": bus, "output": PHONES }));
+        assert!(out.starts_with("Mon plays to alsa_output.phones"), "{out}");
+        let listed: serde_json::Value = serde_json::from_str(&app.exec_tool("get_bus_outputs", &serde_json::json!({}))).unwrap();
+        let buses = listed["buses"].as_array().unwrap();
+        assert_eq!(buses.len(), 3, "two rig buses and the aux bus: {listed}");
+        assert!(buses[0]["rig"] == 0 && buses[0]["output"].is_null() && buses[0]["plays_to"] == "master out", "{listed}");
+        assert!(buses[1]["rig"] == 1 && buses[1]["output"] == M2 && buses[1]["label"] == "MOTU M2" && buses[1]["available"] == true, "{listed}");
+        assert!(buses[2]["bus"] == bus && buses[2]["name"] == "Mon" && buses[2]["output"] == PHONES, "{listed}");
+        // Refusals say why (rule 77) and change nothing.
+        let synth = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        for (args, why) in [
+            (serde_json::json!({ "rig": 0, "bus": bus, "output": M2 }), "exactly one bus"),
+            (serde_json::json!({ "output": M2 }), "exactly one bus"),
+            (serde_json::json!({ "rig": 7, "output": M2 }), "no rig 7"),
+            (serde_json::json!({ "bus": synth, "output": M2 }), "is not an aux bus"),
+            (serde_json::json!({ "rig": 0, "output": "MOTU M2" }), "no output named 'MOTU M2'"),
+        ] {
+            let out = app.exec_tool("set_bus_output", &args);
+            assert!(out.contains(why), "{args}: {out}");
+        }
+        assert_eq!(app.bus_outs.len(), 2);
+        // Four outputs besides the master's are the most (the engine's limit).
+        let real = app.bus_outs.clone();
+        app.bus_outs = (2..6).map(|r| BusOut { bus: SendSource::Rig(r), sink: SinkName::new(&format!("card{r}")) }).collect();
+        let out = app.exec_tool("set_bus_output", &serde_json::json!({ "rig": 0, "output": M2 }));
+        assert!(out.contains("NOT applied") && out.contains("4 outputs"), "{out}");
+        app.bus_outs = real;
+        // An unplugged device keeps its bus's choice and says so.
+        app.audio_out.lock().unwrap().outputs.retain(|o| o.raw != PHONES);
+        let listed: serde_json::Value = serde_json::from_str(&app.exec_tool("get_bus_outputs", &serde_json::json!({}))).unwrap();
+        assert!(listed["buses"][2]["output"] == PHONES && listed["buses"][2]["available"] == false, "{listed}");
+        assert!(listed["buses"][2]["plays_to"].as_str().unwrap().contains("silent until it returns"), "{listed}");
+        // Back into the master.
+        let out = app.exec_tool("set_bus_output", &serde_json::json!({ "rig": 1, "output": null }));
+        assert!(out.contains("plays into the master again"), "{out}");
+        assert_eq!(app.bus_output_of(SendSource::Rig(1)), None);
+        // Every tool the prompt names exists (rule 6) and is served to MCP (rule 66).
+        let names: Vec<String> = crate::assistant::tools().as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        for t in ["set_bus_output", "get_bus_outputs"] {
+            assert!(names.iter().any(|n| n == t), "assistant::tools() has {t}");
+            assert!(UI_BRIDGE_TOOLS.contains(&t), "the bridge serves {t}");
+        }
+        assert!(tool_is_read_only("get_bus_outputs") && !tool_is_read_only("set_bus_output"));
+    }
+
+    #[test]
+    fn a_bus_output_is_picked_in_the_mixer_and_reaches_the_engine() {
+        let (mut app, bus) = app_with_buses_and_cards();
+        let (ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        app.bus = Some(Arc::new(Mutex::new(ebus)));
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        warm(&mut app, &ctx, size);
+        // Every bus strip has the menu, inside its strip (rule 124).
+        let menu = |app: &DemoApp, b: SendSource| app.mixer_bus_out_rects.iter().find(|(x, _)| *x == b).map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("an output menu for {b:?} in {:?}", app.mixer_bus_out_rects));
+        for b in [SendSource::Rig(0), SendSource::Rig(1), SendSource::Node(bus)] { menu(&app, b); }
+        let (_, _, strip) = app.mixer_strip_rects.iter().copied().find(|(_, n, _)| *n == bus).expect("the bus strip");
+        assert!(strip.contains_rect(menu(&app, SendSource::Node(bus))), "the menu sits in the bus strip");
+        // Pick the M2 for rig 2's bus.
+        let pos = menu(&app, SendSource::Rig(1)).center();
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, pos);
+        for want in ["Master out", "Built-in Speakers", "MOTU M2", "Headphones"] {
+            assert!(texts.iter().any(|(t, _)| t == want), "the open menu lists {want:?}");
+        }
+        let item = texts.iter().find(|(t, _)| t == "MOTU M2").unwrap().1.center();
+        click_at(&mut app, &ctx, size, item);
+        assert_eq!(sink_of(&app, SendSource::Rig(1)).as_deref(), Some(M2));
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("→ MOTU")), "the strip names its output");
+        // The engine holds and publishes the same (rules 25, 33).
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let held: Vec<BusOut> = pub_.lock().unwrap().bus_outs.iter().copied().filter(|o| !o.sink.is_none()).collect();
+        assert_eq!(held, vec![BusOut { bus: SendSource::Rig(1), sink: SinkName::new(M2) }]);
+        // A remote edit (MCP, CLI) reaches the mirror and the strip.
+        app.bus.as_ref().unwrap().lock().unwrap().send(Command::SetBusOutput { bus: SendSource::Node(bus), sink: Some(SinkName::new(PHONES)) });
+        engine.render(&mut buf, 2);
+        app.graph_pub = Some(pub_.clone());
+        app.ui_send_grace = -1.0;
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert_eq!(sink_of(&app, SendSource::Node(bus)).as_deref(), Some(PHONES));
+        assert!(texts.iter().any(|(t, _)| t.starts_with("→ Headph")), "the aux bus strip names its output");
+        // The device goes: the choice stays and the strip says so.
+        app.audio_out.lock().unwrap().outputs.retain(|o| o.raw != PHONES);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("→ not avail")), "an unplugged output shows as not available");
+        assert_eq!(sink_of(&app, SendSource::Node(bus)).as_deref(), Some(PHONES));
+        // Back to the master from the menu (its first item, right under it).
+        let at = menu(&app, SendSource::Rig(1));
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, at.center());
+        let item = texts.iter().filter(|(t, r)| t == "Master out" && r.top() > at.bottom() - 1.0)
+            .map(|(_, r)| r.center())
+            .min_by(|a, b| a.distance(at.center_bottom()).total_cmp(&b.distance(at.center_bottom())))
+            .expect("the Master out item");
+        click_at(&mut app, &ctx, size, item);
+        assert_eq!(app.bus_output_of(SendSource::Rig(1)), None);
+    }
+
+    #[test]
+    fn bus_outputs_survive_a_session_round_trip_an_undo_and_a_rig_delete() {
+        // Rules 44, 59, 65: through every reload path, and into the engine.
+        let (mut app, bus) = app_with_buses_and_cards();
+        let (ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        app.bus = Some(Arc::new(Mutex::new(ebus)));
+        app.set_bus_output(SendSource::Rig(1), Some(M2)).unwrap();
+        app.set_bus_output(SendSource::Node(bus), Some(PHONES)).unwrap();
+        let want = sorted_outs(&app);
+        assert_eq!(want.len(), 2);
+
+        // Through the session FILE (rule 54), loaded while the phones are
+        // unplugged: the choice is kept by name.
+        let dir = std::env::temp_dir().join(format!("ksalat-busout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("busout.kabelsalat");
+        app.capture_session("busout").unwrap().save(&pkg).expect("the session saves");
+        let loaded = crate::session::Session::load(&pkg).expect("and loads");
+        let _ = std::fs::remove_dir_all(&dir);
+        app.load_demo_patch();
+        assert!(app.bus_outs.is_empty(), "another patch routes nothing");
+        app.audio_out.lock().unwrap().outputs.retain(|o| o.raw != PHONES);
+        app.apply_session(&loaded).unwrap();
+        assert_eq!(sorted_outs(&app), want, "the outputs survived save and load, the missing one too");
+        // The load reset the engine's table; the app sent it again.
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let mut held: Vec<(String, String)> = pub_.lock().unwrap().bus_outs.iter().filter(|o| !o.sink.is_none())
+            .map(|o| (format!("{:?}", o.bus), o.sink.as_str().to_string())).collect();
+        held.sort();
+        assert_eq!(held, want, "the engine plays what the session holds");
+
+        // Undo restores them after a later job changed them.
+        app.undo_job = None;
+        app.note_agent_change(AgentOrigin::Assistant);
+        app.set_bus_output(SendSource::Rig(1), None).unwrap();
+        app.set_bus_output(SendSource::Rig(0), Some(M2)).unwrap();
+        assert_ne!(sorted_outs(&app), want);
+        let out = app.exec_tool("undo", &serde_json::json!({}));
+        assert!(out.contains("undid"), "{out}");
+        assert_eq!(sorted_outs(&app), want, "undo restored every bus output");
+
+        // Deleting the first rig: rig 2 is now rig 1 and keeps its output,
+        // and the aux bus keeps its own under its new node id.
+        app.edit_rigs(Some(0));
+        let bus = app.bus_units().first().map(|&u| app.units[u].node_id).expect("the bus is still there");
+        assert_eq!(sink_of(&app, SendSource::Rig(0)).as_deref(), Some(M2));
+        assert_eq!(sink_of(&app, SendSource::Node(bus)).as_deref(), Some(PHONES));
+        assert_eq!(app.bus_outs.len(), 2);
+    }
+
+    /// The mixer with rig B routed to headphones and an aux bus ("Mon")
+    /// routed to a second sound card:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat bus_outputs_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn bus_outputs_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh app per image (rule 148).
+        let make = || {
+            let (mut app, bus) = app_with_buses_and_cards();
+            app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "rig": 0, "level": 0.65, "pre": true }));
+            app.exec_tool("set_bus_output", &serde_json::json!({ "rig": 1, "output": PHONES }));
+            app.exec_tool("set_bus_output", &serde_json::json!({ "bus": bus, "output": M2 }));
+            app
+        };
+        for (w, h, name) in [
+            (1600.0, 1000.0, "bus-outputs.png"),
+            (781.0, 950.0, "bus-outputs-781x950.png"),
+        ] {
+            let mut app = make();
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(name));
+        }
+    }
 }
+
 
 /// The app hosting real Surge XT voices on an offline engine (`EvalRig`).
 /// Mixer parity (#72/#73/#74/#77) on the offline app: no engine, no plugins —
@@ -35289,6 +35690,7 @@ mod engine_info_tests {
         let clock_pos = crate::clocksend::ClockPos::new();
         let (stream, _) = open_output_stream(engine.clone(), clock_pos.clone(), Some(sr), 256).expect("open 256");
         let mut audio_host = AudioStreamHost {
+            _bus_outs: None,
             stream: Some(stream),
             engine,
             clock_pos,

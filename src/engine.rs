@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::control::{AuxSend, SendSource};
+use crate::control::{AuxSend, BusOut, SendSource, SinkName};
 use crate::control::{
     split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
     NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
@@ -767,6 +767,35 @@ const BUS_SPAN: usize = 8192 * 2;
 /// Sends the engine tracks and publishes; one past it is dropped.
 pub const MAX_SENDS: usize = 64;
 
+/// Outputs besides the master's that buses can play to at once (#147): one
+/// stereo mix, one ring and one playback stream each.
+pub const MAX_OUTS: usize = 4;
+/// Buses that can leave the main mix: every rig bus and every aux bus.
+pub const MAX_BUS_OUTS: usize = 8 + MAX_BUSES;
+/// An empty slot of the published bus-output table.
+pub const NO_BUS_OUT: BusOut = BusOut { bus: SendSource::Rig(0), sink: SinkName::NONE };
+
+/// One extra output as published (`GraphPub::out_slots`): the sink it plays
+/// to (none = free) and the epoch its ring's samples belong to. The epoch
+/// moves whenever the slot changes hands, so a playback stream opened for an
+/// earlier sink stops before it plays another bus's samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutSlot {
+    pub sink: SinkName,
+    pub epoch: u32,
+}
+
+impl OutSlot {
+    pub const FREE: Self = Self { sink: SinkName::NONE, epoch: 0 };
+}
+
+/// The host's end of the extra outputs: one ring of interleaved stereo f32
+/// per slot and the live epoch of each (see [`OutSlot`]).
+pub struct OutTaps {
+    pub rings: Vec<Arc<Mutex<rtrb::Consumer<f32>>>>,
+    pub epochs: Arc<[std::sync::atomic::AtomicU32; MAX_OUTS]>,
+}
+
 /// The aux buses of one block: their nodes (in DSP slot order) and the
 /// accumulators the sends add into (`MAX_BUSES` stereo blocks, back to back).
 struct BusTaps<'a> {
@@ -942,6 +971,8 @@ impl Default for GraphPub {
             mix: [RigMix::DEFAULT; 8],
             strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
             sends: [NO_SEND; MAX_SENDS],
+            bus_outs: [NO_BUS_OUT; MAX_BUS_OUTS],
+            out_slots: [OutSlot::FREE; MAX_OUTS],
             system_gain: 0.0,
             mix_rev: 0,
             voices: Vec::new(),
@@ -1056,6 +1087,10 @@ pub struct GraphPub {
     pub strips: [StripPub; MAX_STRIP_MIXES],
     /// Sends into aux buses (issue #5), same publication as `strips`.
     pub sends: [AuxSend; MAX_SENDS],
+    /// Buses that play to their own output (#147) and the extra outputs
+    /// they play to, same publication as `strips`.
+    pub bus_outs: [BusOut; MAX_BUS_OUTS],
+    pub out_slots: [OutSlot; MAX_OUTS],
     /// System-audio capture gain, published with the mix (same `mix_rev`).
     pub system_gain: f32,
     pub mix_rev: u64,
@@ -1242,6 +1277,19 @@ pub struct GraphEngine {
     sends: Vec<AuxSend>,
     /// The buses' send accumulators: MAX_BUSES stereo blocks back to back.
     bus_acc: Vec<f32>,
+    /// Buses that play to their own output (SetBusOutput, #147). Capacity
+    /// MAX_BUS_OUTS, fixed.
+    bus_outs: Vec<BusOut>,
+    /// The extra outputs those buses play to: a slot is taken while a bus
+    /// names its sink.
+    out_slots: [OutSlot; MAX_OUTS],
+    /// The slots' mixes of one block: MAX_OUTS stereo blocks back to back.
+    out_mix: Vec<f32>,
+    /// One ring per slot to the thread that plays it. Allocated here once;
+    /// a full ring (nobody plays the sink) drops the block.
+    out_tx: Vec<rtrb::Producer<f32>>,
+    out_rx: Option<Vec<rtrb::Consumer<f32>>>,
+    out_epochs: Arc<[std::sync::atomic::AtomicU32; MAX_OUTS]>,
     /// Per effect (DSP slots, then LV2 slots): it sits in a bus's insert
     /// chain and runs after the rig sums. Rebuilt each block that has a bus.
     fx_after_bus: Vec<bool>,
@@ -1396,6 +1444,10 @@ impl GraphEngine {
             .filter(|n| matches!(n.kind, NodeKind::MidiFx { .. }))
             .map(midi_fx_slot)
             .collect();
+        // A quarter second of stereo per extra output (#147).
+        let (out_tx, out_rx): (Vec<_>, Vec<_>) = (0..MAX_OUTS)
+            .map(|_| rtrb::RingBuffer::<f32>::new((sample_rate as usize / 2).max(BUS_SPAN)))
+            .unzip();
         let mut engine = Self {
             graph,
             drain,
@@ -1408,6 +1460,12 @@ impl GraphEngine {
             fx_after_bus: Vec::with_capacity(256),
             sends: Vec::with_capacity(MAX_SENDS),
             bus_acc: vec![0.0; MAX_BUSES * BUS_SPAN],
+            bus_outs: Vec::with_capacity(MAX_BUS_OUTS),
+            out_slots: [OutSlot::FREE; MAX_OUTS],
+            out_mix: vec![0.0; MAX_OUTS * BUS_SPAN],
+            out_tx,
+            out_rx: Some(out_rx),
+            out_epochs: Arc::new(std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0))),
             master_vol: 0.75,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
@@ -1782,6 +1840,16 @@ impl GraphEngine {
     /// Attach a system-audio capture source (started off the audio thread).
     pub fn set_system_capture(&mut self, cap: SystemCapture) {
         self.system_capture = Some(cap);
+    }
+
+    /// The host's end of the extra outputs (#147), once: whoever plays them
+    /// (`audio_out::BusOutputs`) or a test that reads what a bus sent there.
+    pub fn take_out_taps(&mut self) -> Option<OutTaps> {
+        let rings = self.out_rx.take()?;
+        Some(OutTaps {
+            rings: rings.into_iter().map(|r| Arc::new(Mutex::new(r))).collect(),
+            epochs: self.out_epochs.clone(),
+        })
     }
 
     /// Attach the UI→audio ring that delivers freshly-opened input captures
@@ -3076,6 +3144,89 @@ impl GraphEngine {
         true
     }
 
+    /// Where one rig bus or aux bus plays (SetBusOutput, #147): `sink`, or
+    /// the master's output for `None`. False when `bus` is no bus or every
+    /// extra output already plays another sink. Allocation-free.
+    fn set_bus_output(&mut self, bus: SendSource, sink: Option<SinkName>) -> bool {
+        let is_bus = match bus {
+            SendSource::Rig(r) => r < 8,
+            SendSource::Node(n) => self.graph.is_bus(n),
+        };
+        if !is_bus { return false; }
+        let sink = sink.filter(|s| !s.is_none());
+        let before = self.bus_outs.iter().find(|o| o.bus == bus).copied();
+        if before.map(|o| o.sink) == sink { return true; }
+        self.bus_outs.retain(|o| o.bus != bus);
+        if let Some(sink) = sink {
+            self.bus_outs.push(BusOut { bus, sink });
+        }
+        if !self.assign_out_slots() {
+            // No output left for one more sink: the bus stays where it was.
+            self.bus_outs.retain(|o| o.bus != bus);
+            if let Some(o) = before { self.bus_outs.push(o); }
+            self.assign_out_slots();
+            return false;
+        }
+        self.mix_dirty = true;
+        true
+    }
+
+    /// Fit the extra outputs to the sinks the buses name: a slot nobody
+    /// names is freed, a new sink takes a free one, and a slot whose sink
+    /// stays keeps its stream. False when a sink found no slot.
+    fn assign_out_slots(&mut self) -> bool {
+        let mut fits = true;
+        for k in 0..MAX_OUTS {
+            let sink = self.out_slots[k].sink;
+            if !sink.is_none() && !self.bus_outs.iter().any(|o| o.sink == sink) {
+                self.set_out_slot(k, SinkName::NONE);
+            }
+        }
+        for i in 0..self.bus_outs.len() {
+            let sink = self.bus_outs[i].sink;
+            if self.out_slots.iter().any(|s| s.sink == sink) { continue; }
+            match self.out_slots.iter().position(|s| s.sink.is_none()) {
+                Some(k) => self.set_out_slot(k, sink),
+                None => fits = false,
+            }
+        }
+        fits
+    }
+
+    /// Hand slot `k` to `sink`. The epoch moves first, so whoever still
+    /// plays the slot's earlier sink stops before this block's samples.
+    fn set_out_slot(&mut self, k: usize, sink: SinkName) {
+        let epoch = self.out_slots[k].epoch.wrapping_add(1);
+        self.out_epochs[k].store(epoch, Ordering::SeqCst);
+        self.out_slots[k] = OutSlot { sink, epoch };
+        self.mix_dirty = true;
+    }
+
+    /// The extra output `bus` plays to; `None` = the master.
+    fn out_slot_of(&self, bus: SendSource) -> Option<usize> {
+        let sink = self.bus_outs.iter().find(|o| o.bus == bus)?.sink;
+        self.out_slots.iter().position(|s| s.sink == sink)
+    }
+
+    /// The extra output a return plays to: that of the bus whose insert
+    /// chain effect `f` ends (the first bus found upstream). `None` = the
+    /// master. Allocation-free; only asked while a bus is routed away.
+    fn return_slot(&self, f: usize) -> Option<usize> {
+        let n_fx = self.fx_after_bus.len();
+        let mut cur = f;
+        for _ in 0..=n_fx {
+            if self.fx_is_bus(cur) {
+                return self.out_slot_of(SendSource::Node(self.fx_node(cur)));
+            }
+            let to = self.fx_node(cur);
+            cur = (0..n_fx).find(|&g| {
+                g != cur && (self.fx_after_bus[g] || self.fx_is_bus(g))
+                    && self.graph.has_route(self.fx_node(g), to, PortKind::Audio)
+            })?;
+        }
+        None
+    }
+
     /// A controller bound to a mixer control (`CcTarget::Mix`): the rig bus
     /// when `dest` is a MasterOut, else that node's source strip. The mix is
     /// published back like any other mix edit (rule 33). False when the
@@ -3459,6 +3610,11 @@ impl GraphEngine {
                 let before = self.sends.len();
                 self.sends.retain(|s| s.bus != id && s.from != SendSource::Node(id));
                 if self.sends.len() != before { self.mix_dirty = true; }
+                if self.bus_outs.iter().any(|o| o.bus == SendSource::Node(id)) {
+                    self.bus_outs.retain(|o| o.bus != SendSource::Node(id));
+                    self.assign_out_slots();
+                    self.mix_dirty = true;
+                }
                 self.audio_in.retain(|s| s.node != id);
                 self.arp.retain(|s| s.node != id);
                 if let Some(i) = self.lv2.iter().position(|s| s.node == id) {
@@ -3647,6 +3803,8 @@ impl GraphEngine {
                 self.rig_mix = [RigMix::DEFAULT; 8];
                 self.strips.clear();
                 self.sends.clear();
+                self.bus_outs.clear();
+                self.assign_out_slots();
                 if self.master_clock.is_counting_in() {
                     self.master_clock = MasterClock::Stopped;
                     self.transport.set_playing(false);
@@ -3833,6 +3991,9 @@ impl GraphEngine {
             }
             Command::SetSend { from, bus, level, pre } => {
                 self.set_send(from, bus, level, pre);
+            }
+            Command::SetBusOutput { bus, sink } => {
+                self.set_bus_output(bus, sink);
             }
             Command::SetStripBypass { node, bypass } => {
                 if bypass {
@@ -4466,6 +4627,9 @@ impl GraphEngine {
                     g.strips = self.strips_pub();
                     g.sends = [NO_SEND; MAX_SENDS];
                     g.sends[..self.sends.len()].copy_from_slice(&self.sends);
+                    g.bus_outs = [NO_BUS_OUT; MAX_BUS_OUTS];
+                    g.bus_outs[..self.bus_outs.len()].copy_from_slice(&self.bus_outs);
+                    g.out_slots = self.out_slots;
                     g.system_gain = self.system_gain;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
                     self.mix_dirty = false;
@@ -4698,6 +4862,15 @@ impl GraphEngine {
         // scratch leave `self` for the stage, so the bus chains can run.
         let mut acc_v = std::mem::take(&mut self.lv2_in);
         let mut rig_v = std::mem::take(&mut self.rig_buf);
+        // Buses that play to their own output (#147) sum into that output's
+        // mix instead of the master's. Without one, nothing here runs.
+        let routed = !self.bus_outs.is_empty();
+        let mut outs_v = std::mem::take(&mut self.out_mix);
+        if routed {
+            for k in 0..MAX_OUTS {
+                outs_v[k * BUS_SPAN..k * BUS_SPAN + n2].fill(0.0);
+            }
+        }
         if n_masters > 0 {
             // Per-rig mix gains, once per block (rig_mix changes only via
             // commands drained at block start). Constant-power pan, unity
@@ -4774,11 +4947,14 @@ impl GraphEngine {
                     if sends { taps.tap(&mut self.pdc, &self.sends, from, false, 1.0, rig_buf); }
                 }
                 self.pdc.rig_out(master, rig_buf);
-                if live {
-                    if !bus_solo {
-                        for i in 0..n2 {
-                            acc[i] += rig_buf[i];
-                        }
+                if live && !bus_solo {
+                    let slot = if routed { self.out_slot_of(from) } else { None };
+                    let dest = match slot {
+                        Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
+                        None => &mut acc[..],
+                    };
+                    for i in 0..n2 {
+                        dest[i] += rig_buf[i];
                     }
                 }
                 if let Some(rec) = &mut self.recorder {
@@ -4815,12 +4991,20 @@ impl GraphEngine {
                 for &master in &masters[..n_masters] {
                     for (i, d) in self.dsp.iter().enumerate() {
                         if d.kind == DspKind::Bus || self.fx_after_bus[i] {
-                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.buf[..n2], acc);
+                            let dest = match if routed { self.return_slot(i) } else { None } {
+                                Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
+                                None => &mut acc[..],
+                            };
+                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.buf[..n2], dest);
                         }
                     }
                     for (i, slot) in self.lv2.iter().enumerate() {
                         if self.fx_after_bus[n_dsp + i] {
-                            add_routed(&self.graph, &mut self.pdc, slot.node, master, &slot.buf[..n2], acc);
+                            let dest = match if routed { self.return_slot(n_dsp + i) } else { None } {
+                                Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
+                                None => &mut acc[..],
+                            };
+                            add_routed(&self.graph, &mut self.pdc, slot.node, master, &slot.buf[..n2], dest);
                         }
                     }
                 }
@@ -4919,6 +5103,18 @@ impl GraphEngine {
             // output the user hears.
             self.meter.process(data, ch);
             self.guard_true_peak(post_at_block_start);
+            // The extra outputs: each mix, bounded like the master's last
+            // stage (rule 62), into its ring. A ring nobody drains (its sink
+            // is not there) is full, and the block is dropped whole.
+            if routed {
+                for k in 0..MAX_OUTS {
+                    if self.out_slots[k].sink.is_none() || self.out_tx[k].slots() < n2 { continue; }
+                    for &x in &outs_v[k * BUS_SPAN..k * BUS_SPAN + n2] {
+                        let y = if x.is_finite() { MasterLimiter::knee(x) } else { 0.0 };
+                        let _ = self.out_tx[k].push(y);
+                    }
+                }
+            }
         } else {
             // No master wired: the output is silent. Keep the loudness windows
             // honest (they must decay, not hold stale energy).
@@ -4928,6 +5124,7 @@ impl GraphEngine {
         self.lv2_in = acc_v;
         self.rig_buf = rig_v;
         self.bus_acc = bus_acc;
+        self.out_mix = outs_v;
         self.publish_meter();
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
@@ -9663,5 +9860,160 @@ mod send_tests {
         assert!(r.engine.sends.is_empty(), "a removed bus takes its sends along");
         // The rack plays on without the bus.
         assert!(r.render(20) > 0.05);
+    }
+
+    // ---- #147: a bus on its own output ----------------------------------
+
+    use crate::control::SinkName;
+
+    fn route(r: &mut Rack, bus: SendSource, sink: Option<&str>) {
+        r.bus.send(Command::SetBusOutput { bus, sink: sink.map(SinkName::new) });
+    }
+
+    /// Everything waiting in extra output `k`: (samples, peak).
+    fn drain(taps: &OutTaps, k: usize) -> (usize, f32) {
+        let mut rx = taps.rings[k].lock().unwrap();
+        let n = rx.slots();
+        let chunk = rx.read_chunk(n).unwrap();
+        let (a, b) = chunk.as_slices();
+        let peak = block_peak(a).max(block_peak(b));
+        chunk.commit_all();
+        (n, peak)
+    }
+
+    #[test]
+    fn a_rig_on_its_own_output_arrives_there_and_leaves_the_master() {
+        let mut r = Rack::new();
+        let taps = r.engine.take_out_taps().expect("the taps, once");
+        assert!(r.engine.take_out_taps().is_none());
+        // What the master plays with rig 2 muted: the reference for "left".
+        let mut muted = Rack::new();
+        muted.bus.send(Command::SetRigMix { rig: 1, vol: None, pan: None, mute: Some(true), solo: None });
+        let without_b = muted.render(60);
+        let both = r.render(60);
+        assert!(both > without_b * 1.2, "both rigs are louder than rig 1 alone ({both} vs {without_b})");
+        assert_eq!(drain(&taps, 0).0, 0, "nothing is routed: nothing leaves besides the master");
+
+        route(&mut r, SendSource::Rig(1), Some("phones"));
+        let master = r.render(40);
+        let (n, peak) = drain(&taps, 0);
+        assert_eq!(n, 40 * N * 2, "every block of the rig went to its output");
+        assert!(close(peak, r.in_peak(1)), "rig 2 arrives at unity: {peak} vs {}", r.in_peak(1));
+        assert!((master - without_b).abs() < without_b * 0.02, "the master plays rig 1 alone: {master} vs {without_b}");
+        for k in 1..MAX_OUTS { assert_eq!(drain(&taps, k).0, 0, "output {k} is nobody's"); }
+
+        // Its fader and mute still act on it.
+        r.bus.send(Command::SetRigMix { rig: 1, vol: Some(0.5), pan: None, mute: None, solo: None });
+        r.render(2);
+        assert!(close(drain(&taps, 0).1, 0.5 * r.in_peak(1)), "the rig fader is the output's level");
+
+        // Both rigs away: the master is silent (after its tails, rule 133).
+        route(&mut r, SendSource::Rig(0), Some("phones"));
+        r.render(40);
+        drain(&taps, 0);
+        assert!(r.render(2) < 1e-3, "nothing is left for the master");
+        assert!(close(drain(&taps, 0).1, r.in_peak(0) + 0.5 * r.in_peak(1)), "one output sums the buses routed to it");
+
+        // Back to the master: the output gets nothing more.
+        route(&mut r, SendSource::Rig(0), None);
+        route(&mut r, SendSource::Rig(1), None);
+        r.render(1);
+        assert_eq!(drain(&taps, 0).0, 0);
+        assert!(r.render(40) > without_b, "and the master plays both again");
+    }
+
+    #[test]
+    fn an_aux_bus_on_its_own_output_takes_its_return_and_its_insert_chain_along() {
+        let mut r = Rack::new();
+        let taps = r.engine.take_out_taps().unwrap();
+        let aux = r.aux;
+        // Keep the dry mix below the master limiter ceiling (0.7) so adding
+        // and removing the return moves the master peak cleanly.
+        r.bus.send(Command::SetRigMix { rig: 0, vol: Some(0.25), pan: None, mute: None, solo: None });
+        r.bus.send(Command::SetRigMix { rig: 1, vol: Some(0.0), pan: None, mute: None, solo: None });
+        let dry = r.render(40);
+        // A monitor mix: rig 1 pre fader into the bus, the bus to the phones.
+        r.send(SendSource::Rig(0), 1.0, true);
+        let with_return = r.render(40);
+        assert!(with_return > dry * 1.1, "the return is in the master first ({with_return} vs {dry})");
+        route(&mut r, SendSource::Node(aux), Some("phones"));
+        let master = r.render(40);
+        let (_, peak) = drain(&taps, 0);
+        assert!(close(peak, r.in_peak(0)), "the bus arrives at its output: {peak}");
+        assert!((master - dry).abs() < dry * 0.02, "and its return left the master: {master} vs {dry}");
+
+        // With an insert, the output carries the end of the chain.
+        r.bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false });
+        r.render(1);
+        let gain = r.engine.graph().nodes.iter().find(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Gain))).unwrap().id;
+        let ret: Vec<u32> = r.engine.graph().edges.iter().filter(|e| e.from.node == aux).map(|e| e.id).collect();
+        for id in ret { r.bus.send(Command::Disconnect(id)); }
+        r.bus.send(Command::Connect { id: 50, from: PortRef { node: aux, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });
+        r.bus.send(Command::Connect { id: 51, from: PortRef { node: gain, port: 0 }, to: PortRef { node: r.masters[0], port: 0 }, kind: PortKind::Audio });
+        r.bus.send(Command::SetParam { node: gain, param: 0, value: 0.25 }); // (2·0.25)² = 0.25
+        r.render(40);
+        drain(&taps, 0);
+        let master = r.render(2);
+        assert!(close(drain(&taps, 0).1, 0.25 * r.in_peak(0)), "the insert's output is what plays there");
+        assert!((master - dry).abs() < dry * 0.02, "the chain's return stays out of the master: {master} vs {dry}");
+
+        // Removing the bus frees its output.
+        r.bus.send(Command::RemoveNode(aux));
+        r.render(1);
+        assert!(r.engine.bus_outs.is_empty() && r.engine.out_slots.iter().all(|s| s.sink.is_none()));
+    }
+
+    #[test]
+    fn outputs_are_shared_by_sink_limited_in_number_and_published() {
+        let mut r = Rack::new();
+        let taps = r.engine.take_out_taps().unwrap();
+        let pubd = std::sync::Arc::new(std::sync::Mutex::new(GraphPub::default()));
+        r.engine.set_graph_pub(pubd.clone());
+        let names = ["a", "b", "c", "d"];
+        for (i, n) in names.iter().enumerate() { route(&mut r, SendSource::Rig(i as u8), Some(n)); }
+        route(&mut r, SendSource::Rig(4), Some("a"));
+        route(&mut r, SendSource::Rig(5), Some("e"));
+        let in0 = r.ins[0];
+        route(&mut r, SendSource::Node(in0), Some("a"));
+        r.render(1);
+        assert_eq!(r.engine.bus_outs.len(), 5, "four sinks, one shared; a fifth sink and a non-bus are refused: {:?}", r.engine.bus_outs);
+        {
+            let g = pubd.lock().unwrap();
+            let listed: Vec<BusOut> = g.bus_outs.iter().copied().filter(|o| !o.sink.is_none()).collect();
+            assert_eq!(listed, r.engine.bus_outs, "the engine publishes what it holds (rule 33)");
+            assert_eq!(g.out_slots.map(|s| s.sink.as_str().to_string()), names.map(str::to_string));
+            assert_eq!(g.out_slots, r.engine.out_slots);
+        }
+        // A slot that changes hands moves its epoch, published and live.
+        let before = r.engine.out_slots[1].epoch;
+        route(&mut r, SendSource::Rig(1), Some("e"));
+        r.render(1);
+        let slot = r.engine.out_slots[1];
+        assert_eq!(slot.sink.as_str(), "e");
+        assert_ne!(slot.epoch, before);
+        assert_eq!(taps.epochs[1].load(Ordering::SeqCst), slot.epoch);
+        assert_eq!(pubd.lock().unwrap().out_slots[1], slot);
+        // The shared sink keeps its slot and epoch while one bus still names it.
+        let shared = r.engine.out_slots[0];
+        route(&mut r, SendSource::Rig(0), None);
+        r.render(1);
+        assert_eq!(r.engine.out_slots[0], shared);
+        // A load starts over.
+        let g = r.engine.graph().clone();
+        r.bus.send(Command::LoadGraph { graph: g });
+        r.render(1);
+        assert!(r.engine.bus_outs.is_empty() && r.engine.out_slots.iter().all(|s| s.sink.is_none()));
+        assert!(pubd.lock().unwrap().bus_outs.iter().all(|o| o.sink.is_none()));
+    }
+
+    #[test]
+    fn an_output_nobody_plays_drops_blocks_and_never_stalls_the_render() {
+        let mut r = Rack::new();
+        let taps = r.engine.take_out_taps().unwrap();
+        route(&mut r, SendSource::Rig(0), Some("unplugged"));
+        // Far more than the ring holds: the render goes on, the ring is full.
+        assert!(r.render(400) > 0.05, "the master plays on");
+        let (n, _) = drain(&taps, 0);
+        assert!(n > 0 && n % (N * 2) == 0, "whole blocks only: {n}");
     }
 }

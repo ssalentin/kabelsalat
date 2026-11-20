@@ -198,6 +198,23 @@ sound back to the system's output. The assistant and MCP agents do the same
 
 <p align="center"><img src="docs/shots/system-audio.png" width="85%" alt="The mixer with a System audio section: a Firefox strip turned down and a muted Spotify strip, each with a meter, beside Master out with the MOTU M2 chosen as the output"/></p>
 
+### Send a bus to its own sound card
+Every **rig bus** and every **aux bus** has an output menu under its name:
+**Master out**, or one of your sound cards. A bus on its own card plays there
+only and leaves the main mix. Put the metronome in a rig of its own and send
+that rig's bus to the headphones, and the click never reaches the PA. For a
+monitor mix, send your rigs pre-fader into an aux bus and give that bus the
+headphones. The bus keeps its fader, pan, mute, solo and inserts. Up to four
+cards besides the master's can play at once. The choice is saved with the
+session. While its card is unplugged a bus is silent and its menu reads **not
+available**; it never falls back to another output, and it plays again when
+the card returns. A second card runs on its own clock, so a bus there can
+arrive a few milliseconds apart from the master. The assistant and MCP agents
+do the same (`set_bus_output`, `get_bus_outputs`). This needs PipeWire
+(`pw-cat`, `pactl`).
+
+<p align="center"><img src="docs/shots/bus-outputs.png" width="85%" alt="The mixer with rig B's bus sent to the headphones and an aux bus called Mon sent to a second sound card, each naming its output under the strip name"/></p>
+
 ### Navigate rigs, sessions and plugins
 One top bar holds the session, the rigs and the views. The **session pill**
 on the left (`● Untitled ▾`, teal once saved) opens a small popover to save,

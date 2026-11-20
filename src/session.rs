@@ -114,6 +114,9 @@ pub struct Session {
     /// Sends into aux buses (issue #5), keyed by node and rig like the
     /// engine's table; `remap_session` carries them across reloads.
     sends: Vec<crate::control::AuxSend>,
+    /// Buses that play to their own output (#147), keyed by rig and node
+    /// like the sends. The sink is kept by name, also while it is unplugged.
+    bus_outs: Vec<crate::control::BusOut>,
     /// The master's loudness target with its trim (#12). `None` = this
     /// session says nothing about it (older files, templates, rig edits
     /// built from parts): a load then leaves the engine's target alone.
@@ -175,6 +178,7 @@ impl Session {
             strip_order: Vec::new(),
             strip_knobs: BTreeMap::new(),
             sends: Vec::new(),
+            bus_outs: Vec::new(),
             master_target: None,
             keyboard_mode: None,
         }
@@ -191,6 +195,7 @@ impl Session {
             && self.strip_order == other.strip_order
             && self.strip_knobs == other.strip_knobs
             && self.sends == other.sends
+            && self.bus_outs == other.bus_outs
             && self.master_target == other.master_target
             && self.keyboard_mode == other.keyboard_mode
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
@@ -312,6 +317,31 @@ impl Session {
         self.prune_sends();
     }
 
+    /// Buses that play to their own output (#147).
+    pub fn bus_outs(&self) -> &[crate::control::BusOut] {
+        &self.bus_outs
+    }
+
+    /// Replace the bus outputs. One entry per bus; entries for a rig or an
+    /// aux bus the patch lacks are dropped.
+    pub fn set_bus_outs(&mut self, outs: Vec<crate::control::BusOut>) {
+        self.bus_outs.clear();
+        for o in outs {
+            if !o.sink.is_none() && !self.bus_outs.iter().any(|x| x.bus == o.bus) {
+                self.bus_outs.push(o);
+            }
+        }
+        self.prune_bus_outs();
+    }
+
+    fn prune_bus_outs(&mut self) {
+        let g = &self.graph;
+        self.bus_outs.retain(|o| match o.bus {
+            crate::control::SendSource::Rig(r) => g.nodes.iter().any(|n| n.rig == r),
+            crate::control::SendSource::Node(n) => g.is_bus(n),
+        });
+    }
+
     fn prune_sends(&mut self) {
         let g = &self.graph;
         self.sends.retain(|s| {
@@ -367,6 +397,7 @@ impl Session {
         self.strip_order.retain(|n| self.graph.node(*n).is_some());
         self.strip_knobs.retain(|n, _| self.graph.node(*n).is_some());
         self.prune_sends();
+        self.prune_bus_outs();
     }
 
     /// Plain-language integrity check, run on save and load: every edge must
@@ -519,6 +550,7 @@ impl Session {
             strip_order: self.strip_order.clone(),
             strip_knobs: self.strip_knobs.clone(),
             sends: self.sends.clone(),
+            bus_outs: self.bus_outs.clone(),
             master_target: self.master_target,
             keyboard_mode: self.keyboard_mode,
         };
@@ -560,6 +592,7 @@ impl Session {
             strip_order: manifest.strip_order,
             strip_knobs: manifest.strip_knobs,
             sends: manifest.sends,
+            bus_outs: manifest.bus_outs,
             master_target: manifest.master_target,
             keyboard_mode: manifest.keyboard_mode,
         };
@@ -675,6 +708,9 @@ struct SessionFile {
     /// Sends into aux buses (issue #5); older sessions have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sends: Vec<crate::control::AuxSend>,
+    /// Buses on their own output (#147); older sessions have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bus_outs: Vec<crate::control::BusOut>,
     /// The master's loudness target (#12); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     master_target: Option<crate::meter::MasterTarget>,

@@ -317,6 +317,26 @@ agents are in [AGENTS.md](../AGENTS.md).
   out of the UI. The live status line is derived in one place
   (`DemoApp::live_status`) from the worker's phase, the tool batch and
   `listen::stage()`, the process-wide stage of the one master recording.
+- **2026-11-20** — **A bus on its own output (#147)**: the engine holds a
+  table of buses that leave the main mix (`Command::SetBusOutput`: a rig bus
+  or an aux bus, and a PipeWire sink by name in fixed bytes), published in
+  `GraphPub::bus_outs`, mirrored by the mixer and saved with the session. Up
+  to `MAX_OUTS` (4) distinct sinks each take an output slot: a stereo mix, an
+  `rtrb` ring and an epoch, all allocated in the constructor. In `render` a
+  routed rig's post-fader sum, or a routed bus's return (the end of its insert
+  chain, `return_slot`), adds into its slot's mix instead of the master's; the
+  mix passes the master's last knee and goes into the ring. A full ring drops
+  the block, so a missing device costs nothing. Off the audio thread,
+  `audio_out::BusOutputs` keeps one `pw-cat --target <sink>` per slot and a
+  thread that feeds it from the ring. The stream is `node.dont-reconnect`:
+  when its sink goes PipeWire pauses it instead of moving it to another
+  output, and `BusOutputs` drops the stream on its next sink check; the bus
+  stays silent until the sink is listed again. A slot that changes hands
+  moves its epoch first and the old feeder stops before it writes another
+  bus's samples. Master and bus streams are separate PipeWire streams, on
+  separate clocks when the sinks are separate cards: the feeder cuts a
+  backlog above 40 ms, and `audio-out-test` prints how far apart the two
+  arrive.
 - **2026-11-19** — **Sends and aux buses (#5)**: an aux bus is a node
   (`DspKind::Bus`) with an OUT jack and no input. What feeds it is the send
   table (`Command::SetSend`: a rig or a node, a level, pre or post fader),

@@ -284,6 +284,13 @@ released. Right-click a learned control to limit a fader's range, learn it
 again or clear it. The bindings are saved with the session and stay with their
 rig when you add or delete rigs.
 
+A whole hardware instrument maps in one step with an instrument profile. Pick
+it for the instrument's port in the MIDI matrix (the Nord Electro 2 is built
+in; more are MIDI Guide CSV files in `~/.config/kabelsalat/instruments/`) and
+its drawbars, rotary switch, percussion and drive move the organ. The
+assistant and MCP agents do the same with `list_instrument_profiles` and
+`set_device_instrument`: "the Nord is on the second port".
+
 <p align="center"><img src="docs/shots/mixer-midi-learn.png" width="85%" alt="The mixer with learned controls: rig bus faders showing CC 7 and CC 8 beside their dB readouts, and blue outlines on the learned faders, mute buttons and a pan field"/></p>
 
 ### Record your set

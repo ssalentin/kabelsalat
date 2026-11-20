@@ -83,6 +83,11 @@ struct State {
     count_in_bars: u8,
     /// Headless CC binding mirror keyed by (source, dest).
     cc_maps: std::collections::HashMap<(SourceId, NodeId), Vec<crate::matrix::CcMapping>>,
+    /// Headless: the instrument profile picked per hardware device index
+    /// (the app keeps its own, per port name, in config.json).
+    device_instruments: std::collections::BTreeMap<u32, String>,
+    /// Headless: the CC bindings those profiles hold in `cc_maps`.
+    instrument_bound: Vec<crate::instruments::Bound>,
     /// Recorder status (headless): the shared handle the engine's tap writes.
     record: Arc<crate::record::RecorderShared>,
     /// "Sync to transport" mirror (the engine is authoritative via SetRecordSync).
@@ -559,6 +564,15 @@ struct SetRigDeviceArgs {
     device: Option<u32>,
 }
 
+/// Arguments for `set_device_instrument`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetDeviceInstrumentArgs {
+    /// Hardware device index (the N of source 'hw:N').
+    device: u32,
+    /// Profile id or name from list_instrument_profiles; "none" for no profile.
+    profile: String,
+}
+
 /// Arguments for `set_matrix_rule`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetMatrixRuleArgs {
@@ -977,6 +991,39 @@ fn note_silent_claps(st: &State, result: &mut Value) {
             hosted.len()
         ));
     }
+}
+
+/// Headless: bring the CC mirror and the engine in line with the profiles
+/// picked per device (the app's `sync_instrument_maps`, run on demand here).
+fn sync_instruments(st: &mut State, profiles: &[crate::instruments::Profile]) -> Result<(), String> {
+    let wanted = {
+        let published = st.graph_pub.as_ref().and_then(|p| p.lock().ok());
+        let devices = st.device_instruments.iter().filter_map(|(&d, id)| Some((d, profiles.iter().find(|p| &p.id == id)?)));
+        // Before the engine's first publication there are no rules to ask.
+        crate::instruments::wanted(devices, &st.graph, |src, dest| {
+            published.as_ref().filter(|g| !g.rules.is_empty()).map_or(true, |g| {
+                g.rules.iter().any(|r| r.source == src && r.dest == dest && !r.cc_only)
+            })
+        })
+    };
+    let changes = crate::instruments::changes(&st.instrument_bound, &wanted, |(src, dest, b)| {
+        st.cc_maps.get(&(*src, *dest)).and_then(|v| v.iter().find(|m| m.cc == b.cc)).is_some_and(|m| {
+            (m.param, m.target, m.scale) == (b.param, b.target, b.scale)
+        })
+    });
+    for ((source, dest, b), on) in changes {
+        send_cmd(st, Command::MatrixCcMap { source, dest, cc: b.cc, param: on.then_some(b.param), target: b.target, scale: b.scale })?;
+        let entry = st.cc_maps.entry((source, dest)).or_default();
+        entry.retain(|m| m.cc != b.cc);
+        if on {
+            entry.push(crate::matrix::CcMapping { cc: b.cc, param: b.param, target: b.target, scale: b.scale });
+        }
+        if entry.is_empty() {
+            st.cc_maps.remove(&(source, dest));
+        }
+    }
+    st.instrument_bound = wanted;
+    Ok(())
 }
 
 fn send_cmd(st: &mut State, cmd: Command) -> Result<(), String> {
@@ -2085,6 +2132,55 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"node": args.node, "device": args.device}))
+    }
+
+    /// List instrument profiles and what each device has.
+    #[tool(name = "list_instrument_profiles", description = "List the instrument profiles (what every controller of a hardware instrument means, e.g. the Nord Electro 2: drawbars, rotary, percussion, drive) with the rack nodes each would drive and which CC lands on which parameter, and the hardware MIDI devices with the profile each has now. Attached: the app's ports (chosen_by: pick = set by hand or by an agent, port name = recognised from the port's name). Headless: no MIDI ports are open, so devices lists the indices a profile was set for.")]
+    fn list_instrument_profiles(&self) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("list_instrument_profiles", json!({}));
+        }
+        let profiles = crate::instruments::load_all().0;
+        if let Err(e) = sync_instruments(&mut st, &profiles) {
+            return tool_err(e);
+        }
+        let devices: Vec<Value> = st.device_instruments.iter().map(|(&d, id)| {
+            let profile = profiles.iter().find(|p| &p.id == id);
+            let mut v = crate::instruments::device_report(d, &format!("hw:{d}"), profile, &st.instrument_bound, &st.graph);
+            v["chosen_by"] = json!("pick");
+            v
+        }).collect();
+        ok_json(json!({
+            "profiles": crate::instruments::listing(&profiles, &st.graph),
+            "devices": devices,
+            "more_profiles": "MIDI Guide CSV files in ~/.config/kabelsalat/instruments/ (read at start)",
+        }))
+    }
+
+    /// Pick the instrument profile of a hardware device.
+    #[tool(name = "set_device_instrument", description = "Say which hardware instrument is on a MIDI port: device is the hardware device index (the N of source 'hw:N'), profile a profile id or name from list_instrument_profiles, or 'none' for no profile. The profile's controllers then drive the rack (all drawbars, rotary, percussion and drive of an organ the device plays) without a MIDI learn per knob; 'none' takes back exactly what the profile bound. Attached: the app remembers the choice for that port across sessions and keeps the bindings in step with the rack. Headless: the choice lasts for this server and the bindings are brought in step with the rack on each call of this tool or list_instrument_profiles.")]
+    fn set_device_instrument(&self, Parameters(args): Parameters<SetDeviceInstrumentArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("set_device_instrument", json!({"device": args.device, "profile": args.profile}));
+        }
+        if args.device >= crate::engine::MAX_HW_DEVICES {
+            return tool_err(format!("no hardware MIDI device {}: indices are 0..{}", args.device, crate::engine::MAX_HW_DEVICES - 1));
+        }
+        let profiles = crate::instruments::load_all().0;
+        let profile = match crate::instruments::find(&profiles, &args.profile) {
+            Ok(p) => p,
+            Err(e) => return tool_err(e),
+        };
+        match profile {
+            Some(p) => st.device_instruments.insert(args.device, p.id.clone()),
+            None => st.device_instruments.remove(&args.device),
+        };
+        if let Err(e) = sync_instruments(&mut st, &profiles) {
+            return tool_err(e);
+        }
+        ok_json(crate::instruments::device_report(args.device, &format!("hw:{}", args.device), profile, &st.instrument_bound, &st.graph))
     }
 
     fn parse_rule_source(s: &str) -> Result<SourceId, String> {
@@ -3680,6 +3776,8 @@ pub fn run() -> anyhow::Result<()> {
         count_in_enabled: ci_enabled,
         count_in_bars: ci_bars,
         cc_maps: std::collections::HashMap::new(),
+        device_instruments: Default::default(),
+        instrument_bound: Vec::new(),
         record: audio.record,
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
@@ -3716,6 +3814,8 @@ pub fn run_attach() -> anyhow::Result<()> {
         count_in_enabled: false,
         count_in_bars: 1,
         cc_maps: std::collections::HashMap::new(),
+        device_instruments: Default::default(),
+        instrument_bound: Vec::new(),
         record: Arc::new(crate::record::RecorderShared::new()),
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
@@ -3846,6 +3946,8 @@ mod tests {
             count_in_enabled: false,
             count_in_bars: 1,
             cc_maps: std::collections::HashMap::new(),
+        device_instruments: Default::default(),
+        instrument_bound: Vec::new(),
             record: Arc::new(crate::record::RecorderShared::new()),
             record_sync: false,
             rig_presets_dir: std::env::var_os("CARGO_TARGET_DIR")
@@ -4300,6 +4402,83 @@ mod tests {
         let p = published.lock().unwrap();
         assert_eq!(p.mix[0], crate::engine::RigMix { vol: 64.0 / 127.0, pan: 0.0, mute: true, solo: false });
         assert!(p.strips.iter().any(|s| s.node == 1 && s.mix.pan == -1.0), "the source strip is panned hard left");
+    }
+
+    /// #56 headless: a profile set for a device index binds the organ in
+    /// the engine, raw controller bytes from that device land on the organ's
+    /// own steps, and "none" takes the bindings back.
+    #[test]
+    fn a_device_instrument_profile_drives_the_organ_headless() {
+        let mut graph = Graph::demo_patch();
+        let organ = graph.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new(crate::organ::B_SYNTH) }, crate::control::name_bytes("ORGAN"));
+        let (server, mut engine) = local_server();
+        {
+            let mut st = server.state.lock().unwrap();
+            send_cmd(&mut st, Command::LoadGraph { graph: graph.clone() }).unwrap();
+            st.graph = graph;
+            // Both ports play the organ (the routes its instance gets when
+            // it attaches, rule 153; no plugin is loaded here).
+            for dev in [0, 1] {
+                send_cmd(&mut st, Command::MatrixRule {
+                    source: SourceId::Hardware(dev), dest: organ, channel: None, transpose: 0,
+                    key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true,
+                }).unwrap();
+            }
+        }
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+
+        let list = tool_json(&server.list_instrument_profiles());
+        let electro = list["profiles"].as_array().unwrap().iter().find(|p| p["id"] == "nord-electro-2").expect("the built-in profile");
+        assert_eq!(electro["drives"][0]["node"], json!(organ), "{electro}");
+        assert_eq!(electro["drives"][0]["controls"].as_array().unwrap().len(), 12);
+        assert_eq!(list["devices"], json!([]), "nothing picked yet");
+
+        let set = |device: u32, profile: &str| server.set_device_instrument(Parameters(SetDeviceInstrumentArgs { device, profile: profile.into() }));
+        let unknown = set(1, "nord-stage").unwrap();
+        assert!(unknown.is_error == Some(true) && format!("{unknown:?}").contains("nord-electro-2"), "{unknown:?}");
+        assert_eq!(set(99, "nord-electro-2").unwrap().is_error, Some(true));
+
+        let res = tool_json(&set(1, "Nord Electro 2"));
+        assert_eq!((&res["profile"], &res["source"]), (&json!("nord-electro-2"), &json!("hw:1")), "{res}");
+        assert_eq!(res["drives"], json!([{"node": organ, "name": "ORGAN", "controls": 12}]), "{res}");
+        let maps = tool_json(&server.list_cc_maps(Parameters(ListCcMapsArgs { node: Some(organ), source: Some("hw:1".into()) })));
+        assert_eq!(maps["cc_maps"][0]["bindings"].as_array().unwrap().len(), 12, "{maps}");
+        let list = tool_json(&server.list_instrument_profiles());
+        assert_eq!((&list["devices"][0]["device"], &list["devices"][0]["profile"]), (&json!(1), &json!("nord-electro-2")), "{list}");
+
+        // The Nord's bytes: B0 12 56 (8' drawbar), B0 52 7F (rotary fast),
+        // B0 57 00 (percussion off); the same drawbar from another port.
+        {
+            let mut st = server.state.lock().unwrap();
+            for (dev, cc, value) in [(1u32, 0x12u8, 0x56u8), (1, 0x52, 0x7F), (1, 0x57, 0x00), (0, 0x12, 0x7F)] {
+                send_cmd(&mut st, Command::Cc { source: SourceId::Hardware(dev), channel: 0, cc, value }).unwrap();
+            }
+        }
+        engine.render(&mut buf, 2);
+        let log = engine.cc_log.clone();
+        let value_of = |param| log.iter().rev().find(|(n, p, _)| *n == organ && *p == param).map(|(_, _, v)| *v as f32);
+        assert_eq!(log.len(), 3, "only the profiled port's controllers reach the organ: {log:?}");
+        assert_eq!(value_of(crate::organ::drawbar_param(2)).map(crate::organ::drawbar_position), Some(6));
+        assert_eq!(value_of(crate::organ::P_LESLIE).and_then(|v| crate::organ::step_name(crate::organ::P_LESLIE, v)), Some("FAST"));
+        assert_eq!(value_of(crate::organ::P_PERC).and_then(|v| crate::organ::step_name(crate::organ::P_PERC, v)), Some("OFF"));
+
+        // A controller rebound by hand since stays; the rest goes with "none".
+        tool_json(&server.set_cc_map(Parameters(SetCcMapArgs {
+            node: organ, source: "hw:1".into(), cc: 111, param: Some(crate::organ::P_REVERB), target: Some("knob".into()), knob: None, mix: None, min: None, max: None,
+        })));
+        let off = tool_json(&set(1, "none"));
+        assert_eq!((&off["profile"], &off["drives"]), (&Value::Null, &json!([])), "{off}");
+        let maps = tool_json(&server.list_cc_maps(Parameters(ListCcMapsArgs { node: Some(organ), source: Some("hw:1".into()) })));
+        let left: Vec<u64> = maps["cc_maps"][0]["bindings"].as_array().unwrap().iter().map(|b| b["cc"].as_u64().unwrap()).collect();
+        assert_eq!(left, [111], "{maps}");
+        {
+            let mut st = server.state.lock().unwrap();
+            send_cmd(&mut st, Command::Cc { source: SourceId::Hardware(1), channel: 0, cc: 0x12, value: 0 }).unwrap();
+        }
+        engine.cc_log.clear();
+        engine.render(&mut buf, 2);
+        assert!(engine.cc_log.is_empty(), "an unbound drawbar moves nothing: {:?}", engine.cc_log);
     }
 
     #[test]

@@ -769,8 +769,12 @@ const NOTO_DIRS: [&str; 4] = [
     "/usr/share/fonts/google-noto",
 ];
 
-/// Load `file` from the first Noto directory that has it.
+/// Load `file` from `KABELSALAT_FONT_DIR` (if set) or the first Noto
+/// directory that has it.
 fn load_noto(fonts: &mut egui::FontDefinitions, name: &str, file: &str) -> bool {
+    if let Ok(dir) = std::env::var("KABELSALAT_FONT_DIR") {
+        if load_font(fonts, name, &format!("{dir}/{file}")) { return true; }
+    }
     NOTO_DIRS.iter().any(|dir| load_font(fonts, name, &format!("{dir}/{file}")))
 }
 

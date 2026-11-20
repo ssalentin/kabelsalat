@@ -624,6 +624,9 @@ fn system_prompt() -> String {
      add_insert with source = the bus node puts the effect on it (set that effect fully \
      wet), set_send sends a rig (rig=) or one source (node=) into it at a level, pre or \
      post fader; get_sends lists buses and sends. Never cable into a bus: it has no input. \
+     - A click or monitor mix on the headphones only: set_bus_output plays one rig bus \
+     (rig=) or aux bus (bus=) to its own sound card (name from list_audio_outputs) and \
+     takes it out of the master mix; output null brings it back; get_bus_outputs lists them. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -871,6 +874,16 @@ pub(crate) fn tools() -> Value {
             "name":"set_send",
             "description":"Set one send into an aux bus: how much of a whole rig (rig = 0-based index, tapped at its rig bus) OR of one source (node = its node id) goes to bus (the bus's node id from add_bus / get_sends). level 0..1 is a linear gain (1 = 0 dB, 0.5 = -6 dB, 0 = off). pre=true taps before the fader, so the send keeps its level when the fader moves; pre=false (default) follows the fader. A muted source sends nothing. Omitted fields keep their value. Example: rig 1, bus 9, level 0.5.",
             "parameters":{"type":"object","properties":{"bus":{"type":"integer","description":"Aux bus node id"},"rig":{"type":"integer","description":"Source rig (0-based); give rig OR node"},"node":{"type":"integer","description":"Source node id; give rig OR node"},"level":{"type":"number"},"pre":{"type":"boolean"}},"required":["bus"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_bus_output",
+            "description":"Play one rig bus (rig = 0-based index) OR one aux bus (bus = its node id) to a sound card of its own instead of the master's, e.g. the click or a monitor mix only on the headphones while the main mix goes to the PA. output: a name from list_audio_outputs; null or empty = back into the master. A bus on its own output is no longer in the master mix; its fader, pan, mute and inserts still act on it. At most 4 different outputs besides the master's. Saved with the session; while the device is unplugged the bus is silent, never on another output.",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer","description":"Rig whose bus to route (0-based); give rig OR bus"},"bus":{"type":"integer","description":"Aux bus node id; give rig OR bus"},"output":{"type":["string","null"],"description":"Sink name from list_audio_outputs; null = master out"}},"required":[]}
+        }},
+        {"type":"function","function":{
+            "name":"get_bus_outputs",
+            "description":"List every rig bus and aux bus with the output it plays to (null = the master's), the output's label and whether that device is there now.",
+            "parameters":{"type":"object","properties":{},"required":[]}
         }},
         {"type":"function","function":{
             "name":"get_sends",

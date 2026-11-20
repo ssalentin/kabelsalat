@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 use crate::bridge;
 use crate::control::{
     self, merge_rigs, name_bytes, name_str, Command, CommandBus, DspKind, EdgeId, Graph, NodeId,
-    NodeKind, PortKind, PortRef, Rig, RigSnapshot, SendSource,
+    NodeKind, PortKind, PortRef, Rig, RigSnapshot, SendSource, SinkName,
 };
 use crate::engine::{GraphEngine, GraphPub};
 use crate::host::{ClapVoice, ClapVoiceMain};
@@ -710,6 +710,21 @@ struct RemoveBusArgs {
     /// The aux bus's node id.
     bus: NodeId,
 }
+
+/// Arguments for `set_bus_output` (#147).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetBusOutputArgs {
+    /// The rig whose bus to route (0-based). Give `rig` OR `bus`.
+    rig: Option<u8>,
+    /// An aux bus's node id (add_bus / get_sends). Give `rig` OR `bus`.
+    bus: Option<u32>,
+    /// PipeWire sink name from list_audio_outputs; omit or empty = back into the master.
+    output: Option<String>,
+}
+
+/// Arguments for `get_bus_outputs` (#147).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetBusOutputsArgs {}
 
 /// Arguments for `get_sends` (issue #5).
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2690,6 +2705,61 @@ impl McpServer {
         ok_json(json!({"buses": buses, "sends": sends, "max_buses": crate::engine::MAX_BUSES}))
     }
 
+    /// Route a rig bus or aux bus to its own output (#147).
+    #[tool(name = "set_bus_output", description = "Play one rig bus (rig = 0-based index) OR one aux bus (bus = its node id) to a sound card of its own instead of the master's (#147): the click or a monitor mix only on the headphones while the main mix goes to the PA. output: a PipeWire sink name (list_audio_outputs in the running app; `pactl list short sinks`); omit or empty = back into the master. A bus on its own output is no longer in the master mix; its fader, pan, mute and inserts still act on it. At most 4 different outputs besides the master's. While the device is not there the bus is silent, never on another output. Resets on graph loads (the running app saves it with the session and re-sends it).")]
+    fn set_bus_output(&self, Parameters(args): Parameters<SetBusOutputArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_bus_output", json!({"rig": args.rig, "bus": args.bus, "output": args.output}));
+        }
+        let bus = match (args.rig, args.bus) {
+            (Some(r), None) if st.graph.nodes.iter().any(|n| n.rig == r) => SendSource::Rig(r),
+            (Some(r), None) => return tool_err(format!("no rig {r} (see get_rigs)")),
+            (None, Some(n)) if st.graph.is_bus(n) => SendSource::Node(n),
+            (None, Some(n)) => return tool_err(format!("node {n} is not an aux bus (get_bus_outputs lists the buses; a rig bus is rig=)")),
+            _ => return tool_err("set_bus_output needs exactly one bus: rig (0-based index) or bus (an aux bus's node id)"),
+        };
+        let output = args.output.filter(|o| !o.is_empty());
+        if let Some(o) = &output {
+            if o.len() > SinkName::MAX_LEN {
+                return tool_err(format!("the output name is longer than {} bytes", SinkName::MAX_LEN));
+            }
+            let held = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| g.bus_outs));
+            let mut others: Vec<String> = held.iter().flatten().filter(|x| !x.sink.is_none() && x.bus != bus)
+                .map(|x| x.sink.as_str().to_string()).collect();
+            others.sort();
+            others.dedup();
+            if !others.contains(o) && others.len() >= crate::engine::MAX_OUTS {
+                return tool_err(format!("buses already play to {} outputs besides the master's, the most kabelsalat serves at once", crate::engine::MAX_OUTS));
+            }
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetBusOutput { bus, sink: output.as_deref().map(SinkName::new) }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"rig": args.rig, "bus": args.bus, "output": output}))
+    }
+
+    /// List the outputs of rig buses and aux buses (#147).
+    #[tool(name = "get_bus_outputs", description = "List every rig bus and aux bus with the output it plays to (null = the master's), as the engine holds it. In the running app (mcp --attach) each entry also has the output's label and whether the device is there now.")]
+    fn get_bus_outputs(&self, Parameters(_args): Parameters<GetBusOutputsArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("get_bus_outputs", json!({}));
+        }
+        let held = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| g.bus_outs));
+        let out = |bus: SendSource| held.iter().flatten().find(|x| !x.sink.is_none() && x.bus == bus)
+            .map(|x| x.sink.as_str().to_string());
+        let mut rigs: Vec<u8> = st.graph.nodes.iter().map(|n| n.rig).collect();
+        rigs.sort();
+        rigs.dedup();
+        let mut buses: Vec<Value> = rigs.iter().map(|&r| json!({"rig": r, "output": out(SendSource::Rig(r))})).collect();
+        buses.extend(st.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus)))
+            .map(|n| json!({"bus": n.id, "name": name_str(&n.name), "output": out(SendSource::Node(n.id))})));
+        ok_json(json!({"buses": buses, "max_outputs": crate::engine::MAX_OUTS}))
+    }
+
     /// Remove an aux bus (issue #5).
     #[tool(name = "remove_bus", description = "Remove an aux bus and every send into it (issue #5). In the running app (mcp --attach) its inserts go with it and undo brings it back; headless, remove its insert nodes with remove_node.")]
     fn remove_bus(&self, Parameters(args): Parameters<RemoveBusArgs>) -> Result<CallToolResult, McpError> {
@@ -3376,6 +3446,8 @@ struct AudioHandles {
     sample_rate: f64,
     live: bool,
     record: Arc<crate::record::RecorderShared>,
+    /// Plays buses routed to their own output (#147); stops when dropped.
+    _bus_outs: Option<crate::audio_out::BusOutputs>,
 }
 
 /// Prefer the native PipeWire host (same policy as the app), fall back to
@@ -3439,6 +3511,8 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     let level = engine.level_handle();
     let node_times = engine.node_times_handle();
     bridge::SAMPLE_RATE.store(sample_rate as u32, Ordering::Relaxed);
+    let bus_outs = engine.take_out_taps()
+        .map(|taps| crate::audio_out::BusOutputs::spawn(taps, graph_pub.clone(), sample_rate as u32));
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
@@ -3453,7 +3527,7 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
         None,
     )?;
     stream.play()?;
-    Ok(AudioHandles { mains, stream: Some(stream), bus, level, graph_pub, node_times, sample_rate, live: true, record })
+    Ok(AudioHandles { mains, stream: Some(stream), bus, level, graph_pub, node_times, sample_rate, live: true, record, _bus_outs: bus_outs })
 }
 
 /// No audio device (or plugin failure): keep the engine rendering into a
@@ -3483,7 +3557,7 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
             }
         })
         .expect("spawning dummy audio thread");
-    AudioHandles { mains: vec![], stream: None, bus, level, graph_pub, node_times, sample_rate, live: false, record }
+    AudioHandles { mains: vec![], stream: None, bus, level, graph_pub, node_times, sample_rate, live: false, record, _bus_outs: None }
 }
 
 fn build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
@@ -4261,5 +4335,49 @@ mod tests {
         assert!(!builtins.iter().any(|b| b["name"] == "Metronome"), "Metronome is a utility, not an effect");
         assert_eq!(fx["counts"]["instrument"], json!(0));
         assert!(fx["effect_categories"]["delay_reverb"].as_u64().unwrap() >= 2);
+    }
+
+    #[test]
+    fn set_bus_output_and_get_bus_outputs_drive_engine_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        // Add an aux bus so both rig bus and aux bus paths are exercised.
+        let added = tool_json(&server.add_bus(Parameters(AddBusArgs { name: Some("Mon".into()), rig: Some(0) })));
+        let bus = added["bus"].as_u64().unwrap() as u32;
+        engine.render(&mut buf, 2);
+
+        let set_rig = tool_json(&server.set_bus_output(Parameters(SetBusOutputArgs {
+            rig: Some(0), bus: None, output: Some("alsa_output.m2".into()),
+        })));
+        assert_eq!(set_rig["output"], json!("alsa_output.m2"));
+        let set_aux = tool_json(&server.set_bus_output(Parameters(SetBusOutputArgs {
+            rig: None, bus: Some(bus), output: Some("alsa_output.phones".into()),
+        })));
+        assert_eq!(set_aux["output"], json!("alsa_output.phones"));
+        engine.render(&mut buf, 2);
+
+        let listed = tool_json(&server.get_bus_outputs(Parameters(GetBusOutputsArgs {})));
+        let buses = listed["buses"].as_array().unwrap();
+        assert!(buses.iter().any(|b| b["rig"] == json!(0) && b["output"] == json!("alsa_output.m2")), "{listed}");
+        assert!(buses.iter().any(|b| b["bus"] == json!(bus) && b["output"] == json!("alsa_output.phones")), "{listed}");
+
+        // Invalid arguments are refused.
+        assert!(is_err(server.set_bus_output(Parameters(SetBusOutputArgs { rig: Some(0), bus: Some(bus), output: Some("x".into()) }))));
+        assert!(is_err(server.set_bus_output(Parameters(SetBusOutputArgs { rig: None, bus: None, output: Some("x".into()) }))));
+        assert!(is_err(server.set_bus_output(Parameters(SetBusOutputArgs { rig: None, bus: Some(1), output: Some("x".into()) }))));
+        assert!(is_err(server.set_bus_output(Parameters(SetBusOutputArgs { rig: Some(0), bus: None, output: Some("x".repeat(128)) }))));
+
+        // Clearing brings the rig bus back into the master.
+        let cleared = tool_json(&server.set_bus_output(Parameters(SetBusOutputArgs {
+            rig: Some(0), bus: None, output: None,
+        })));
+        assert_eq!(cleared["output"], Value::Null);
+        engine.render(&mut buf, 2);
+        let listed = tool_json(&server.get_bus_outputs(Parameters(GetBusOutputsArgs {})));
+        assert!(listed["buses"].as_array().unwrap().iter().any(|b| b["rig"] == json!(0) && b["output"].is_null()), "{listed}");
     }
 }

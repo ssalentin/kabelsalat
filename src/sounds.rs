@@ -7,7 +7,7 @@
 //! instantiate a plugin, so `Libraries` runs them on their own thread and
 //! keeps the results (rules 46, 57).
 
-use crate::control::{name_str, Command, CommandBus, NodeId, NodeKind};
+use crate::control::{Command, CommandBus, NodeId, NodeKind};
 use crate::host::{ClapVoiceMain, ParamDesc, VoiceController};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,7 +31,7 @@ impl Instrument {
     pub fn of(kind: &NodeKind) -> Option<Instrument> {
         match kind {
             NodeKind::Clap { plugin_id } => {
-                let id = name_str(plugin_id);
+                let id = plugin_id.as_str();
                 // Graphs written before plugin ids name Surge by its label.
                 Some(Instrument::Clap(if id.is_empty() || id == "Surge XT" { SURGE_ID.to_string() } else { id.to_string() }))
             }
@@ -747,8 +747,8 @@ mod tests {
     #[test]
     fn a_node_names_its_instrument() {
         use crate::control::{name_bytes, Lv2Uri};
-        assert_eq!(Instrument::of(&NodeKind::Clap { plugin_id: name_bytes("org.yanes.native") }), Some(Instrument::Clap("org.yanes.native".into())));
-        assert_eq!(Instrument::of(&NodeKind::Clap { plugin_id: name_bytes("Surge XT") }), Some(Instrument::Clap(SURGE_ID.into())));
+        assert_eq!(Instrument::of(&NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.yanes.native") }), Some(Instrument::Clap("org.yanes.native".into())));
+        assert_eq!(Instrument::of(&NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }), Some(Instrument::Clap(SURGE_ID.into())));
         assert_eq!(Instrument::of(&NodeKind::Lv2 { uri: Lv2Uri::new("urn:distrho:vitalium") }), Some(Instrument::Lv2("urn:distrho:vitalium".into())));
         assert_eq!(Instrument::of(&NodeKind::Keys), None);
     }

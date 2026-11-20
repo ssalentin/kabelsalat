@@ -60,7 +60,6 @@ use crate::transport::{Transport, BEATS_PER_BAR};
 /// Frames per processing block. Small enough for live latency, big enough for Surge.
 const BLOCK: usize = 256;
 /// Upper bound on output ports (Surge XT: main + Scene A + Scene B = 3).
-const MAX_OUT_PORTS: usize = 8;
 /// How long the arpeggio demo runs.
 const DEMO_SECONDS: u64 = 9;
 
@@ -410,9 +409,11 @@ pub struct ClapVoice {
     sample_rate: f64,
     in_count: usize,
     main_out: usize,
-    n_out: usize,
     in_bufs: Vec<Vec<f32>>,
-    out_bufs: [Vec<Vec<f32>>; MAX_OUT_PORTS],
+    /// One buffer set per output port; only `main_out` is heard. Drum
+    /// machines (OneTrick CRYPTID: 12 ports) put each drum on its own port
+    /// and the mix on the main one.
+    out_bufs: Vec<Vec<Vec<f32>>>,
     in_ports: AudioPorts,
     out_ports: AudioPorts,
     ev_in: EventBuffer,
@@ -546,7 +547,6 @@ impl ClapVoice {
 
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
         let gate = Arc::new(StateGate::default());
-        let n_out = out_chs.len();
         let voice = ClapVoice {
             voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             plugin_id: id_str.clone(),
@@ -561,17 +561,10 @@ impl ClapVoice {
             sample_rate,
             in_count,
             main_out,
-            n_out,
             in_bufs: (0..in_ch.max(1)).map(|_| vec![0.0; BLOCK]).collect(),
-            out_bufs: std::array::from_fn(|i| {
-                if i < n_out {
-                    (0..out_chs[i]).map(|_| vec![0.0; BLOCK]).collect()
-                } else {
-                    vec![vec![0.0; BLOCK]]
-                }
-            }),
+            out_bufs: out_chs.iter().map(|&chs| (0..chs).map(|_| vec![0.0; BLOCK]).collect()).collect(),
             in_ports: AudioPorts::with_capacity(in_ch.max(1), 1),
-            out_ports: AudioPorts::with_capacity(out_chs.iter().sum(), n_out),
+            out_ports: AudioPorts::with_capacity(out_chs.iter().sum(), out_chs.len()),
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
@@ -736,21 +729,9 @@ impl ClapVoice {
             // Zero input ports: same concrete type, empty iterator.
             self.in_ports.with_input_buffers([in_port].into_iter().take(0))
         };
-        // Stack array of port configs (no heap alloc); only the first n_out
-        // entries are handed to the plugin. Destructure into disjoint locals
-        // so the borrow checker accepts simultaneous per-port borrows.
-        let [p0, p1, p2, p3, p4, p5, p6, p7] = &mut self.out_bufs;
-        let out_arr = [
-            out_port!(p0),
-            out_port!(p1),
-            out_port!(p2),
-            out_port!(p3),
-            out_port!(p4),
-            out_port!(p5),
-            out_port!(p6),
-            out_port!(p7),
-        ];
-        let mut output = self.out_ports.with_output_buffers(out_arr.into_iter().take(self.n_out));
+        // Port configs from an iterator (no heap alloc: `out_ports` holds
+        // room for every port and channel).
+        let mut output = self.out_ports.with_output_buffers(self.out_bufs.iter_mut().map(|p| out_port!(p)));
         // Buffers are BLOCK-sized; process exactly n frames.
         input.truncate(n as u32);
         output.truncate(n as u32);
@@ -2857,9 +2838,6 @@ fn inspect_audio_ports(
     let main_out = main_out.ok_or_else(|| anyhow!("Surge exposes no main output port"))?;
     if out_chs[main_out] != 2 {
         bail!("P0 host expects a stereo main output, got {} channels", out_chs[main_out]);
-    }
-    if out_chs.len() > MAX_OUT_PORTS {
-        bail!("P0 host supports at most {MAX_OUT_PORTS} output ports, got {}", out_chs.len());
     }
     Ok((in_count, in_ch, out_chs, main_out))
 }

@@ -577,7 +577,7 @@ fn surge_clip(category: &str, name: &str, phrase: Phrase, secs: f32) -> anyhow::
     let mut g = Graph::default();
     g.reserve(8, 8);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);

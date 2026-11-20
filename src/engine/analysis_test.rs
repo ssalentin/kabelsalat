@@ -174,7 +174,7 @@ fn surge(clips: &mut Vec<Clip>) -> anyhow::Result<()> {
     let (mut bus, drain) = crate::control::command_bus();
     let mut g = Graph::default();
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
     probe::wire(&mut g, 2, synth, master, 0);

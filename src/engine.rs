@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::control::{AuxSend, SendSource};
 use crate::control::{
-    name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
+    split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
     NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
 };
 use crate::dsp::{build_processor, Processor};
@@ -1641,7 +1641,7 @@ impl GraphEngine {
             if self.voices.iter().any(|v| v.node == n.id) {
                 continue;
             }
-            let key = crate::control::clap_plugin_key(name_str(plugin_id));
+            let key = crate::control::clap_plugin_key(plugin_id.as_str());
             let free = self
                 .voices
                 .iter_mut()
@@ -5356,8 +5356,8 @@ mod tests {
         use crate::control::{name_bytes, Graph, NodeKind};
         let mut g = Graph::default();
         g.reserve(8, 8);
-        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes("x") }, name_bytes("A"));
-        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes("x") }, name_bytes("B"));
+        let a = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("x") }, name_bytes("A"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("x") }, name_bytes("B"));
         let strips = [(b, super::StripMix { solo: true, ..super::StripMix::DEFAULT })];
         let mut solo = [false; 8];
         solo[0] = true;
@@ -5678,7 +5678,7 @@ mod tests {
         let mut g = crate::control::Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let synth = g.add_node(
-            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") },
             name_bytes("SURGE"),
         );
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
@@ -6725,7 +6725,7 @@ mod tests {
         let (mut bus, drain) = command_bus();
         let mut g = crate::control::Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
         g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -6802,7 +6802,7 @@ mod tests {
         let (mut bus, drain) = command_bus();
         let mut g = crate::control::Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
         g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -6885,7 +6885,7 @@ mod tests {
         let (mut bus, drain) = command_bus();
         let mut g = crate::control::Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
         g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -6926,7 +6926,7 @@ pub fn lv2_engine_test() -> anyhow::Result<()> {
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let synth = g.add_node(
-        NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+        NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") },
         name_bytes("SYNTH"),
     );
     let lv2 = g.add_node(
@@ -6968,7 +6968,7 @@ pub fn edge_level_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE"));
     let fx = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
@@ -7587,7 +7587,7 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let kind = match instrument {
-        Instrument::Clap(id) => NodeKind::Clap { plugin_id: name_bytes(id) },
+        Instrument::Clap(id) => NodeKind::Clap { plugin_id: crate::control::ClapId::new(id) },
         Instrument::Lv2(uri) => NodeKind::Lv2 { uri: Lv2Uri::new(uri) },
     };
     let node = g.add_node(kind, name_bytes("INSTRUMENT"));
@@ -7731,13 +7731,16 @@ fn vital_patch_readback(engine: &mut GraphEngine, node: NodeId, path: &std::path
 pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
     use crate::sounds::Instrument;
     let asked = |id: &str| queries.iter().find_map(|q| q.strip_prefix(id).and_then(|r| r.strip_prefix('=')).map(str::to_string));
-    // A search the instrument's library should answer.
+    // A search the instrument's library should answer; None: kabelsalat
+    // has no library for that card yet (it plays the plugin's own presets
+    // in the plugin's editor).
     let builtin = |id: &str| match id {
-        "setbfree" => "jazz",
-        "dexed" => "brass",
-        "vitalium" => "pad",
-        "aeolus" => "flute",
-        _ => "bass",
+        "setbfree" => Some("jazz"),
+        "dexed" => Some("brass"),
+        "vitalium" => Some("pad"),
+        "aeolus" => Some("flute"),
+        "surge-xt" | "yanes" | "odin2" | "floe" | "guitarix" => Some("bass"),
+        _ => None,
     };
     let clap = crate::host::list_clap_plugins();
     let lv2 = crate::lv2::discover();
@@ -7751,13 +7754,16 @@ pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
             println!("  {:<9} not installed, skipped", entry.name);
             continue;
         };
+        let Some(query) = asked(entry.id).or_else(|| builtin(entry.id).map(str::to_string)) else {
+            println!("  {:<9} no sound library in kabelsalat yet, skipped", entry.name);
+            continue;
+        };
         tested += 1;
         if let Instrument::Clap(id) = &instrument {
             let providers = crate::host::clap_preset_providers(id)?;
             println!("  {:<9} CLAP preset-discovery providers in its bundle: {}", entry.name,
                 if providers.is_empty() { "none".to_string() } else { format!("{} ({})", providers.len(), providers.join(", ")) });
         }
-        let query = asked(entry.id).unwrap_or_else(|| builtin(entry.id).to_string());
         match sound_library_check(&instrument, &query) {
             Ok(line) => println!("  {:<9} {line}", entry.name),
             Err(e) => {
@@ -7848,7 +7854,7 @@ pub fn add_node_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -7886,7 +7892,7 @@ pub fn mono_master_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 2 }, PortKind::Audio);
@@ -7923,9 +7929,9 @@ pub fn multi_rig_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(32, 32);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let sa = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+    let sa = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE A"));
     let ma = g.add_node(NodeKind::MasterOut, name_bytes("MASTER A"));
-    let sb = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+    let sb = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE B"));
     let mb = g.add_node(NodeKind::MasterOut, name_bytes("MASTER B"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: sa, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: ma, port: 0 }, PortKind::Audio);
@@ -7965,9 +7971,9 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(32, 32);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let sa = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+    let sa = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE A"));
     let ma = g.add_node(NodeKind::MasterOut, name_bytes("MASTER A"));
-    let sb = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+    let sb = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE B"));
     let mb = g.add_node(NodeKind::MasterOut, name_bytes("MASTER B"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: sa, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: ma, port: 0 }, PortKind::Audio);
@@ -8029,8 +8035,8 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
         let mut g = Graph::default();
         g.reserve(16, 16);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
-        let s1 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE A"));
+        let s1 = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE B"));
         let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
         g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
@@ -8107,7 +8113,7 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
         let mut g = Graph::default();
         g.reserve(16, 16);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE A"));
         let fx = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
         let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
@@ -8134,7 +8140,7 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
         let mut g = Graph::default();
         g.reserve(16, 16);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE A"));
         let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let fx = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("INSERT"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
@@ -8179,7 +8185,7 @@ pub fn multi_rig_load_test() -> anyhow::Result<()> {
         g.reserve(8, 8);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let synth = g.add_node(
-            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") },
             name_bytes("SURGE"),
         );
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
@@ -8269,7 +8275,7 @@ pub fn many_voices_test() -> anyhow::Result<()> {
     let mut units: Vec<(NodeId, u32)> = Vec::new();
     let mut edge = 1u32;
     for (name, id) in &plugins {
-        let node = g.add_node(NodeKind::Clap { plugin_id: name_bytes(id) }, name_bytes(&name.to_uppercase()));
+        let node = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(id) }, name_bytes(&name.to_uppercase()));
         g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, PortKind::Midi);
         g.connect_with_id(edge + 1, PortRef { node, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
         g.connect_with_id(edge + 2, PortRef { node, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
@@ -8428,7 +8434,7 @@ pub fn arp_test() -> anyhow::Result<()> {
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     let arp = g.add_node(NodeKind::Arp, name_bytes("ARP"));
-    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_PLUGIN_ID) }, name_bytes("SURGE"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_PLUGIN_ID) }, name_bytes("SURGE"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: arp, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: arp, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
     g.connect_with_id(3, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -8568,7 +8574,7 @@ pub fn cc_map_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -8746,7 +8752,7 @@ fn instrument_graph(kind: crate::control::NodeKind) -> (Graph, NodeId) {
 }
 
 fn clap_main_controls_check(name: &str, plugin_id: &str) -> anyhow::Result<()> {
-    use crate::control::{command_bus, name_bytes, Command, NodeKind};
+    use crate::control::{command_bus, Command, NodeKind};
     let sr = 48000.0;
     let (voice, mut main) = ClapVoice::new_plugin(sr, plugin_id)?;
     let found = main.main_controls().clone();
@@ -8756,7 +8762,7 @@ fn clap_main_controls_check(name: &str, plugin_id: &str) -> anyhow::Result<()> {
     });
     let Some(c) = found.controls.first() else { return Ok(()) };
     let knob = voice.controller();
-    let (g, inst) = instrument_graph(NodeKind::Clap { plugin_id: name_bytes(plugin_id) });
+    let (g, inst) = instrument_graph(NodeKind::Clap { plugin_id: crate::control::ClapId::new(plugin_id) });
     let (mut bus, drain) = command_bus();
     let mut engine = GraphEngine::new(g, drain, sr, vec![(inst, voice)]);
     let mut buf = vec![0.0f32; 256 * 2];
@@ -8851,7 +8857,7 @@ pub fn target_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(8, 8);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SYNTH"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SYNTH"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -8970,7 +8976,7 @@ pub fn meter_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(8, 8);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SYNTH"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SYNTH"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -9183,9 +9189,9 @@ pub fn send_test() -> anyhow::Result<()> {
     let mut g = Graph::default();
     g.reserve(32, 32);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let sa = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+    let sa = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE A"));
     let ma = g.add_node(NodeKind::MasterOut, name_bytes("MASTER A"));
-    let sb = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+    let sb = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }, name_bytes("SURGE B"));
     let mb = g.add_node(NodeKind::MasterOut, name_bytes("MASTER B"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: sa, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: ma, port: 0 }, PortKind::Audio);

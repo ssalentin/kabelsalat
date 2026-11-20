@@ -927,18 +927,24 @@ unsafe fn find_plugin(world: *mut LilvWorld, needle: &str) -> *const LilvPlugin 
     if plugins.is_null() {
         return std::ptr::null();
     }
+    // An exact URI first: AVL Drumkits' "…#BlondeBop" is also part of
+    // "…#BlondeBopHR" and "…#BlondeBopMulti".
+    let mut fallback: *const LilvPlugin = std::ptr::null();
     let mut iter = lilv_plugins_begin(plugins);
     while !iter.is_null() && !lilv_plugins_is_end(plugins, iter) {
         let plugin = lilv_plugins_get(plugins, iter);
         if !plugin.is_null() {
             let uri = node_borrowed(lilv_plugin_get_uri(plugin));
-            if uri.contains(needle) {
+            if uri == needle {
                 return plugin;
+            }
+            if fallback.is_null() && uri.contains(needle) {
+                fallback = plugin;
             }
         }
         iter = lilv_plugins_next(plugins, iter);
     }
-    std::ptr::null()
+    fallback
 }
 
 /// Hosting self-test: instantiate a simple audio gain plugin, feed a known

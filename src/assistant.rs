@@ -683,8 +683,7 @@ fn system_prompt() -> String {
      node=<the instrument's node id>.\n\
      Be concise and practical. When something is broken, diagnose step by step starting \
      with get_status. Notes: loading a template or adding a plugin rebuilds the current \
-     patch; system-audio capture of the output monitor can feed \
-     back if kabelsalat plays to the same output."
+     patch; system-audio capture records other playing apps, never kabelsalat's own output."
         .into()
 }
 
@@ -826,7 +825,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"system_audio",
-            "description":"Mix system audio (e.g. YouTube/browser playback) into the master. gain 0..1 (0 mutes, default). Captures the default output's monitor source. Warn the user about feedback if kabelsalat plays to the same output.",
+            "description":"Mix system audio (e.g. YouTube/browser playback) into the master. gain 0..1 (0 mutes, default). Captures the other apps that are playing (the mixer's System audio strips), never kabelsalat's own output, so it cannot feed back; sound arrives about a second after the gain comes up.",
             "parameters":{"type":"object","properties":{"gain":{"type":"number","description":"0..1 mix level; 0 mutes"}},"required":["gain"]}
         }},
         {"type":"function","function":{

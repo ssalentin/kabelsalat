@@ -1608,4 +1608,12 @@ Learned so far (2026-11-15, UI polish pass):
     up again. Pads, drums and anything struck use `DemoApp::struck` (the
     primary press on the widget), and their test asserts the note after the
     press frame alone (`a_drum_pad_sounds_when_it_is_pressed`).
+182. **System-audio capture records only streams proven to belong to another
+    process:** capturing a sink's monitor includes kabelsalat's own output
+    and feeds back (#27), and a stream whose client lacks a readable PID (or
+    belongs to a child process we started) could still be ours.
+    `audio_out::foreign_streams` and `is_own_process` fail closed,
+    `CaptureFeed` runs one `parec --monitor-stream` per foreign stream (none
+    while muted), and `kabelsalat capture-test` proves our tone stays absent
+    across sink moves, default-sink changes and stream reopens.
 

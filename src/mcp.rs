@@ -2299,7 +2299,7 @@ impl McpServer {
     }
 
     /// Mix system audio into the master.
-    #[tool(name = "set_system_audio", description = "Mix system-audio capture (e.g. YouTube) into the master (Command::SetSystemAudio). gain 0..1, 0 mutes. In the GUI app this captures the default output's monitor; headless mode has no capture source so it only stores the gain.")]
+    #[tool(name = "set_system_audio", description = "Mix system-audio capture (e.g. YouTube) into the master (Command::SetSystemAudio). gain 0..1, 0 mutes. In the GUI app this captures the other apps that are playing (list_app_streams), never kabelsalat's own output; headless mode has no capture source so it only stores the gain.")]
     fn set_system_audio(&self, Parameters(args): Parameters<SetSystemAudioArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         let gain = args.gain.clamp(0.0, 1.0);

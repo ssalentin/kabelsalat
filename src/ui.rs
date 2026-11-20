@@ -5091,6 +5091,7 @@ impl DemoApp {
         let state = self.audio_out.clone();
         let wanted = self.wanted_output.clone();
         let mut meters = crate::audio_out::StreamMeters::new(self.stream_levels.clone());
+        let mut capture = crate::capture::take_feed();
         std::thread::Builder::new()
             .name("kabelsalat-audio-out".into())
             .spawn(move || { let mut previous: Option<String> = None; loop {
@@ -5105,6 +5106,7 @@ impl DemoApp {
                 let st = crate::audio_out::scan_and_apply(crate::audio_out::target_for(w.as_deref(), previous.as_deref()));
                 previous = crate::audio_out::remember(w, previous, &st);
                 meters.sync(&st.streams);
+                if let Some(c) = &mut capture { c.sync(&st.capturable); }
                 if let Ok(mut s) = state.lock() { *s = st; }
             }})
             .ok();
@@ -8014,7 +8016,7 @@ impl DemoApp {
                     let _ = bus.lock().unwrap().send(Command::SetSystemAudio { gain });
                 }
                 if gain > 0.0 {
-                    format!("system audio mixed in at gain {gain:.2} — captures the default output monitor (e.g. YouTube). Beware feedback if kabelsalat plays to the same output.")
+                    format!("system audio mixed in at gain {gain:.2} — captures other playing apps (never kabelsalat's own output); sound arrives about a second after raising gain.")
                 } else {
                     "system audio muted".into()
                 }
@@ -28964,7 +28966,6 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let cfg = device.default_output_config()?;
     let sample_rate = cfg.sample_rate() as f64;
     crate::bridge::SAMPLE_RATE.store(sample_rate as u32, std::sync::atomic::Ordering::Relaxed);
-    let ch = cfg.channels() as usize;
     let wanted_buffer = crate::assistant::load_buffer_frames();
     crate::bridge::set_configured_buffer_frames(wanted_buffer);
     let (voices, mains) = startup_voices(sample_rate)?;
@@ -28993,17 +28994,12 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // block; the clock thread schedules ticks from it (never per UI frame).
     let clock_pos = crate::clocksend::ClockPos::new();
     engine.set_clock_pos(clock_pos.clone());
-    // System-audio capture: stream the default sink's monitor (e.g. YouTube)
-    // into the engine, muted by default (gain 0). Started off the audio thread.
-    if let Some(source) = crate::capture::SystemCapture::default_monitor() {
-        match crate::capture::SystemCapture::start(&source, sample_rate as u32, ch) {
-            Ok(cap) => {
-                eprintln!("system audio: capturing {source} (muted; raise gain to mix in)");
-                engine.set_system_capture(cap);
-            }
-            Err(e) => eprintln!("system audio: capture unavailable: {e}"),
-        }
-    }
+    // System-audio capture: other apps' streams (e.g. YouTube), one reader
+    // each, never our own output (#27). Muted by default (gain 0); the
+    // audio-out scan thread starts readers once the gain comes up.
+    let (system_capture, capture_feed) = crate::capture::system_capture(sample_rate as u32);
+    engine.set_system_capture(system_capture);
+    crate::capture::install(capture_feed);
     // File player (backing track): the decode thread parses WAVs off the
     // UI and audio threads and hands each decoded buffer to the engine
     // through this ring. The engine owns the clock (loop/sync/beats,
@@ -37754,6 +37750,7 @@ mod settings_and_dropdown_tests {
                 title: "(2) Neo Soul Guitar Backing Track in A minor - YouTube".into(),
                 volume: 1.0, muted: false,
             }],
+            capturable: vec![77],
         };
         let (tx, rx) = std::sync::mpsc::channel();
         app.stream_cmds = Some(tx);

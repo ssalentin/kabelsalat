@@ -143,6 +143,15 @@ struct AddRigArgs {
     plugin_id: Option<String>,
 }
 
+/// Arguments for `clone_rig`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CloneRigArgs {
+    /// Source rig index (0-based, see get_rigs). Defaults to the active rig.
+    rig: Option<usize>,
+    /// Optional name for the cloned rig (up to 24 characters; default "<source> Copy").
+    name: Option<String>,
+}
+
 /// Arguments for `rename_rig`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RenameRigArgs {
@@ -2695,6 +2704,64 @@ impl McpServer {
         self.edit_rigs(None, args.name)
     }
 
+    /// Clone an existing rig into a new independent rig.
+    #[tool(name = "clone_rig", description = "Clone an existing rig (rack) into a new independent rig, copying its units, cables, knobs, plugin states, matrix routes, mixer strips, sends, MIDI device binding and rig mix (knob/plugin state copy needs the running app via --attach). rig defaults to the active rig. Returns {rigs, active}.")]
+    fn clone_rig(&self, Parameters(args): Parameters<CloneRigArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            let mut a = json!({});
+            if let Some(r) = args.rig { a["rig"] = json!(r); }
+            if let Some(n) = &args.name { a["name"] = json!(n); }
+            return Self::ui_bridge_tool("clone_rig", a);
+        }
+        let mut st = self.state.lock().unwrap();
+        let meta = match rig_meta(&st) { Ok(m) => m, Err(e) => return tool_err(e) };
+        let (graphs, _) = control::split_rigs(&st.graph);
+        let active_now = st.rigs.lock().map(|s| s.active).unwrap_or(0);
+        let src = args.rig.unwrap_or(active_now);
+        if src >= graphs.len() {
+            return tool_err(format!("no rig {src}: there are {}", graphs.len()));
+        }
+        if graphs.len() >= 8 {
+            return tool_err("at most 8 rigs");
+        }
+        let mut rigs: Vec<Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
+            let m = meta.get(i);
+            let name = m.map(|m| m.name.clone()).filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+            Rig::new(name, g, m.and_then(|m| m.midi_device))
+        }).collect();
+        let used: Vec<String> = rigs.iter().map(|r| r.name.clone()).collect();
+        let clone_name = args.name
+            .map(|s| s.trim().chars().take(24).collect::<String>())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| control::unique_clone_rig_name(&rigs[src].name, &used));
+        let cloned = Rig::new(clone_name, rigs[src].graph.clone(), rigs[src].midi_device);
+        rigs.push(cloned);
+        let target = rigs.len() - 1;
+        let mut mixes = [crate::engine::RigMix::DEFAULT; 8];
+        if let Some(gp) = &st.graph_pub {
+            if let Ok(g) = gp.lock() { mixes = g.mix; }
+        }
+        mixes[target.min(7)] = mixes[src.min(7)];
+        if let Err(e) = send_cmd(&mut st, Command::LoadRigs { rigs: rigs.clone(), active: target }) {
+            return tool_err(e);
+        }
+        for (i, m) in mixes.iter().enumerate().take(rigs.len()) {
+            let _ = send_cmd(&mut st, Command::SetRigMix {
+                rig: i as u8, vol: Some(m.vol), pan: Some(m.pan), mute: Some(m.mute), solo: Some(m.solo),
+            });
+        }
+        st.graph = merge_rigs(&rigs);
+        let metas: Vec<crate::control::RigMeta> = rigs.iter()
+            .map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+        if matches!(st.backend, Backend::Local(_)) {
+            if let Ok(mut s) = st.rigs.lock() { s.rigs = metas.clone(); s.active = target; }
+        }
+        let mut result = json!({"rigs": metas, "active": target});
+        note_silent_claps(&st, &mut result);
+        ok_json(result)
+    }
+
     /// Rename one rig.
     #[tool(name = "rename_rig", description = "Rename rig `rig` (index from get_rigs), e.g. 'Bass'. Up to 24 characters; kept in saved sessions.")]
     fn rename_rig(&self, Parameters(args): Parameters<RenameRigArgs>) -> Result<CallToolResult, McpError> {
@@ -4102,6 +4169,45 @@ mod tests {
         engine.render(&mut buf, 64);
         assert_eq!(engine.graph().nodes.len(), 3);
         assert!(is_err(server.delete_rig(Parameters(DeleteRigArgs { rig: 0, confirm: true }))), "last rig stays");
+    }
+
+    #[test]
+    fn clone_rig_through_the_engine_headless() {
+        let (server, mut engine) = local_server();
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        let mut buf = vec![0.0f32; 64 * 2];
+        let _ = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Lead".into()), plugin_id: None })));
+        engine.render(&mut buf, 64);
+        let _ = tool_json(&server.set_rig_mix(Parameters(SetRigMixArgs {
+            rig: 1,
+            vol: Some(0.55),
+            pan: Some(-0.3),
+            mute: Some(false),
+            solo: Some(false),
+        })));
+        engine.render(&mut buf, 64);
+
+        // Clone active rig (1 = "Lead") with default name -> "Lead Copy".
+        let cloned = tool_json(&server.clone_rig(Parameters(CloneRigArgs { rig: None, name: None })));
+        assert_eq!(cloned["rigs"].as_array().unwrap().len(), 3);
+        assert_eq!(cloned["rigs"][2]["name"], json!("Lead Copy"));
+        assert_eq!(cloned["active"], json!(2));
+        engine.render(&mut buf, 64);
+        let g = engine.graph();
+        let rig1_n = g.nodes.iter().filter(|n| n.rig == 1).count();
+        let rig2_n = g.nodes.iter().filter(|n| n.rig == 2).count();
+        assert_eq!(rig2_n, rig1_n, "clone has same node count as source");
+
+        // Second clone of rig 1 with custom name.
+        let cloned2 = tool_json(&server.clone_rig(Parameters(CloneRigArgs { rig: Some(1), name: Some("Lead 2".into()) })));
+        assert_eq!(cloned2["rigs"][3]["name"], json!("Lead 2"));
+        assert_eq!(cloned2["active"], json!(3));
+
+        // Out-of-range rig fails cleanly.
+        assert!(is_err(server.clone_rig(Parameters(CloneRigArgs { rig: Some(9), name: None }))));
     }
 
     #[test]

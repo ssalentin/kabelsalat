@@ -610,8 +610,9 @@ fn system_prompt() -> String {
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
      sound once wired.\n\
      - Rigs (you operate on ALL of them, not only the one in view): get_rigs lists every \
-     rig; add_rig creates a new playable rig (Keys -> Surge -> Master); delete_rig removes \
-     one; select_rig changes the view; add_node \
+     rig; add_rig creates a new playable rig (Keys -> Surge -> Master); clone_rig duplicates \
+     an existing rig (units, cables, knobs, synth state, matrix routes, mix) as a new rig; \
+     delete_rig removes one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
      save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
      - Loudness (\"make it streaming-ready\", \"master to -14\", \"club loud\"): set_master_target \
@@ -1114,6 +1115,11 @@ pub(crate) fn tools() -> Value {
             "name":"add_rig",
             "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional sound query loaded into the new rig's instrument from its own library (e.g. 'flute' for Surge, 'bass' for YANES). Returns get_rigs.",
             "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional sound query for the new rig's instrument, e.g. 'flute'"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
+        }},
+        {"type":"function","function":{
+            "name":"clone_rig",
+            "description":"Clone an existing rig (rack) into a new independent rig, copying its units, cables, knob values, plugin states, matrix routes, mixer strips, sends, MIDI device binding and rig mix. The view switches to the new clone. rig defaults to the rig in view. Returns get_rigs.",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer","description":"Source rig index from get_rigs (default: active rig)"},"name":{"type":"string","description":"Optional name for the cloned rig (up to 24 chars; default '<source> Copy')"}}}
         }},
         {"type":"function","function":{
             "name":"rename_rig",

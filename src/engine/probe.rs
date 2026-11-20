@@ -411,6 +411,35 @@ pub fn hard_clipped(x: &[f32]) -> Vec<f32> {
     x.iter().map(|s| (s * 2.0).clamp(-MASTER_KNEE, MASTER_KNEE)).collect()
 }
 
+/// One second of white noise at the master, through `chain` as strip
+/// inserts (Audio In → units → Master) or as master inserts (Audio In →
+/// Master, Master OUT → units): the same units on the same signal either
+/// way, because one source at unity is the whole mix. `bypassed` switches
+/// every unit off. Stereo interleaved.
+pub fn noise_through_inserts(chain: &[DspKind], on_master: bool, bypassed: bool) -> Vec<f32> {
+    let mut g = Graph::default();
+    let ain = audio_in(&mut g, "IN");
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    let mut prev = if on_master { master } else { ain };
+    let mut units = Vec::new();
+    for (i, k) in chain.iter().enumerate() {
+        let unit = g.add_node(NodeKind::Dsp(k.clone()), name_bytes("UNIT"));
+        wire(&mut g, 10 + i as u32, prev, unit, 0);
+        units.push(unit);
+        prev = unit;
+    }
+    let from = if on_master { ain } else { prev };
+    wire(&mut g, 1, from, master, 0);
+    wire(&mut g, 2, from, master, 1);
+    let mut probe = Probe::new(g);
+    for node in units {
+        probe.send(Command::SetStripBypass { node, bypass: bypassed });
+    }
+    probe.feed("noise", ain, noise(7));
+    let blocks = SR as usize / probe.block;
+    probe.run(blocks, &[]).master
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +477,28 @@ mod tests {
             assert!(m.at_knee == 0.0 && m.flat_top < FLAT_TOP_MAX && m.above_8k < HF_MAX, "loud {l:?}, quiet {q:?}");
         }
         assert!(c.at_knee > 0.05 && c.flat_top > FLAT_TOP_MAX && c.above_8k > HF_MAX, "clipped {c:?}");
+    }
+
+    /// A master insert runs once per block, on the mix (#154): a unit with
+    /// state sounds the same after Master OUT as it does in a strip. Run a
+    /// second time on silence, a Delay played a block of its line and then
+    /// skipped one, and a Limiter's gain recovered between the blocks.
+    #[test]
+    fn a_master_insert_sounds_like_the_same_unit_in_a_strip() {
+        use DspKind::*;
+        let rms_of = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        let apart = |a: &[f32], b: &[f32]| rms_of(&a.iter().zip(b).map(|(a, b)| a - b).collect::<Vec<f32>>());
+        let dry = noise_through_inserts(&[], true, false);
+        for chain in [&[Gain][..], &[Delay], &[Reverb], &[Limiter], &[Filter], &[Delay, Reverb, Limiter]] {
+            let strip = noise_through_inserts(chain, false, false);
+            let master = noise_through_inserts(chain, true, false);
+            let (rms, off) = (rms_of(&strip), apart(&strip, &master));
+            println!("{chain:?}: strip rms {rms:.5}, master insert differs by rms {off:.7}");
+            assert!(rms > 0.01, "{chain:?}: the strip insert is heard, rms {rms}");
+            assert!(off < rms * 1e-3, "{chain:?}: master insert differs from the strip insert, rms {off} of {rms}");
+            // Bypassed, the mix passes as if the insert were not there.
+            let off = apart(&dry, &noise_through_inserts(chain, true, true));
+            assert!(off < rms_of(&dry) * 1e-3, "{chain:?}: a bypassed master insert changes the mix, rms {off}");
+        }
     }
 }

@@ -1271,6 +1271,15 @@ Learned so far (2026-11-15, UI polish pass):
     fast as it could played the probe notes before any kit existed (peak
     0.000 on all five kits). Render in real time until the worker is done
     (`lv2_probe_chord` warms up for 3 s) before judging silence.
+179. **An effect that a later stage runs is marked done in the effect
+    pass:** a master insert (Master OUT → FX) is an ordinary effect node, so
+    `run_effects` ran it on silence (a MasterOut is no source) and the master
+    stage ran the same processor again on the mix. State advanced twice a
+    block: a Delay as master insert was 90 % off the same Delay in a strip.
+    `master_inserts` is the one list; the effect pass skips what it names
+    and the master stage runs it. A stage that runs effects itself (bus
+    chains, master inserts) sets `fx_done` for them
+    (`a_master_insert_sounds_like_the_same_unit_in_a_strip`).
 
 ## Working on kabelsalat
 

@@ -1312,6 +1312,18 @@ Learned so far (2026-11-15, UI polish pass):
     `master_inserts` (skipped by step 1's instrument loop so its state never
     advances twice, rule 179). Check with `kabelsalat analysis-test` and
     `cargo test --bin kabelsalat a_clap_effect`.
+183. **What `apply_session` resets, the session carries, and a device is
+    saved by name:** `apply_session` reset every CLAP synth's keyboard and
+    hardware switches and its device, and only undo and rig edits put them
+    back by hand (rules 59, 106), so a saved session and a mixer insert
+    (`reload_with_graph`) lost them (#124: a Dexed bound to one keyboard
+    played from all hardware after a reload). They are `Session`
+    `voice_inputs`, keyed by node through `remap_session`. A hardware device
+    index is the order one start of the app found the ports in: persist the
+    port name (`midi_port_key`, rule 58) and resolve it on load with
+    `hw_device_index`, which enters an unplugged device as offline, never
+    falls back to "every device"
+    (`a_saved_session_restores_each_clap_synths_keyboard_hardware_and_device`).
 
 ## Working on kabelsalat
 

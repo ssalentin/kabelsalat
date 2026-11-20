@@ -1038,6 +1038,9 @@ fn remap_session(
     for (&old, label) in s.strip_knobs() {
         if let Some(node) = remap(old) { ns.set_strip_knob(node, label.clone()); }
     }
+    for v in s.voice_inputs() {
+        if let Some(node) = remap(v.node) { ns.set_voice_input(crate::session::VoiceInput { node, ..v.clone() }); }
+    }
     // Sends (issue #5) follow their bus and their source: a node by its id, a
     // rig by where its nodes went (a deleted rig takes its sends along).
     let rig_of = |old: u8| -> Option<u8> {
@@ -6323,7 +6326,58 @@ impl DemoApp {
         }
         s.set_sends(self.sends.clone());
         s.set_bus_outs(self.bus_outs.clone());
+        // Which keyboard and hardware each CLAP instrument listens to (#124).
+        // The device goes in by port name: its index is only the order this
+        // start of the app found it in. An index no known port stands behind
+        // has no name to save and is left out.
+        for (slot, node) in self.clap_rigs() {
+            let (keyboard, hardware) = self.rig_sources.get(slot).copied().unwrap_or((true, true));
+            let device = self.rig_device.get(slot).copied().flatten()
+                .and_then(|d| self.hw_devices.get(d as usize))
+                .map(|raw| midi_port_key(raw).to_string());
+            s.set_voice_input(crate::session::VoiceInput { node, keyboard, hardware, device });
+        }
         Ok(s)
+    }
+
+    /// The index of the hardware MIDI device with this port name (without
+    /// ALSA's numbers, `midi_port_key`). A device this start of the app has
+    /// not seen is entered as unplugged: it has an index at once, so what a
+    /// session binds to it waits for it, and the MIDI thread connects it
+    /// under that index when it is plugged in (`match_midi_device`). None
+    /// only when the device table is full.
+    fn hw_device_index(&mut self, key: &str) -> Option<u32> {
+        let mut devices = self.hw_midi.devices.lock().ok()?;
+        let at = match devices.iter().position(|(n, _)| midi_port_key(n) == key) {
+            Some(i) => i,
+            None if devices.len() >= crate::engine::MAX_HW_DEVICES as usize => return None,
+            None => {
+                devices.push((key.to_string(), false));
+                self.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+                devices.len() - 1
+            }
+        };
+        self.hw_devices = devices.iter().map(|(n, _)| n.clone()).collect();
+        self.hw_live = devices.iter().map(|(_, l)| *l).collect();
+        Some(at as u32)
+    }
+
+    /// Set each CLAP instrument's inputs as the session saved them (#124),
+    /// here and in the engine. Runs after the load reset both.
+    fn restore_voice_inputs(&mut self, s: &crate::session::Session) {
+        for v in s.voice_inputs() {
+            let Some(slot) = self.voice_slot_of_node(v.node) else { continue };
+            let device = v.device.as_deref().and_then(|key| self.hw_device_index(key));
+            // A device that found no place in the table is not "every
+            // device": the hardware switch goes off instead.
+            let hardware = v.hardware && (v.device.is_none() || device.is_some());
+            self.rig_sources[slot] = (v.keyboard, hardware);
+            self.rig_device[slot] = device;
+            self.send_rig_source(v.node);
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node: v.node, device });
+            }
+        }
     }
 
     /// Re-apply a session's shaped matrix routes after its graph is loaded.
@@ -6503,6 +6557,7 @@ impl DemoApp {
         // Reset per-rig filters for the new graph (Keys splits travel IN the
         // graph — Node::split — so LoadGraph restores them).
         self.reset_rig_inputs();
+        self.restore_voice_inputs(s);
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
             for u in &mut self.units {
@@ -24290,6 +24345,44 @@ pub fn run_session_test() -> anyhow::Result<()> {
         println!("  mixer strips: name, colour, mute/pan, collapse, quick knob round-trip — OK");
     }
 
+    // --- MIDI inputs of the CLAP synths (#124): keyboard and hardware
+    // switches and the bound device round-trip through the package, the
+    // device by port name, into an app that knows the devices in another
+    // order. ---
+    {
+        let known = |app: &mut DemoApp, ports: &[&str]| {
+            if let Ok(mut d) = app.hw_midi.devices.lock() {
+                *d = ports.iter().map(|n| (n.to_string(), true)).collect();
+            }
+            app.hw_devices = ports.iter().map(|n| n.to_string()).collect();
+            app.hw_live = vec![true; ports.len()];
+        };
+        app.apply_session(&crate::session::Session::load(&pkg)?)?;
+        known(&mut app, &["FM-1:FM-1 MIDI 1 24:0", "U6MIDI Pro:U6MIDI Pro MIDI 1 28:0"]);
+        let sinks = app.matrix_sinks();
+        anyhow::ensure!(sinks.len() >= 2, "the demo has two synths");
+        let (node_a, node_b) = (app.units[sinks[0]].node_id, app.units[sinks[1]].node_id);
+        app.matrix_toggle(sinks[0], MatrixRow::HwDev(1), true);
+        app.matrix_toggle(sinks[0], MatrixRow::Keys, false);
+        app.matrix_toggle(sinks[1], MatrixRow::HwAll, false);
+        let inputs_pkg = crate::session::Session::package_path(&dir, "selftest-inputs")?;
+        app.capture_session("inputs")?.save(&inputs_pkg)?;
+        app.load_demo_patch();
+        known(&mut app, &["U6MIDI Pro:U6MIDI Pro MIDI 1 32:0", "FM-1:FM-1 MIDI 1 36:0"]);
+        app.apply_session(&crate::session::Session::load(&inputs_pkg)?)?;
+        let inputs = |app: &DemoApp, node: u32| app.voice_slot_of_node(node)
+            .map(|slot| (app.rig_sources[slot], app.rig_device[slot]));
+        anyhow::ensure!(inputs(&app, node_a) == Some(((false, true), Some(0))),
+            "synth A's inputs not restored: {:?}", inputs(&app, node_a));
+        anyhow::ensure!(inputs(&app, node_b) == Some(((true, false), None)),
+            "synth B's inputs not restored: {:?}", inputs(&app, node_b));
+        known(&mut app, &[]);
+        app.apply_session(&crate::session::Session::load(&pkg)?)?;
+        anyhow::ensure!(app.rig_sources.iter().all(|s| *s == (true, true)) && app.rig_device.iter().all(Option::is_none),
+            "a session without saved inputs must leave every input on");
+        println!("  MIDI inputs: keyboard off + one device (by port name, new index), hardware off round-trip — OK");
+    }
+
     // --- Starter templates: each must rebuild a correct, playable rack ---
     // (units, cables, Keys/Master present, default params applied, layout grouped)
     let expect = [
@@ -27335,6 +27428,14 @@ mod rig_switch_tests {
         assert_eq!(later.hw_live, vec![true, false], "the session's device is listed as offline");
         let known = later.hw_midi.devices.lock().unwrap().clone();
         assert_eq!(match_midi_device(&known, "U6MIDI Pro:U6MIDI Pro MIDI 1 40:0"), Ok(Some(1)));
+
+        // No free place in the device table: the synth must not fall back to
+        // every keyboard, so its hardware switch goes off.
+        let (mut full, _, _, _, _) = rack();
+        let ports: Vec<String> = (0..crate::engine::MAX_HW_DEVICES).map(|i| format!("Pad {i}:Pad {i} MIDI 1 {}:0", 40 + i)).collect();
+        plug(&mut full, &ports.iter().map(String::as_str).collect::<Vec<_>>());
+        full.apply_session(&loaded).unwrap();
+        assert_eq!(inputs(&full, node_a), ((false, false), None));
 
         // An edit that reloads the rack (a mixer insert) keeps the selection.
         let g = fresh.capture_session("edit").unwrap().graph;

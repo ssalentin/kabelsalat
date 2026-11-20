@@ -127,6 +127,33 @@ pub struct Session {
     /// The time signature (#87). `None` = this session says nothing about
     /// it (older files, templates): a load then leaves the clock's as it is.
     pub time_sig: Option<crate::transport::TimeSig>,
+    /// Which MIDI inputs each CLAP instrument listens to (#124), sorted by
+    /// node. A node without an entry listens to the keyboard and to every
+    /// hardware device, which is also what older files mean.
+    voice_inputs: Vec<VoiceInput>,
+}
+
+/// The MIDI inputs of one CLAP instrument (#124): the keyboard switch, the
+/// hardware switch, and the one device it is bound to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceInput {
+    pub node: NodeId,
+    #[serde(default = "default_true")]
+    pub keyboard: bool,
+    #[serde(default = "default_true")]
+    pub hardware: bool,
+    /// The only hardware device heard, as its port name without ALSA's
+    /// "client:port" numbers (rule 58): a device's index is the order it was
+    /// found in and differs from one start of the app to the next. `None` =
+    /// every device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+impl VoiceInput {
+    fn is_default(&self) -> bool {
+        self.keyboard && self.hardware && self.device.is_none()
+    }
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -185,6 +212,7 @@ impl Session {
             master_target: None,
             keyboard_mode: None,
             time_sig: None,
+            voice_inputs: Vec::new(),
         }
     }
 
@@ -203,6 +231,7 @@ impl Session {
             && self.master_target == other.master_target
             && self.keyboard_mode == other.keyboard_mode
             && self.time_sig == other.time_sig
+            && self.voice_inputs == other.voice_inputs
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -357,6 +386,21 @@ impl Session {
         });
     }
 
+    /// The CLAP instruments whose MIDI inputs differ from "everything on"
+    /// (#124), sorted by node.
+    pub fn voice_inputs(&self) -> &[VoiceInput] {
+        &self.voice_inputs
+    }
+
+    /// Set one instrument's MIDI inputs; "everything on" removes its entry.
+    pub fn set_voice_input(&mut self, input: VoiceInput) {
+        self.voice_inputs.retain(|v| v.node != input.node);
+        if !input.is_default() {
+            let at = self.voice_inputs.partition_point(|v| v.node < input.node);
+            self.voice_inputs.insert(at, input);
+        }
+    }
+
     /// All strip rows (sorted by node).
     pub fn strips(&self) -> &[StripSaved] {
         &self.strips
@@ -401,6 +445,7 @@ impl Session {
         self.strips.retain(|s| self.graph.node(s.node).is_some());
         self.strip_order.retain(|n| self.graph.node(*n).is_some());
         self.strip_knobs.retain(|n, _| self.graph.node(*n).is_some());
+        self.voice_inputs.retain(|v| self.graph.node(v.node).is_some());
         self.prune_sends();
         self.prune_bus_outs();
     }
@@ -507,6 +552,15 @@ impl Session {
                 );
             }
         }
+        for v in &self.voice_inputs {
+            if self.graph.node(v.node).is_none() {
+                bail!(
+                    "The MIDI inputs of node {} are saved, but it is no longer in the patch. \
+                     Call prune_to_graph() after removing nodes.",
+                    v.node
+                );
+            }
+        }
         for s in &self.sends {
             if !self.graph.is_bus(s.bus) {
                 bail!("A send goes to node {} which is not an aux bus of the patch.", s.bus);
@@ -559,6 +613,7 @@ impl Session {
             master_target: self.master_target,
             keyboard_mode: self.keyboard_mode,
             time_signature: self.time_sig,
+            voice_inputs: self.voice_inputs.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -603,6 +658,7 @@ impl Session {
             keyboard_mode: manifest.keyboard_mode,
             // A hand-edited file cannot give the clock a bar it cannot count.
             time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
+            voice_inputs: manifest.voice_inputs,
         };
         session.validate()?;
         Ok(session)
@@ -728,6 +784,9 @@ struct SessionFile {
     /// The time signature (#87); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     time_signature: Option<crate::transport::TimeSig>,
+    /// MIDI inputs per CLAP instrument (#124); older sessions have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    voice_inputs: Vec<VoiceInput>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1626,6 +1685,43 @@ mod tests {
         assert!(err.contains("newer kabelsalat"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #124: the inputs of a CLAP instrument are in the package, and a
+    /// session without any (every older file) still loads, with all on.
+    #[test]
+    fn voice_inputs_round_trip_and_old_sessions_have_none() {
+        let dir = std::env::temp_dir().join(format!("ksalat-voiceinputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("t.ksalat");
+        let mut s = Session::new("t", Graph::demo_patch());
+        let bound = VoiceInput { node: 1, keyboard: false, hardware: true, device: Some("U6MIDI Pro:U6MIDI Pro MIDI 1".into()) };
+        s.set_voice_input(bound.clone());
+        s.set_voice_input(VoiceInput { node: 0, keyboard: true, hardware: true, device: None });
+        assert_eq!(s.voice_inputs(), &[bound.clone()], "an instrument with everything on has no entry");
+        s.save(&pkg).unwrap();
+        let back = Session::load(&pkg).unwrap();
+        assert_eq!(back.voice_inputs(), &[bound.clone()]);
+        assert!(back.same_content(&s));
+
+        // Switching everything on again removes the entry, and the file is
+        // then what an older build wrote: no `voice_inputs` at all.
+        let mut plain = s.clone();
+        plain.set_voice_input(VoiceInput { node: 1, keyboard: true, hardware: true, device: None });
+        assert!(!plain.same_content(&s), "a changed input makes the session differ (autosave)");
+        let pkg2 = dir.join("old.ksalat");
+        plain.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
+        assert!(!json.contains("voice_inputs"), "absent when unset: old readers stay happy");
+        assert!(Session::load(&pkg2).unwrap().voice_inputs().is_empty());
+
+        // An entry for a node that left the patch is pruned, never saved.
+        let mut orphan = s.clone();
+        orphan.set_voice_input(VoiceInput { node: 99, keyboard: false, hardware: false, device: None });
+        assert!(orphan.validate().is_err());
+        orphan.prune_to_graph();
+        assert_eq!(orphan.voice_inputs(), &[bound]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

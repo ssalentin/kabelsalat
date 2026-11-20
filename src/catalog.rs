@@ -386,6 +386,37 @@ pub static CATALOG: &[CatalogEntry] = &[
         data: None,
     },
     CatalogEntry {
+        id: "unsampled-piano",
+        name: "Unsampled Piano",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Physically modelled acoustic grand piano",
+        about: "A concert grand piano modelled from physics in Rust: felt hammers, stiff multi-string choirs coupled at the bridge, a modal soundboard, lid and room reflections, sympathetic resonance, and half-pedal, sostenuto and una corda pedals. No sample download needed.",
+        license: "GPL-3.0-or-later",
+        homepage: Some("https://unsampled.mgth.fr"),
+        source: Source::GitHub("mgth/unsampled-piano"),
+        routes: &[
+            InstallRoute::Release {
+                arch: "x86_64",
+                tag: "v0.2.1",
+                url: "https://github.com/mgth/unsampled-piano/releases/download/v0.2.1/unsampled-piano-linux-x86_64.zip",
+                sha256: "951e2d33e16dfdb2f4c58085b3bc142299fda1cf61ec4b50a44daddbf7ae14fa",
+                artifact: "Unsampled Piano.clap",
+            },
+            InstallRoute::Source {
+                repo: "mgth/unsampled-piano",
+                submodules: false,
+                build: &[&["env", "-u", "CARGO_TARGET_DIR", "cargo", "xtask", "bundle", "piano-plugin", "--release"]],
+                artifact: "target/bundled/Unsampled Piano.clap",
+            },
+        ],
+        home: Home::Clap,
+        clap_id: Some("fr.mgth.unsampled-piano"),
+        lv2_uris: &[],
+        bundles: &["Unsampled Piano.clap"],
+        data: None,
+    },
+    CatalogEntry {
         id: "ot-keys",
         name: "OneTrick KEYS",
         format: Format::Clap,
@@ -1388,7 +1419,7 @@ mod tests {
                 e.id
             );
         }
-        assert_eq!(CATALOG.len(), 22);
+        assert_eq!(CATALOG.len(), 23);
         assert_eq!(CATALOG[0].id, "setbfree", "setBfree is first per the spec");
     }
 
@@ -1646,6 +1677,21 @@ mod tests {
             cmds[6].argv,
             ["cp", "-r", "/c/airwindows/unpacked/awcons-products/Airwindows Consolidated.clap", "/home/u/.clap/"]
         );
+    }
+
+    #[test]
+    fn unsampled_piano_is_a_clap_instrument_with_release_and_source_routes() {
+        let piano = find("unsampled-piano").unwrap();
+        assert_eq!(piano.format, Format::Clap);
+        assert_eq!(piano.plugin_type, crate::plugins::PluginType::Instrument);
+        assert_eq!(piano.clap_id, Some("fr.mgth.unsampled-piano"));
+        assert_eq!(route_for(piano, "x86_64").unwrap().kind(), "release");
+        assert_eq!(route_for(piano, "aarch64").unwrap().kind(), "source");
+        let x86 = plan(piano, route_for(piano, "x86_64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        assert_eq!(x86[6].argv, ["cp", "-r", "/c/unsampled-piano/unpacked/Unsampled Piano.clap", "/home/u/.clap/"]);
+        let arm = plan(piano, route_for(piano, "aarch64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        assert_eq!(arm[2].argv, ["env", "-u", "CARGO_TARGET_DIR", "cargo", "xtask", "bundle", "piano-plugin", "--release"]);
+        assert_eq!(arm[4].argv, ["cp", "-r", "/c/unsampled-piano/target/bundled/Unsampled Piano.clap", "/home/u/.clap/"]);
     }
 
     #[test]

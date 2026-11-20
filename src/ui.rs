@@ -27268,6 +27268,86 @@ mod rig_switch_tests {
         assert_eq!(fresh1.rig_name(0), "Rig A");
     }
 
+    /// #124: a session forgot which keyboard, hardware and device each CLAP
+    /// synth listens to. The device comes back by its port name, at whatever
+    /// index it has in the app that loads the session.
+    #[test]
+    fn a_saved_session_restores_each_clap_synths_keyboard_hardware_and_device() {
+        fn plug(app: &mut DemoApp, ports: &[&str]) {
+            *app.hw_midi.devices.lock().unwrap() = ports.iter().map(|n| (n.to_string(), true)).collect();
+            app.hw_devices = ports.iter().map(|n| n.to_string()).collect();
+            app.hw_live = vec![true; ports.len()];
+        }
+        fn rack() -> (DemoApp, usize, usize, u32, u32) {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            let sinks = app.matrix_sinks();
+            let (a, b) = (sinks[0], sinks[1]);
+            let (node_a, node_b) = (app.units[a].node_id, app.units[b].node_id);
+            (app, a, b, node_a, node_b)
+        }
+        fn inputs(app: &DemoApp, node: u32) -> ((bool, bool), Option<u32>) {
+            let slot = app.voice_slot_of_node(node).expect("a CLAP unit");
+            (app.rig_sources[slot], app.rig_device[slot])
+        }
+
+        let (mut app, a, b, node_a, node_b) = rack();
+        plug(&mut app, &["FM-1:FM-1 MIDI 1 24:0", "U6MIDI Pro:U6MIDI Pro MIDI 1 28:0"]);
+        // Rig A: only the U6MIDI Pro, keyboard off. Rig B: keyboard only.
+        app.matrix_toggle(a, MatrixRow::HwDev(1), true);
+        app.matrix_toggle(a, MatrixRow::Keys, false);
+        app.matrix_toggle(b, MatrixRow::HwAll, false);
+        assert_eq!(inputs(&app, node_a), ((false, true), Some(1)));
+        assert_eq!(inputs(&app, node_b), ((true, false), None));
+
+        let dir = std::env::temp_dir().join(format!("ksalat-voice-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkg = crate::session::Session::package_path(&dir, "inputs").unwrap();
+        app.capture_session("inputs").unwrap().save(&pkg).unwrap();
+        let loaded = crate::session::Session::load(&pkg).unwrap();
+
+        // Another start of the app: the devices came up in the other order,
+        // under new ALSA client numbers (rule 58).
+        let (mut fresh, _, _, _, _) = rack();
+        plug(&mut fresh, &["U6MIDI Pro:U6MIDI Pro MIDI 1 32:0", "FM-1:FM-1 MIDI 1 36:0"]);
+        let (tx, mut drain) = crate::control::command_bus();
+        fresh.bus = Some(Arc::new(Mutex::new(tx)));
+        fresh.apply_session(&loaded).unwrap();
+        assert_eq!(inputs(&fresh, node_a), ((false, true), Some(0)), "rig A: U6MIDI Pro only, wherever it sits now");
+        assert_eq!(inputs(&fresh, node_b), ((true, false), None), "rig B: keyboard only");
+        // The engine is told, after the load that reset its voices.
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        let load = sent.iter().position(|c| matches!(c, Command::LoadRigs { .. } | Command::LoadGraph { .. })).expect("a load");
+        let after = &sent[load..];
+        assert!(after.iter().any(|c| matches!(c, Command::SetRigSource { node, keyboard: false, hardware: true } if *node == node_a)), "{after:?}");
+        assert!(after.iter().any(|c| matches!(c, Command::SetRigDevice { node, device: Some(0) } if *node == node_a)));
+        assert!(after.iter().any(|c| matches!(c, Command::SetRigSource { node, keyboard: true, hardware: false } if *node == node_b)));
+
+        // The device is not plugged in when the session loads: the synth
+        // waits for it (an offline device with its own index) and does not
+        // fall back to every keyboard. Plugged in later, it takes that index.
+        let (mut later, _, _, _, _) = rack();
+        plug(&mut later, &["FM-1:FM-1 MIDI 1 24:0"]);
+        later.apply_session(&loaded).unwrap();
+        assert_eq!(inputs(&later, node_a), ((false, true), Some(1)));
+        assert_eq!(later.hw_live, vec![true, false], "the session's device is listed as offline");
+        let known = later.hw_midi.devices.lock().unwrap().clone();
+        assert_eq!(match_midi_device(&known, "U6MIDI Pro:U6MIDI Pro MIDI 1 40:0"), Ok(Some(1)));
+
+        // An edit that reloads the rack (a mixer insert) keeps the selection.
+        let g = fresh.capture_session("edit").unwrap().graph;
+        fresh.reload_with_graph(g).unwrap();
+        assert_eq!(inputs(&fresh, node_a), ((false, true), Some(0)));
+        assert_eq!(inputs(&fresh, node_b), ((true, false), None));
+
+        // A later session that says nothing has every input on again.
+        fresh.apply_session(&crate::session::Session::new("plain", Graph::demo_patch())).unwrap();
+        assert!(fresh.rig_sources.iter().all(|s| *s == (true, true)) && fresh.rig_device.iter().all(Option::is_none));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rig_preset_saves_from_slot_a_and_loads_into_other_slots_intact() {
         let (mut app, ctx) = two_rigs();

@@ -11130,6 +11130,33 @@ mod send_tests {
     }
 
     #[test]
+    fn a_rig_demo_plays_through_a_rig_that_is_not_in_the_song() {
+        use crate::control::{command_bus, merge_rigs, standard_rig_graph, Command, NodeKind, Rig, RigZone};
+        use crate::demo::PhraseKind;
+        let rigs = vec![Rig::new("Rig A", standard_rig_graph(true), None), Rig::new("Rig B", standard_rig_graph(true), None)];
+        let merged = merge_rigs(&rigs);
+        let sa = merged.nodes.iter().find(|n| n.rig == 0 && matches!(n.kind, NodeKind::Clap { .. })).unwrap().id;
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(merged, drain, 48000.0, vec![]);
+        bus.send(Command::LoadRigs { rigs, active: 0 });
+        // Rig A is out of the song, with a transpose: live keys do not reach it.
+        let mut zones = [RigZone::OPEN; 8];
+        zones[0] = RigZone { live: false, transpose: 5, ..RigZone::OPEN };
+        bus.send(Command::SetRigZones { zones });
+        let mut buf = vec![0.0f32; 256 * 2];
+        engine.render(&mut buf, 2);
+        engine.note_log.clear();
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: crate::matrix::SourceId::Keys, channel: 0 });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.iter().all(|&(d, _, _)| d != sa), "live keys skip a rig out of the song: {:?}", engine.note_log);
+        engine.note_log.clear();
+        // The demo of that rig plays it anyway, untransposed (bass phrase starts on 40).
+        bus.send(Command::DemoPlay { rig: 0, phrase: PhraseKind::Bass });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.iter().any(|&(d, n, on)| d == sa && n == 40 && on), "the demo plays past the zone: {:?}", engine.note_log);
+    }
+
+    #[test]
     fn demo_phrase_plays_only_its_rig_ignores_source_switch_and_publishes() {
         use crate::control::{
             command_bus, merge_rigs, standard_rig_graph, Command, DspKind, NodeKind, PortKind,

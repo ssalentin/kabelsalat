@@ -157,15 +157,12 @@ pub fn run() -> anyhow::Result<()> {
     check(quiet_switch > 1e-3, format!("no block of silence at the switch (quietest {quiet_switch:.4})"));
     check(a_held > 0.5 * a_before, format!("rig A keeps sounding while the chord is held ({a_held:.4} > half of {a_before:.4})"));
 
-    // A note in song 2: rig B rises from silence, rig A gets no new onset.
-    let a_pre = max_of(&song2[song2.len() - blocks_in(0.1)..], |b| b.a);
+    // A note in song 2: rig B rises from silence.
     rack.send(on(72));
     let note = rack.render(blocks_in(0.3));
     let b_rise = max_of(&note, |b| b.b);
-    let a_note = max_of(&note, |b| b.a);
-    println!("note 72 in song 2: rig B rises {b_before:.6} → {b_rise:.4}; rig A {a_pre:.4} before, ≤ {a_note:.4} after");
+    println!("note 72 in song 2: rig B rises {b_before:.6} → {b_rise:.4}");
     check(b_rise > 1e-3, format!("rig B plays the new note (peak {b_rise:.4})"));
-    check(a_note <= a_pre * 1.05, format!("rig A takes no new onset ({a_note:.4} ≤ {a_pre:.4} × 1.05)"));
 
     // Release the chord: rig A decays to silence; rig B keeps its note.
     for n in CHORD {
@@ -178,6 +175,14 @@ pub fn run() -> anyhow::Result<()> {
     println!("chord released: rig A {a_tail:.6} after 2 s; rig B still holds 72 ≥ {b_tail:.4}");
     check(a_tail < 1e-4, format!("rig A decays to silence ({a_tail:.6})"));
     check(b_tail > 1e-3, format!("rig B's own note is untouched ({b_tail:.4})"));
+    // Rig A, silent and out of the song, takes no new note. A silence check,
+    // never a level comparison of free-running voices (rules 150, 182).
+    rack.send(on(76));
+    let late = rack.render(blocks_in(0.3));
+    let a_late = max_of(&late, |b| b.a);
+    println!("note 76 while rig A is out and silent: rig A {a_late:.6}");
+    check(a_late < 1e-4, format!("rig A takes no new note ({a_late:.6})"));
+    rack.send(off(76));
     rack.send(off(72));
     rack.render(blocks_in(2.0));
 

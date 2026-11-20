@@ -255,10 +255,13 @@ pub struct VoiceSlot {
     // Which hardware device feeds this rig: None = any, Some(id) = only that
     // device (per-device routing, AUM's "different keyboard per rig").
     rig_device: Option<u32>,
+    /// The latency the CLAP voice last reported, in frames.
+    latency: u32,
 }
 
 impl VoiceSlot {
     pub fn new(voice: ClapVoice) -> Self {
+        let latency = voice.latency();
         Self {
             node: NodeId::MAX,
             voice,
@@ -267,6 +270,7 @@ impl VoiceSlot {
             src_keys: true,
             src_hw: true,
             rig_device: None,
+            latency,
         }
     }
 
@@ -403,6 +407,9 @@ struct Lv2Slot {
     node: NodeId,
     plugin: crate::lv2::Lv2Plugin,
     buf: Vec<f32>,
+    /// The latency the plugin last reported, in frames: what the delay
+    /// plan counts for this unit.
+    latency: u32,
 }
 
 /// Input events a MIDI-FX unit may hold between blocks (a full queue drops,
@@ -594,7 +601,7 @@ const LV2_SLOT_CAP: usize = 32;
 
 fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
     match crate::lv2::Lv2Plugin::load(uri, sample_rate, 8192) {
-        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2] }),
+        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2], latency: 0 }),
         Err(e) => {
             eprintln!("lv2 node {node}: {e}");
             None
@@ -678,7 +685,7 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
         .iter()
         .filter_map(|n| match &n.kind {
             NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sample_rate, 8192) {
-                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2] }),
+                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2], latency: 0 }),
                 Err(e) => {
                     eprintln!("lv2 node {}: {e}", n.id);
                     None
@@ -946,6 +953,8 @@ impl Default for GraphPub {
             meter: MeterSnapshot::default(),
             meter_rev: 0,
             master_target: MasterTarget::OFF,
+            latency: Vec::new(),
+            latency_rev: 0,
         }
     }
 }
@@ -1068,6 +1077,20 @@ pub struct GraphPub {
     /// The master's loudness target and its trim (#12), published with the
     /// meter (same `meter_rev`).
     pub master_target: MasterTarget,
+    /// How late each strip sounds in the mix, in frames (#76): sources,
+    /// rigs (by their master) and buses; a strip on time has no entry.
+    /// What the plugins report plus what delay compensation adds. Bumped
+    /// by `latency_rev`.
+    pub latency: Vec<(NodeId, u32)>,
+    pub latency_rev: u64,
+}
+
+fn write_latency(g: &mut GraphPub, late: &[(NodeId, u32)]) {
+    if g.latency != late {
+        g.latency.clear();
+        g.latency.extend_from_slice(late);
+        g.latency_rev = g.latency_rev.wrapping_add(1);
+    }
 }
 
 fn write_voices(g: &mut GraphPub, voices: &[VoiceSlot]) {
@@ -1225,6 +1248,11 @@ pub struct GraphEngine {
     /// A SetRigMix awaits publication to `graph_pub` (retried each block:
     /// the audio thread only ever `try_lock`s the publication).
     mix_dirty: bool,
+    /// A hosted plugin reported another latency in the last block: replan
+    /// at the next block boundary.
+    latency_dirty: bool,
+    /// The plan changed and `GraphPub::latency` does not show it yet.
+    latency_unpublished: bool,
     // Shared frontend snapshot (UI/MCP/bridge). Written ONLY on the rare
     // LoadRigs/LoadGraph structural ops at block boundaries — the per-block
     // render path never locks it. None until a frontend attaches a handle.
@@ -1413,6 +1441,8 @@ impl GraphEngine {
             rig_mix: [RigMix::DEFAULT; 8],
             strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
+            latency_dirty: false,
+            latency_unpublished: false,
             rig_snapshot: None,
             graph_pub: None,
             system_capture: None,
@@ -1450,7 +1480,7 @@ impl GraphEngine {
             meter: MasterMeter::new(sample_rate),
             pdc: pdc::Pdc::default(),
         };
-        engine.replan_delays();
+        engine.replan_delays(true);
         engine
     }
 
@@ -1546,6 +1576,9 @@ impl GraphEngine {
         match self.lv2.iter().position(|s| s.node == node) {
             Some(i) if live => {
                 let old = std::mem::replace(&mut self.lv2[i], slot);
+                if old.latency != 0 {
+                    self.latency_dirty = true;
+                }
                 self.retire_lv2(old);
             }
             None if live && self.lv2.len() < self.lv2.capacity() => {
@@ -1725,6 +1758,8 @@ impl GraphEngine {
         }
         if changed {
             self.bind_free_voices();
+            // Another voice may report another latency for its strip.
+            self.latency_dirty = true;
         }
     }
 
@@ -2191,23 +2226,55 @@ impl GraphEngine {
         self.graph_pub = Some(p);
     }
 
-    /// Plan the delays that keep parallel paths in phase. Built-in units
-    /// report their latency; LV2 and CLAP latency are not read yet.
-    fn replan_delays(&mut self) {
-        let dsp = &self.dsp;
-        self.pdc.replan(&self.graph, &self.sends, |id| dsp.iter().find(|d| d.node == id).map_or(0, |d| d.proc.latency_frames()));
+    /// Plan the delays that keep parallel paths in phase, from the latency
+    /// every unit reports: built-in units their lookahead, an LV2 plugin
+    /// its `lv2:reportsLatency` port, a CLAP voice its `latency` extension.
+    /// `allocate`: a graph edit, which may make and drop delay lines; a
+    /// latency a plugin changed while running replans without it.
+    fn replan_delays(&mut self, allocate: bool) {
+        let (dsp, lv2, voices) = (&self.dsp, &self.lv2, &self.voices);
+        let latency_of = |id: NodeId| {
+            let built_in = dsp.iter().find(|d| d.node == id).map(|d| d.proc.latency_frames());
+            let hosted = || lv2.iter().find(|s| s.node == id).map(|s| s.latency as usize);
+            let voice = || voices.iter().find(|v| v.node == id).map(|v| v.voice.latency() as usize);
+            built_in.or_else(hosted).or_else(voice).unwrap_or(0)
+        };
+        let varies = |id: NodeId| lv2.iter().any(|s| s.node == id && s.plugin.reports_latency());
+        self.pdc.replan(&self.graph, &self.sends, latency_of, varies, allocate);
+        self.latency_dirty = false;
+        self.latency_unpublished = true;
+    }
+
+    /// Hand the strips' latency to the frontends (rule 33). Non-blocking,
+    /// and within the room `publish_graph` reserved; retried next block
+    /// while the UI holds the lock.
+    fn publish_latency(&mut self) {
+        let Some(p) = &self.graph_pub else {
+            self.latency_unpublished = false;
+            return;
+        };
+        if let Ok(mut g) = p.try_lock() {
+            write_latency(&mut g, self.pdc.late());
+            self.latency_unpublished = false;
+        }
     }
 
     /// Publish the current graph (structural ops only). A poisoned lock is
     /// skipped, not fatal — the publication is advisory frontend state.
     /// Every structural edit ends here, so the delay plan follows it here.
     fn publish_graph(&mut self) {
-        self.replan_delays();
+        self.replan_delays(true);
         let tp = self.transport_pub();
         if let Some(p) = &self.graph_pub {
             if let Ok(mut g) = p.lock() {
                 g.rev = g.rev.wrapping_add(1);
                 g.graph = self.graph.clone();
+                // Room for a strip per node, so a latency a plugin changes
+                // later is published without allocating.
+                let nodes = g.graph.nodes.len();
+                g.latency.reserve(nodes);
+                write_latency(&mut g, self.pdc.late());
+                self.latency_unpublished = false;
                 g.rules = self.matrix.rules.clone();
                 g.mix = self.rig_mix;
                 g.system_gain = self.system_gain;
@@ -2452,6 +2519,12 @@ impl GraphEngine {
                     slot.buf[..n2].copy_from_slice(&bus[..n2]);
                 } else {
                     slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                    // LV2 writes its latency in every run.
+                    let latency = slot.plugin.latency_frames();
+                    if latency != slot.latency {
+                        slot.latency = latency;
+                        self.latency_dirty = true;
+                    }
                 }
             }
             // A bypassed unit with a lookahead still delays by it, so the
@@ -2994,9 +3067,10 @@ impl GraphEngine {
         if let Some(p) = pre { self.sends[i].pre = p; }
         self.sends.retain(|s| !s.is_default());
         // A send that starts or stops sounding changes how late its bus is;
-        // a level move does not.
+        // a level move does not. Replans without allocating: bus lines are
+        // preallocated when the graph has a bus and any latent unit.
         if sounding(&self.sends) != was {
-            self.replan_delays();
+            self.replan_delays(false);
         }
         self.mix_dirty = true;
         true
@@ -4363,6 +4437,14 @@ impl GraphEngine {
         }
         self.drain_voice_msgs();
         self.publish_voices();
+        // A plugin reported another latency while it ran the last block:
+        // the delay lines follow before this one, without allocating.
+        if self.latency_dirty {
+            self.replan_delays(false);
+        }
+        if self.latency_unpublished {
+            self.publish_latency();
+        }
         // MIDI-FX units run before the instruments render, so the notes they
         // emit sound in the same block the events arrived in.
         let fx_frames = data.len() / ch;
@@ -4425,6 +4507,11 @@ impl GraphEngine {
             // A free voice (no Clap node bound): skip the plugin entirely.
             if s.node == NodeId::MAX { continue; }
             s.voice.render(&mut s.scratch[..n2], self.transport);
+            let latency = s.voice.latency();
+            if latency != s.latency {
+                s.latency = latency;
+                self.latency_dirty = true;
+            }
             // Level and strip mix (mute/solo/pan) at the source's own output:
             // the edge levels published from this buffer stay post-fader
             // (rule 53). Sends tap on either side of it.
@@ -5089,6 +5176,7 @@ fn render_metronome(
 
 #[cfg(test)]
 mod held_notes;
+mod latent;
 mod pdc;
 mod probe;
 pub mod analysis_test;

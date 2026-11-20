@@ -157,10 +157,16 @@ the session. The assistant and MCP agents do the same with
 `set_master_target` and read the numbers with `get_master_target`.
 
 Parallel paths stay in phase. When a signal splits and meets again, and one
-path runs through a unit that looks ahead (the Limiter waits 5 ms to catch
-peaks), the other paths wait for it, so a dry sound and its limited copy add
-up cleanly instead of sounding hollow. A bypassed Limiter keeps its delay, so
-switching it in and out never shifts anything in time.
+path runs through a unit that takes time (the Limiter waits 5 ms to catch
+peaks, and a hosted plugin reports its own latency: a look-ahead compressor,
+a linear-phase EQ), the other paths of that sound wait for it, so a dry sound
+and its processed copy add up cleanly instead of sounding hollow. Only paths
+that carry the same sound wait: a latent effect on the pad never makes the
+piano beside it late. When a plugin changes its latency while you play (you
+turn its look-ahead up), the paths are back in phase a moment later. A
+bypassed unit keeps its delay, so switching it in and out never shifts
+anything in time. A strip that sounds late says by how much, in milliseconds
+under its fader: what its plugins report plus what keeping it in phase adds.
 
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 

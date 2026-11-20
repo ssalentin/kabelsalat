@@ -160,6 +160,52 @@ fn compensation(clips: &mut Vec<Clip>) -> anyhow::Result<()> {
             clips.push(Clip { file: "noise-dry-left-limited-right", listen: "the noise sits in the centre; paths 5 ms apart would pull it to the left", samples: run.master });
         }
     }
+    hosted_latency()
+}
+
+/// A hosted plugin's reported latency (#76): the latent test plugin, an LV2
+/// unit that delays by its Delay control and reports that as its latency,
+/// loaded the way the app loads plugins. Its latency is changed while it
+/// runs, as a look-ahead knob would.
+fn hosted_latency() -> anyhow::Result<()> {
+    use super::latent;
+    latent::install()?;
+    println!("  hosted LV2 plugin reporting its latency ({}), in place of the units:", latent::URI);
+    let (mut p, units) = probe::split_paths_of(&[latent::kind()]);
+    let input = p.engine.graph().nodes[0].id;
+    for frames in [latent::DEFAULT_FRAMES, 1000, 37, 0, 4096] {
+        p.send(Command::SetParam { node: units[0], param: latent::P_DELAY, value: latent::delay_value(frames) });
+        let x = probe::lag_r_behind_l(&mut p);
+        let strip = p.engine.pdc.late().iter().find(|l| l.0 == input).map_or(0, |l| l.1);
+        println!("  {:>25}: R is {} frames behind L, r {:.3}; the input's strip shows {strip} frames", format!("reports {frames} frames"), x.lag_frames, x.r);
+        anyhow::ensure!(x.lag_frames == 0 && x.r > 0.95, "a plugin reporting {frames} frames: the parallel paths are {} frames apart (r {:.3})", x.lag_frames, x.r);
+        anyhow::ensure!(strip as usize == frames, "a plugin reporting {frames} frames: the strip shows {strip}");
+    }
+    // And in an aux bus's chain: dry rig + bus return stay in phase as the bus plugin's latency moves.
+    let mut g = Graph::default();
+    let ain = g.add_node(NodeKind::AudioIn { device: None, channels: crate::control::AudioInChannel::Stereo }, name_bytes("IN"));
+    let bus = g.add_node(NodeKind::Dsp(DspKind::Bus), name_bytes("BUS"));
+    let fx = g.add_node(latent::kind(), name_bytes("BUS LATENT"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    probe::wire(&mut g, 1, ain, master, 0);
+    probe::wire(&mut g, 2, ain, master, 1);
+    probe::wire(&mut g, 3, bus, fx, 0);
+    probe::wire(&mut g, 4, fx, master, 0);
+    probe::wire(&mut g, 5, fx, master, 1);
+    let mut p = probe::Probe::hosting(g);
+    p.send(Command::SetSend { from: crate::control::SendSource::Rig(0), bus, level: Some(1.0), pre: Some(false) });
+    p.feed("noise", ain, analysis::white(11).map(|x| x * 0.1));
+    for frames in [latent::DEFAULT_FRAMES, 1000] {
+        p.send(Command::SetParam { node: fx, param: latent::P_DELAY, value: latent::delay_value(frames) });
+        let settle = probe::SETTLE_BLOCKS.max(frames / crate::bridge::BUFFER_FRAMES as usize + 4);
+        p.settle(settle);
+        let win = 32 * crate::bridge::BUFFER_FRAMES as usize;
+        let blocks = 32 + frames / crate::bridge::BUFFER_FRAMES as usize + 1;
+        let run = p.run(blocks, &[probe::Tap::MasterL]);
+        let x = analysis::xcorr_peak(&run.feeds[0].1[..win], &run.taps[0].1[frames..frames + win], 600);
+        println!("  {:>25}: rig+bus return off by {} frames at lag {frames}, r {:.3}", format!("bus plugin {frames} frames"), x.lag_frames, x.r);
+        anyhow::ensure!(x.lag_frames == 0 && x.r > 0.95, "bus plugin at {frames} frames: off by {} (r {:.3})", x.lag_frames, x.r);
+    }
     Ok(())
 }
 

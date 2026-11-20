@@ -420,9 +420,17 @@ pub struct ClapVoice {
     ev_out: EventBuffer,
     process_errors: u64,
     gate: Arc<StateGate>,
+    /// What the plugin reported when it was activated, or after a
+    /// `host_latency.changed()` poll on the main thread, in frames.
+    latency: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ClapVoice {
+    /// The plugin's reported latency, in frames. Allocation- and lock-free.
+    pub fn latency(&self) -> u32 {
+        self.latency.load(Ordering::Relaxed)
+    }
+
     /// Load Surge XT from the CLAP search paths, instantiate, activate and start
     /// processing at `sample_rate`. Returns the audio-side voice and the
     /// main-thread handle (state/GUI/deactivation). Call on the main thread.
@@ -526,8 +534,11 @@ impl ClapVoice {
             .activate(|_, _| (), audio_config)
             .context("activating Surge XT")?;
         // Surge only reports meaningful latency once active.
+        // CLAP lets a plugin change it only while it is being activated,
+        // so this value holds for as long as the voice runs.
         let latency = exts.latency.map(|l| l.get(&plugin.plugin_handle())).unwrap_or(0);
         println!("plugin-reported latency (active): {latency} samples");
+        let shared_latency = Arc::new(std::sync::atomic::AtomicU32::new(latency));
         let mut param_ranges = Vec::new();
         if let Some(params) = exts.params {
             let handle = plugin.plugin_handle();
@@ -569,6 +580,7 @@ impl ClapVoice {
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
             gate: gate.clone(),
+            latency: shared_latency.clone(),
         };
         let main_id = id_str;
         let mut main = ClapVoiceMain {
@@ -578,6 +590,7 @@ impl ClapVoice {
             main_controls_rechecks: 0,
             editor: None,
             gate,
+            shared_latency,
             load_mark: None,
             _entry: entry,
         };
@@ -1133,6 +1146,9 @@ pub struct ClapVoiceMain {
     /// The plugin's own editor, while it is open.
     editor: Option<ClapEditor>,
     gate: Arc<StateGate>,
+    /// Shared with the audio-side [`ClapVoice`]; updated whenever the plugin
+    /// announces `host_latency.changed()`.
+    shared_latency: Arc<std::sync::atomic::AtomicU32>,
     /// `StateGate::mark` of the last state load, until a block applied it.
     load_mark: Option<u64>,
     _entry: PluginEntry,
@@ -1269,6 +1285,18 @@ impl ClapVoiceMain {
     /// Plugin-reported latency in samples (meaningful once active).
     pub fn latency(&mut self) -> u32 {
         self.exts.latency.map(|l| l.get(&self.instance.plugin_handle())).unwrap_or(0)
+    }
+
+    /// Re-read the plugin's latency if it called `host_latency.changed()`
+    /// since the last poll, publishing it to the audio-side [`ClapVoice`].
+    pub fn poll_latency(&mut self) -> u32 {
+        if self.instance.access_handler(|h| h.latency_changed.replace(false)) {
+            let frames = self.latency();
+            self.shared_latency.store(frames, Ordering::Relaxed);
+            frames
+        } else {
+            self.shared_latency.load(Ordering::Relaxed)
+        }
     }
 
     /// Serialize the full plugin state (Surge patch XML in a `sub3` container).

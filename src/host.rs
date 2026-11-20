@@ -2053,6 +2053,37 @@ impl ClapVoiceMain {
             .collect()
     }
 
+    /// Describe a single parameter by id (main thread only).
+    pub fn param_desc(&mut self, id: u32) -> Option<ParamDesc> {
+        let params = self.exts.params?;
+        let handle = self.instance.plugin_handle();
+        let count = params.count(&handle);
+        let mut info_buf = ParamInfoBuffer::new();
+        for i in 0..count {
+            let Some(info) = params.get_info(&handle, i, &mut info_buf) else {
+                continue;
+            };
+            if info.id.get() != id {
+                continue;
+            }
+            let value = params.get_value(&handle, info.id).unwrap_or(info.default_value);
+            return Some(ParamDesc {
+                id: info.id.get(),
+                name: String::from_utf8_lossy(info.name).into_owned(),
+                module: String::from_utf8_lossy(info.module).into_owned(),
+                min: info.min_value,
+                max: info.max_value,
+                value,
+                default: info.default_value,
+                automatable: info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE),
+                stepped: info.flags.contains(ParamInfoFlags::IS_STEPPED),
+                hidden: info.flags.contains(ParamInfoFlags::IS_HIDDEN),
+                readonly: info.flags.contains(ParamInfoFlags::IS_READONLY),
+            });
+        }
+        None
+    }
+
     /// Current plain value of a single parameter (main thread only).
     pub fn param_value(&mut self, id: u32) -> Option<f64> {
         self.exts.params?.get_value(&self.instance.plugin_handle(), ClapId::new(id))

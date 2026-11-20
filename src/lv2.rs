@@ -610,6 +610,42 @@ pub(crate) fn set_main_controls_for_test(uri: &str, found: crate::main_controls:
     store_main_controls(uri, found);
 }
 
+type ControlDescsCache = std::sync::Mutex<Vec<(String, Option<Vec<Lv2ControlDesc>>)>>;
+static CONTROL_DESCS: ControlDescsCache = std::sync::Mutex::new(Vec::new());
+
+/// Control port descriptions per plugin URI, resolved once on a worker thread.
+/// `None` while that thread runs: the caller asks again on a later frame.
+/// Tests never read the machine's plugins here: they see only what
+/// [`set_control_descs_for_test`] stored.
+pub fn control_descs_cached(uri: &str) -> Option<Vec<Lv2ControlDesc>> {
+    let mut cache = CONTROL_DESCS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, found)) = cache.iter().find(|(u, _)| u == uri) {
+        return found.clone();
+    }
+    if cfg!(test) {
+        return None;
+    }
+    cache.push((uri.to_string(), None));
+    drop(cache);
+    let uri = uri.to_string();
+    std::thread::spawn(move || {
+        let found = control_descs_for_uri(&uri);
+        store_control_descs(&uri, found);
+    });
+    None
+}
+
+fn store_control_descs(uri: &str, found: Vec<Lv2ControlDesc>) {
+    let mut cache = CONTROL_DESCS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(u, _)| u != uri);
+    cache.push((uri.to_string(), Some(found)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_control_descs_for_test(uri: &str, found: Vec<Lv2ControlDesc>) {
+    store_control_descs(uri, found);
+}
+
 pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
     let _lilv = lilv_guard();
     unsafe {

@@ -487,7 +487,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         }],
         home: Home::Clap,
         // Not published; the card finds the bundle by its file name.
-        clap_id: None,
+        clap_id: Some("org.starbreath.starbreath"),
         lv2_uris: &[],
         bundles: &["Starbreath.clap"],
         data: None,
@@ -961,7 +961,22 @@ pub fn install_test(ids: &[String]) -> anyhow::Result<()> {
     let (mut tested, mut failed) = (0, Vec::new());
     for entry in entries {
         let Some(route) = local_route(entry) else {
-            println!("  {}: no route for {}, skipped", entry.name, std::env::consts::ARCH);
+            // A build you were given by hand (a beta, a build for your CPU
+            // that is not published) is played where you put it.
+            let Some(bundle) = hand_installed(entry) else {
+                println!("  {}: no route for {}, skipped", entry.name, std::env::consts::ARCH);
+                continue;
+            };
+            tested += 1;
+            println!("  {}: no route for {}, playing the copy installed by hand at {}", entry.name, std::env::consts::ARCH, bundle.display());
+            let played = match entry.format {
+                Format::Clap => play_clap_card(entry, &bundle),
+                Format::Lv2 => play_lv2_card(entry, bundle.parent().expect("a bundle lies in a folder")),
+            };
+            if let Err(e) = played {
+                println!("  {}: FAILED: {e:#}", entry.name);
+                failed.push(entry.name);
+            }
             continue;
         };
         tested += 1;
@@ -976,7 +991,7 @@ pub fn install_test(ids: &[String]) -> anyhow::Result<()> {
     }
     anyhow::ensure!(tested > 0, "catalog-install-test: nothing installable here");
     anyhow::ensure!(failed.is_empty(), "catalog-install-test failed: {}", failed.join(", "));
-    println!("catalog-install-test: OK ({tested} fetched, loaded and heard)");
+    println!("catalog-install-test: OK ({tested} loaded and heard)");
     Ok(())
 }
 
@@ -1041,6 +1056,15 @@ fn fetch_package(pkg: &str, dir: &Path, log: &mut dyn FnMut(String)) -> anyhow::
     .map_err(anyhow::Error::msg)
 }
 
+/// The card's bundle in the user's plugin folder, when one is there.
+fn hand_installed(entry: &CatalogEntry) -> Option<PathBuf> {
+    let dir = home_dir().join(entry.home.dir_name());
+    entry.bundles.iter().map(|b| dir.join(b)).find(|p| p.exists())
+}
+
+/// Cards built for a wind controller: their test also blows into them.
+const BREATH_CARDS: &[&str] = &["starbreath"];
+
 /// Notes every card should answer: General MIDI kick and snare for the drum
 /// machines, middle C for everything else.
 const PROBE_CHORD: [u8; 3] = [36, 38, 60];
@@ -1072,10 +1096,41 @@ fn play_clap_card(entry: &CatalogEntry, bundle: &Path) -> anyhow::Result<()> {
     for n in PROBE_CHORD {
         voice.note_off(n.into());
     }
+    let breath = BREATH_CARDS.contains(&entry.id).then(|| breath_response(&mut voice));
     main.retire(voice);
     println!("  {}: {id} loads from {}, probe chord peak {peak:.3}", entry.name, bundle.display());
     anyhow::ensure!(peak >= 1e-3, "silent");
+    if let Some([soft, hard, pressure]) = breath {
+        println!("  {}: one held note, RMS at breath (CC2) 20: {soft:.4}, at 127: {hard:.4}; channel pressure 127: {pressure:.4}", entry.name);
+        anyhow::ensure!(hard > 2.0 * soft, "breath (CC2) does not shape the level");
+    }
     Ok(())
+}
+
+/// RMS of one held note at a soft and a full breath (CC2, how an EWI or
+/// Aerophone sends it), then at full channel pressure after CC2 went to 0.
+fn breath_response(voice: &mut crate::host::ClapVoice) -> [f32; 3] {
+    let mut buf = vec![0.0f32; 2 * 4800];
+    let mut hold = |voice: &mut crate::host::ClapVoice, msg: [u8; 3]| {
+        let mut sum = 0.0f64;
+        for i in 0..10 {
+            voice.send_midi_rt(msg);
+            voice.render(&mut buf, crate::transport::Transport::default());
+            // The second half: what the instrument settled on.
+            if i >= 5 {
+                sum += buf.iter().map(|s| f64::from(s * s)).sum::<f64>();
+            }
+        }
+        (sum / (5.0 * buf.len() as f64)).sqrt() as f32
+    };
+    hold(voice, [0xB0, 2, 0]); // let the chord ring out
+    voice.note_on(60, 0.8);
+    let soft = hold(voice, [0xB0, 2, 20]);
+    let hard = hold(voice, [0xB0, 2, 127]);
+    hold(voice, [0xB0, 2, 0]);
+    let pressure = hold(voice, [0xD0, 127, 0]);
+    voice.note_off(60);
+    [soft, hard, pressure]
 }
 
 /// Load every URI of the card from `plugins` alone (`LV2_PATH`, so a copy in

@@ -2493,7 +2493,7 @@ impl BrowserCard {
                 None,
                 vec![
                     ("New rig", NEW_RIG, BrowserAction::NewClapRig(p.id.clone(), name.clone())),
-                    ("Add to rig", RIG, BrowserAction::AddInstrument(NodeKind::Clap { plugin_id: name_bytes(&p.id) }, name.clone())),
+                    ("Add to rig", RIG, BrowserAction::AddInstrument(NodeKind::Clap { plugin_id: crate::control::ClapId::new(&p.id) }, name.clone())),
                 ],
             ),
             Source::Clap(p) => {

@@ -1374,6 +1374,12 @@ Learned so far (2026-11-15, UI polish pass):
     took over half a second and it read "1 of 4 s". Give the test a time that
     cannot move (here a recording that starts in the future), never a bigger
     margin (`a_listen_shows_its_recording_progress_and_then_the_judging_model`).
+185. **Instrument visualizers read the full MIDI range and active registration,
+    never only the on-screen keybed's visible octave:** the pipe organ facade
+    mapped `0..=span` directly to `console_led(semi)`, so notes below the
+    keybed's octave had no pipes and drawn stops (32', 16', 4', mutations,
+    mixtures) had no effect. Map all 128 `note_leds` through
+    `aeolus::stop_semitones` onto the full C0–C8 compass (`pipe_facade_tests`).
 
 ## Working on kabelsalat
 

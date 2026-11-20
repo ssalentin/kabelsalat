@@ -900,8 +900,9 @@ impl DemoApp {
         p.rect_filled(bed_area, 2.0, rgb(0x0A, 0x07, 0x05));
         laid.bed = self.kb_keybed(ui, bed_area, KeyboardType::PipeOrgan, 0.0);
         vgrad(&p, Rect::from_min_size(laid.bed.min + egui::vec2(6.0, 6.0), egui::vec2(laid.bed.width() - 12.0, (laid.bed.height() * 0.1).clamp(7.0, 16.0))), alpha(SHADE, 0.4), alpha(SHADE, 0.0));
+        let drawn = self.kb_pipe_drawn();
         if facade_h > 0.0 {
-            self.console_pipe_facade(&p, facade, laid.bed);
+            self.console_pipe_facade(&p, facade, drawn);
         }
         laid.deck = jambs;
 
@@ -912,7 +913,6 @@ impl DemoApp {
         let left = Rect::from_min_size(jambs.min, egui::vec2(jw, jambs.height()));
         let right = Rect::from_min_size(Pos2::new(jambs.right() - jw, jambs.top()), egui::vec2(jw, jambs.height()));
         let center = Rect::from_min_max(Pos2::new(left.right() + 12.0, jambs.top()), Pos2::new(right.left() - 12.0, jambs.bottom()));
-        let drawn = self.kb_pipe_drawn();
         for (jamb, divs) in [(left, [0usize, 1]), (right, [2, 3])] {
             drop_shadow(&p, jamb, 6.0, 2.0, 7.0, 0.5);
             plate(&p, jamb, 6.0, rgb(0x1E, 0x16, 0x0E), rgb(0x12, 0x0D, 0x08));
@@ -1054,21 +1054,26 @@ impl DemoApp {
         }
     }
 
-    /// The case pipes: one per key, bass to the left, their lengths halving
-    /// up the scale, each speaking (mouth lit) while its note sounds. A
-    /// carved shade closes the case above them.
-    fn console_pipe_facade(&self, p: &egui::Painter, f: Rect, bed: Rect) {
+    /// The case pipes: full 8-octave compass from C0 (MIDI 12, 32' bass) to
+    /// C8 (MIDI 108, 1' treble), bass to the left, their lengths halving up
+    /// the scale. Every drawn stop speaks at its own pitch offset(s) — 32',
+    /// 16', 8', 5⅓', 4', 2⅔', 2', 1⅗', 1⅓', 1' and multi-rank mixtures —
+    /// so the facade shows both the played notes (including low bass/pedal
+    /// tones below the keybed's octave) and the active registration. A carved
+    /// shade closes the case above them.
+    fn console_pipe_facade(&self, p: &egui::Painter, f: Rect, drawn: [u32; 4]) {
         well(p, f, 6.0, rgb(0x0D, 0x09, 0x06));
-        let octaves = Self::dock_octaves(bed);
-        let span = 12 * octaves;
+        let (flue, reed) = pipe_facade_levels(&self.note_leds, drawn);
+        let span = PIPE_COUNT - 1;
+        let octaves = span as f32 / 12.0;
         let inner = f.shrink2(egui::vec2(10.0, 0.0));
-        let step = inner.width() / (span as f32 + 1.0);
-        let impost_h = (f.height() * 0.07).clamp(6.0, 12.0);
+        let step = inner.width() / PIPE_COUNT as f32;
+        let impost_h = (f.height() * 0.085).clamp(11.0, 16.0);
         let base_y = f.bottom() - impost_h - 2.0;
         let full = base_y - f.top() - 12.0;
-        let short = 2f32.powf(-0.6 * octaves as f32);
-        let len_of = |t: f32| full * (0.36 + 0.64 * (2f32.powf(-0.6 * octaves as f32 * t) - short) / (1.0 - short));
-        let x_of = |semi: usize| inner.left() + step * (semi as f32 + 0.5);
+        let short = 2f32.powf(-0.32 * octaves);
+        let len_of = |t: f32| full * (0.32 + 0.68 * (2f32.powf(-0.32 * octaves * t) - short) / (1.0 - short));
+        let x_of = |idx: usize| inner.left() + step * (idx as f32 + 0.5);
 
         // The pipe shade: carved wood from the case top down to the pipes.
         let mut m = Mesh::default();
@@ -1112,22 +1117,32 @@ impl DemoApp {
         p.add(egui::Shape::line(edge.iter().map(|q| *q + egui::vec2(0.0, 2.0)).collect(), Stroke::new(3.0, alpha(SHADE, 0.5))));
         p.add(egui::Shape::line(edge, Stroke::new(1.5, alpha(GOLD_LEAF, 0.75))));
 
-        for semi in 0..=span {
-            let x = x_of(semi);
-            let t = semi as f32 / span.max(1) as f32;
-            let pw = (step * (0.84 - 0.2 * t)).clamp(3.0, 30.0);
+        for idx in 0..PIPE_COUNT {
+            let x = x_of(idx);
+            let t = idx as f32 / span.max(1) as f32;
+            let pw = (step * (0.86 - 0.22 * t)).clamp(3.0, 30.0);
             let len = len_of(t);
             let foot_h = (len * 0.2).clamp(8.0, 40.0);
             let body = Rect::from_min_max(Pos2::new(x - pw * 0.5, base_y - len), Pos2::new(x + pw * 0.5, base_y - foot_h));
-            let led = self.console_led(semi).min(1.0);
+            let f_lv = flue[idx];
+            let r_lv = reed[idx];
+            let led = 1.0 - (1.0 - f_lv) * (1.0 - r_lv);
             let speaks = led > 0.02;
+            let reed_share = if speaks { r_lv / (f_lv + r_lv).max(1e-4) } else { 0.0 };
+            let glow_col = mix(GOLD_LEAF, theme::CABLE_AMBER, reed_share * 0.75);
+            let slit_col = mix(mix(theme::ACCENT, BRASS_HI, 0.25), BRASS_HI, reed_share * 0.55);
             let (edge_c, mid_c, hi_c) = if speaks {
-                (mix(PIPE_TIN, GOLD_LEAF, 0.5), mix(TIN_HI, GOLD_LEAF, 0.35), IVORY_HI)
+                let s = 0.45 + 0.55 * led;
+                (
+                    mix(TIN_DEEP, mix(PIPE_TIN, glow_col, 0.55), s),
+                    mix(PIPE_TIN, mix(TIN_HI, glow_col, 0.4), s),
+                    mix(TIN_HI, IVORY_HI, s),
+                )
             } else {
                 (TIN_DEEP, PIPE_TIN, TIN_HI)
             };
             if speaks {
-                soft(p, body.expand(pw * 0.3), pw * 0.5, pw * 0.9, alpha(GOLD_LEAF, 0.22 * led));
+                soft(p, body.expand(pw * 0.35), pw * 0.5, pw * 0.95, alpha(glow_col, 0.26 * led));
             }
             // A cylinder under one light: dark edge, a bright stripe left
             // of the middle, the tin's own grey, dark edge again.
@@ -1155,14 +1170,24 @@ impl DemoApp {
             }
             let slit = Rect::from_center_size(Pos2::new(x, body.bottom()), egui::vec2((pw * 0.66).max(2.0), (pw * 0.16).clamp(1.5, 3.5)));
             if speaks {
-                glow(p, slit.center(), pw * 0.9, alpha(theme::ACCENT, 0.4 * led));
+                glow(p, slit.center(), pw * 0.95, alpha(slit_col, 0.48 * led));
             }
-            p.rect_filled(slit, 0.5, if speaks { mix(theme::ACCENT, BRASS_HI, 0.25) } else { rgb(0x12, 0x0F, 0x0C) });
+            p.rect_filled(slit, 0.5, if speaks { slit_col } else { rgb(0x12, 0x0F, 0x0C) });
         }
-        // The impost the pipes stand on.
+        // The impost the pipes stand on, with subtle C-octave compass marks.
         let impost = Rect::from_min_max(Pos2::new(f.left() + 2.0, base_y), Pos2::new(f.right() - 2.0, f.bottom() - 2.0));
         vgrad(p, impost, WALNUT_HI, WALNUT);
         p.line_segment([impost.left_top() + egui::vec2(0.0, 0.5), impost.right_top() + egui::vec2(0.0, 0.5)], Stroke::new(1.0, alpha(GOLD_LEAF, 0.6)));
+        if 12.0 * step >= 28.0 && impost.height() >= 11.0 {
+            let font = FontId::monospace(7.5);
+            let ink = alpha(GOLD_LEAF, 0.62);
+            for oct in 0..=(span / 12) {
+                let idx = oct * 12;
+                let x = x_of(idx);
+                let label = format!("C{oct}");
+                p.text(Pos2::new(x, impost.center().y + 0.5), egui::Align2::CENTER_CENTER, label, font.clone(), ink);
+            }
+        }
         p.rect_stroke(f, 6.0, Stroke::new(2.0, rgb(0x07, 0x05, 0x03)), egui::StrokeKind::Inside);
     }
 
@@ -1375,6 +1400,43 @@ const GENERATOR_WHEELS: usize = 91;
 /// Semitones from the played key to the wheel each drawbar draws on
 /// (16', 5⅓', 8', 4', 2⅔', 2', 1⅗', 1⅓', 1').
 const DRAWBAR_SEMITONES: [i32; crate::organ::DRAWBARS] = [-12, 7, 0, 12, 19, 24, 28, 31, 36];
+
+/// Pipe-organ facade compass: C0 (MIDI 12, 32' sub-bass) through C8 (MIDI 108,
+/// 1' treble) — 97 pipes across 8 octaves, so low bass notes and 16'/32'
+/// stops have dedicated tall bass pipes on the left and upperwork/mixtures
+/// reach the treble pipes on the right.
+const PIPE_LOW: i32 = 12;
+const PIPE_HIGH: i32 = 108;
+const PIPE_COUNT: usize = (PIPE_HIGH - PIPE_LOW + 1) as usize;
+
+/// Speaking level (0..=1) of every pipe in `PIPE_LOW..=PIPE_HIGH`, split into
+/// flue and reed energy, given the currently sounding MIDI notes and the
+/// drawn stops across all four Aeolus divisions.
+fn pipe_facade_levels(note_leds: &[f32; 128], drawn: [u32; 4]) -> ([f32; PIPE_COUNT], [f32; PIPE_COUNT]) {
+    let mut flue = [0.0f32; PIPE_COUNT];
+    let mut reed = [0.0f32; PIPE_COUNT];
+    for (d, div) in crate::aeolus::DIVISIONS.iter().enumerate() {
+        let bits = drawn[d];
+        if bits == 0 { continue; }
+        for (i, stop) in div.stops.iter().enumerate() {
+            if (bits >> i) & 1 == 0 { continue; }
+            let offsets = crate::aeolus::stop_semitones(stop);
+            let target = if crate::aeolus::is_reed(stop) { &mut reed } else { &mut flue };
+            for (note, &led) in note_leds.iter().enumerate() {
+                if led <= 0.02 { continue; }
+                let drive = 0.72 * led.min(1.0);
+                for &semi in offsets {
+                    let mut p = note as i32 + semi as i32;
+                    while p < PIPE_LOW { p += 12; }
+                    while p > PIPE_HIGH { p -= 12; }
+                    let idx = (p - PIPE_LOW) as usize;
+                    target[idx] = 1.0 - (1.0 - target[idx]) * (1.0 - drive);
+                }
+            }
+        }
+    }
+    (flue, reed)
+}
 
 // ----------------------------------------------------------------------
 // Materials: gradients, shadows and glows the parts are built from.
@@ -2278,4 +2340,115 @@ fn drawknob(ui: &mut egui::Ui, id: egui::Id, cell: Rect, d: f32, name: &str, foo
 /// A console part's id: global, keyed by what the part is (rule 135).
 fn cid(salt: impl std::hash::Hash + std::fmt::Debug) -> egui::Id {
     egui::Id::NULL.with(("kb_console", salt))
+}
+
+#[cfg(test)]
+mod pipe_facade_tests {
+    use super::*;
+
+    fn pipe_idx(midi: i32) -> usize {
+        (midi - PIPE_LOW) as usize
+    }
+
+    #[test]
+    fn no_drawn_stops_means_no_pipes_speak() {
+        let mut leds = [0.0f32; 128];
+        leds[60] = 1.0;
+        let (flue, reed) = pipe_facade_levels(&leds, [0; 4]);
+        assert!(flue.iter().all(|&v| v == 0.0));
+        assert!(reed.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn principal_chorus_lights_8_4_and_2_foot_pipes() {
+        let mut leds = [0.0f32; 128];
+        leds[48] = 1.0; // C3
+        let reg = crate::aeolus::default_registration(); // Principal Chorus: 8', 4', 2'
+        let drawn = crate::aeolus::drawn(&crate::aeolus::state(reg)).unwrap();
+        let (flue, reed) = pipe_facade_levels(&leds, drawn);
+        let lit: Vec<usize> = flue.iter().enumerate().filter(|(_, &v)| v > 0.02).map(|(i, _)| i).collect();
+        assert_eq!(lit, vec![pipe_idx(48), pipe_idx(60), pipe_idx(72)], "C3 lights C3 (8'), C4 (4'), C5 (2')");
+        assert!(reed.iter().all(|&v| v == 0.0), "Principal Chorus has no reeds");
+    }
+
+    #[test]
+    fn low_tones_and_sub_octave_stops_light_dedicated_bass_pipes() {
+        // Playing C2 (MIDI 36) with Manual I Double Open Diapason 16' and
+        // Pedal Bombarde 32' lights C1 (24) as flue and C0 (12) as reed.
+        let mut leds = [0.0f32; 128];
+        leds[36] = 1.0; // C2 — below default on-screen keybed C3/C4
+        let mut drawn = [0u32; 4];
+        // Manual I (div 2) stop 0 = Double Open Diapason 16'
+        drawn[2] |= 1 << 0;
+        // Pedal (div 3) stop 8 = Bombarde 32'
+        assert_eq!(crate::aeolus::DIVISIONS[3].stops[8], "Bombarde\n32");
+        drawn[3] |= 1 << 8;
+        let (flue, reed) = pipe_facade_levels(&leds, drawn);
+        assert!(flue[pipe_idx(24)] > 0.5, "16' flue speaks at C1 (MIDI 24)");
+        assert!(reed[pipe_idx(12)] > 0.5, "32' Bombarde reed speaks at C0 (MIDI 12)");
+        assert_eq!(flue[pipe_idx(36)], 0.0, "no 8' stop drawn, so C2 itself stays dark");
+
+        // Playing even lower (C1 = MIDI 24) at 8' still hits a real bass pipe (C1 = 24),
+        // and 32' folds cleanly into C0 (12) rather than disappearing.
+        let mut low = [0.0f32; 128];
+        low[24] = 1.0;
+        let (flue_low, reed_low) = pipe_facade_levels(&low, drawn);
+        assert!(flue_low[pipe_idx(12)] > 0.5, "C1 on 16' hits C0 (12)");
+        assert!(reed_low[pipe_idx(12)] > 0.5, "C1 on 32' folds into C0 (12) instead of going dark");
+    }
+
+    #[test]
+    fn mutation_and_mixture_stops_light_their_harmonic_pipes() {
+        let mut leds = [0.0f32; 128];
+        leds[48] = 1.0; // C3
+        let mut drawn = [0u32; 4];
+        // Manual II (div 1): Nazard 2 2/3' (stop 6, +19 -> G4=67) and Tierce 1 3/5' (stop 9, +28 -> E5=76)
+        assert_eq!(crate::aeolus::DIVISIONS[1].stops[6], "Nazard\n2 2/3");
+        assert_eq!(crate::aeolus::DIVISIONS[1].stops[9], "Tierce\n1 3/5");
+        drawn[1] |= (1 << 6) | (1 << 9);
+        let (flue, _) = pipe_facade_levels(&leds, drawn);
+        let lit: Vec<usize> = flue.iter().enumerate().filter(|(_, &v)| v > 0.02).map(|(i, _)| i).collect();
+        assert_eq!(lit, vec![pipe_idx(67), pipe_idx(76)], "Nazard -> G4, Tierce -> E5");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat pipe_organ_register_shots -- --ignored"]
+    fn pipe_organ_register_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make_app = |reg_name: &str, extra_stops: &[(usize, usize)], notes: &[usize]| {
+            let mut app = DemoApp::new_with_sink(None);
+            let mut g = crate::control::Graph::default();
+            let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            let inst = g.add_node(
+                NodeKind::Clap { plugin_id: crate::control::ClapId::new(crate::aeolus::AEOLUS_ID) },
+                name_bytes("AEOLUS"),
+            );
+            let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, crate::control::PortKind::Midi);
+            g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, crate::control::PortKind::Audio);
+            app.build_rack(&g, &[]);
+            if let Some(u) = app.kb_target_unit() {
+                let node = app.units[u].node_id;
+                let reg = crate::aeolus::REGISTRATIONS.iter().find(|r| r.name == reg_name).unwrap();
+                let mut drawn = crate::aeolus::drawn(&crate::aeolus::state(reg)).unwrap();
+                for &(d, s) in extra_stops { drawn[d] |= 1 << s; }
+                app.aeolus_faces.entry(node).or_default().drawn = Some(drawn);
+                app.aeolus_poll_at = app.ui_time + 1e6;
+            }
+            app.dock = DockView::Keyboard;
+            app.kb_expanded = true;
+            for &n in notes {
+                app.note_leds[n] = 1.0;
+                app.notes_down[n] = 1;
+            }
+            app
+        };
+        // 1) Principal Chorus (8', 4', 2') on C4-E4-G4.
+        let mut chorus = make_app("Principal Chorus", &[], &[60, 64, 67]);
+        super::super::offline_shots::shot(&mut chorus, Vec2::new(1600.0, 1000.0), &dir.join("pipe-chorus-c4.png"));
+        // 2) Low bass tones C2 (36) + G2 (43) with Full Organ + Pedal Bombarde 32' (div 3, stop 8).
+        let mut bass = make_app("Full Organ", &[(3, 8)], &[36, 43]);
+        super::super::offline_shots::shot(&mut bass, Vec2::new(1600.0, 1000.0), &dir.join("pipe-bass-32-16.png"));
+    }
 }

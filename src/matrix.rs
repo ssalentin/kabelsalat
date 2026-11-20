@@ -202,6 +202,10 @@ pub enum CcTarget {
     /// other performance CCs (glide, sustain, modulation) keep passing through.
     #[serde(alias = "pressure", alias = "aftertouch", alias = "channel_pressure")]
     ChannelPressure,
+    /// Standard MIDI CC delivered to an instrument (e.g. CC 11 Swell,
+    /// CC 1 Mod Wheel, CC 64 Sustain, CC 67 Soft); `param` is the output CC (0..=127).
+    #[serde(alias = "cc", alias = "midi_cc")]
+    MidiCc,
 }
 
 impl CcTarget {
@@ -211,6 +215,7 @@ impl CcTarget {
             CcTarget::Knob => "knob",
             CcTarget::Mix => "mix",
             CcTarget::ChannelPressure => "channel_pressure",
+            CcTarget::MidiCc => "cc",
         }
     }
 
@@ -221,8 +226,37 @@ impl CcTarget {
             Some("knob") => Ok(CcTarget::Knob),
             Some("mix") => Ok(CcTarget::Mix),
             Some("channel_pressure") | Some("pressure") | Some("aftertouch") => Ok(CcTarget::ChannelPressure),
-            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin', 'knob', 'mix' or 'channel_pressure')")),
+            Some("cc") | Some("midi_cc") | Some("midicc") => Ok(CcTarget::MidiCc),
+            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin', 'knob', 'mix', 'cc' or 'channel_pressure')")),
         }
+    }
+}
+
+/// Human-readable label for a standard MIDI CC targeted by [`CcTarget::MidiCc`].
+pub fn midi_cc_label(cc: ParamId) -> String {
+    match cc {
+        1 => "Mod Wheel".into(),
+        11 => "Swell".into(),
+        64 => "Sustain".into(),
+        67 => "Soft".into(),
+        _ => format!("CC {cc}"),
+    }
+}
+
+/// Whether a [`CcTarget::MidiCc`] control is a two-state pedal/switch (no continuous range).
+pub fn midi_cc_is_switch(cc: ParamId) -> bool {
+    matches!(cc, 64 | 67)
+}
+
+/// Resolve a well-known instrument MIDI CC name (e.g. "swell", "sustain", "soft", "mod")
+/// to its CC number (0..=127).
+pub fn parse_midi_cc_name(name: &str) -> Option<ParamId> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "mod" | "modwheel" | "mod_wheel" | "mod wheel" | "modulation" | "cc1" => Some(1),
+        "swell" | "expression" | "expr" | "swell pedal" | "cc11" => Some(11),
+        "sustain" | "damper" | "hold" | "sustain pedal" | "cc64" => Some(64),
+        "soft" | "una_corda" | "una corda" | "soft pedal" | "cc67" => Some(67),
+        _ => None,
     }
 }
 
@@ -1470,5 +1504,28 @@ mod tests {
         }
         assert_eq!(MixControl::from_param(MixControl::Send(MixControl::SEND_SLOTS - 1).param() + 1), None);
         assert_eq!(at(MixControl::Send(2), 127), MixEdit { send: Some((2, 1.0)), ..MixEdit::default() });
+    }
+
+    #[test]
+    fn midi_cc_binding_round_trips_and_names_controls() {
+        let mut r = Rule::new(SourceId::Hardware(0), SURGE_A);
+        assert!(r.set_cc_target(74, 11, CcTarget::MidiCc));
+        let back: Rule = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.cc_map, r.cc_map);
+        assert_eq!(CcTarget::parse(Some("cc")), Ok(CcTarget::MidiCc));
+        assert_eq!(CcTarget::parse(Some("midi_cc")), Ok(CcTarget::MidiCc));
+        assert_eq!(CcTarget::MidiCc.as_str(), "cc");
+        assert_eq!(midi_cc_label(11), "Swell");
+        assert_eq!(midi_cc_label(64), "Sustain");
+        assert_eq!(midi_cc_label(67), "Soft");
+        assert_eq!(midi_cc_label(1), "Mod Wheel");
+        assert_eq!(midi_cc_label(74), "CC 74");
+        assert!(!midi_cc_is_switch(11) && !midi_cc_is_switch(1));
+        assert!(midi_cc_is_switch(64) && midi_cc_is_switch(67));
+        assert_eq!(parse_midi_cc_name("swell"), Some(11));
+        assert_eq!(parse_midi_cc_name("damper"), Some(64));
+        assert_eq!(parse_midi_cc_name("soft"), Some(67));
+        assert_eq!(parse_midi_cc_name("mod wheel"), Some(1));
+        assert_eq!(parse_midi_cc_name("unknown"), None);
     }
 }

@@ -4496,6 +4496,27 @@ impl GraphEngine {
                         }
                         continue;
                     }
+                    if let Some(CcMapping { param: out_cc, target: CcTarget::MidiCc, .. }) = mapping {
+                        let out_cc = (out_cc & 0x7F) as u8;
+                        let out_val = (norm.clamp(0.0, 1.0) * 127.0).round() as u8;
+                        let mut handled = false;
+                        if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                            s.voice.send_cc_rt(m.channel, out_cc, out_val);
+                            handled = true;
+                        } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                            s.plugin.control_change(out_cc, out_val);
+                            handled = true;
+                        } else if is_clap_node
+                            || self.graph.node(dest).is_some_and(|n| matches!(n.kind, NodeKind::Lv2 { .. }))
+                        {
+                            handled = true;
+                        }
+                        #[cfg(test)]
+                        if handled {
+                            self.cc_log.push((dest, out_cc as u32, norm));
+                        }
+                        continue;
+                    }
                     // A MIDI-FX unit takes the CC into its plugin (needs its cable).
                     if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
                         match mapping {
@@ -7563,6 +7584,32 @@ mod tests {
         engine.render(&mut buf, 2);
         let steps: Vec<_> = engine.cc_log.iter().map(|&(_, p, v)| (p, crate::organ::step_name(p, v as f32))).collect();
         assert_eq!(steps, vec![(crate::organ::P_LESLIE, Some("SLOW")), (crate::organ::P_LESLIE, Some("FAST"))]);
+    }
+
+    #[test]
+    fn midi_cc_binding_delivers_scaled_cc_to_instrument() {
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::default();
+        let organ = g.add_node(NodeKind::Lv2 { uri: crate::control::Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadGraph { graph: g });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        // Hardware pedal on an unrouted device (cc_only rule) mapped to CC 11 (Swell) with min 20%, max 80%.
+        let pedal = SourceId::Hardware(3);
+        bus.send(Command::MatrixCcMap {
+            source: pedal, dest: organ, cc: 74, param: Some(11),
+            target: CcTarget::MidiCc, scale: crate::matrix::CcScale::range(0.2, 0.8),
+        });
+        engine.cc_log.clear();
+        bus.send(Command::Cc { source: pedal, channel: 0, cc: 74, value: 0 });
+        bus.send(Command::Cc { source: pedal, channel: 0, cc: 74, value: 127 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_log.len(), 2, "{:?}", engine.cc_log);
+        assert_eq!(engine.cc_log[0].0, organ);
+        assert_eq!(engine.cc_log[0].1, 11);
+        assert!((engine.cc_log[0].2 - 25.0 / 127.0).abs() < 1e-6, "lo=20%: {:?}", engine.cc_log[0]);
+        assert!((engine.cc_log[1].2 - 102.0 / 127.0).abs() < 1e-6, "hi=80%: {:?}", engine.cc_log[1]);
     }
 
     #[test]

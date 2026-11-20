@@ -2037,9 +2037,13 @@ impl McpServer {
         let target_is_knob = args.target.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("knob"));
         let param = if let Some(ref name) = args.name {
             match Self::resolve_headless_knob(&node_kind, name) {
-                Ok(p) => p,
-                Err(_) if is_clap => {
+                Ok((p, crate::matrix::CcTarget::Knob)) => p,
+                // A pedal or wheel name ("swell") is a MIDI CC the keys send, not a parameter.
+                Ok(_) | Err(_) if is_clap => {
                     return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+                }
+                Ok((cc, _)) => {
+                    return tool_err(format!("'{name}' is MIDI CC {cc}, not a parameter — map a controller to it with set_cc_map"));
                 }
                 Err(e) => return tool_err(e),
             }
@@ -2552,14 +2556,21 @@ impl McpServer {
 
     /// Same tables as the rack faces: `engine::knob_specs` (labels like
     /// "RESO"/"CEIL" are canonical, long names are aliases), and for an LV2
-    /// plugin its main controls, by full name or knob label.
-    fn resolve_headless_knob(kind: &NodeKind, knob: &str) -> Result<u32, String> {
+    /// plugin its main controls, by full name or knob label, plus standard
+    /// instrument MIDI CCs ("swell", "sustain", "soft", "mod").
+    fn resolve_headless_knob(kind: &NodeKind, knob: &str) -> Result<(u32, crate::matrix::CcTarget), String> {
         if let Some(spec) = crate::engine::find_knob_spec(kind, knob) {
-            return spec.param.ok_or_else(|| format!("knob '{}' is local-only", spec.label));
+            let p = spec.param.ok_or_else(|| format!("knob '{}' is local-only", spec.label))?;
+            return Ok((p, crate::matrix::CcTarget::Knob));
         }
         if let NodeKind::Lv2 { uri } = kind {
             if let Some(c) = crate::lv2::main_controls_blocking(uri.as_str()).find(knob) {
-                return Ok(c.id);
+                return Ok((c.id, crate::matrix::CcTarget::Knob));
+            }
+        }
+        if matches!(kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }) {
+            if let Some(cc) = crate::matrix::parse_midi_cc_name(knob) {
+                return Ok((cc, crate::matrix::CcTarget::MidiCc));
             }
         }
         Err(format!("no knob '{knob}' on this node"))
@@ -2626,8 +2637,8 @@ impl McpServer {
                 Err(e) => return tool_err(e),
             },
             (None, Some(k)) => match Self::resolve_headless_knob(&node_kind, k) {
-                Ok(p) => {
-                    target = crate::matrix::CcTarget::Knob;
+                Ok((p, t)) => {
+                    target = t;
                     Some(p)
                 }
                 Err(e) => return tool_err(e),
@@ -2641,6 +2652,11 @@ impl McpServer {
                 .and_then(|c| c.fits(matches!(node_kind, NodeKind::MasterOut)).map_err(String::from));
             if let Err(e) = fits {
                 return tool_err(e);
+            }
+        }
+        if let (crate::matrix::CcTarget::MidiCc, Some(p)) = (target, param) {
+            if p > 127 {
+                return tool_err("target='cc' param must be 0..=127");
             }
         }
         if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param, target, scale }) {
@@ -2714,7 +2730,7 @@ impl McpServer {
                 Err(e) => return tool_err(e),
             },
             (None, Some(k)) => match Self::resolve_headless_knob(&node_kind, k) {
-                Ok(p) => Some((p, crate::matrix::CcTarget::Knob)),
+                Ok(pair) => Some(pair),
                 Err(e) => return tool_err(e),
             },
             (None, None) => None,
@@ -4519,14 +4535,14 @@ mod tests {
     #[test]
     fn headless_knob_names_match_the_rack_labels() {
         let lim = NodeKind::Dsp(crate::control::DspKind::Limiter);
-        assert_eq!(McpServer::resolve_headless_knob(&lim, "CEIL"), Ok(0));
-        assert_eq!(McpServer::resolve_headless_knob(&lim, "ceiling"), Ok(0), "CEILING never binds DRIVE");
-        assert_eq!(McpServer::resolve_headless_knob(&lim, "DRIVE"), Ok(1));
+        assert_eq!(McpServer::resolve_headless_knob(&lim, "CEIL"), Ok((0, crate::matrix::CcTarget::Knob)));
+        assert_eq!(McpServer::resolve_headless_knob(&lim, "ceiling"), Ok((0, crate::matrix::CcTarget::Knob)), "CEILING never binds DRIVE");
+        assert_eq!(McpServer::resolve_headless_knob(&lim, "DRIVE"), Ok((1, crate::matrix::CcTarget::Knob)));
         let filter = NodeKind::Dsp(crate::control::DspKind::Filter);
-        assert_eq!(McpServer::resolve_headless_knob(&filter, "RESO"), Ok(1));
-        assert_eq!(McpServer::resolve_headless_knob(&filter, "Resonance"), Ok(1));
+        assert_eq!(McpServer::resolve_headless_knob(&filter, "RESO"), Ok((1, crate::matrix::CcTarget::Knob)));
+        assert_eq!(McpServer::resolve_headless_knob(&filter, "Resonance"), Ok((1, crate::matrix::CcTarget::Knob)));
         assert!(McpServer::resolve_headless_knob(&NodeKind::Keys, "RATE").is_err(), "local-only knob");
-        assert_eq!(McpServer::resolve_headless_knob(&NodeKind::SystemAudio, "GAIN"), Ok(crate::engine::P_SYSTEM_GAIN));
+        assert_eq!(McpServer::resolve_headless_knob(&NodeKind::SystemAudio, "GAIN"), Ok((crate::engine::P_SYSTEM_GAIN, crate::matrix::CcTarget::Knob)));
 
         let (server, _engine) = local_server();
         // Demo node 2 = DELAY A: knobs TIME + MIX.
@@ -4553,8 +4569,9 @@ mod tests {
             controls: vec![control(7, "Filter Cutoff"), control(2, "Resonance")],
         });
         let kind = NodeKind::Lv2 { uri: control::Lv2Uri::new(uri) };
-        assert_eq!(McpServer::resolve_headless_knob(&kind, "filter cutoff"), Ok(7), "by full name");
-        assert_eq!(McpServer::resolve_headless_knob(&kind, "RESO"), Ok(2), "by knob label");
+        assert_eq!(McpServer::resolve_headless_knob(&kind, "filter cutoff"), Ok((7, crate::matrix::CcTarget::Knob)), "by full name");
+        assert_eq!(McpServer::resolve_headless_knob(&kind, "RESO"), Ok((2, crate::matrix::CcTarget::Knob)), "by knob label");
+        assert_eq!(McpServer::resolve_headless_knob(&kind, "swell"), Ok((11, crate::matrix::CcTarget::MidiCc)), "standard instrument CC");
         assert!(McpServer::resolve_headless_knob(&kind, "GAIN").is_err(), "no knob on port 0 by a made-up name");
 
         let (server, mut engine) = local_server();
@@ -4572,6 +4589,13 @@ mod tests {
         assert_eq!(out["main_controls"][1]["knob"], json!("RESO"));
         let labels: Vec<&str> = out["knobs"].as_array().unwrap().iter().map(|k| k["label"].as_str().unwrap()).collect();
         assert_eq!(labels, ["CUTOFF", "RESO"], "the knobs the app's face shows");
+        // set_param by a main control's name sets it; a pedal name is a MIDI CC,
+        // never sent as that number's parameter.
+        let set = |name: &str| -> SetParamArgs { serde_json::from_value(json!({"node": node, "name": name, "normalized": 0.5})).unwrap() };
+        assert_eq!(tool_json(&server.set_param(Parameters(set("filter cutoff"))))["param"], json!(7));
+        let swell = serde_json::to_value(server.set_param(Parameters(set("swell"))).unwrap()).unwrap();
+        assert_eq!(swell["isError"], json!(true), "{swell}");
+        assert!(swell.to_string().contains("MIDI CC 11") && swell.to_string().contains("set_cc_map"), "{swell}");
         // A node without a plugin has none, and says so with an empty list.
         let delay = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None })));
         assert_eq!(delay["main_controls"], json!([]));

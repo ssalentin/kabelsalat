@@ -78,6 +78,7 @@ impl DemoApp {
     /// The expanded keyboard: the header row over the instrument's console,
     /// filling the window (the caller hides every other panel).
     pub(super) fn keyboard_console_ui(&mut self, root: &mut egui::Ui) {
+        self.kb_learn_rects.clear();
         let h = (root.available_height() - 2.0).max(164.0).round();
         let surface = self.kb_surface();
         let target = self.kb_target_unit();
@@ -213,13 +214,15 @@ impl DemoApp {
     }
 
     fn console_swell(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        if let Some(v) = swell_shoe(ui, cid("con_swell"), rect, self.kb_swell) {
+        let (val, track, resp) = swell_shoe(ui, cid("con_swell"), rect, self.kb_swell);
+        if let Some(v) = val {
             if (v - self.kb_swell).abs() > 1e-4 {
                 self.kb_swell = v;
                 self.kb_cc(11, (v * 127.0).round() as u8);
                 self.kb_strip_pulse(0.3 + v * 0.4);
             }
         }
+        self.instrument_learn_ui(ui, &resp, track, self.kb_midi_cc_dest(11));
     }
 
     fn console_vel(&mut self, ui: &mut egui::Ui, rect: Rect) -> Rect {
@@ -363,9 +366,11 @@ impl DemoApp {
                     Pos2::new(content.right() - rw + i as f32 * cell_w, nb.top() + 4.0),
                     Pos2::new(content.right() - rw + (i + 1) as f32 * cell_w, nb.bottom() - 3.0),
                 );
-                if let Some(nv) = knob(ui, cid(("con_main", i)), cell, label, *v, KnobLook::Brass, 64.0) {
+                let (nv, mark, resp) = knob(ui, cid(("con_main", i)), cell, label, *v, KnobLook::Brass, 64.0);
+                if let Some(nv) = nv {
                     self.console_set_main(target, label, nv);
                 }
+                self.instrument_learn_ui(ui, &resp, mark, self.kb_main_dest(target, label));
             }
         }
         let name_w = nb.width() - 2.0 * (zone_w + 16.0 + 22.0);
@@ -431,16 +436,21 @@ impl DemoApp {
         p.line_segment([lyre_box.left_top() + egui::vec2(4.0, 1.0), lyre_box.right_top() + egui::vec2(-4.0, 1.0)], Stroke::new(1.0, alpha(theme::CREAM, 0.3)));
         let soft_r = Rect::from_min_size(Pos2::new(cx - pw * 1.3, py), egui::vec2(pw, ph));
         let sus_r = Rect::from_min_size(Pos2::new(cx + pw * 0.3, py), egui::vec2(pw, ph));
-        if pedal(ui, cid("con_soft"), soft_r, "SOFT", self.kb_soft).on_hover_text("una corda (CC 67)").clicked() {
+        let soft = pedal(ui, cid("con_soft"), soft_r, "SOFT", self.kb_soft)
+            .on_hover_text("una corda (CC 67) · right-click for MIDI learn");
+        if soft.clicked() {
             self.kb_soft = !self.kb_soft;
             self.kb_cc(67, if self.kb_soft { 127 } else { 0 });
             self.kb_strip_pulse(0.6);
         }
-        let sus = pedal(ui, cid("con_sustain"), sus_r, "SUSTAIN", self.kb_sustain);
+        self.instrument_learn_ui(ui, &soft, soft_r, self.kb_midi_cc_dest(67));
+        let sus = pedal(ui, cid("con_sustain"), sus_r, "SUSTAIN", self.kb_sustain)
+            .on_hover_text("sustain pedal (CC 64): released keys ring on, lit teal · right-click for MIDI learn");
         laid.strip[2] = sus.rect;
-        if sus.on_hover_text("sustain pedal (CC 64): released keys ring on, lit teal").clicked() {
+        if sus.clicked() {
             self.kb_toggle_sustain();
         }
+        self.instrument_learn_ui(ui, &sus, sus_r, self.kb_midi_cc_dest(64));
         laid.deck = nb;
     }
 
@@ -704,20 +714,27 @@ impl DemoApp {
             legend(ui, Pos2::new(left.left(), ry), Align::Min, "REGISTRATION", 9.0, theme::CREAM_DIM);
             self.console_registration(&p, Rect::from_min_size(Pos2::new(left.left(), ry + leg_h), egui::vec2(left.width(), reg_h)));
         }
+        let organ_node = self.kb_organ_node();
         legend(ui, Pos2::new(left.left(), py - leg_h), Align::Min, "PERCUSSION", 9.0, theme::CREAM_DIM);
         let tw = (left.width() - 6.0) / 2.0;
-        if tablet(ui, cid("con_perc"), Rect::from_min_size(Pos2::new(left.left(), py), egui::vec2(tw, tab_h)), "PERC", "", perc > 0, BRASS)
-            .on_hover_text("percussion on/off (CC 80)")
-            .clicked()
-        {
+        let perc_r = Rect::from_min_size(Pos2::new(left.left(), py), egui::vec2(tw, tab_h));
+        let perc_soft_r = Rect::from_min_size(Pos2::new(left.left() + tw + 6.0, py), egui::vec2(tw, tab_h));
+        let perc_resp = tablet(ui, cid("con_perc"), perc_r, "PERC", "", perc > 0, BRASS)
+            .on_hover_text("percussion on/off (CC 80) · right-click for MIDI learn");
+        if perc_resp.clicked() {
             self.kb_set_organ_param(crate::organ::P_PERC, if perc > 0 { 0.0 } else { 0.5 });
         }
-        if tablet(ui, cid("con_perc_soft"), Rect::from_min_size(Pos2::new(left.left() + tw + 6.0, py), egui::vec2(tw, tab_h)), "SOFT", "", perc == 2, BRASS)
-            .on_hover_text("soft percussion")
-            .clicked()
-        {
+        let perc_soft_resp = tablet(ui, cid("con_perc_soft"), perc_soft_r, "SOFT", "", perc == 2, BRASS)
+            .on_hover_text("soft percussion · right-click for MIDI learn");
+        if perc_soft_resp.clicked() {
             self.kb_set_organ_param(crate::organ::P_PERC, if perc == 2 { 0.5 } else { 1.0 });
         }
+        self.instrument_learn_group(
+            ui,
+            &[&perc_resp, &perc_soft_resp],
+            perc_r.union(perc_soft_r),
+            organ_node.map(|n| (n, crate::organ::P_PERC, crate::matrix::CcTarget::Knob)),
+        );
 
         // Middle: the nine drawbars, centred.
         let n_bars = crate::organ::DRAWBARS as f32;
@@ -728,12 +745,15 @@ impl DemoApp {
         for i in 0..crate::organ::DRAWBARS {
             if i == 2 { x += 14.0; } // the two sub-octave bars stand apart
             let r = Rect::from_min_size(Pos2::new(x, mid.top()), egui::vec2(bar_w, mid.height()));
-            let pos = crate::organ::drawbar_position(self.kb_organ_value(crate::organ::drawbar_param(i)));
-            if let Some(np) = drawbar(ui, cid(("con_drawbar", i)), r, i, crate::organ::FOOTAGES[i], pos) {
+            let param = crate::organ::drawbar_param(i);
+            let pos = crate::organ::drawbar_position(self.kb_organ_value(param));
+            let (np, mark, resp) = drawbar(ui, cid(("con_drawbar", i)), r, i, crate::organ::FOOTAGES[i], pos);
+            if let Some(np) = np {
                 if np != pos {
-                    self.kb_set_organ_param(crate::organ::drawbar_param(i), crate::organ::drawbar_value(np));
+                    self.kb_set_organ_param(param, crate::organ::drawbar_value(np));
                 }
             }
+            self.instrument_learn_ui(ui, &resp, mark, organ_node.map(|n| (n, param, crate::matrix::CcTarget::Knob)));
             x += bar_w + bar_gap;
         }
 
@@ -746,13 +766,26 @@ impl DemoApp {
         let sw_h = tab_h;
         let sw_y = col_a.bottom() - sw_h;
         let sw_w = (col_a.width() - 6.0) / 3.0;
+        let mut leslie_resps: Vec<egui::Response> = Vec::with_capacity(3);
+        let mut leslie_group = Rect::NOTHING;
         for (i, name) in ["STOP", "SLOW", "FAST"].iter().enumerate() {
             let r = Rect::from_min_size(Pos2::new(col_a.left() + i as f32 * (sw_w + 3.0), sw_y), egui::vec2(sw_w, sw_h));
-            if tablet(ui, cid(("con_leslie", i)), r, name, "", rotary == i, theme::LIVE_TEAL).clicked() {
+            leslie_group = leslie_group.union(r);
+            let resp = tablet(ui, cid(("con_leslie", i)), r, name, "", rotary == i, theme::LIVE_TEAL)
+                .on_hover_text("rotary speaker speed · right-click for MIDI learn");
+            if resp.clicked() {
                 self.kb_set_organ_param(crate::organ::P_LESLIE, i as f32 / 2.0);
                 self.kb_strip_pulse(0.5);
             }
+            leslie_resps.push(resp);
         }
+        let leslie_refs: Vec<&egui::Response> = leslie_resps.iter().collect();
+        self.instrument_learn_group(
+            ui,
+            &leslie_refs,
+            leslie_group,
+            organ_node.map(|n| (n, crate::organ::P_LESLIE, crate::matrix::CcTarget::Knob)),
+        );
         let rotor_area = Rect::from_min_max(Pos2::new(col_a.left(), col_a.top() + leg_h + 2.0), Pos2::new(col_a.right(), sw_y - 8.0));
         let d = rotor_area.width().min(rotor_area.height()).min(190.0);
         let dt = ui.input(|i| i.stable_dt).clamp(0.0, 0.1);
@@ -773,9 +806,11 @@ impl DemoApp {
             let at = if stacked { egui::vec2(0.0, k as f32 * knob_h) } else { egui::vec2(k as f32 * knob_w, 0.0) };
             let cell = Rect::from_min_size(col_b.min + at, egui::vec2(knob_w, knob_h));
             let v = self.kb_organ_value(param);
-            if let Some(nv) = knob(ui, cid(("con_organ_knob", k)), cell, label, v, KnobLook::Bakelite, 104.0) {
+            let (nv, mark, resp) = knob(ui, cid(("con_organ_knob", k)), cell, label, v, KnobLook::Bakelite, 104.0);
+            if let Some(nv) = nv {
                 self.kb_set_organ_param(param, nv);
             }
+            self.instrument_learn_ui(ui, &resp, mark, organ_node.map(|n| (n, param, crate::matrix::CcTarget::Knob)));
         }
         // Under the knobs in every layout: the switch never moves away from
         // the pointer that just turned the second manual on or off.
@@ -1229,6 +1264,9 @@ impl DemoApp {
             let resp = ui.interact(r, cid(("con_wheel", k)), egui::Sense::click_and_drag());
             let value = self.kb_wheel_drive(&resp, r, spring);
             wheel(&p, r, if spring { (value + 1.0) * 0.5 } else { value }, spring, resp.hovered() || resp.dragged());
+            if !spring {
+                self.instrument_learn_ui(ui, &resp, r, self.kb_midi_cc_dest(1));
+            }
             legend(ui, Pos2::new(r.center().x, wheels.bottom() - 16.0), Align::Center, label, 8.0, theme::CREAM_DIM);
             laid.strip[k] = r;
         }
@@ -1309,6 +1347,11 @@ impl DemoApp {
                     _ => self.kb_toggle_sustain(),
                 }
             }
+            match *id {
+                "arp" => self.instrument_learn_ui(ui, &resp, r, self.kb_arp_dest()),
+                "sustain" => self.instrument_learn_ui(ui, &resp, r, self.kb_midi_cc_dest(64)),
+                _ => {}
+            }
         }
         let vel_w = (fr.right() - x - 4.0).min(240.0);
         laid.strip[3] = if vel_w >= 72.0 {
@@ -1342,9 +1385,11 @@ impl DemoApp {
             let x0 = area.center().x - cw * cols as f32 * 0.5;
             for (i, (label, v)) in mains.iter().enumerate() {
                 let cell = Rect::from_min_size(Pos2::new(x0 + (i % cols) as f32 * cw, top + (i / cols) as f32 * ch), egui::vec2(cw, ch));
-                if let Some(nv) = knob(ui, cid(("con_macro", i)), cell, label, *v, KnobLook::Synth, 136.0) {
+                let (nv, mark, resp) = knob(ui, cid(("con_macro", i)), cell, label, *v, KnobLook::Synth, 136.0);
+                if let Some(nv) = nv {
                     self.console_set_main(target, label, nv);
                 }
+                self.instrument_learn_ui(ui, &resp, mark, self.kb_main_dest(target, label));
             }
         }
 
@@ -1871,7 +1916,7 @@ enum KnobLook {
 }
 
 /// A knob in `cell` (label under it), at most `max_d` across: drag up/down.
-fn knob(ui: &mut egui::Ui, id: egui::Id, cell: Rect, label: &str, value: f32, look: KnobLook, max_d: f32) -> Option<f32> {
+fn knob(ui: &mut egui::Ui, id: egui::Id, cell: Rect, label: &str, value: f32, look: KnobLook, max_d: f32) -> (Option<f32>, Rect, egui::Response) {
     let label_h = 15.0;
     let d0 = (cell.width() * 0.74).min(cell.height() - label_h - 8.0).clamp(10.0, max_d + 16.0);
     let ring = (d0 * 0.1).clamp(3.5, 8.0);
@@ -1881,7 +1926,7 @@ fn knob(ui: &mut egui::Ui, id: egui::Id, cell: Rect, label: &str, value: f32, lo
     let group_h = d + 2.0 * ring + label_h;
     let c = Pos2::new(cell.center().x, cell.center().y - group_h * 0.5 + ring + r);
     let hit = Rect::from_center_size(c, egui::Vec2::splat(d + 2.0 * ring));
-    let resp = ui.interact(hit, id, egui::Sense::click_and_drag()).on_hover_text(format!("{label}: drag up/down"));
+    let resp = ui.interact(hit, id, egui::Sense::click_and_drag()).on_hover_text(format!("{label}: drag up/down · right-click for MIDI learn"));
     let out = resp.dragged().then(|| (value - resp.drag_delta().y / (d * 2.5).max(80.0)).clamp(0.0, 1.0));
     let v = out.unwrap_or(value).clamp(0.0, 1.0);
     let hot = resp.hovered() || resp.dragged();
@@ -1936,17 +1981,17 @@ fn knob(ui: &mut egui::Ui, id: egui::Id, cell: Rect, label: &str, value: f32, lo
     }
     let (t, f) = fit_text(ui, label, cell.width() - 4.0, 10.5, 7.5, false);
     p.text(Pos2::new(cell.center().x, c.y + r + ring + 2.0), egui::Align2::CENTER_TOP, t, f, theme::CREAM_META);
-    out
+    (out, hit, resp)
 }
 
 /// One tonewheel drawbar: the footage over its channel, the shaft pulled
 /// down to `pos` (0..8) with its stops engraved, the coloured handle at
 /// the end (brown: sub-octave, ivory: octaves, black: the rest).
-fn drawbar(ui: &mut egui::Ui, id: egui::Id, r: Rect, bar: usize, footage: &str, pos: u8) -> Option<u8> {
+fn drawbar(ui: &mut egui::Ui, id: egui::Id, r: Rect, bar: usize, footage: &str, pos: u8) -> (Option<u8>, Rect, egui::Response) {
     let slot = Rect::from_min_max(r.min + egui::vec2(0.0, 19.0), r.max);
     let tip_h = (r.width() * 0.95).clamp(18.0, 52.0);
     let unit = (slot.height() - tip_h - 6.0) / 8.0;
-    let resp = ui.interact(r, id, egui::Sense::click_and_drag()).on_hover_text(format!("drawbar {footage}: drag down to pull it out (0 to 8)"));
+    let resp = ui.interact(r, id, egui::Sense::click_and_drag()).on_hover_text(format!("drawbar {footage}: drag down to pull it out (0 to 8) · right-click for MIDI learn"));
     let mut out = None;
     if resp.dragged() || resp.clicked() {
         if let Some(q) = resp.interact_pointer_pos() {
@@ -1995,7 +2040,7 @@ fn drawbar(ui: &mut egui::Ui, id: egui::Id, r: Rect, bar: usize, footage: &str, 
     p.rect_stroke(tip_r, 5.0, Stroke::new(1.0, if hot { theme::CREAM_DIM } else { mix(tip, SHADE, 0.7) }), egui::StrokeKind::Inside);
     p.line_segment([tip_r.left_top() + egui::vec2(5.0, 1.5), tip_r.right_top() + egui::vec2(-5.0, 1.5)], Stroke::new(1.0, alpha(IVORY_HI, 0.4)));
     p.text(Pos2::new(tip_r.center().x, tip_r.top() + tip_h * 0.38), egui::Align2::CENTER_CENTER, pos.to_string(), theme::medium_font((tip_h * 0.42).clamp(9.0, 17.0)), ink);
-    out
+    (out, slot, resp)
 }
 
 /// The rotary speaker seen from above: the horn turning in its baffle,
@@ -2051,8 +2096,8 @@ fn swell_box(p: &egui::Painter, r: Rect, v: f32) {
 
 /// A swell (expression) shoe: a ribbed rubber tread in its track, the
 /// track lit up to where it stands; drag left/right.
-fn swell_shoe(ui: &mut egui::Ui, id: egui::Id, r: Rect, value: f32) -> Option<f32> {
-    let resp = ui.interact(r, id, egui::Sense::click_and_drag()).on_hover_text("swell pedal (CC 11): drag to open or close");
+fn swell_shoe(ui: &mut egui::Ui, id: egui::Id, r: Rect, value: f32) -> (Option<f32>, Rect, egui::Response) {
+    let resp = ui.interact(r, id, egui::Sense::click_and_drag()).on_hover_text("swell pedal (CC 11): drag to open or close · right-click for MIDI learn");
     let label_w = 54.0;
     let track = Rect::from_min_max(Pos2::new(r.left() + label_w, r.top()), r.max);
     let mut out = None;
@@ -2088,7 +2133,7 @@ fn swell_shoe(ui: &mut egui::Ui, id: egui::Id, r: Rect, value: f32) -> Option<f3
     }
     p.rect_stroke(tread, 4.0, Stroke::new(1.0, if hot { theme::CREAM_DIM } else { rgb(0x05, 0x05, 0x05) }), egui::StrokeKind::Inside);
     p.line_segment([tread.left_top() + egui::vec2(4.0, 1.5), tread.right_top() + egui::vec2(-4.0, 1.5)], Stroke::new(1.0, alpha(theme::CREAM, 0.25)));
-    out
+    (out, track, resp)
 }
 
 /// A horizontal value bar (VEL): label left, value right, drag to set.

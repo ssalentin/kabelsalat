@@ -1247,6 +1247,13 @@ impl CcLearnCapture {
     }
 }
 
+/// An on/off CC destination (mixer Mute/Solo, sustain and soft pedals):
+/// learn binds it on the first CC and it gets no range or curve.
+fn cc_dest_is_switch(target: crate::matrix::CcTarget, param: u32) -> bool {
+    (target == CcTarget::Mix && MixControl::from_param(param).is_some_and(|c| c.is_switch()))
+        || (target == CcTarget::MidiCc && crate::matrix::midi_cc_is_switch(param))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CcLearn {
     source: SourceId,
@@ -1272,7 +1279,7 @@ impl CcLearn {
     }
 
     fn is_switch(&self) -> bool {
-        self.target == CcTarget::Mix && MixControl::from_param(self.param).is_some_and(|c| c.is_switch())
+        cc_dest_is_switch(self.target, self.param)
     }
 
     fn capture_json(&self) -> Option<serde_json::Value> {
@@ -1434,6 +1441,9 @@ struct KnobMenu {
     pos: Pos2,
     /// The view it was opened in; it closes when the view changes.
     stage: StageView,
+    /// Opened from the keyboard dock or expanded console (stays open as long
+    /// as the keyboard dock is open, regardless of `stage_view` / `side`).
+    from_dock: bool,
 }
 
 /// What a CC binding drives: destination node, param and target space. A
@@ -3417,6 +3427,8 @@ struct DemoApp {
     cc_learn: Option<CcLearn>,
     knob_menu: Option<KnobMenu>,
     knob_menu_rect: Rect,
+    /// Learnable controls rendered in the keyboard dock / expanded console this frame.
+    kb_learn_rects: Vec<(CcDest, Rect)>,
     /// The Keys-face scale picker (issue #90), open on a SCALE readout.
     scale_menu: Option<ScaleMenu>,
     scale_menu_rect: Rect,
@@ -3986,6 +3998,7 @@ impl DemoApp {
             cc_learn: None,
             knob_menu: None,
             knob_menu_rect: Rect::NOTHING,
+            kb_learn_rects: Vec::new(),
             scale_menu: None,
             scale_menu_rect: Rect::NOTHING,
             rule_cc_num: 74,
@@ -8377,6 +8390,7 @@ impl DemoApp {
                                 crate::matrix::CcTarget::PluginParam => choices.iter().find(|(id, _)| *id == m.param).map(|(_, n)| n.clone()),
                                 crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param),
                                 crate::matrix::CcTarget::ChannelPressure => Some("Channel pressure (breath)".to_string()),
+                                crate::matrix::CcTarget::MidiCc => Some(format!("{} (MIDI CC)", crate::matrix::midi_cc_label(m.param))),
                             };
                             serde_json::json!({
                                 "cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name,
@@ -10657,6 +10671,9 @@ impl DemoApp {
                 Ok(CcTarget::Mix) => {
                     return "error: set_param does not edit mixer strips — use set_rig_mix or set_strip_mix".into();
                 }
+                Ok(CcTarget::MidiCc | CcTarget::ChannelPressure) => {
+                    return "error: set_param sets parameters, not MIDI messages — map a controller with set_cc_map".into();
+                }
                 Ok(parsed) => Some(parsed),
                 Err(e) => return format!("error: {e}"),
             },
@@ -10678,6 +10695,8 @@ impl DemoApp {
                 // If caller explicitly asked for target="plugin" on a CLAP node,
                 // don't match the rack's built-in LEVEL knob (CcTarget::Knob).
                 !(is_clap && explicit_target == Some(CcTarget::PluginParam) && tgt == CcTarget::Knob)
+                    // A pedal or wheel name ("swell") is a MIDI CC the keys send, not a parameter.
+                    && tgt != CcTarget::MidiCc
             });
             if let Some((id, tgt)) = knob_hit {
                 (id, tgt)
@@ -10719,7 +10738,10 @@ impl DemoApp {
                 };
                 match found {
                     Some(id) => (id, if is_clap { CcTarget::PluginParam } else { CcTarget::Knob }),
-                    None => return format!("error: no parameter '{name}' on {unit_display} (call list_params(node={node}) to inspect)"),
+                    None => return match crate::matrix::parse_midi_cc_name(name) {
+                        Some(cc) => format!("error: '{name}' is MIDI CC {cc}, not a parameter of {unit_display} — map a controller to it with set_cc_map"),
+                        None => format!("error: no parameter '{name}' on {unit_display} (call list_params(node={node}) to inspect)"),
+                    },
                 }
             }
         } else if let Some(id) = param_arg {
@@ -11038,6 +11060,11 @@ impl DemoApp {
             let ctl = MixControl::from_param(p).ok_or_else(|| format!("no mixer control {p}: pass mix 'vol', 'pan', 'mute' or 'solo'"))?;
             ctl.fits(self.rig_of_bus_node(node).is_some())?;
         }
+        if let (CcTarget::MidiCc, Some(p)) = (*target, param) {
+            if p > 127 {
+                return Err("target 'cc' param must be 0..=127".into());
+            }
+        }
         Ok(param)
     }
 
@@ -11064,6 +11091,9 @@ impl DemoApp {
             };
             return Some(format!("{strip} · {}", ctl.label()));
         }
+        if target == CcTarget::MidiCc {
+            return Some(format!("{} · {}", sentence_case(&u.name), crate::matrix::midi_cc_label(param)));
+        }
         let k = u.knobs.iter().find(|k| k.cc_target() == Some((param, target)))?;
         Some(format!("{} · {}", sentence_case(&u.name), k.label))
     }
@@ -11071,9 +11101,13 @@ impl DemoApp {
     /// Right-click on a learnable control, a rack knob or a mixer control:
     /// arm MIDI learn; on a bound control, or on the one being learned, open
     /// its menu (learning keeps running until the menu decides, #20).
-    fn cc_right_click(&mut self, (node, param, target): CcDest, pos: Pos2) {
+    fn cc_right_click(&mut self, dest: CcDest, pos: Pos2) {
+        self.cc_right_click_from(dest, pos, false);
+    }
+
+    fn cc_right_click_from(&mut self, (node, param, target): CcDest, pos: Pos2, from_dock: bool) {
         let same_learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node && l.param == param && l.target == target);
-        let menu = KnobMenu { node, param, target, pos, stage: self.stage_view };
+        let menu = KnobMenu { node, param, target, pos, stage: self.stage_view, from_dock };
         if same_learning {
             self.knob_menu = Some(menu);
         } else if self.knob_cc_binding(node, param, target).is_some() {
@@ -11083,6 +11117,67 @@ impl DemoApp {
             self.knob_menu = None;
             self.cc_learn = Some(CcLearn::new(SourceId::Keys, node, param, target, true));
         }
+    }
+
+    /// Paint the MIDI-learn / bound outline and compact pill badge on an
+    /// instrument interface control (`mark`).
+    fn paint_instrument_learn(&self, ui: &egui::Ui, mark: Rect, dest: CcDest) {
+        let (node, param, target) = dest;
+        let learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node && l.param == param && l.target == target);
+        let bound = self.knob_cc_binding(node, param, target);
+        if !learning && bound.is_none() {
+            return;
+        }
+        let p = ui.painter();
+        let (stroke, badge) = if learning {
+            let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
+            let col = mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse);
+            ui.ctx().request_repaint();
+            (Stroke::new(2.0, alpha(col, 0.72 + 0.28 * pulse)), "LEARN".to_string())
+        } else {
+            let (_, cc) = bound.unwrap();
+            (Stroke::new(1.2, theme::MIDI_BLUE), format!("CC {cc}"))
+        };
+        p.rect_stroke(mark.expand(2.0), 3.0, stroke, egui::StrokeKind::Outside);
+        // Compact pill at the top-right corner of the control (never covers the whole widget).
+        let font = egui::FontId::monospace(8.5);
+        let galley = p.layout_no_wrap(badge, font, theme::DARK_PANEL);
+        let pill_w = (galley.size().x + 6.0).min((mark.width() + 14.0).max(28.0));
+        let pill_h = galley.size().y + 2.0;
+        let pill = Rect::from_min_size(
+            Pos2::new((mark.right() - pill_w + 2.0).max(mark.left() - 2.0), mark.top() - pill_h * 0.5 - 1.0),
+            egui::vec2(pill_w, pill_h),
+        );
+        let fill = if learning { theme::CABLE_CYAN } else { theme::MIDI_BLUE };
+        p.rect_filled(pill, 2.0, fill);
+        p.galley(Pos2::new(pill.center().x - galley.size().x * 0.5, pill.center().y - galley.size().y * 0.5), galley, theme::DARK_PANEL);
+    }
+
+    /// One instrument-interface control's part in MIDI learn (keyboard dock
+    /// and expanded console): right-click arms learn or opens the menu, and
+    /// `mark` shows the pulsing learn ring / bound "CC n" badge.
+    pub(super) fn instrument_learn_ui(&mut self, ui: &egui::Ui, resp: &egui::Response, mark: Rect, dest: Option<CcDest>) {
+        let Some(dest) = dest else { return };
+        self.kb_learn_rects.push((dest, resp.rect));
+        if resp.secondary_clicked() {
+            self.cc_right_click_from(dest, resp.interact_pointer_pos().unwrap_or(mark.center()), true);
+        }
+        self.paint_instrument_learn(ui, mark, dest);
+    }
+
+    /// Group of buttons that share one parameter (e.g. Leslie STOP/SLOW/FAST
+    /// or PERC/SOFT): right-clicking any button arms MIDI learn for the shared
+    /// parameter, and one outline + badge wraps the group `mark`.
+    pub(super) fn instrument_learn_group(&mut self, ui: &egui::Ui, resps: &[&egui::Response], mark: Rect, dest: Option<CcDest>) {
+        let Some(dest) = dest else { return };
+        self.kb_learn_rects.push((dest, mark));
+        for r in resps {
+            if r.secondary_clicked() {
+                self.cc_right_click_from(dest, r.interact_pointer_pos().unwrap_or(mark.center()), true);
+                break;
+            }
+        }
+        self.paint_instrument_learn(ui, mark, dest);
     }
 
     /// One mixer control's part in MIDI learn (#75), the rack knobs' flow:
@@ -11207,6 +11302,12 @@ impl DemoApp {
             let target = if matches!(u.node_kind, UnitKind::Clap) { crate::matrix::CcTarget::PluginParam } else { crate::matrix::CcTarget::Knob };
             return Ok((c.id, target));
         }
+        // Standard instrument MIDI CCs (swell, sustain/damper, soft, mod wheel).
+        if matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst || self.is_organ_unit(unit) {
+            if let Some(cc) = crate::matrix::parse_midi_cc_name(knob) {
+                return Ok((cc, crate::matrix::CcTarget::MidiCc));
+            }
+        }
         Err(format!("no knob '{knob}' on node {node_id}"))
     }
 
@@ -11231,11 +11332,11 @@ impl DemoApp {
     /// unit, plugin and knob targets reach the same engine param
     /// (`apply_engine_param`), so the agent's `param: 0` is the learned CUTOFF.
     fn binds_knob(&self, node_id: u32, m: &crate::matrix::CcMapping, param: u32, target: crate::matrix::CcTarget) -> bool {
-        // A mixer control or channel-pressure binding shares its node with
-        // the unit's knobs and params, and its param numbers with them: only
-        // its own target is the same binding.
-        if matches!(m.target, CcTarget::Mix | CcTarget::ChannelPressure)
-            || matches!(target, CcTarget::Mix | CcTarget::ChannelPressure)
+        // Mixer controls, standard MIDI CCs, and channel-pressure bindings share
+        // their node with the unit's knobs and params, and their param numbers
+        // with them: only their own target is the same binding.
+        if matches!(m.target, CcTarget::Mix | CcTarget::MidiCc | CcTarget::ChannelPressure)
+            || matches!(target, CcTarget::Mix | CcTarget::MidiCc | CcTarget::ChannelPressure)
         {
             return m.target == target && m.param == param;
         }
@@ -11278,13 +11379,37 @@ impl DemoApp {
         }
     }
 
-    /// Mirror an incoming hardware CC onto matching rack knobs. Normally the
-    /// engine already applied it, so `sent` is updated and nothing is re-sent
-    /// (no feedback loop). `resend` is for the CC that completed a learn: the
-    /// engine saw it before the binding existed, so publish must catch it up.
+    /// Sync a standard instrument MIDI CC (1 = Mod, 11 = Swell, 64 = Sustain,
+    /// 67 = Soft) into the keyboard dock / expanded console controls so
+    /// hardware pedals and wheels always move the on-screen controls.
+    fn apply_kb_cc_state(&mut self, cc: u8, norm: f32) {
+        let v = norm.clamp(0.0, 1.0);
+        match cc {
+            1 => self.kb_mod = v,
+            11 => self.kb_swell = v,
+            64 => {
+                let on = v >= 0.5;
+                self.kb_sustain = on;
+                if !on {
+                    self.kb_sustained = [false; 128];
+                }
+            }
+            67 => self.kb_soft = v >= 0.5,
+            _ => {}
+        }
+    }
+
+    /// Mirror an incoming hardware CC onto matching rack knobs and instrument
+    /// interface controls. Normally the engine already applied it, so `sent` is
+    /// updated and nothing is re-sent (no feedback loop). `resend` is for the
+    /// CC that completed a learn: the engine saw it before the binding existed,
+    /// so publish must catch it up.
     fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8, resend: bool) {
         let hold_until = self.ui_time + READBACK_HOLD_SECS;
+        let kb_target = self.kb_target_unit();
+        let kb_target_node = kb_target.map(|u| self.units[u].node_id);
         let mut mixer: Vec<(u32, MixControl, f64)> = Vec::new();
+        let mut midi_ccs: Vec<(u32, u8, f32)> = Vec::new();
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
             if let Some(rule_ch) = edit.channel {
@@ -11299,6 +11424,10 @@ impl DemoApp {
                     if let Some(ctl) = MixControl::from_param(m.param) {
                         mixer.push((*dest, ctl, m.scale.norm(val)));
                     }
+                    continue;
+                }
+                if m.target == CcTarget::MidiCc {
+                    midi_ccs.push((*dest, (m.param & 0x7F) as u8, m.scale.norm(val) as f32));
                     continue;
                 }
                 let norm = m.scale.norm(val) as f32;
@@ -11328,6 +11457,49 @@ impl DemoApp {
         }
         for (node, ctl, norm) in mixer {
             self.apply_mix_cc(node, ctl, norm, resend);
+        }
+        let mut synced_kb_target = false;
+        let mut resend_midi_cc = false;
+        for (dest, out_cc, norm) in midi_ccs {
+            if kb_target_node == Some(dest) {
+                self.apply_kb_cc_state(out_cc, norm);
+                synced_kb_target = true;
+            }
+            if resend {
+                resend_midi_cc = true;
+            }
+        }
+        if resend_midi_cc {
+            // The CC that completed a MidiCc learn arrived before the binding
+            // existed on the engine (rule 51): re-send it now that MatrixCcMap
+            // is queued on the same FIFO bus.
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().map(|mut b| b.send(Command::Cc { source: src, channel: ch, cc, value: val }));
+            }
+        }
+        // Unmapped passthrough hardware CCs (e.g. a real expression pedal on
+        // CC 11, sustain pedal on CC 64, soft pedal on CC 67, or mod wheel on
+        // CC 1) also sync to the instrument interface when transparently routed.
+        if !synced_kb_target && matches!(cc, 1 | 11 | 64 | 67) {
+            if let (Some(tu), Some(dest)) = (kb_target, kb_target_node) {
+                // On setBfree, CC 1 is Leslie speed, not a synth mod wheel.
+                if cc == 1 && self.is_organ_unit(tu) {
+                    return;
+                }
+                let transparent = match self.rule_edits.get(&(src, dest)) {
+                    Some(e) => e.enabled && !e.cc_only && e.cc_map.is_empty() && e.channel.is_none_or(|c| c == ch),
+                    None => match self.graph_pub.as_ref().and_then(|p| p.lock().ok()) {
+                        Some(g) => g.rules.iter().any(|r| {
+                            r.source == src && r.dest == dest && r.enabled && !r.cc_only
+                                && r.cc_map.is_empty() && r.channel.is_none_or(|c| c == ch)
+                        }),
+                        None => true,
+                    },
+                };
+                if transparent {
+                    self.apply_kb_cc_state(cc, val as f32 / 127.0);
+                }
+            }
         }
     }
 
@@ -11650,6 +11822,7 @@ impl DemoApp {
                 crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param)
                     .unwrap_or_else(|| format!("Mixer {}", m.param)),
                 crate::matrix::CcTarget::ChannelPressure => "Channel pressure (breath)".to_string(),
+                crate::matrix::CcTarget::MidiCc => format!("{} (MIDI CC)", crate::matrix::midi_cc_label(m.param)),
             };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("CC {:>3}", m.cc)).size(12.0).color(theme::MIDI_BLUE));
@@ -18638,6 +18811,7 @@ impl DemoApp {
         // instrument's deck on top of that, never out of the keys (#164),
         // and only what the rack spares (rule 22). With no room to spare the
         // dock keeps the playable minimum plus the deck, and the rack pans.
+        self.kb_learn_rects.clear();
         let avail = root.available_height();
         let need = self.rack_need_h();
         let keys_h = Self::keyboard_dock_h(win_h, avail, need);
@@ -19368,11 +19542,38 @@ impl DemoApp {
         track
     }
 
+    /// Target node id for keyboard-dock / console MIDI learn helpers.
+    pub(super) fn kb_target_node(&self) -> Option<u32> {
+        self.kb_target_unit().map(|u| self.units[u].node_id)
+    }
+
+    pub(super) fn kb_organ_node(&self) -> Option<u32> {
+        self.kb_target_unit().filter(|&u| self.is_organ_unit(u)).map(|u| self.units[u].node_id)
+    }
+
+    pub(super) fn kb_midi_cc_dest(&self, cc: u8) -> Option<CcDest> {
+        self.kb_target_node().map(|n| (n, cc as u32, CcTarget::MidiCc))
+    }
+
+    pub(super) fn kb_arp_dest(&self) -> Option<CcDest> {
+        self.units.iter()
+            .find(|u| u.rig == self.active_rig as u8 && matches!(u.node_kind, UnitKind::Arp))
+            .map(|u| (u.node_id, crate::arp::P_ARP_MODE, CcTarget::Knob))
+    }
+
+    pub(super) fn kb_main_dest(&self, target: Option<usize>, label: &str) -> Option<CcDest> {
+        let u = &self.units[target?];
+        let k = u.knobs.iter().find(|k| k.label == label && k.source != KnobSource::BuiltIn)?;
+        let (param, tgt) = k.cc_target()?;
+        Some((u.node_id, param, tgt))
+    }
+
     /// One small arc knob (macros, DRIVE/REVERB): vertical drag moves the
-    /// value; returns the new value when the pointer moved it.
-    fn kb_mini_knob(&mut self, ui: &mut egui::Ui, w: f32, h: f32, label: &str, value: f32) -> Option<f32> {
+    /// value; right-click arms MIDI learn when `dest` is Some.
+    fn kb_mini_knob(&mut self, ui: &mut egui::Ui, w: f32, h: f32, label: &str, value: f32, dest: Option<CcDest>) -> Option<f32> {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
-        let resp = resp.on_hover_text(format!("{label} — drag up/down"));
+        let tip = if dest.is_some() { format!("{label} — drag up/down · right-click for MIDI learn") } else { format!("{label} — drag up/down") };
+        let resp = resp.on_hover_text(tip);
         let out = if resp.dragged() {
             Some((value - resp.drag_delta().y / 120.0).clamp(0.0, 1.0))
         } else {
@@ -19391,12 +19592,13 @@ impl DemoApp {
         let short: String = label.chars().take(7).collect();
         p.text(Pos2::new(rect.center().x, rect.bottom() - 6.0), egui::Align2::CENTER_CENTER,
             short, FontId::proportional(8.5), theme::INK_2);
+        self.instrument_learn_ui(ui, &resp, rect, dest);
         out
     }
 
     /// One dock drawbar: footage label above a track the bar is pulled down
     /// in (0 = pushed in at the top, 8 = pulled out at the bottom).
-    fn kb_drawbar(&mut self, ui: &mut egui::Ui, w: f32, h: f32, footage: &str, pos: u8, bar: usize) -> Option<u8> {
+    fn kb_drawbar(&mut self, ui: &mut egui::Ui, w: f32, h: f32, footage: &str, pos: u8, bar: usize, dest: Option<CcDest>) -> Option<u8> {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
         let track = Rect::from_min_max(rect.min + egui::vec2(0.0, 15.0), rect.max - egui::vec2(0.0, 2.0));
         let mut out = None;
@@ -19422,12 +19624,14 @@ impl DemoApp {
             p.text(Pos2::new(bar_r.center().x, bar_r.bottom() - 7.0), egui::Align2::CENTER_CENTER,
                 pos.to_string(), theme::medium_font(10.0), ink);
         }
+        self.instrument_learn_ui(ui, &resp, track, dest);
         out
     }
 
     /// A vertical fader at an explicit rect (SWELL): top = 1, bottom = 0.
-    fn kb_fader_at(&mut self, ui: &mut egui::Ui, rect: Rect, value: f32) -> Option<f32> {
+    fn kb_fader_at(&mut self, ui: &mut egui::Ui, rect: Rect, value: f32, dest: Option<CcDest>) -> Option<f32> {
         let resp = ui.interact(rect, ui.id().with(("kb_fader", rect.min.x.to_bits(), rect.min.y.to_bits())), egui::Sense::click_and_drag());
+        let resp = if dest.is_some() { resp.on_hover_text("swell pedal (CC 11) — drag · right-click for MIDI learn") } else { resp };
         let out = if resp.dragged() || resp.clicked() {
             resp.interact_pointer_pos().map(|p| 1.0 - ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0))
         } else {
@@ -19439,6 +19643,7 @@ impl DemoApp {
         let v = out.unwrap_or(value).clamp(0.0, 1.0);
         let fill = Rect::from_min_max(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0 - (rect.height() - 4.0) * v), rect.max - egui::vec2(2.0, 2.0));
         if fill.height() > 0.0 { p.rect_filled(fill, 1.0, theme::CREAM); }
+        self.instrument_learn_ui(ui, &resp, rect, dest);
         out
     }
 
@@ -19461,14 +19666,19 @@ impl DemoApp {
     /// and the SWELL fader (CC 11).
     fn kb_cheek_jazz(&mut self, ui: &mut egui::Ui, h: f32) {
         let leslie = crate::organ::step(self.kb_organ_value(crate::organ::P_LESLIE), 3);
+        let leslie_dest = self.kb_organ_node().map(|n| (n, crate::organ::P_LESLIE, CcTarget::Knob));
+        let swell_dest = self.kb_midi_cc_dest(11);
         // Three switches + the label fit the bed's height: a short dock
         // (dual manual at the default window) shrinks the switches.
         let btn_h = ((h - 24.0 - 9.0) / 3.0).clamp(14.0, 20.0).floor();
+        let mut leslie_resps: Vec<egui::Response> = Vec::with_capacity(3);
+        let mut leslie_group = Rect::NOTHING;
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add_space(((h - 3.0 * btn_h - 9.0 - 14.0) * 0.5).max(0.0));
             for (i, name) in ["STOP", "SLOW", "FAST"].iter().enumerate() {
                 let (r, resp) = ui.allocate_exact_size(egui::vec2(46.0, btn_h), egui::Sense::click());
+                leslie_group = leslie_group.union(r);
                 let on = leslie == i;
                 let p = ui.painter();
                 let fill = if on { theme::CREAM } else if resp.hovered() { theme::DARK_PANEL_HI } else { theme::PAPER_SINK };
@@ -19479,14 +19689,17 @@ impl DemoApp {
                     self.kb_set_organ_param(crate::organ::P_LESLIE, i as f32 / 2.0);
                     self.kb_strip_pulse(0.5);
                 }
+                leslie_resps.push(resp);
                 ui.add_space(3.0);
             }
             ui.label(egui::RichText::new("LESLIE").size(8.5).color(theme::CREAM_DIM));
         });
+        let resp_refs: Vec<&egui::Response> = leslie_resps.iter().collect();
+        self.instrument_learn_group(ui, &resp_refs, leslie_group, leslie_dest);
         ui.add_space(6.0);
         let (frect, _) = ui.allocate_exact_size(egui::vec2(24.0, h - 4.0), egui::Sense::hover());
         let track = Rect::from_min_max(frect.min + egui::vec2(0.0, 6.0), frect.max - egui::vec2(0.0, 14.0));
-        if let Some(v) = self.kb_fader_at(ui, track, self.kb_swell) {
+        if let Some(v) = self.kb_fader_at(ui, track, self.kb_swell, swell_dest) {
             self.kb_swell = v;
             self.kb_cc(11, (v * 127.0).round() as u8);
             self.kb_strip_pulse(0.3 + v * 0.4);
@@ -19497,9 +19710,10 @@ impl DemoApp {
 
     /// Pipe Organ cheekblock: SWELL (CC 11), the expression pedal.
     fn kb_cheek_swell(&mut self, ui: &mut egui::Ui, h: f32) {
+        let swell_dest = self.kb_midi_cc_dest(11);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, h), egui::Sense::hover());
         let track = Rect::from_min_max(Pos2::new(rect.center().x - 10.0, rect.top() + 6.0), Pos2::new(rect.center().x + 10.0, rect.bottom() - 16.0));
-        if let Some(v) = self.kb_fader_at(ui, track, self.kb_swell) {
+        if let Some(v) = self.kb_fader_at(ui, track, self.kb_swell, swell_dest) {
             self.kb_swell = v;
             self.kb_cc(11, (v * 127.0).round() as u8);
             self.kb_strip_pulse(0.3 + v * 0.4);
@@ -19527,15 +19741,19 @@ impl DemoApp {
     /// drive — whatever the plugin names, rule 89).
     fn kb_deck_piano(&mut self, ui: &mut egui::Ui, target: Option<usize>, deck_h: f32, strip: &mut [Rect; 4]) {
         let damper = theme::chip_button(ui, "DAMPER", self.kb_sustain)
-            .on_hover_text("sustain pedal (CC 64): released keys keep sounding, lit teal, until the pedal lifts");
+            .on_hover_text("sustain pedal (CC 64): released keys keep sounding, lit teal, until the pedal lifts · right-click for MIDI learn");
         strip[2] = damper.rect;
         if damper.clicked() { self.kb_toggle_sustain(); }
+        self.instrument_learn_ui(ui, &damper, damper.rect, self.kb_midi_cc_dest(64));
         ui.add_space(8.0);
-        if theme::chip_button(ui, "SOFT", self.kb_soft).on_hover_text("una corda pedal (CC 67)").clicked() {
+        let soft = theme::chip_button(ui, "SOFT", self.kb_soft)
+            .on_hover_text("una corda pedal (CC 67) · right-click for MIDI learn");
+        if soft.clicked() {
             self.kb_soft = !self.kb_soft;
             self.kb_cc(67, if self.kb_soft { 127 } else { 0 });
             self.kb_strip_pulse(0.6);
         }
+        self.instrument_learn_ui(ui, &soft, soft.rect, self.kb_midi_cc_dest(67));
         ui.add_space(8.0);
         if theme::chip_button(ui, "Y-TOUCH", self.kb_y_touch)
             .on_hover_text("vertical hit position sets velocity: top of the key = pp, bottom = ff")
@@ -19553,7 +19771,8 @@ impl DemoApp {
                 .collect();
             for (label, v) in mains {
                 ui.add_space(8.0);
-                if let Some(nv) = self.kb_mini_knob(ui, 34.0, deck_h - 4.0, &label, v) {
+                let dest = self.kb_main_dest(Some(t), &label);
+                if let Some(nv) = self.kb_mini_knob(ui, 34.0, deck_h - 4.0, &label, v, dest) {
                     if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && k.source != KnobSource::BuiltIn) {
                         k.set_immediate(nv);
                     }
@@ -19573,6 +19792,7 @@ impl DemoApp {
     /// Jazz Organ deck: four instant registrations, PERC, DUAL MANUAL, the
     /// nine drawbars (when the dock is tall enough) and DRIVE / REVERB.
     fn kb_deck_jazz(&mut self, ui: &mut egui::Ui, organ_unit: Option<usize>, deck_h: f32) {
+        let organ_node = organ_unit.map(|u| self.units[u].node_id);
         for preset in crate::keyboard::JAZZ_ORGAN_PRESETS {
             if theme::chip_button(ui, preset.short, false).on_hover_text(preset.label).clicked() {
                 self.kb_jazz_preset(&preset);
@@ -19581,12 +19801,12 @@ impl DemoApp {
         }
         ui.add_space(4.0);
         let perc = crate::organ::step(self.kb_organ_value(crate::organ::P_PERC), 3);
-        if theme::chip_button(ui, &format!("PERC {}", ["OFF", "ON", "SOFT"][perc]), perc > 0)
-            .on_hover_text("percussion (CC 80): off / normal / soft")
-            .clicked()
-        {
+        let perc_resp = theme::chip_button(ui, &format!("PERC {}", ["OFF", "ON", "SOFT"][perc]), perc > 0)
+            .on_hover_text("percussion (CC 80): off / normal / soft · right-click for MIDI learn");
+        if perc_resp.clicked() {
             self.kb_set_organ_param(crate::organ::P_PERC, ((perc + 1) % 3) as f32 / 2.0);
         }
+        self.instrument_learn_ui(ui, &perc_resp, perc_resp.rect, organ_node.map(|n| (n, crate::organ::P_PERC, CcTarget::Knob)));
         ui.add_space(4.0);
         let dual_tip = if organ_unit.is_some() { "stack Upper (CH 1) and Lower (CH 2) manuals" } else { "stack two manuals (a hosted setBfree plays CH 1 / CH 2)" };
         if theme::chip_button(ui, "DUAL", self.kb_dual_manual).on_hover_text(dual_tip).clicked() {
@@ -19595,17 +19815,20 @@ impl DemoApp {
         if deck_h >= 60.0 {
             ui.add_space(10.0);
             for i in 0..crate::organ::DRAWBARS {
-                let pos = crate::organ::drawbar_position(self.kb_organ_value(crate::organ::drawbar_param(i)));
+                let param = crate::organ::drawbar_param(i);
+                let pos = crate::organ::drawbar_position(self.kb_organ_value(param));
                 let bar_w = (deck_h * 0.16).clamp(22.0, 36.0);
-                if let Some(np) = self.kb_drawbar(ui, bar_w, deck_h, crate::organ::FOOTAGES[i], pos, i) {
-                    self.kb_set_organ_param(crate::organ::drawbar_param(i), crate::organ::drawbar_value(np));
+                let dest = organ_node.map(|n| (n, param, CcTarget::Knob));
+                if let Some(np) = self.kb_drawbar(ui, bar_w, deck_h, crate::organ::FOOTAGES[i], pos, i, dest) {
+                    self.kb_set_organ_param(param, crate::organ::drawbar_value(np));
                 }
                 ui.add_space(3.0);
             }
             if ui.available_width() > 110.0 {
                 for (param, label) in [(crate::organ::P_DRIVE, "DRIVE"), (crate::organ::P_REVERB, "REVERB")] {
                     let v = self.kb_organ_value(param);
-                    if let Some(nv) = self.kb_mini_knob(ui, (deck_h * 0.4).clamp(36.0, 72.0), (deck_h - 4.0).min(96.0), label, v) {
+                    let dest = organ_node.map(|n| (n, param, CcTarget::Knob));
+                    if let Some(nv) = self.kb_mini_knob(ui, (deck_h * 0.4).clamp(36.0, 72.0), (deck_h - 4.0).min(96.0), label, v, dest) {
                         self.kb_set_organ_param(param, nv);
                     }
                     ui.add_space(4.0);
@@ -19761,7 +19984,8 @@ impl DemoApp {
         }).unwrap_or_default();
         let n_macros = if deck_h < 50.0 { 2 } else { 4 };
         for (label, v) in mains.iter().take(n_macros) {
-            if let Some(nv) = self.kb_mini_knob(ui, (deck_h * 0.4).clamp(32.0, 72.0), (deck_h - 4.0).min(96.0), label, *v) {
+            let dest = self.kb_main_dest(target, label);
+            if let Some(nv) = self.kb_mini_knob(ui, (deck_h * 0.4).clamp(32.0, 72.0), (deck_h - 4.0).min(96.0), label, *v, dest) {
                 if let Some(t) = target {
                     if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == *label && k.source != KnobSource::BuiltIn) {
                         k.set_immediate(nv);
@@ -19827,9 +20051,11 @@ impl DemoApp {
         } else {
             "no Arp unit in this rig — add one (Plugins view, or ask the agent)"
         };
-        if theme::chip_button(ui, "ARP", arp == Some(true)).on_hover_text(tip).clicked() {
+        let arp_resp = theme::chip_button(ui, "ARP", arp == Some(true)).on_hover_text(tip);
+        if arp_resp.clicked() {
             self.kb_arp_toggle();
         }
+        self.instrument_learn_ui(ui, &arp_resp, arp_resp.rect, self.kb_arp_dest());
         ui.add_space(4.0);
         if theme::chip_button(ui, self.kb_synth_drag.label(), false)
             .on_hover_text("horizontal drag: GLISS slides note-to-note, SLIDE bends the held note")
@@ -19842,9 +20068,10 @@ impl DemoApp {
         }
         ui.add_space(8.0);
         let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain)
-            .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts");
+            .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts · right-click for MIDI learn");
         strip[2] = sus.rect;
         if sus.clicked() { self.kb_toggle_sustain(); }
+        self.instrument_learn_ui(ui, &sus, sus.rect, self.kb_midi_cc_dest(64));
         ui.add_space(8.0);
         strip[3] = self.kb_vel_slider(ui, 90.0);
     }
@@ -20013,6 +20240,9 @@ impl DemoApp {
                 Vec2::new(t_rect.width() - 6.0, 4.0),
             );
             painter.rect_filled(thumb, 1.0, theme::CREAM);
+            if !spring {
+                self.instrument_learn_ui(ui, &resp, t_rect, self.kb_midi_cc_dest(1));
+            }
             ui.add_space(2.0);
             ui.label(egui::RichText::new(label).size(9.5).color(theme::INK_2));
         });
@@ -22084,22 +22314,49 @@ impl DemoApp {
             return;
         }
 
-        if right_clicked {
+        // Expanded console covers the whole window: never hit-test the hidden
+        // rack underneath, only let a primary click outside dismiss knob_menu.
+        if self.dock == DockView::Keyboard && self.kb_expanded {
+            if self.knob_menu.is_some() && self.knob_menu_rect.contains(s) {
+                self.hover = Some(Hit::Background);
+                return;
+            }
+            if pressed && self.knob_menu.is_some() {
+                self.knob_menu = None;
+            }
+            self.hover = Some(Hit::Background);
+            return;
+        }
+
+        if right_clicked && !self.dock_rect.contains(s) {
             if self.pending.is_some() {
                 self.pending = None;
             } else if self.side == Side::Front {
-                if let Hit::Knob { unit, idx } = self.hit_test(s) {
-                    let node_id = self.units[unit].node_id;
-                    let target = self.units[unit].knobs[idx].cc_target();
-                    if let Some((param, tgt)) = target {
-                        self.cc_right_click((node_id, param, tgt), s);
-                    } else {
-                        self.knob_menu = None;
-                        self.units[unit].knobs[idx].value = self.units[unit].knobs[idx].default;
+                match self.hit_test(s) {
+                    Hit::Knob { unit, idx } => {
+                        let node_id = self.units[unit].node_id;
+                        let target = self.units[unit].knobs[idx].cc_target();
+                        if let Some((param, tgt)) = target {
+                            self.cc_right_click((node_id, param, tgt), s);
+                        } else {
+                            self.knob_menu = None;
+                            self.units[unit].knobs[idx].value = self.units[unit].knobs[idx].default;
+                        }
                     }
-                } else {
-                    self.knob_menu = None;
-                    self.cc_learn = None;
+                    Hit::Unit(ui) => {
+                        let lp = self.xf.inv(s).to_pos2();
+                        if let Some(bar) = self.drawbar_rects(ui).and_then(|b| b.iter().position(|r| r.contains(lp))) {
+                            let node_id = self.units[ui].node_id;
+                            self.cc_right_click((node_id, crate::organ::drawbar_param(bar), CcTarget::Knob), s);
+                        } else {
+                            self.knob_menu = None;
+                            self.cc_learn = None;
+                        }
+                    }
+                    _ => {
+                        self.knob_menu = None;
+                        self.cc_learn = None;
+                    }
                 }
             } else {
                 self.knob_menu = None;
@@ -24468,8 +24725,20 @@ impl DemoApp {
             self.face_text(painter, Pos2::new(slot.center().x, slot.top() + 6.0), crate::organ::FOOTAGES[i],
                 FontId::proportional(10.0), if hov { TEXT } else { SUBTEXT });
             let track = Self::drawbar_track(*slot);
+            let learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == u.node_id && l.param == param && l.target == CcTarget::Knob);
+            let bound = self.knob_cc_binding(u.node_id, param, CcTarget::Knob);
             painter.rect_filled(xf.rect(track), 2.0, CHASSIS);
-            painter.rect_stroke(xf.rect(track), 2.0, Stroke::new(1.0, if hov { theme::CREAM_DIM } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+            let border = if learning {
+                let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
+                Stroke::new(2.0, alpha(mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse), 0.75 + 0.25 * pulse))
+            } else if bound.is_some() {
+                Stroke::new(1.5, theme::MIDI_BLUE)
+            } else if hov {
+                Stroke::new(1.0, theme::CREAM_DIM)
+            } else {
+                Stroke::new(1.0, theme::HAIRLINE)
+            };
+            painter.rect_stroke(xf.rect(track), 2.0, border, egui::StrokeKind::Inside);
             let (cap, ink) = match i {
                 0 | 1 => (theme::DRAWBAR_BROWN, theme::CREAM),
                 // Mutations: black caps on an organ; mid-grey here so they
@@ -25482,16 +25751,21 @@ impl DemoApp {
             app.knob_menu = None;
             app.knob_menu_rect = Rect::NOTHING;
         };
-        let shown = match self.stage_view {
-            StageView::Rack => self.side == Side::Front,
-            StageView::Mixer => true,
-            _ => false,
+        let shown = if menu.from_dock {
+            self.dock == DockView::Keyboard
+        } else {
+            let stage_ok = match self.stage_view {
+                StageView::Rack => self.side == Side::Front,
+                StageView::Mixer => true,
+                _ => false,
+            };
+            stage_ok && self.stage_view == menu.stage
         };
-        if !shown || self.stage_view != menu.stage {
+        if !shown {
             return close(self);
         }
         let (node_id, param, target) = (menu.node, menu.param, menu.target);
-        // A mixer control (#75) has a binding and no knob: no value to reset.
+        // A mixer control (#75) or MidiCc control has a binding and no knob: no value to reset.
         let knob = self.knob_menu_target(&menu);
         let Some(title) = self.cc_dest_title((node_id, param, target)) else { return close(self) };
         let active_learn = self.cc_learn.as_ref().filter(|l| l.dest == node_id && l.param == param && l.target == target).cloned();
@@ -25507,7 +25781,7 @@ impl DemoApp {
         let mut cancel_learn = false;
         let mut clear = false;
         let mut reset_val = false;
-        let switch = target == CcTarget::Mix && MixControl::from_param(param).is_some_and(|c| c.is_switch());
+        let switch = cc_dest_is_switch(target, param);
         let ranged = mapping.filter(|(_, m)| m.scale.is_continuous() && !learning && !switch);
         let (mut lo_pct, mut hi_pct) = ranged.map_or((0.0, 100.0), |(_, m)| {
             let (lo, hi) = m.scale.bounds();
@@ -26814,7 +27088,13 @@ impl DemoApp {
             if self.dock == DockView::Keyboard && self.kb_expanded
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
             {
-                self.kb_expanded = false;
+                if self.knob_menu.is_some() {
+                    self.knob_menu = None;
+                } else if self.cc_learn.is_some() {
+                    self.cc_learn = None;
+                } else {
+                    self.kb_expanded = false;
+                }
             }
             // Agent undo/redo (Ctrl+Shift+Z first: Ctrl+Z would match it too).
             let redo = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
@@ -32471,7 +32751,7 @@ mod split_bpm_tests {
         let surge_unit = 1usize;
         let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let node = app.units[surge_unit].node_id;
-        let menu = KnobMenu { node, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, pos: Pos2::ZERO, stage: StageView::Rack };
+        let menu = KnobMenu { node, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, pos: Pos2::ZERO, stage: StageView::Rack, from_dock: false };
         assert_eq!(app.knob_menu_target(&menu), Some((surge_unit, level_idx)));
         app.units.swap(0, surge_unit);
         assert_eq!(app.knob_menu_target(&menu), Some((0, level_idx)), "follows the unit to its new index");
@@ -38675,7 +38955,7 @@ mod mixer_parity_tests {
             let wi = app.units[m].knob_index("WARM").unwrap();
             let (param, target) = app.units[m].knobs[wi].cc_target().unwrap();
             let pos = app.xf.p(app.knob_center(m, wi));
-            app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack });
+            app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack, from_dock: false });
             super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
         }
     }
@@ -38718,7 +38998,7 @@ mod mixer_parity_tests {
         let (param, target) = app.units[m].knobs[wi].cc_target().unwrap();
         app.set_cc_scaled(SourceId::Hardware(1), node, 1, Some(param), target, crate::matrix::CcScale::input_range(64, 104));
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 1, 84));
-        app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack });
+        app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack, from_dock: false });
         super::offline_shots::shot(&mut app, size, &dir.join("midi-learn-input-range-menu.png"));
     }
 
@@ -39675,6 +39955,229 @@ mod mixer_midi_learn_tests {
             }
             super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
         }
+    }
+}
+
+#[cfg(test)]
+mod instrument_midi_learn_tests {
+    use super::*;
+    use crate::control::{Graph, Lv2Uri, NodeKind};
+    use crate::matrix::{CcTarget, SourceId};
+
+    const SIZE: Vec2 = Vec2 { x: 1400.0, y: 900.0 };
+
+    fn organ_graph() -> (Graph, u32) {
+        let mut g = Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: organ, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        (g, organ)
+    }
+
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, SIZE));
+        raw.events = events;
+        raw.time = Some(app.ui_time as f64 + 1.0);
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+    }
+
+    fn rclick(app: &mut DemoApp, ctx: &egui::Context, pos: Pos2) {
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(app, ctx, vec![egui::Event::PointerMoved(pos)]);
+        frame(app, ctx, vec![b(true)]);
+        frame(app, ctx, vec![b(false)]);
+        frame(app, ctx, vec![]);
+    }
+
+    fn cc(app: &mut DemoApp, ctx: &egui::Context, dev: u32, cc: u8, val: u8) {
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(dev), 0, cc, val));
+        frame(app, ctx, vec![]);
+    }
+
+    fn organ_console_app() -> (DemoApp, egui::Context, crate::control::CommandDrain, u32) {
+        let mut app = DemoApp::new_with_sink(None);
+        let (bus_tx, drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus_tx)));
+        let (g, organ) = organ_graph();
+        app.build_rack(&g, &[]);
+        app.dock = DockView::Keyboard;
+        app.kb_expanded = true;
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        (app, ctx, drain, organ)
+    }
+
+    /// Continuous learns keep listening until the controller is still for
+    /// `LEARN_SETTLE_SECS` (range capture); let it settle.
+    fn settle_learn(app: &mut DemoApp, ctx: &egui::Context) {
+        assert!(app.cc_learn.as_ref().is_some_and(|l| l.capture.is_some()), "learn captured the CC and waits to settle");
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(app, ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "learn finished after settling");
+    }
+
+    fn rect_for(app: &DemoApp, dest: CcDest) -> Rect {
+        app.kb_learn_rects.iter().find(|(d, _)| *d == dest).map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("no learnable control for {dest:?} in {:?}", app.kb_learn_rects.iter().map(|(d, _)| d).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn organ_console_swell_and_buttons_learn_and_sync_from_hardware() {
+        let (mut app, ctx, mut drain, organ) = organ_console_app();
+        while drain.pop().is_some() {}
+
+        // 1. Right-click SWELL shoe → arms MIDI learn for (organ, 11, MidiCc).
+        let swell_dest = (organ, 11, CcTarget::MidiCc);
+        let swell_r = rect_for(&app, swell_dest);
+        rclick(&mut app, &ctx, swell_r.center());
+        assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == swell_dest),
+            "right-click on SWELL arms MIDI learn: {:?}", app.cc_learn.as_ref().map(|l| (l.dest, l.param, l.target)));
+
+        // Hardware CC 74 completes learn, sends MatrixCcMap + catch-up CC, and moves kb_swell.
+        cc(&mut app, &ctx, 1, 74, 32);
+        settle_learn(&mut app, &ctx);
+        assert!((app.kb_swell - 32.0 / 127.0).abs() < 1e-4, "kb_swell synced immediately: {}", app.kb_swell);
+        let mut cmds = Vec::new();
+        while let Some(c) = drain.pop() { cmds.push(c); }
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(1), dest, cc: 74, param: Some(11), target: CcTarget::MidiCc, .. } if *dest == organ)),
+            "sent MatrixCcMap for SWELL: {cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::Cc { source: SourceId::Hardware(1), cc: 74, value: 32, .. })),
+            "rule 51 catch-up CC sent: {cmds:?}");
+
+        // Subsequent hardware CC 74 moves kb_swell smoothly.
+        cc(&mut app, &ctx, 1, 74, 127);
+        assert!((app.kb_swell - 1.0).abs() < 1e-4, "kb_swell followed CC 74 to 1.0");
+
+        // Second right-click on bound SWELL opens KnobMenu and stays open on the expanded console.
+        rclick(&mut app, &ctx, swell_r.center());
+        assert!(app.knob_menu.as_ref().is_some_and(|m| m.from_dock && m.target == CcTarget::MidiCc && m.param == 11),
+            "KnobMenu opened on expanded console");
+        assert_eq!(app.cc_dest_title(swell_dest).as_deref(), Some("Organ · Swell"));
+
+        // Escape closes KnobMenu without collapsing the expanded console.
+        frame(&mut app, &ctx, vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        assert!(app.knob_menu.is_none() && app.kb_expanded, "Esc closed menu while keeping console expanded");
+
+        // 2. Right-click ROTARY (Leslie) button group → arms learn, hardware CC 82 syncs Leslie.
+        let leslie_dest = (organ, crate::organ::P_LESLIE, CcTarget::Knob);
+        let leslie_r = rect_for(&app, leslie_dest);
+        rclick(&mut app, &ctx, leslie_r.center());
+        assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == leslie_dest));
+        cc(&mut app, &ctx, 1, 82, 127);
+        settle_learn(&mut app, &ctx);
+        assert_eq!(crate::organ::step_name(crate::organ::P_LESLIE, app.kb_organ_value(crate::organ::P_LESLIE)), Some("FAST"),
+            "hardware CC synced Leslie buttons to FAST");
+
+        // 3. Right-click a drawbar → arms learn, hardware CC 18 syncs drawbar.
+        let bar_dest = (organ, crate::organ::drawbar_param(2), CcTarget::Knob);
+        let bar_r = rect_for(&app, bar_dest);
+        rclick(&mut app, &ctx, bar_r.center());
+        assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == bar_dest));
+        cc(&mut app, &ctx, 1, 18, 64);
+        settle_learn(&mut app, &ctx);
+        assert_eq!(crate::organ::drawbar_position(app.kb_organ_value(crate::organ::drawbar_param(2))), 4,
+            "hardware CC synced 8' drawbar to position 4");
+    }
+
+    #[test]
+    fn set_param_never_sends_a_pedal_name_as_a_parameter_id() {
+        let (mut app, _ctx, mut drain, organ) = organ_console_app();
+        while drain.pop().is_some() {}
+        let out = app.exec_tool("set_param", &serde_json::json!({"node": organ, "name": "swell", "normalized": 0.5}));
+        assert!(out.starts_with("error:") && out.contains("MIDI CC 11") && out.contains("set_cc_map"), "{out}");
+        let out = app.exec_tool("set_param", &serde_json::json!({"node": organ, "param": 11, "target": "cc", "normalized": 0.5}));
+        assert!(out.starts_with("error:"), "{out}");
+        let mut cmds = Vec::new();
+        while let Some(c) = drain.pop() { cmds.push(c); }
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SetParam { param: 11, .. })), "{cmds:?}");
+    }
+
+    #[test]
+    fn a_learned_sustain_pedal_is_a_switch_and_binds_on_the_first_cc() {
+        let (mut app, ctx, _drain, organ) = organ_console_app();
+        app.cc_learn = Some(CcLearn::new(SourceId::Keys, organ, 64, CcTarget::MidiCc, true));
+        app.feed_cc_learn(SourceId::Hardware(1), 66, 127);
+        assert!(app.cc_learn.is_none(), "a pedal learn finishes on its first CC, no range capture");
+        let e = app.rule_edits.get(&(SourceId::Hardware(1), organ)).expect("binding stored");
+        assert!(e.cc_map.iter().any(|m| m.cc == 66 && m.param == 64 && m.target == CcTarget::MidiCc
+            && m.scale == crate::matrix::CcScale::IDENTITY), "{:?}", e.cc_map);
+        frame(&mut app, &ctx, vec![]);
+    }
+
+    #[test]
+    fn unmapped_hardware_pedals_and_wheels_sync_to_interface() {
+        let (mut app, ctx, _drain, _organ) = organ_console_app();
+        // Transparent hardware CC 11 moves kb_swell without any MIDI learn binding.
+        cc(&mut app, &ctx, 0, 11, 0);
+        assert!(app.kb_swell.abs() < 1e-4, "passthrough CC 11 closed swell: {}", app.kb_swell);
+        // Transparent hardware CC 64 presses SUSTAIN, CC 67 presses SOFT.
+        cc(&mut app, &ctx, 0, 64, 127);
+        assert!(app.kb_sustain, "passthrough CC 64 engaged sustain");
+        cc(&mut app, &ctx, 0, 64, 0);
+        assert!(!app.kb_sustain, "passthrough CC 64 released sustain");
+        cc(&mut app, &ctx, 0, 67, 127);
+        assert!(app.kb_soft, "passthrough CC 67 engaged soft pedal");
+    }
+
+    #[test]
+    fn organ_console_midi_learn_works_via_agent_tools() {
+        let (mut app, ctx, _drain, organ) = organ_console_app();
+        let out = app.exec_tool("set_cc_map", &serde_json::json!({"node": organ, "source": "hw:2", "cc": 4, "knob": "swell", "min": 0.25, "max": 0.75}));
+        assert!(out.contains("\"target\":\"cc\"") && out.contains("\"param\":11"), "{out}");
+        cc(&mut app, &ctx, 2, 4, 127);
+        assert!((app.kb_swell - 95.0 / 127.0).abs() < 1e-3, "max=0.75 caps swell: {}", app.kb_swell);
+        let listed = app.exec_tool("list_cc_maps", &serde_json::json!({}));
+        assert!(listed.contains("Swell (MIDI CC)"), "{listed}");
+    }
+
+    /// Screenshots of the Organ console with MIDI-learned controls & active learn state:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat instrument_midi_learn_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn instrument_midi_learn_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dev = SourceId::Hardware(0);
+
+        // 1. Jazz Organ expanded console: SWELL bound to CC 11, ROTARY to CC 82,
+        //    8' drawbar learning, DRIVE to CC 111.
+        let mut app = DemoApp::new_with_sink(None);
+        let (g, organ) = organ_graph();
+        app.build_rack(&g, &[]);
+        app.dock = DockView::Keyboard;
+        app.kb_expanded = true;
+        app.set_cc_binding(dev, organ, 11, Some(11), CcTarget::MidiCc);
+        app.set_cc_binding(dev, organ, 82, Some(crate::organ::P_LESLIE), CcTarget::Knob);
+        app.set_cc_binding(dev, organ, 111, Some(crate::organ::P_DRIVE), CcTarget::Knob);
+        app.apply_cc_to_knobs(dev, 0, 11, 88, false);
+        app.apply_cc_to_knobs(dev, 0, 82, 127, false);
+        app.apply_cc_to_knobs(dev, 0, 111, 76, false);
+        app.cc_learn = Some(CcLearn {
+            source: SourceId::Keys,
+            dest: organ,
+            param: crate::organ::drawbar_param(2),
+            target: CcTarget::Knob,
+            replace_existing: true,
+            capture: None,
+        });
+        super::offline_shots::shot(&mut app, SIZE, &dir.join("organ-console-midi-learn.png"));
+
+        // 2. Jazz Organ dock (non-expanded) with SWELL & LESLIE bound.
+        let mut app2 = DemoApp::new_with_sink(None);
+        let (g2, organ2) = organ_graph();
+        app2.build_rack(&g2, &[]);
+        app2.dock = DockView::Keyboard;
+        app2.set_cc_binding(dev, organ2, 11, Some(11), CcTarget::MidiCc);
+        app2.set_cc_binding(dev, organ2, 82, Some(crate::organ::P_LESLIE), CcTarget::Knob);
+        app2.set_cc_binding(dev, organ2, 18, Some(crate::organ::drawbar_param(2)), CcTarget::Knob);
+        app2.apply_cc_to_knobs(dev, 0, 11, 96, false);
+        app2.apply_cc_to_knobs(dev, 0, 82, 127, false);
+        super::offline_shots::shot(&mut app2, SIZE, &dir.join("organ-dock-midi-learn.png"));
     }
 }
 

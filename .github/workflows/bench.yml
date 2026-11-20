@@ -2,12 +2,14 @@ name: Bench tests
 
 # Most development runs on headless servers, so a PR can merge with checks
 # still owed on real hardware (AGENTS.md, "Bench tests"). Every PR body says
-# what is left under `## Bench test`. `bench-check` fails a PR whose section
-# is missing or malformed (advisory, like readme-check). When a PR merges,
-# `bench-issue` turns the section into one issue labelled `bench`, which a
-# bench session on a machine with the devices picks up; a PR that merged
-# without a valid section still gets an issue, asking for the steps. Open
-# bench issues hold back prepare-release.yml.
+# what is left under `## Bench test`. Regular PRs are not checked by
+# `bench-check` so they merge automatically on green CI; when a PR merges,
+# `bench-issue` turns its section into one issue labelled `bench`, which a
+# bench session on a machine with the devices picks up (a PR that merged
+# without a valid section still gets an issue, asking for the steps).
+# `bench-check` runs only on release PRs (`release-*`) and runs
+# `bench.py gate`, failing while any `bench` or `bench-failed` issue is open
+# (matching prepare-release.yml).
 #
 # The merge job runs on pull_request_target so a fork's PR can open the
 # issue too. It checks out main, never the PR's head, and reads the PR's
@@ -15,7 +17,7 @@ name: Bench tests
 # Re-run or backfill one PR: gh workflow run bench.yml -f pr=<number>
 on:
   pull_request:
-    types: [opened, edited, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review]
   pull_request_target:
     types: [closed]
   workflow_dispatch:
@@ -35,20 +37,22 @@ permissions:
 jobs:
   check:
     name: bench-check
-    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
+    if: >-
+      ${{ github.event_name == 'pull_request'
+      && !github.event.pull_request.draft
+      && startsWith(github.event.pull_request.head.ref, 'release-') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      pull-requests: read
+      issues: read
     steps:
       - uses: actions/checkout@v7
       - name: The parser reads real PR bodies
         run: python3 scripts/ci/bench.py --selftest
-      - name: The PR says what is left to test on real hardware
+      - name: Every merged change is tested on real hardware
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: python3 scripts/ci/bench.py check --pr "$PR"
+        run: python3 scripts/ci/bench.py gate
 
   issue:
     name: bench-issue

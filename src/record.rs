@@ -1775,6 +1775,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// In 3/4 the bar lines are beats 3, 6, 9 (#87): a start pressed at beat
+    /// 1 begins at 3, a stop pressed at beat 4 ends at 6, and a signature
+    /// set while a start waits moves it to the new bar line.
+    #[test]
+    fn bar_quantized_start_and_stop_follow_the_time_signature() {
+        const SR: f64 = 48000.0;
+        const BLOCK: usize = 480; // 0.02 beats/block at 120 BPM
+        let dir = temp_dir("bar-quant-34");
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, SR, vec![]);
+        let (tap, shared) = start_with_capacity(dir.clone(), SR as u32, 2, SR as usize * 2 * 4);
+        engine.set_recorder(tap);
+        let mut buf = [0.0f32; BLOCK * 2];
+        // Render until the song clock is at `beat`; the next block applies
+        // whatever is due there.
+        fn run_to(engine: &mut GraphEngine, buf: &mut [f32], beat: f64, mut each: impl FnMut()) {
+            while engine.transport().beats < beat - 1e-6 {
+                engine.render(buf, 2);
+                each();
+            }
+        }
+
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetTimeSignature { num: 3, den: 4 });
+        bus.send(Command::TransportPlay);
+        run_to(&mut engine, &mut buf, 1.0, || {});
+        bus.send(Command::RecordStart);
+        run_to(&mut engine, &mut buf, 3.0, || {});
+        assert!(!shared.is_recording() && shared.is_pending(), "waits for the bar line at beat 3");
+        engine.render(&mut buf, 2);
+        assert!(shared.is_recording() && !shared.is_pending(), "starts at beat 3, not 4");
+
+        run_to(&mut engine, &mut buf, 4.0, || {});
+        bus.send(Command::RecordStop);
+        run_to(&mut engine, &mut buf, 6.0, || {});
+        assert!(shared.is_recording() && shared.is_pending(), "keeps recording until beat 6");
+        engine.render(&mut buf, 2);
+        assert!(!shared.is_recording() && !shared.is_pending(), "stops at beat 6, not 8");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            let s = shared.snapshot();
+            if s.finalized && !s.recording {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "did not finalize");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!((status.seconds - 1.5).abs() < 0.02, "expected one 3/4 bar (1.5 s), got {} s", status.seconds);
+
+        // Pressed at beat 7 in 3/4 it would wait for 9; in 5/4, set while it
+        // waits, the next bar line is 10.
+        run_to(&mut engine, &mut buf, 7.0, || {});
+        bus.send(Command::RecordStart);
+        engine.render(&mut buf, 2);
+        bus.send(Command::SetTimeSignature { num: 5, den: 4 });
+        run_to(&mut engine, &mut buf, 10.0, || {});
+        assert!(!shared.is_recording() && shared.is_pending(), "beat 9 is no bar line in 5/4");
+        engine.render(&mut buf, 2);
+        assert!(shared.is_recording(), "starts at beat 10");
+        drop(engine);
+        shared.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn bar_quantized_start_and_stop_while_transport_rolls() {
         const SR: f64 = 48000.0;

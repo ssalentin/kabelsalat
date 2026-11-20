@@ -598,6 +598,9 @@ fn system_prompt() -> String {
      song clock CLAP plugins follow: play runs it from beat 0, stop halts it. \
      set_count_in(enabled, bars) enables/configures a count-in bar of clicks before \
      the song clock starts (and the user can tap tempo with Shift+T or TAP on a metronome). \
+     set_time_signature(numerator, denominator) sets the bar: 3 and 4 for a waltz, 6 and 8 \
+     for 6/8. The metronome accents each bar's first beat, and the count-in and every \
+     bar-quantized start follow it; get_status shows it as time_signature. \
      get_midi_clock/set_midi_clock control the MIDI Clock Send: kabelsalat as the master \
      beat clock (24 per beat, Start/Stop) for external hardware and apps.\n\
      - Sessions: save_session/load_session/list_sessions.\n\
@@ -1009,6 +1012,11 @@ pub(crate) fn tools() -> Value {
             "name":"set_count_in",
             "description":"Enable/disable master transport count-in or set its length in bars (1..=4). When enabled, master play plays N bars of metronome clicks before the song clock and plugins start at beat 0.",
             "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"bars":{"type":"integer"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_time_signature",
+            "description":"Set the time signature: numerator = beats per bar (1..=12), denominator = the note value of one beat (2, 4, 8 or 16). The metronome accents the first beat of each bar and clicks once per beat (eighths in x/8), the count-in lasts whole bars of it, bar-quantized recording and file-player starts wait for its bar line, and hosted plugins are told. Saved with the session; tempo stays in quarter notes per minute.",
+            "parameters":{"type":"object","properties":{"numerator":{"type":"integer"},"denominator":{"type":"integer"}},"required":["numerator","denominator"]}
         }},
         {"type":"function","function":{
             "name":"get_midi_clock",

@@ -449,6 +449,15 @@ struct SetBpmArgs {
     bpm: f32,
 }
 
+/// Arguments for `set_time_signature`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetTimeSignatureArgs {
+    /// Beats per bar, 1..=12 (the 3 of 3/4).
+    numerator: u8,
+    /// The note value of one beat: 2, 4, 8 or 16 (the 4 of 3/4).
+    denominator: u8,
+}
+
 /// Arguments for `set_count_in`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetCountInArgs {
@@ -1362,6 +1371,7 @@ impl McpServer {
             Some(t) => (t.playing, t.counting_in, t.count_in_beat, t.count_in_enabled, t.count_in_bars, t.bpm, t.record_sync),
             None => (st.playing, false, 0, st.count_in_enabled, st.count_in_bars, 96.0, st.record_sync),
         };
+        let time_sig = tp.map_or(crate::transport::TimeSig::FOUR_FOUR, |t| t.time_sig);
         let meter = st
             .graph_pub
             .as_ref()
@@ -1386,6 +1396,7 @@ impl McpServer {
             "count_in_beat": count_in_beat,
             "count_in_enabled": count_in_enabled,
             "count_in_bars": count_in_bars,
+            "time_signature": time_sig.to_json(),
             "record_sync": record_sync,
             "bpm": bpm,
             "buffer_frames": counters.buffer_frames(),
@@ -3286,6 +3297,20 @@ impl McpServer {
         ok_json(json!({"bpm": bpm}))
     }
 
+    /// Set the time signature.
+    #[tool(name = "set_time_signature", description = "Set the time signature (Command::SetTimeSignature): numerator = beats per bar (1..=12), denominator = the note value of one beat (2, 4, 8 or 16), e.g. 3 and 4 for a waltz, 6 and 8 for 6/8. The metronome accents the first beat of each bar and clicks once per beat (eighths in x/8); the count-in lasts whole bars of it; bar-quantized starts (recording start/stop, a synced file player) wait for its bar line; hosted plugins are told. It is saved with the session. Tempo stays in quarter notes per minute. get_status reads it back as time_signature.")]
+    fn set_time_signature(&self, Parameters(args): Parameters<SetTimeSignatureArgs>) -> Result<CallToolResult, McpError> {
+        let sig = match crate::transport::TimeSig::checked(args.numerator as u64, args.denominator as u64) {
+            Ok(sig) => sig,
+            Err(e) => return tool_err(e),
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::SetTimeSignature { num: sig.num, den: sig.den }) {
+            return tool_err(e);
+        }
+        ok_json(sig.to_json())
+    }
+
     /// Configure master transport count-in.
     #[tool(name = "set_count_in", description = "Configure master transport count-in (Command::SetCountIn): plays N bars (1..=4, default 1) of metronome clicks before the song clock starts at beat 0. Pass enabled (bool) and/or bars (0 disables, 1..=4 enables).")]
     fn set_count_in(&self, Parameters(args): Parameters<SetCountInArgs>) -> Result<CallToolResult, McpError> {
@@ -4248,6 +4273,26 @@ mod tests {
         let p = published.lock().unwrap();
         assert_eq!(p.mix[0], crate::engine::RigMix { vol: 64.0 / 127.0, pan: 0.0, mute: true, solo: false });
         assert!(p.strips.iter().any(|s| s.node == 1 && s.mix.pan == -1.0), "the source strip is panned hard left");
+    }
+
+    #[test]
+    fn set_time_signature_reaches_the_engine_and_reads_back_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 480 * 2];
+        engine.render(&mut buf, 2);
+        assert_eq!(tool_json(&server.get_status())["time_signature"], json!({"numerator": 4, "denominator": 4}));
+        let set = tool_json(&server.set_time_signature(Parameters(SetTimeSignatureArgs { numerator: 6, denominator: 8 })));
+        assert_eq!(set, json!({"numerator": 6, "denominator": 8}));
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.transport().sig, crate::transport::TimeSig { num: 6, den: 8 }, "the engine holds it");
+        assert_eq!(tool_json(&server.get_status())["time_signature"], json!({"numerator": 6, "denominator": 8}));
+        // A bar the clock cannot count is refused and changes nothing.
+        for (n, d) in [(0, 4), (13, 4), (4, 3)] {
+            let bad = server.set_time_signature(Parameters(SetTimeSignatureArgs { numerator: n, denominator: d }));
+            assert_eq!(bad.unwrap().is_error, Some(true), "{n}/{d} must be refused");
+        }
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.transport().sig, crate::transport::TimeSig { num: 6, den: 8 });
     }
 
     #[test]

@@ -252,6 +252,16 @@ only loud notes.
 
 <p align="center"><img src="docs/shots/matrix.png" width="85%" alt="The MIDI matrix: keyboard and hardware sources routed to two rigs"/></p>
 
+### Count in any metre
+The metronome follows the time signature you pick: beats per bar and the note
+that counts as one, under **Settings → Session**, or the chip on the metronome
+that steps through 4/4, 3/4, 6/8, 5/4, 7/8 and 2/4. The first beat of each bar
+clicks higher, the count-in lasts whole bars, and recording and a synced backing
+track start and stop on the bar lines of that signature. Plugins you host are
+told it too, and it is saved with the session.
+
+<p align="center"><img src="docs/shots/time-signature.png" width="85%" alt="The rack with a Metronome unit showing PLAY, tempo steppers, TAP, COUNT-IN and the 6/8 time-signature chip"/></p>
+
 ### Be the clock
 Switch on MIDI Clock Send in the matrix view and kabelsalat becomes the master
 clock: 24 clocks per beat plus Start and Stop go to the MIDI outputs you wire

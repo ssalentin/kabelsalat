@@ -716,6 +716,21 @@ mod engine_tests {
         assert!((gap_a - 60.0 / 90.0).abs() < 2e-3, "beat gap at 90 BPM = {gap_a} s");
     }
 
+    /// In 3/4 the next bar line after beat 5.3 is beat 6, not 8 (#87).
+    #[test]
+    fn play_enable_waits_for_the_bar_line_of_the_time_signature() {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 120.0 });
+        r.send(Command::SetTimeSignature { num: 3, den: 4 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(4.0), offset: None, bpm: Some(100.0) });
+        r.send(Command::TransportPlay);
+        r.run((2.65 * OUT_SR) as usize, 512, |_, _, _| {}); // beat 5.3
+        r.load(aligned_loop(100.0));
+        let on = r.onsets(5 * 48_000, 512);
+        assert!(r.state().playing && !r.state().pending, "{:?}", r.state());
+        assert!((on[0] - 6.0).abs() < frames_to_beats(3.0, 120.0), "first onset at beat {}, wanted the bar line 6", on[0]);
+    }
+
     /// Sync + a rolling transport: enabling mid-bar waits for the NEXT bar
     /// line (beat 8 after beat 5.3), and the loop then sits on the grid.
     #[test]

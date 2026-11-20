@@ -1009,6 +1009,7 @@ fn remap_session(
     ns.rig_names = s.rig_names.clone(); // names follow their rig (#33)
     ns.master_target = s.master_target; // session-level, no node ids (#12)
     ns.keyboard_mode = s.keyboard_mode; // session-level, no node ids (#163)
+    ns.time_sig = s.time_sig; // session-level too (#87)
     for p in s.params() {
         if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
     }
@@ -2192,6 +2193,8 @@ const BPM_STEP_W: f32 = 22.0;
 const BPM_VALUE_W: f32 = 66.0;
 const METRO_TAP_W: f32 = 48.0;
 const METRO_COUNT_IN_W: f32 = 84.0;
+/// Time-signature chip: "12/16" in Medium 12 plus 8 px each side (rule 7).
+const METRO_SIG_W: f32 = 52.0;
 
 /// Metronome-face BPM control rects (rack-local).
 #[derive(Clone, Copy, Debug)]
@@ -2223,6 +2226,8 @@ const ZONE_VALUE_W: f32 = 70.0;
 struct MetroActionRects {
     tap: Rect,
     count_in: Rect,
+    /// Time signature, where the face has room beside COUNT-IN.
+    sig: Option<Rect>,
     compact: bool,
 }
 
@@ -2344,6 +2349,7 @@ enum SettingsAction {
     ToggleReduceMotion,
     ToggleAutosave,
     SetCountIn(bool, u8),
+    SetTimeSig(crate::transport::TimeSig),
     SetAudioOutput(Option<String>),
     SetBufferSize(u32),
 }
@@ -2696,6 +2702,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_midi_clock", "set_midi_clock",
     "get_master_target", "set_master_target",
     "get_keyboard_state", "set_keyboard_mode",
+    "set_time_signature",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2926,6 +2933,8 @@ struct DemoApp {
     tap_flash_t: f32,
     count_in_enabled: bool,
     count_in_bars: u8,
+    /// The session's time signature (#87), mirrored from the engine.
+    time_sig: crate::transport::TimeSig,
     counting_in: bool,
     count_in_beat: u8,
     last_transport_rev: u64,
@@ -3574,6 +3583,7 @@ impl DemoApp {
             tap_flash_t: 0.0,
             count_in_enabled: false,
             count_in_bars: 1,
+            time_sig: crate::transport::TimeSig::FOUR_FOUR,
             counting_in: false,
             count_in_beat: 0,
             last_transport_rev: 0,
@@ -5093,6 +5103,7 @@ impl DemoApp {
                     || bpm_diff
                     || g.transport.count_in_enabled != self.count_in_enabled
                     || g.transport.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS) != self.count_in_bars
+                    || g.transport.time_sig != self.time_sig
                     || g.transport.record_sync != self.record_sync)
             {
                 transport_changed = true;
@@ -5101,6 +5112,7 @@ impl DemoApp {
             self.count_in_beat = g.transport.count_in_beat;
             self.count_in_enabled = g.transport.count_in_enabled;
             self.count_in_bars = g.transport.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS);
+            self.time_sig = g.transport.time_sig;
             self.record_sync = g.transport.record_sync;
             if !matches!(self.drag, Drag::Bpm { .. }) {
                 self.bpm = g.transport.bpm;
@@ -5689,6 +5701,11 @@ impl DemoApp {
             "transport_stop" => "Stop transport".into(),
             "set_bpm" => format!("Tempo → {} BPM", args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(120.0).round() as u32),
             "set_count_in" => "Set count-in".into(),
+            "set_time_signature" => format!(
+                "Time signature → {}/{}",
+                args.get("numerator").and_then(|v| v.as_u64()).unwrap_or(4),
+                args.get("denominator").and_then(|v| v.as_u64()).unwrap_or(4),
+            ),
             "get_midi_clock" => "MIDI clock status".into(),
             "set_midi_clock" => "Set MIDI clock".into(),
             "record_start" => "Start recording".into(),
@@ -6244,6 +6261,7 @@ impl DemoApp {
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
         s.master_target = Some(self.master_target);
         s.keyboard_mode = Some(self.kb_mode);
+        s.time_sig = Some(self.time_sig);
         // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
         // display order, keyed by node like every other session value.
         for u in &self.units {
@@ -6486,6 +6504,11 @@ impl DemoApp {
         if let Some(mode) = s.keyboard_mode {
             self.kb_mode = mode;
         }
+        // The same for the time signature (#87): a session that states none
+        // keeps the clock's.
+        if let Some(sig) = s.time_sig {
+            self.set_time_sig(sig);
+        }
         Ok(())
     }
 
@@ -6682,6 +6705,7 @@ impl DemoApp {
                 "count_in_beat": self.count_in_beat,
                 "count_in_enabled": self.count_in_enabled,
                 "count_in_bars": self.count_in_bars,
+                "time_signature": self.time_sig.to_json(),
                 "record_sync": self.record_sync,
                 "bpm": self.bpm,
                 "player": serde_json::json!({
@@ -7977,6 +8001,19 @@ impl DemoApp {
                 let nodes: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
                 self.agent_activity.record(origin, format!("Count-in {enabled} ({bars}b)"), nodes, now);
                 serde_json::json!({"enabled": self.count_in_enabled, "bars": self.count_in_bars}).to_string()
+            }
+            "set_time_signature" => {
+                let int = |k: &str| args.get(k).and_then(|v| v.as_u64()).ok_or(format!("give {k} as a whole number"));
+                match int("numerator").and_then(|n| int("denominator").and_then(|d| crate::transport::TimeSig::checked(n, d))) {
+                    Ok(sig) => {
+                        self.set_time_sig(sig);
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        let nodes: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
+                        self.agent_activity.record(origin, format!("Time signature {sig}"), nodes, now);
+                        sig.to_json().to_string()
+                    }
+                    Err(e) => format!("error: {e}"),
+                }
             }
             "get_midi_clock" => self.midi_clock_json().to_string(),
             "set_midi_clock" => match self.set_midi_clock(args) {
@@ -14969,6 +15006,43 @@ impl DemoApp {
                 actions.push(SettingsAction::SetCountIn(!enabled, bars));
             }
         });
+        Self::settings_gap(ui);
+        self.settings_time_sig_row(ui, actions);
+    }
+
+    /// Time signature (#87): beats per bar over the note value of a beat.
+    fn settings_time_sig_row(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        use crate::transport::{TimeSig, MAX_SIG_NUMERATOR, SIG_DENOMINATORS};
+        let sig = self.time_sig;
+        Self::settings_row(
+            ui,
+            "Time signature",
+            "Beats per bar: the metronome accents the first, and the count-in and bar-quantized starts follow it. Saved with the session.",
+            |ui| {
+                // Right to left: the note value, the slash, the beats.
+                theme::Dropdown::new("dd_settings_time_sig_den", sig.den.to_string())
+                    .width(56.0)
+                    .text_size(12.0)
+                    .show_ui(ui, |menu| {
+                        for d in SIG_DENOMINATORS {
+                            if menu.item(sig.den == d, &d.to_string()) {
+                                actions.push(SettingsAction::SetTimeSig(TimeSig { den: d, ..sig }));
+                            }
+                        }
+                    });
+                ui.label(egui::RichText::new("/").size(13.0).color(theme::CREAM_META));
+                theme::Dropdown::new("dd_settings_time_sig_num", sig.num.to_string())
+                    .width(56.0)
+                    .text_size(12.0)
+                    .show_ui(ui, |menu| {
+                        for n in 1..=MAX_SIG_NUMERATOR {
+                            if menu.item(sig.num == n, &n.to_string()) {
+                                actions.push(SettingsAction::SetTimeSig(TimeSig { num: n, ..sig }));
+                            }
+                        }
+                    });
+            },
+        );
     }
 
     fn settings_display_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
@@ -15224,6 +15298,7 @@ impl DemoApp {
                 };
             }
             SettingsAction::SetCountIn(enabled, bars) => self.set_count_in(enabled, bars),
+            SettingsAction::SetTimeSig(sig) => self.set_time_sig(sig),
             SettingsAction::SetAudioOutput(out) => self.set_audio_output(out),
             SettingsAction::SetBufferSize(frames) => match self.set_buffer_frames(frames) {
                 Ok(msg) => self.settings_msg = msg,
@@ -18252,7 +18327,19 @@ impl DemoApp {
         };
         let tap = Rect::from_min_size(Pos2::new(chip.left(), y), Vec2::new(tap_w, FACE_CTL_H));
         let count_in = Rect::from_min_size(Pos2::new(tap.right() + gap, y), Vec2::new(ci_w, FACE_CTL_H));
-        Some(MetroActionRects { tap, count_in, compact })
+        // The signature chip goes beside COUNT-IN, or under TAP on a face
+        // too narrow for three chips in a row, or nowhere (Settings has it).
+        let sig_at = |x: f32, y: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(METRO_SIG_W, FACE_CTL_H));
+        let beside = sig_at(count_in.right() + gap, y);
+        let under = sig_at(chip.left(), y + FACE_CTL_H + 4.0);
+        let sig = if beside.right() <= right {
+            Some(beside)
+        } else if under.right() <= right && under.bottom() <= r.bottom() - FACE_PAD_B {
+            Some(under)
+        } else {
+            None
+        };
+        Some(MetroActionRects { tap, count_in, sig, compact })
     }
 
     /// Is rack-local `lp` on one of a unit's face drag readouts (the split
@@ -18388,7 +18475,7 @@ impl DemoApp {
         let net_ns = (self.clock.net_offset_ms() as f64 * 1e6).round() as i64;
         if net_ns >= 0 { return false; }
         let count_in_secs = if self.count_in_enabled {
-            self.count_in_bars as f64 * crate::transport::BEATS_PER_BAR as f64 * 60.0 / self.bpm.max(1.0) as f64
+            self.count_in_bars as f64 * self.time_sig.bar_beats() * 60.0 / self.bpm.max(1.0) as f64
         } else { 0.0 };
         let armed = crate::clocksend::arm_preroll(crate::alsaseq::mono_ns(), net_ns, count_in_secs, self.bpm as f64);
         self.clock.request_arm(armed);
@@ -18403,6 +18490,16 @@ impl DemoApp {
         let _ = crate::assistant::save_count_in(enabled, bars);
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap().send(Command::SetCountIn { enabled, bars });
+        }
+    }
+
+    /// Set the time signature (Settings, a tool, a session load): the mirror
+    /// at once, the engine by command. It is saved with the session.
+    fn set_time_sig(&mut self, sig: crate::transport::TimeSig) {
+        let sig = crate::transport::TimeSig::normalized(sig.num, sig.den);
+        self.time_sig = sig;
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetTimeSignature { num: sig.num, den: sig.den });
         }
     }
 
@@ -18443,8 +18540,9 @@ impl DemoApp {
             self.time += dt as f64;
             if self.graph_pub.is_none() && self.counting_in {
                 let beats = self.time * self.bpm.max(1.0) as f64 / 60.0;
-                let total = self.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS) as f64
-                    * crate::transport::BEATS_PER_BAR as f64;
+                // Counted in the signature's beats, like the engine's count-in.
+                let beats = beats / self.time_sig.beat_len();
+                let total = (self.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS) * self.time_sig.num) as f64;
                 if beats >= total {
                     self.counting_in = false;
                     self.count_in_beat = 0;
@@ -19382,6 +19480,11 @@ impl DemoApp {
                         && self.metro_action_rects(ui).map_or(false, |m| m.count_in.contains(l.to_pos2())) => {
                         self.ui_transport_grace = self.ui_time + 0.6;
                         self.set_count_in(!self.count_in_enabled, self.count_in_bars);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.metro_action_rects(ui).and_then(|m| m.sig).map_or(false, |r| r.contains(l.to_pos2())) => {
+                        self.ui_transport_grace = self.ui_time + 0.6;
+                        self.set_time_sig(self.time_sig.next_common());
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.transport_chip_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
@@ -21606,7 +21709,7 @@ impl DemoApp {
         // dim track when stopped.
         let led = Vec2::new(chip.right() + 16.0, chip.center().y);
         if u.playing {
-            let beat = 60.0 / self.bpm.max(1.0) as f64;
+            let beat = 60.0 / self.bpm.max(1.0) as f64 * self.time_sig.beat_len();
             let phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
             let thump = if self.playing { (1.0 - phase).powi(3) } else { 0.0 };
             let led_col = if self.counting_in { theme::ACCENT } else { GREEN };
@@ -21627,8 +21730,7 @@ impl DemoApp {
 
         let ci_hov = self.face_hovered(painter, unit, m.count_in);
         let ci_on = self.count_in_enabled || self.counting_in;
-        let total_beats = self.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS)
-            * crate::transport::BEATS_PER_BAR as u8;
+        let total_beats = self.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS) * self.time_sig.num;
         let ci_label = if self.counting_in {
             if m.compact {
                 format!("IN {}", self.count_in_beat.max(1))
@@ -21643,6 +21745,10 @@ impl DemoApp {
             "COUNT-IN".into()
         };
         self.paint_face_chip(painter, m.count_in, &ci_label, ci_on, ci_hov);
+        if let Some(sig) = m.sig {
+            let hov = self.face_hovered(painter, unit, sig);
+            self.paint_face_chip(painter, sig, &self.time_sig.to_string(), false, hov);
+        }
     }
 
     /// Metronome-face tempo: −/+ steppers around a drag readout ("96 BPM").
@@ -29040,6 +29146,12 @@ mod split_bpm_tests {
             assert!(!m.tap.intersects(m.count_in), "w={w}: TAP overlaps COUNT-IN");
             assert!(app.unit_rects[u1].contains_rect(m.tap), "w={w}: TAP outside face");
             assert!(app.unit_rects[u1].contains_rect(m.count_in), "w={w}: COUNT-IN outside face");
+            if let Some(sig) = m.sig {
+                assert!(!sig.intersects(m.count_in) && !sig.intersects(chip) && !sig.intersects(b.value), "w={w}: signature chip overlaps");
+                assert!(sig.right() <= app.unit_rects[u1].right() - FACE_PAD_R + 0.01, "w={w}: signature chip past the face padding");
+            }
+            assert!(m.sig.is_some(), "w={w}: the signature chip has a place on this face");
+            assert_eq!(m.sig.unwrap().top() > m.tap.top(), w < 320.0, "w={w}: beside COUNT-IN where three chips fit, else under TAP");
         }
         app.unit_rects[u1] = r_orig;
         frame(&mut app, &ctx, vec![]);
@@ -29051,6 +29163,20 @@ mod split_bpm_tests {
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
         assert!(cmds.iter().any(|c| matches!(c, Command::SetCountIn { enabled: true, bars: 1 })), "sent SetCountIn: {cmds:?}");
+
+        // The time-signature chip (#87) shows the signature and steps
+        // through the common ones on a click.
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "4/4"), "signature chip painted: {texts:?}");
+        let sig_pos = screen(&app, app.metro_action_rects(u1).unwrap().sig.expect("room for the signature chip"));
+        click(&mut app, &ctx, sig_pos);
+        assert_eq!(app.time_sig, crate::transport::TimeSig { num: 3, den: 4 });
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetTimeSignature { num: 3, den: 4 })), "sent SetTimeSignature: {cmds:?}");
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "3/4") && texts.iter().all(|t| t != "4/4"), "{texts:?}");
+        app.set_time_sig(crate::transport::TimeSig::FOUR_FOUR);
 
         // Shift+T taps tempo without firing laptop piano F#4 (Key::T).
         let (note_tx, note_log) = {
@@ -29163,6 +29289,86 @@ mod split_bpm_tests {
         app.exec_tool("undo", &serde_json::json!({}));
         frame(&mut app, &ctx, vec![]);
         assert!(!app.arm_rigs[0] && app.arm_master, "undoing the arm job restores the defaults");
+    }
+
+    /// #87: the time signature is an agent tool, reaches the engine, is
+    /// refused when the clock cannot count it, is undone, and travels with
+    /// the session (a session that states none leaves it alone, rule 165).
+    #[test]
+    fn the_time_signature_tool_sets_undoes_and_travels_with_the_session() {
+        use crate::transport::TimeSig;
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(names.contains(&"set_time_signature"), "assistant tools missing set_time_signature");
+        assert!(UI_BRIDGE_TOOLS.contains(&"set_time_signature"));
+        assert!(!tool_is_read_only("set_time_signature"));
+
+        let mut app = DemoApp::new_with_sink(None);
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let json = |s: String| -> serde_json::Value { serde_json::from_str(&s).unwrap_or_else(|_| panic!("not JSON: {s}")) };
+        let status = |app: &mut DemoApp| json(app.exec_tool("get_status", &serde_json::json!({})))["time_signature"].clone();
+        assert_eq!(status(&mut app), serde_json::json!({"numerator": 4, "denominator": 4}));
+
+        let out = json(app.exec_tool("set_time_signature", &serde_json::json!({"numerator": 3, "denominator": 4})));
+        assert_eq!(out, serde_json::json!({"numerator": 3, "denominator": 4}));
+        assert_eq!(app.time_sig, TimeSig { num: 3, den: 4 });
+        assert_eq!(status(&mut app), serde_json::json!({"numerator": 3, "denominator": 4}));
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetTimeSignature { num: 3, den: 4 })), "the engine is told: {cmds:?}");
+        assert_eq!(app.human_tool_label("set_time_signature", &serde_json::json!({"numerator": 6, "denominator": 8})), "Time signature → 6/8");
+
+        // Refused with a reason the model can act on; nothing changes.
+        for bad in [
+            serde_json::json!({"numerator": 0, "denominator": 4}),
+            serde_json::json!({"numerator": 13, "denominator": 4}),
+            serde_json::json!({"numerator": 4, "denominator": 3}),
+            serde_json::json!({"numerator": 4}),
+        ] {
+            let res = app.exec_tool("set_time_signature", &bad);
+            assert!(res.starts_with("error:"), "{bad}: {res}");
+        }
+        assert_eq!(app.time_sig, TimeSig { num: 3, den: 4 });
+
+        // Saved with the session, and undone with the job that changed it.
+        let saved = app.capture_session("waltz").unwrap();
+        assert_eq!(saved.time_sig, Some(TimeSig { num: 3, den: 4 }));
+        app.undo_job = None; // a new request opens a new undo step
+        let _ = app.exec_tool("set_time_signature", &serde_json::json!({"numerator": 7, "denominator": 8}));
+        assert_eq!(app.time_sig, TimeSig { num: 7, den: 8 });
+        let undone = app.exec_tool("undo", &serde_json::json!({}));
+        assert!(undone.contains("undid"), "{undone}");
+        assert_eq!(app.time_sig, TimeSig { num: 3, den: 4 }, "undo restored the signature");
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(matches!(cmds.iter().rev().find(|c| matches!(c, Command::SetTimeSignature { .. })), Some(Command::SetTimeSignature { num: 3, den: 4 })), "{cmds:?}");
+
+        // A session that states none (template, older file) keeps the clock's.
+        app.apply_session(&crate::session::Session::new("plain", Graph::demo_patch())).unwrap();
+        assert_eq!(app.time_sig, TimeSig { num: 3, den: 4 });
+        // One that states 4/4 sets it; a rig edit (remap) carries it along.
+        let mut common = crate::session::Session::new("common", Graph::demo_patch());
+        common.time_sig = Some(TimeSig::FOUR_FOUR);
+        app.apply_session(&common).unwrap();
+        assert_eq!(app.time_sig, TimeSig::FOUR_FOUR);
+        app.apply_session(&saved).unwrap();
+        assert_eq!(app.time_sig, TimeSig { num: 3, den: 4 });
+        let moved = remap_session(&saved, saved.graph.clone(), Some);
+        assert_eq!(moved.time_sig, saved.time_sig, "the signature survives remap_session (rule 65)");
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetTimeSignature { num: 4, den: 4 })), "a load tells the engine: {cmds:?}");
+
+        // The engine's publication is adopted (an MCP agent set it there).
+        app.count_in_enabled = true;
+        app.counting_in = true;
+        app.playing = true;
+        app.time_sig = TimeSig { num: 6, den: 8 };
+        app.bpm = 120.0;
+        app.time = 0.0;
+        app.update(0.6); // 1.2 quarters = 2.4 eighths: the third click of six
+        assert_eq!(app.count_in_beat, 3, "the offline count-in counts the signature's beats");
     }
 
     #[test]
@@ -31860,7 +32066,7 @@ mod face_layout_tests {
             if let Some(p) = b.plus { br = br.union(p); }
             v.push(("bpm".into(), br));
         }
-        if let Some(m) = app.metro_action_rects(ui) { v.push(("metro".into(), m.tap.union(m.count_in))); }
+        if let Some(m) = app.metro_action_rects(ui) { v.push(("metro".into(), m.tap.union(m.count_in).union(m.sig.unwrap_or(m.count_in)))); }
         v
     }
 
@@ -33218,6 +33424,77 @@ mod settings_and_dropdown_tests {
             .expect("Count-in toggle").1.center();
         click_at(&mut app, &ctx, size, ci_toggle);
         assert!(app.count_in_enabled);
+    }
+
+    /// #87: the Session page sets the time signature with two dropdowns,
+    /// beats over note value, read left to right like the signature.
+    #[test]
+    fn settings_time_signature_dropdowns_set_beats_and_note_value() {
+        use crate::transport::TimeSig;
+        let mut app = DemoApp::new_with_sink(None);
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        app.stage_view = StageView::Settings;
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(1280.0, 900.0)] {
+            app.set_time_sig(TimeSig::FOUR_FOUR);
+            let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Session");
+            let row_y = texts.iter().find(|(t, _)| t == "Time signature").expect("Time signature row").1.center().y;
+            let in_row = |texts: &[(String, Rect)], label: &str| -> Vec<Rect> {
+                let mut v: Vec<Rect> = texts.iter().filter(|(t, r)| t == label && (r.center().y - row_y).abs() < 16.0).map(|(_, r)| *r).collect();
+                v.sort_by(|a, b| a.left().total_cmp(&b.left()));
+                v
+            };
+            let fours = in_row(&texts, "4");
+            let slash = in_row(&texts, "/");
+            assert_eq!((fours.len(), slash.len()), (2, 1), "{size:?}: beats / note value: {texts:?}");
+            assert!(fours[0].right() < slash[0].left() && slash[0].right() < fours[1].left(), "{size:?}: reads 4 / 4");
+
+            // Beats per bar: the left dropdown.
+            let (menu, _, _) = open_dropdown(&mut app, &ctx, size, fours[0].center());
+            let three = menu.iter().find(|(t, r)| t == "3" && r.top() > fours[0].bottom()).expect("3 in the beats menu").1.center();
+            assert!(menu.iter().any(|(t, _)| t == "5") && menu.iter().all(|(t, _)| t != "13" && t != "0"), "{size:?}: beats from 1: {menu:?}");
+            click_at(&mut app, &ctx, size, three);
+            assert_eq!(app.time_sig, TimeSig { num: 3, den: 4 }, "{size:?}");
+
+            // Note value: the right dropdown.
+            let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+            let den_dd = in_row(&texts, "4")[0].center();
+            let (menu, _, _) = open_dropdown(&mut app, &ctx, size, den_dd);
+            let eight = menu.iter().find(|(t, r)| t == "8" && r.top() > row_y).expect("8 in the note-value menu").1.center();
+            assert!(menu.iter().any(|(t, _)| t == "16") && menu.iter().all(|(t, _)| t != "32"), "{size:?}: 2, 4, 8, 16");
+            click_at(&mut app, &ctx, size, eight);
+            assert_eq!(app.time_sig, TimeSig { num: 3, den: 8 }, "{size:?}");
+            let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+            assert_settings_text_layout(&app, &texts, size);
+            let mut cmds = Vec::new();
+            drain.drain(|c| cmds.push(c));
+            assert!(cmds.iter().any(|c| matches!(c, Command::SetTimeSignature { num: 3, den: 8 })), "{size:?}: the engine is told: {cmds:?}");
+        }
+    }
+
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat time_signature_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn time_signature_shots() {
+        use crate::transport::TimeSig;
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (w, h, name, settings) in [
+            (1280.0, 800.0, "time-signature-rack.png", false),
+            (781.0, 950.0, "time-signature-rack-781x950.png", false),
+            (1280.0, 800.0, "time-signature-settings.png", true),
+        ] {
+            let mut app = DemoApp::new_with_sink(None);
+            app.add_metronome_to_active_rig();
+            app.set_count_in(true, 1);
+            app.set_time_sig(TimeSig { num: 6, den: 8 });
+            if settings {
+                app.stage_view = StageView::Settings;
+                app.settings_page = SettingsPage::Session;
+            }
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(name));
+        }
     }
 
     /// Agent settings have pages of their own, listed after every App page

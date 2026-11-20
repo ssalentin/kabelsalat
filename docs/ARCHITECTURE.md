@@ -106,7 +106,13 @@ agents are in [AGENTS.md](../AGENTS.md).
   gives each hardware port a profile (picked in the matrix, or matched by the
   port name) and keeps the matrix CC bindings in line with it
   (`DemoApp::sync_instrument_maps`).
-- `transport.rs` — song clock, tempo, count-in, tap tempo.
+- `transport.rs` — song clock, tempo, time signature, count-in, tap tempo.
+  The song position stays in quarter notes; `TimeSig` (#87) only decides the
+  bar length (`bar_beats`) and the beat the metronome clicks (`beat_len`).
+  Everything that waits for a bar asks `next_bar_beats`, and the CLAP clock
+  reads the signature from `Transport::sig`. MIDI clock has no signature
+  message (24 clocks per quarter, song position in sixteenths), so
+  `clocksend.rs` is untouched by it.
 - `clocksend.rs` / `alsaseq.rs` — MIDI Clock Send (#85): kabelsalat as the master
   beat clock. The engine publishes its song position and a monotonic stamp every
   audio block (`ClockPos`); the clock thread derives the 24-ppqn grid from that

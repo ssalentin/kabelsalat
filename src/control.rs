@@ -1277,6 +1277,8 @@ pub enum Command {
     /// Put a saved loudness target back as it was (session load, undo): no
     /// measuring, and a no-op when the engine already holds it.
     RestoreMasterTarget { target: crate::meter::MasterTarget },
+    /// Mute or unmute everything coming from kabelsalat to Master out.
+    SetMasterMute { muted: bool },
     /// Play a demo phrase (#200) through rig `rig` as if it were played on
     /// that rig's Keys, looping on the engine's clock until `DemoStop` or a
     /// routing edit ends it (`Command::demo_effect`). One demo at a time: a
@@ -1324,7 +1326,7 @@ impl Command {
             | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::SetBusOutput { .. } | Command::RenameNode { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. }
-            | Command::SetKeysScale { .. })
+            | Command::SetKeysScale { .. } | Command::SetMasterMute { .. })
     }
 }
 
@@ -1394,6 +1396,7 @@ impl Command {
             | Command::ResetMeter
             | Command::SetMasterTarget { .. }
             | Command::RestoreMasterTarget { .. }
+            | Command::SetMasterMute { .. }
             | Command::DemoPlay { .. }
             | Command::DemoStop => Keeps,
         }
@@ -1561,6 +1564,8 @@ mod tests {
             Command::SetMasterTarget { lufs: None },
             Command::RestoreMasterTarget { target: crate::meter::MasterTarget { lufs: Some(-16.0), gain_db: 4.5, before_lufs: Some(-20.5), guard_db: -0.4, last_point: None, limited: false } },
             Command::RestoreMasterTarget { target: crate::meter::MasterTarget::OFF },
+            Command::SetMasterMute { muted: true },
+            Command::SetMasterMute { muted: false },
             Command::SetAudioIn { node: 9, device: None, channels: Some(AudioInChannel::MonoR) },
             Command::SetAudioIn { node: 9, device: Some("USB Audio".into()), channels: None },
             Command::DemoPlay { rig: 1, phrase: crate::demo::PhraseKind::Bass },

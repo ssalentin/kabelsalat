@@ -994,6 +994,7 @@ impl Default for GraphPub {
             bus_outs: [NO_BUS_OUT; MAX_BUS_OUTS],
             out_slots: [OutSlot::FREE; MAX_OUTS],
             system_gain: 0.0,
+            master_mute: false,
             mix_rev: 0,
             voices: Vec::new(),
             voices_rev: 0,
@@ -1124,6 +1125,8 @@ pub struct GraphPub {
     pub out_slots: [OutSlot; MAX_OUTS],
     /// System-audio capture gain, published with the mix (same `mix_rev`).
     pub system_gain: f32,
+    /// Whether Kabelsalat's master mix to Master out is muted, published with `mix_rev`.
+    pub master_mute: bool,
     pub mix_rev: u64,
     /// Every hosted voice and the Clap node it plays (`NodeId::MAX` = free),
     /// bumped by `voices_rev`. The engine binds voices; frontends that hold
@@ -1245,6 +1248,7 @@ pub struct GraphEngine {
     /// Per-block scratch: which effects already ran (render step 2b).
     fx_done: Vec<bool>,
     master_vol: f32,
+    master_mute: bool,
     master_warm: f32,
     /// Master bus limiter (zero latency) in front of the warmth stage: many
     /// voices at once drove `tanh` into hard, buzzing saturation.
@@ -1504,6 +1508,7 @@ impl GraphEngine {
             out_rx: Some(out_rx),
             out_epochs: Arc::new(std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0))),
             master_vol: 0.75,
+            master_mute: false,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
             master_target: MasterTarget::OFF,
@@ -2387,6 +2392,7 @@ impl GraphEngine {
                 g.rules = self.matrix.rules.clone();
                 g.mix = self.rig_mix;
                 g.system_gain = self.system_gain;
+                g.master_mute = self.master_mute;
                 g.mix_rev = g.mix_rev.wrapping_add(1);
                 g.transport = tp;
                 g.transport_rev = g.transport_rev.wrapping_add(1);
@@ -4090,6 +4096,7 @@ impl GraphEngine {
                 }
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
+                self.master_mute = false;
                 self.strips.clear();
                 self.sends.clear();
                 self.bus_outs.clear();
@@ -4707,6 +4714,12 @@ impl GraphEngine {
             Command::DemoStop => {
                 self.stop_demo();
             }
+            Command::SetMasterMute { muted } => {
+                if self.master_mute != muted {
+                    self.master_mute = muted;
+                    self.mix_dirty = true;
+                }
+            }
         }
     }
 
@@ -4929,6 +4942,7 @@ impl GraphEngine {
                     g.bus_outs[..self.bus_outs.len()].copy_from_slice(&self.bus_outs);
                     g.out_slots = self.out_slots;
                     g.system_gain = self.system_gain;
+                    g.master_mute = self.master_mute;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
                     self.mix_dirty = false;
                 },
@@ -5410,7 +5424,7 @@ impl GraphEngine {
                 self.node_timer.record(node, node_t0.elapsed());
             }
             let drive = 1.0 + self.master_warm * 3.0;
-            let vol = self.master_vol;
+            let vol = if self.master_mute { 0.0 } else { self.master_vol };
             let lim = &mut self.master_lim;
             let post_at_block_start = lim.post;
             for (i, frame) in data.chunks_mut(ch).enumerate() {
@@ -6493,6 +6507,47 @@ mod tests {
         // A CC bound to the knob (CcTarget::Knob) reaches the same setter.
         assert!(engine.apply_engine_param(sys, super::P_SYSTEM_GAIN, 1.0));
         assert!((engine.system_gain - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn master_mute_silences_master_output_and_publishes() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let mut buf = vec![0.0f32; 128 * 2];
+        // Metronome/tone or note — demo_patch has a synth voice? No, demo_patch has no CLAP voice unless passed;
+        // let's use a DSP gain + test or check `master_vol` via a sine / metronome.
+        // Actually, add a DSP Metronome or check `SetMasterMute` + `master_mute` + `mix_rev` + audio output!
+        // Even simpler: wire a Metronome at high BPM or check `master_mute` on a built-in DSP source.
+        let mut g = crate::control::Graph::default();
+        let met = g.add_node(NodeKind::Dsp(crate::control::DspKind::Metronome), name_bytes("MET"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: met, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g.connect_with_id(2, PortRef { node: met, port: 1 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+        bus.send(Command::LoadGraph { graph: g });
+        bus.send(Command::TransportPlay);
+        engine.render(&mut buf, 2);
+        let peak_unmuted = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(peak_unmuted > 0.01, "expected audible metronome click before mute, got {peak_unmuted}");
+
+        let rev_before = pub_.lock().unwrap().mix_rev;
+        bus.send(Command::SetMasterMute { muted: true });
+        bus.send(Command::TransportStop);
+        bus.send(Command::TransportPlay);
+        engine.render(&mut buf, 2);
+        let peak_muted = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert_eq!(peak_muted, 0.0, "master mute must silence the master output");
+        assert!(pub_.lock().unwrap().master_mute);
+        assert!(pub_.lock().unwrap().mix_rev > rev_before);
+
+        bus.send(Command::SetMasterMute { muted: false });
+        bus.send(Command::TransportStop);
+        bus.send(Command::TransportPlay);
+        engine.render(&mut buf, 2);
+        let peak_restored = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        assert!(peak_restored > 0.01, "unmuting must restore audio, got {peak_restored}");
+        assert!(!pub_.lock().unwrap().master_mute);
     }
 
     /// #19: one knob table — rack labels canonical, long names as aliases.

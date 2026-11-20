@@ -1308,6 +1308,11 @@ const NEVER_FREE: &[&str] = &["urn:distrho:vitalium"];
 /// Never dropped — not even at exit (statics are not destructed).
 static PARKED: std::sync::Mutex<Vec<Lv2Plugin>> = std::sync::Mutex::new(Vec::new());
 
+/// The state the first instance of each `NEVER_FREE` plugin started with
+/// (URI, state chunk): what a reused instance is put back to, so a new unit
+/// never plays the patch of the unit that had the instance before.
+static INIT_STATE: std::sync::Mutex<Vec<(String, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
 fn never_free(uri: &str) -> bool {
     NEVER_FREE.iter().any(|u| uri.contains(u))
 }
@@ -1499,13 +1504,30 @@ impl Lv2Plugin {
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), is_midi_fx, _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate, latency_port })
+            let mut fresh = Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), is_midi_fx, _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate, latency_port };
+            fresh.remember_init_state();
+            Ok(fresh)
+        }
+    }
+
+    /// Keep what a new instance of a `NEVER_FREE` plugin starts with, once
+    /// per plugin, for `take_parked`.
+    fn remember_init_state(&mut self) {
+        if !never_free(&self.uri) { return; }
+        let Some(format) = state_format(&self.uri) else { return };
+        let mut store = INIT_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if store.iter().any(|(uri, _)| *uri == self.uri) { return; }
+        if let Ok(state) = self.saved_state(format.key) {
+            store.push((self.uri.clone(), state));
         }
     }
 
     /// A parked instance of `needle` at this rate/block, reset to a fresh
     /// state: re-activated, controls at their declared defaults (rule 42),
-    /// audio and MIDI buffers cleared.
+    /// audio and MIDI buffers cleared, nothing sounding, and the plugin's
+    /// own state back at what a new instance starts with. The control ports
+    /// alone do not reset a patch: the JUCE wrapper pushes a port only when
+    /// its value changed, so whatever the last unit restored kept playing.
     fn take_parked(needle: &str, sample_rate: f64, block: usize) -> Option<Self> {
         if !never_free(needle) { return None; }
         let mut parked = PARKED.lock().ok()?;
@@ -1519,8 +1541,19 @@ impl Lv2Plugin {
             if let Some(b) = p.buffers.get_mut(i) { b.fill(0.0); }
         }
         if p.atom_in.is_some() { init_atom_sequence(&mut p.atom_buf, p.urid_sequence); }
+        // What the last unit left sounding ends before the next one plays:
+        // a note whose note-off never reached a run(), and its effect tails
+        // (All Sound Off, All Notes Off).
+        p.control_change(120, 0);
+        p.control_change(123, 0);
         p.last_event = None;
         p.set_active(true);
+        let init = INIT_STATE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(uri, _)| *uri == p.uri).map(|(_, s)| s.clone());
+        if let (Some(init), Some(format)) = (init, state_format(&p.uri)) {
+            if let Err(e) = p.restore_state(&[(format.key, format.kind, &init)]) {
+                eprintln!("lv2: {} kept its last state on reuse: {e}", p.uri);
+            }
+        }
         Some(p)
     }
 
@@ -2678,6 +2711,43 @@ mod tests {
         let up = pitch_hz(&mut plugin, 57);
         assert!((up - 440.0).abs() < 30.0, "the patch's +12 transpose plays A4 at 440 Hz, measured {up}");
         retire(plugin);
+    }
+
+    #[test]
+    fn a_reused_vitalium_plays_the_init_patch_not_the_last_units() {
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut plugin) = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256) else { return };
+        let saved = plugin.saved_state("urn:juce:stateBinary").expect("save");
+        let text = String::from_utf8_lossy(&saved);
+        let mut patch: serde_json::Value = serde_json::from_str(text.trim_end_matches('\0')).expect("Vitalium saves JSON");
+        patch["settings"]["osc_1_transpose"] = serde_json::json!(12.0);
+        let patch = patch.to_string();
+        plugin.restore_state(&[("urn:juce:stateBinary", "http://lv2plug.in/ns/ext/atom#Chunk", patch.as_bytes())]).expect("restore");
+        let up = pitch_hz(&mut plugin, 57);
+        assert!((up - 440.0).abs() < 30.0, "the unit's patch plays A4 at 440 Hz, measured {up}");
+        // The unit goes while a key is held: its note-off never runs.
+        let (input, mut output) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+        plugin.note_on(64, 100);
+        for _ in 0..20 { plugin.process(&input, &mut output, 256); }
+        assert!(output.iter().any(|s| s.abs() > 1e-4), "the held note sounds");
+        retire(plugin);
+        // Whichever parked instance the next unit gets, it is silent and
+        // plays the init patch: take them all (other tests park theirs too).
+        let mut taken = Vec::new();
+        for _ in 0..parked_count("vitalium") {
+            let mut next = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256).expect("reload");
+            let mut peak = 0.0f32;
+            for _ in 0..20 {
+                next.process(&input, &mut output, 256);
+                peak = output.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            assert!(peak < 1e-4, "a reused instance starts silent, peak {peak}");
+            let hz = pitch_hz(&mut next, 57);
+            assert!((hz - 220.0).abs() < 15.0, "a reused instance plays the init patch, A3 at 220 Hz, measured {hz}");
+            taken.push(next);
+        }
+        assert!(!taken.is_empty(), "the retired instance was parked");
+        for p in taken { retire(p); }
     }
 
     #[test]

@@ -203,7 +203,7 @@ pub fn classify_instrument(
         return KeyboardType::JazzOrgan;
     }
     if let NodeKind::Clap { plugin_id } = kind {
-        if crate::control::name_str(plugin_id) == aeolus::AEOLUS_ID {
+        if plugin_id.as_str() == aeolus::AEOLUS_ID {
             return KeyboardType::PipeOrgan;
         }
     }
@@ -456,17 +456,17 @@ pub fn folded_scale_keys(choice: ScaleChoice, base_midi: u8, count: usize) -> Ve
 mod tests {
     use super::*;
     use crate::arp::Scale;
-    use crate::control::{name_bytes, Lv2Uri};
+    use crate::control::Lv2Uri;
 
     #[test]
     fn classifies_dedicated_plugins_and_patch_categories() {
         let b3 = NodeKind::Lv2 { uri: Lv2Uri::new(organ::B_SYNTH) };
         assert_eq!(classify_instrument(&b3, None, None, &[]), KeyboardType::JazzOrgan);
 
-        let aeolus = NodeKind::Clap { plugin_id: name_bytes(aeolus::AEOLUS_ID) };
+        let aeolus = NodeKind::Clap { plugin_id: crate::control::ClapId::new(aeolus::AEOLUS_ID) };
         assert_eq!(classify_instrument(&aeolus, None, None, &[]), KeyboardType::PipeOrgan);
 
-        let surge = NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") };
+        let surge = NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") };
         assert_eq!(classify_instrument(&surge, None, Some("Surge XT"), &[]), KeyboardType::Synth);
         assert_eq!(classify_instrument(&surge, Some("Keys/Wurli Warm"), Some("Surge XT"), &[]), KeyboardType::Piano);
         assert_eq!(classify_instrument(&surge, Some("Keyboards/Rhodes Mk1"), Some("Surge XT"), &[]), KeyboardType::Piano);

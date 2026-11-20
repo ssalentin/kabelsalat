@@ -17,17 +17,67 @@ use base64::Engine as _;
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde_json::{json, Value};
 
-use crate::llm::{self, LlmError, Route, Transport};
+use crate::llm::{self, LlmError, Role, Transport};
 use crate::meter::{MasterMeter, MeterSnapshot};
 
 /// The longest clip a listen may take.
 pub const MAX_SECS: f32 = 8.0;
 pub const DEFAULT_SECS: f32 = 4.0;
-/// The config.json field that overrides the listening model.
-pub const MODEL_FIELD: &str = "agent_listen_model";
-/// The default listening model: its OpenRouter entry lists `audio` in
-/// `architecture.input_modalities`.
-pub const DEFAULT_MODEL: &str = llm::GEMINI_FLASH;
+
+/// Where a running listen is, for whoever shows it. The user has to know
+/// when the master is being recorded (what they play now is what gets
+/// judged) and that the wait afterwards is the model, not a hang.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stage {
+    /// The master is being recorded for `secs` from `since`.
+    Recording { since: Instant, secs: f32 },
+    /// The clip is with the listening model.
+    Judging { since: Instant, model: String },
+}
+
+impl Stage {
+    /// How far a recording is, 0 to 1; None while the model judges.
+    pub fn progress(&self, now: Instant) -> Option<f32> {
+        match self {
+            Stage::Recording { since, secs } => Some((now.saturating_duration_since(*since).as_secs_f32() / secs.max(0.1)).clamp(0.0, 1.0)),
+            Stage::Judging { .. } => None,
+        }
+    }
+}
+
+// One process records one master (`CAPTURE`), so one stage describes it,
+// whoever asked: the assistant or an attached MCP agent. Tests keep it per
+// thread, so parallel tests never see each other's listen.
+#[cfg(not(test))]
+static STAGE: Mutex<Option<Stage>> = Mutex::new(None);
+#[cfg(test)]
+thread_local! { static STAGE: std::cell::RefCell<Option<Stage>> = const { std::cell::RefCell::new(None) }; }
+
+/// The stage of the listen running in this process, None when none runs.
+pub fn stage() -> Option<Stage> {
+    #[cfg(not(test))]
+    return STAGE.lock().ok().and_then(|s| s.clone());
+    #[cfg(test)]
+    return STAGE.with(|s| s.borrow().clone());
+}
+
+pub fn set_stage(stage: Option<Stage>) {
+    #[cfg(not(test))]
+    if let Ok(mut s) = STAGE.lock() {
+        *s = stage;
+    }
+    #[cfg(test)]
+    STAGE.with(|s| *s.borrow_mut() = stage);
+}
+
+/// Clears the stage when a listen ends, on every way out.
+struct StageEnd;
+
+impl Drop for StageEnd {
+    fn drop(&mut self) {
+        set_stage(None);
+    }
+}
 
 /// Interleaved audio, mono or stereo.
 #[derive(Clone, Debug)]
@@ -249,19 +299,14 @@ pub fn parse(content: &str, request: &Request) -> (Vec<(String, Option<f32>)>, S
 }
 
 /// Ask the listening model about `clip`.
-pub fn judge<T: Transport>(client: &mut llm::Client<T>, route: &Route, key: &str, clip: &Clip, request: &Request) -> Result<Verdict, LlmError> {
-    let done = client.chat(route, key, body(clip, request))?;
+pub fn judge<T: Transport>(client: &mut llm::Client<T>, model: &str, key: &str, clip: &Clip, request: &Request) -> Result<Verdict, LlmError> {
+    let done = client.chat(model, key, body(clip, request))?;
     let content = done.message.get("content").and_then(Value::as_str).unwrap_or("");
     let (scores, heard) = parse(content, request);
     if heard.is_empty() && scores.iter().all(|(_, s)| s.is_none()) {
-        return Err(LlmError::Request(format!("{} answered without scores or HEARD: {content:.200}", route.model)));
+        return Err(LlmError::Request(format!("{model} answered without scores or HEARD: {content:.200}")));
     }
-    Ok(Verdict { scores, heard, model: if done.model.is_empty() { route.model.clone() } else { done.model }, ms: done.ms })
-}
-
-/// The listening model config.json asks for, else the default.
-pub fn route() -> Route {
-    Route::for_model(&crate::assistant::load_config_str(MODEL_FIELD).unwrap_or_else(|| DEFAULT_MODEL.to_string()))
+    Ok(Verdict { scores, heard, model: if done.model.is_empty() { model.to_string() } else { done.model }, ms: done.ms })
 }
 
 // ---------------------------------------------------------------------------
@@ -365,15 +410,17 @@ pub fn request_of(args: &Value) -> (f32, Request) {
 /// Blocking; run it off the UI thread. The answer is the text the agent reads.
 pub fn listen(args: &Value) -> String {
     let (secs, request) = request_of(args);
-    let route = route();
-    let Some(key) = route.endpoint.key() else {
+    let model = Role::Listen.model();
+    let Some(key) = llm::key() else {
         return format!(
-            "listen: no listening model: {} needs a {} key in config.json ({}). Use measure_mix for loudness, peak and bands.",
-            route.model, route.endpoint.spec().label, route.endpoint.spec().key_field
+            "listen: no listening model: {model} needs an {} key in config.json ({}). Use measure_mix for loudness, peak and bands.",
+            llm::PROVIDER, llm::KEY_FIELD
         );
     };
     let capture = CAPTURE.lock().ok().and_then(|c| c.clone());
     let Some(capture) = capture else { return "listen: this process renders no master to listen to".into() };
+    let _end = StageEnd;
+    set_stage(Some(Stage::Recording { since: Instant::now(), secs }));
     let clip = match capture.record(secs) {
         Ok(c) => c,
         Err(e) => return format!("listen: {e}"),
@@ -386,9 +433,10 @@ pub fn listen(args: &Value) -> String {
         Ok(t) => llm::Client::new(t),
         Err(e) => return format!("listen: {e}"),
     };
-    match judge(&mut client, &route, &key, &clip, &request) {
+    set_stage(Some(Stage::Judging { since: Instant::now(), model: model.clone() }));
+    match judge(&mut client, &model, &key, &clip, &request) {
         Ok(v) => report(&v, &features),
-        Err(e) => format!("listen: {} failed: {e}. measure_mix still works.", route.model),
+        Err(e) => format!("listen: {model} failed: {e}. measure_mix still works."),
     }
 }
 
@@ -529,7 +577,7 @@ fn surge_clip(category: &str, name: &str, phrase: Phrase, secs: f32) -> anyhow::
     let mut g = Graph::default();
     g.reserve(8, 8);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -613,7 +661,7 @@ fn reference_clips() -> anyhow::Result<Vec<(&'static str, Clip)>> {
 pub fn run_test() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
-    let route = value("--model").map_or_else(route, |m| Route::for_model(&m));
+    let model = value("--model").unwrap_or_else(|| Role::Listen.model());
     let runs: usize = value("--runs").and_then(|r| r.parse().ok()).unwrap_or(2).max(1);
     let mut wire = Wire::default();
     if let Some(r) = value("--reasoning") {
@@ -628,7 +676,7 @@ pub fn run_test() -> anyhow::Result<()> {
         audio_only: args.iter().any(|a| a == "--audio-only"),
         wire,
     };
-    let key = route.endpoint.key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", route.endpoint.spec().label))?;
+    let key = llm::key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", llm::PROVIDER))?;
     let clips = reference_clips()?;
     if let Some(dir) = value("--save") {
         std::fs::create_dir_all(&dir)?;
@@ -639,8 +687,8 @@ pub fn run_test() -> anyhow::Result<()> {
     let upload_kb = body(&clips[0].1, &request).to_string().len() / 1000;
     println!(
         "listen-test: {} on {}, {runs} run(s), {}, upload {}, reasoning {}, {upload_kb} KB per request",
-        route.model,
-        route.endpoint.spec().label,
+        model,
+        llm::PROVIDER,
         if request.audio_only { "audio only" } else { "audio + measured features" },
         request.wire.rate.map_or("as recorded".into(), |r| format!("mono {r} Hz")),
         request.wire.reasoning.as_deref().unwrap_or("default"),
@@ -651,10 +699,10 @@ pub fn run_test() -> anyhow::Result<()> {
             let calls: Vec<_> = clips
                 .iter()
                 .map(|(name, clip)| {
-                    let (route, key, request) = (&route, &key, &request);
+                    let (model, key, request) = (&model, &key, &request);
                     s.spawn(move || {
                         let mut client = llm::Client::new(llm::HttpTransport::new()?);
-                        judge(&mut client, route, key, clip, request).map_err(|e| format!("{name}: {e}"))
+                        judge(&mut client, model, key, clip, request).map_err(|e| format!("{name}: {e}"))
                     })
                 })
                 .collect();
@@ -760,11 +808,10 @@ mod tests {
     }
 
     #[test]
-    fn judge_sends_to_the_listening_route_and_reports_text() {
+    fn judge_sends_to_the_listening_model_and_reports_text() {
         let mut client = llm::Client::new(FakeTransport::new(vec![fake::text("google/gemini-3.8-flash", "SCORES\nbright: 8\nHEARD: An open saw riff.")]));
-        let route = Route::for_model(DEFAULT_MODEL);
         let clip = saw_riff(9000.0);
-        let v = judge(&mut client, &route, "k", &clip, &request(&["bright"])).unwrap();
+        let v = judge(&mut client, Role::Listen.default_model(), "k", &clip, &request(&["bright"])).unwrap();
         assert_eq!(v.score("bright"), Some(8.0));
         let text = report(&v, &Features::of(&clip));
         assert!(text.starts_with("listened to 4.0 s"), "{text}");
@@ -774,7 +821,7 @@ mod tests {
     #[test]
     fn an_answer_with_neither_scores_nor_heard_is_an_error() {
         let mut client = llm::Client::new(FakeTransport::new(vec![fake::text("m", "I cannot hear audio.")]));
-        let err = judge(&mut client, &Route::for_model(DEFAULT_MODEL), "k", &chiptune(), &request(&["soft"])).unwrap_err();
+        let err = judge(&mut client, Role::Listen.default_model(), "k", &chiptune(), &request(&["soft"])).unwrap_err();
         assert!(matches!(err, LlmError::Request(_)), "{err:?}");
     }
 

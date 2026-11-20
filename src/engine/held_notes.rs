@@ -282,7 +282,7 @@ impl Edit {
 fn start_graph() -> Graph {
     let mut g = Graph::default();
     g.reserve(16, 16);
-    let clap = || NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") };
+    let clap = || NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") };
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let a = g.add_node(clap(), name_bytes("SURGE A"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
@@ -302,7 +302,7 @@ fn start_graph() -> Graph {
 fn start_graph_with_strip() -> Graph {
     let mut g = Graph::default();
     g.reserve(16, 16);
-    let clap = || NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") };
+    let clap = || NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") };
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let a = g.add_node(clap(), name_bytes("SURGE A"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));

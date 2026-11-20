@@ -83,6 +83,34 @@ you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
 it has loaded.
 
+### Browse and install plugins by type
+Press **F9** (or **B**) to open **Plugins**, organized by what each unit does
+rather than by plugin format: **Instruments**, **Effects**, **MIDI FX**,
+**Utilities** and the **Install** catalog. Narrow **Effects** by subcategory
+(**Delay & Reverb**, **EQ & Filter**, **Dynamics**, **Drive & Amp**,
+**Modulation**, **Pitch & Spatial**, **Multi-FX**) or filter by format
+(**Built-in**, **CLAP**, **LV2**). Add an instrument as a **New rig** alongside
+your existing rigs or layer it into the active rig, insert any effect onto the
+active rig or straight onto the **Master FX** bus, and filter the mixer's
+**+ insert** picker by the same effect categories. The assistant and MCP agents
+search the same taxonomy with `list_plugins`.
+
+<p align="center"><img src="docs/shots/plugins.png" width="85%" alt="The Plugins view organized by type (Instruments, Effects, MIDI FX, Utilities) with effect subcategory and format filters"/></p>
+
+### Install instruments from the catalog
+**Plugins → Install** lists 20 hand-picked plugins that are known to work in
+kabelsalat, and **Install** fetches one for you: the Arch package where there is
+one, otherwise a pinned release or a build from source into `~/.clap` or
+`~/.lv2`. Synths: Surge XT, Dexed, Vitalium, Odin 2, OB-Xf (Oberheim), the
+Juno-style Ultramaster KR-106, Six Sines (FM), JC303 (TB-303), YANES (chiptune)
+and Cardinal (modular). Keys and organs: setBfree, Aeolus, OneTrick KEYS
+(modelled piano). Bass and drums: OneTrick CHONK, OneTrick CRYPTID (FM drums),
+AVL Drumkits (sampled kits). Winds: Starbreath, modelled flutes, reeds and
+brass for a wind controller (freeware, x86-64 only). Also Floe (sample
+libraries), Guitarix and the x42 MIDI filters (chord, strum, mono legato, CC
+remap). A card says when a plugin has no build for your CPU, and links its
+source code and website.
+
 ### Put MIDI effects in front of an instrument
 A **MIDI strip** sits between your keys and the instrument and changes the notes
 on the way: the built-in **MIDI transpose**, or any installed LV2 MIDI plugin
@@ -128,6 +156,12 @@ readout says so and asks for more master VOLUME. The target is saved with
 the session. The assistant and MCP agents do the same with
 `set_master_target` and read the numbers with `get_master_target`.
 
+Parallel paths stay in phase. When a signal splits and meets again, and one
+path runs through a unit that looks ahead (the Limiter waits 5 ms to catch
+peaks), the other paths wait for it, so a dry sound and its limited copy add
+up cleanly instead of sounding hollow. A bypassed Limiter keeps its delay, so
+switching it in and out never shifts anything in time.
+
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 
 ### Share an effect with sends
@@ -158,12 +192,22 @@ sound back to the system's output. The assistant and MCP agents do the same
 
 <p align="center"><img src="docs/shots/system-audio.png" width="85%" alt="The mixer with a System audio section: a Firefox strip turned down and a muted Spotify strip, each with a meter, beside Master out with the MOTU M2 chosen as the output"/></p>
 
-### Navigate rigs, channels and plugins
-Press **Q** (or click **Navigator** in the top bar) to open the right-hand
-Navigator panel. Switch between **CHANNELS**, **PLUGINS** and **ALL** to see
-every rig's channels in their mixer colours and unfold their plugin chains
-(**CLAP**, **LV2** and **built-in**). Clicking an entry switches to that rig
-and selects the unit in the rack or scrolls and flashes its strip in the mixer.
+### Navigate rigs, sessions and plugins
+One top bar holds the session, the rigs and the views. The **session pill**
+on the left (`● Untitled ▾`, teal once saved) opens a small popover to save,
+load or delete sessions and start from a template (**Ctrl+O**). While the
+left rail is closed, the bar shows the rigs as compact pills: the active one
+as `1 · Lead` with a live level bar, the others as numbers with an activity
+dot, and **+** adds a rig.
+
+Press **Q** (or the rail button left of the session pill) to open the
+**left rail**. Its **Rigs** tab lists every rig with its MIDI input, level and
+a **⋯** menu (rename, save as or replace from a rig preset, MIDI input, delete), its channels in their mixer
+colours and their plugin chains (**CLAP**, **LV2** and **built-in**); filter
+with **ALL**, **CHANNELS** and **PLUGINS**. Clicking an entry switches to that
+rig and selects the unit in the rack or scrolls and flashes its strip in the
+mixer. The **Library** tab keeps sessions, rig presets and starter templates
+in one place.
 
 ### Keep an eye on the engine
 Beside your rigs, **DSP** shows how much of each audio buffer the engine needs
@@ -173,7 +217,7 @@ sample rate and buffer, inputs and outputs, late blocks and xruns, the
 latencies kabelsalat measures, and the render time of every instrument and
 effect, most expensive first, so you see which unit to swap when the load
 climbs. Adjust the audio **Buffer size** (64–2048 frames, default 256) live
-with **− / +** in Engine info or from **Settings** — smaller lowers latency,
+with **− / +** in Engine info or from **Settings → Audio** — smaller lowers latency,
 larger prevents xruns — and the choice is remembered across restarts. The
 assistant and MCP agents read and adjust the same engine settings
 (`get_engine_info`, `set_buffer_size`).
@@ -226,8 +270,16 @@ shifts the start. With sync on and the transport rolling, it starts on the next
 bar line.
 
 ### Ask the assistant — or your own AI agent
-The built-in assistant (bring your own DeepSeek key) can set things up for you:
-"add a reverb to this rig", "split the keys at C4", "load a warm pad". Everything
+The built-in assistant (bring your own [OpenRouter](https://openrouter.ai/keys)
+key, entered under **Settings → Agent → API key**) can set things up for you:
+"add a reverb to this rig", "split the keys at C4", "load a warm pad". One key
+reaches every model: **Settings → Agent → Models** picks the chat model, the
+decisions model and the listening model, or takes any OpenRouter model id. While
+it works, the assistant says what it is doing ("Planning the next step · after
+Load sound"), and when it listens to your sound a bar shows how long it still
+records, in the dock, on the top bar's button and on the rack's hint line.
+Don't want it? Switch **Assistant** off on the same page and it leaves the top
+bar and the dock. Everything
 an agent changes lights up in the rack, and **Ctrl+Z** undoes the whole request
 in one step. External AI agents (Claude, …) can drive the running app through
 the built-in MCP server; the top bar shows when one is connected and pauses it
@@ -314,7 +366,10 @@ how it is built in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   an agent tool. `kabelsalat send '<json>'` is a one-shot CLI client.
 - **Testing:** a unit suite (`cargo test --bin kabelsalat`) plus CLI self-tests
   that run real plugins (`record-test`, `rig-mix-test`, `cc-map-test`,
-  `transport-test`, …). Rules learned from real bugs are kept in
+  `transport-test`, …). `analysis-test` checks the engine by what it sounds
+  like: a note's pitch, brightness and aliasing from its spectrum, the
+  master's crackle, routing proven with noise, and delay compensation by
+  cross-correlation. Rules learned from real bugs are kept in
   [AGENTS.md](AGENTS.md).
 - **Platforms:** developed and tested on Asahi Linux (Arch, ARM64); x86_64 Linux builds the same way.
 

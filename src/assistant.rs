@@ -1,16 +1,16 @@
 //! Built-in assistant: the agent loop behind the chat, bring-your-own-key.
 //!
 //! The assistant talks to the same control surface the UI uses (the MCP
-//! server exposes the identical toolset). Which model answers is a route
-//! (`llm::Route`); keys are stored locally in ~/.config/kabelsalat/config.json
-//! (mode 0600) and only ever sent to the endpoint they belong to.
+//! server exposes the identical toolset). Every model is reached through
+//! OpenRouter (`llm`); its key is stored locally in
+//! ~/.config/kabelsalat/config.json (mode 0600) and only ever sent there.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use serde_json::{json, Value};
 
 use crate::control::{DspKind, Edge, Graph, NodeId, NodeKind, PortKind};
-use crate::llm::{self, Endpoint, LlmError, Role, Route, Transport};
+use crate::llm::{self, LlmError, Role, Transport};
 
 pub fn config_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -18,10 +18,6 @@ pub fn config_path() -> std::path::PathBuf {
         .join(".config")
         .join("kabelsalat")
         .join("config.json")
-}
-
-pub fn save_key(key: &str) -> std::io::Result<()> {
-    save_config_field("deepseek_api_key", key)
 }
 
 /// A string field of config.json (None in tests — they never read the
@@ -150,6 +146,16 @@ pub fn save_reduce_motion(reduce: bool) -> std::io::Result<()> {
     save_reduce_motion_to(&config_path(), reduce)
 }
 
+/// Whether the built-in assistant is part of the app (default: yes). Off
+/// hides its top-bar button, its dock and its shortcut.
+pub fn load_assistant_enabled() -> bool {
+    load_config_value("assistant_enabled").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+pub fn save_assistant_enabled(on: bool) -> std::io::Result<()> {
+    save_config_value("assistant_enabled", Value::Bool(on))
+}
+
 /// Persisted `session_autosave` flag in config.json (default on; off in
 /// tests, which never write the user's sessions, rule 37).
 pub fn load_session_autosave() -> bool {
@@ -215,43 +221,23 @@ pub enum ToWorker {
     ToolResults(Vec<String>),
 }
 
-/// Live phase of an in-flight assistant turn.
+/// Live phase of an in-flight assistant turn: which model has the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunPhase {
+    /// The decisions model reads the request.
     Deciding,
+    /// The chat model works on its `step`-th answer of the turn.
     Thinking { step: usize, model: String },
 }
 
-impl RunPhase {
-    pub fn route_name(model: &str) -> &str {
-        let low = model.to_ascii_lowercase();
-        if low.contains("jev-router") {
-            "Jev router"
-        } else if low.contains("jev") {
-            "Jev"
-        } else if low.contains("deepseek") {
-            "DeepSeek"
-        } else if low.contains("gemini") {
-            "Gemini"
-        } else if low.contains("claude") {
-            "Claude"
-        } else {
-            model.rsplit('/').next().unwrap_or(model)
-        }
-    }
-
-    pub fn label(&self) -> String {
-        match self {
-            RunPhase::Deciding => "Jev · deciding".to_string(),
-            RunPhase::Thinking { step, model } => format!("{} · step {step}", Self::route_name(model)),
-        }
-    }
+/// A model id as the transcript names it: without the vendor and without
+/// OpenRouter's alias mark ("~anthropic/claude-haiku-latest" → "claude-haiku-latest").
+pub fn short_model(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model).trim_start_matches('~')
 }
 
 #[derive(Debug)]
 pub enum FromWorker {
-    /// Chat models the DeepSeek key can use (GET /models), fetched once.
-    Models(Vec<String>),
     Phase(RunPhase),
     Text(String),
     /// Every valid tool call of one model step, in call order. The host runs
@@ -296,35 +282,38 @@ impl TurnStats {
         let last = self.steps.last()?;
         let n = self.steps.len();
         let secs = self.steps.iter().map(|s| s.ms).sum::<u64>() as f64 / 1000.0;
-        let model = last.model.rsplit('/').next().unwrap_or(&last.model);
+        let model = short_model(&last.model);
         let retries: u32 = self.steps.iter().map(|s| s.attempts - 1).sum();
         let retried = if retries > 0 { format!(" · {retries} retr{}", if retries == 1 { "y" } else { "ies" }) } else { String::new() };
         Some(format!("{n} step{} · {secs:.1} s · {model}{retried}", if n == 1 { "" } else { "s" }))
     }
 }
 
-type SharedRoute = std::sync::Arc<std::sync::Mutex<Route>>;
-type SharedOptRoute = std::sync::Arc<std::sync::Mutex<Option<Route>>>;
+type SharedModel = std::sync::Arc<std::sync::Mutex<String>>;
+type SharedOptModel = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
-/// Where each kind of request goes. Every role is read on each request so
-/// changes in Settings or `/model` take effect without restarting a chat.
+/// The model of each kind of request. Read on every request, so a change in
+/// Settings or `/model` takes effect without restarting a chat.
 #[derive(Clone)]
 struct Routes {
-    act: SharedRoute,
-    decide: SharedOptRoute,
+    act: SharedModel,
+    /// None = no decisions model in front of the chat model.
+    decide: SharedOptModel,
 }
 
 pub struct Assistant {
     pub history: Vec<ChatLine>,
     pub busy: bool,
+    /// config.json holds an OpenRouter key.
     pub key_set: bool,
+    /// config.json still holds a key of the retired direct DeepSeek endpoint.
+    pub retired_key: bool,
     pub phase: Option<RunPhase>,
     routes: Routes,
-    keys_present: llm::Keys,
     decide_enabled: bool,
     decide_model: String,
-    act_overridden: bool,
-    /// Models offered in the picker.
+    listen_model: String,
+    /// Chat models offered in the picker.
     pub models: Vec<String>,
     pub turn: TurnStats,
     tx: Option<Sender<ToWorker>>,
@@ -333,128 +322,76 @@ pub struct Assistant {
 
 impl Assistant {
     pub fn new() -> Self {
-        Self::on_route(Route::configured(Role::Act), true)
+        Self::on_model(Role::Act.model(), true)
     }
 
     /// An assistant on `model` for this process only: nothing is written to
     /// the user's config (agent-eval compares models without changing the
     /// one the app uses). `decide` false = no decisions model in front.
     pub fn with_model(model: &str, decide: bool) -> Self {
-        Self::on_route(Route::for_model(model), decide)
+        Self::on_model(model.to_string(), decide)
     }
 
-    fn on_route(route: Route, decide: bool) -> Self {
-        let keys_present = llm::Keys {
-            openrouter: Endpoint::OpenRouter.key().is_some(),
-            deepseek: Endpoint::DeepSeek.key().is_some(),
-        };
+    fn on_model(act: String, decide: bool) -> Self {
         let decide_cfg = load_config_str(Role::Decide.model_field());
         let decide_enabled = decide && !matches!(decide_cfg.as_deref(), Some("off"));
-        let decide_route = if decide_enabled {
-            Route::configured(Role::Decide)
-        } else {
-            Route::for_model(llm::JEV)
-        };
-        let decide_model = decide_route.model.clone();
-        let decide_active = Some(decide_route)
-            .filter(|r| decide_enabled && r.endpoint.spec().decisions_url.is_some() && keys_present.has(r.endpoint));
-        let act_overridden = load_config_str(Role::Act.model_field()).is_some();
-        let models = picker_models(keys_present.openrouter, keys_present.deepseek, &route.model);
-        let key_set = keys_present.has(route.endpoint);
         let mut a = Self {
             history: Vec::new(),
             busy: false,
-            key_set,
+            key_set: llm::key().is_some(),
+            retired_key: load_config_str(llm::RETIRED_KEY_FIELD).is_some(),
             phase: None,
+            models: picker_models(&act),
             routes: Routes {
-                act: std::sync::Arc::new(std::sync::Mutex::new(route)),
-                decide: std::sync::Arc::new(std::sync::Mutex::new(decide_active)),
+                act: std::sync::Arc::new(std::sync::Mutex::new(act)),
+                decide: std::sync::Arc::new(std::sync::Mutex::new(None)),
             },
-            keys_present,
             decide_enabled,
-            decide_model,
-            act_overridden,
-            models,
+            decide_model: Role::Decide.resolve(decide_cfg.as_deref()),
+            listen_model: Role::Listen.model(),
             turn: TurnStats::default(),
             tx: None,
             rx: None,
         };
+        a.sync_decide_model();
         if a.key_set {
             a.start_worker();
         }
         a
     }
 
-    /// The user just stored a DeepSeek key. A route that still has no key
-    /// (an OpenRouter model without an OpenRouter key) falls back to it.
-    pub fn key_saved(&mut self) {
-        self.keys_present.deepseek = true;
-        if let Ok(mut route) = self.routes.act.lock() {
-            if !self.keys_present.has(route.endpoint) {
-                *route = Route::for_model(llm::DEEPSEEK_CHAT);
-            }
-        }
-        self.restart_worker();
-    }
-
-    /// Save an API key for `endpoint` (test-safe no-op on disk under cfg(test))
-    /// and restart the worker so it takes effect immediately.
-    pub fn save_api_key(&mut self, endpoint: Endpoint, key: &str) -> std::io::Result<()> {
-        save_config_field(endpoint.spec().key_field, key)?;
-        self.keys_present.set(endpoint, true);
-        if endpoint == Endpoint::DeepSeek {
-            if let Ok(mut route) = self.routes.act.lock() {
-                if !self.keys_present.has(route.endpoint) {
-                    *route = Route::for_model(llm::DEEPSEEK_CHAT);
-                }
-            }
-        }
+    /// Save the OpenRouter key (a no-op on disk under cfg(test)) and restart
+    /// the worker so it takes effect immediately.
+    pub fn save_api_key(&mut self, key: &str) -> std::io::Result<()> {
+        save_config_field(llm::KEY_FIELD, key)?;
+        self.key_set = true;
         self.restart_worker();
         Ok(())
     }
 
-    /// Remove an API key for `endpoint` (test-safe no-op on disk under cfg(test))
-    /// and restart/stop the worker accordingly.
-    pub fn remove_api_key(&mut self, endpoint: Endpoint) -> std::io::Result<()> {
-        remove_config_field(endpoint.spec().key_field)?;
-        self.keys_present.set(endpoint, false);
+    /// Remove the OpenRouter key (a no-op on disk under cfg(test)) and stop
+    /// the worker.
+    pub fn remove_api_key(&mut self) -> std::io::Result<()> {
+        remove_config_field(llm::KEY_FIELD)?;
+        self.key_set = false;
         self.restart_worker();
         Ok(())
     }
 
-    /// Drop any existing worker channels and start a fresh worker if a key is
-    /// available (never spawns network threads under cfg(test), rule 37).
+    /// Drop the worker and start a fresh one when there is a key (never
+    /// spawns network threads under cfg(test), rule 37).
     pub fn restart_worker(&mut self) {
         self.tx = None;
         self.rx = None;
         self.busy = false;
         self.phase = None;
-
-        if !self.act_overridden {
-            if let Ok(mut act) = self.routes.act.lock() {
-                *act = Route::resolve(Role::Act, None, self.keys_present);
-            }
-        }
-        let act_route = self.route_for(Role::Act);
-        self.models = picker_models(self.keys_present.openrouter, self.keys_present.deepseek, &act_route.model);
-        self.sync_decide_route();
-        self.key_set = self.keys_present.has(act_route.endpoint)
-            || self.keys_present.deepseek
-            || self.keys_present.openrouter;
         if self.key_set {
             self.start_worker();
         }
     }
 
-    fn sync_decide_route(&mut self) {
-        let next = if self.decide_enabled {
-            let r = Route::for_model(&self.decide_model);
-            let ok_endpoint = r.endpoint.spec().decisions_url.is_some();
-            let ok_key = cfg!(test) || self.keys_present.has(r.endpoint);
-            (ok_endpoint && ok_key).then_some(r)
-        } else {
-            None
-        };
+    fn sync_decide_model(&mut self) {
+        let next = self.decide_enabled.then(|| self.decide_model.clone());
         if let Ok(mut d) = self.routes.decide.lock() {
             *d = next;
         }
@@ -469,46 +406,28 @@ impl Assistant {
         self.tx = Some(tx_in);
         self.rx = Some(rx_out);
         let routes = self.routes.clone();
-        // Its own thread: a slow model list must not delay the first request.
-        let list_tx = tx_out.clone();
-        std::thread::spawn(move || {
-            if let Some(ids) = fetch_deepseek_models() { let _ = list_tx.send(FromWorker::Models(ids)); }
-        });
         std::thread::spawn(move || match llm::HttpTransport::new() {
-            Ok(transport) => worker(llm::Client::new(transport), routes, Endpoint::key, rx_in, tx_out),
+            Ok(transport) => worker(llm::Client::new(transport), routes, llm::key, rx_in, tx_out),
             Err(e) => { let _ = tx_out.send(FromWorker::Error(e)); }
         });
     }
 
+    /// The chat model.
     pub fn model(&self) -> String {
-        self.routes.act.lock().map(|r| r.model.clone()).unwrap_or_default()
-    }
-
-    pub fn keys(&self) -> llm::Keys {
-        self.keys_present
+        self.model_for(Role::Act)
     }
 
     pub fn decide_enabled(&self) -> bool {
         self.decide_enabled
     }
 
-    /// Current route for `role` (`Decide` returns its configured model even
-    /// while disabled so Settings can display and edit it).
-    pub fn route_for(&self, role: Role) -> Route {
+    /// The model of `role` (`Decide` names its model even while it is off,
+    /// so Settings can show and change it).
+    pub fn model_for(&self, role: Role) -> String {
         match role {
-            Role::Decide => self
-                .routes
-                .decide
-                .lock()
-                .ok()
-                .and_then(|d| d.clone())
-                .unwrap_or_else(|| Route::for_model(&self.decide_model)),
-            Role::Act => self
-                .routes
-                .act
-                .lock()
-                .map(|r| r.clone())
-                .unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT)),
+            Role::Decide => self.decide_model.clone(),
+            Role::Act => self.routes.act.lock().map(|m| m.clone()).unwrap_or_default(),
+            Role::Listen => self.listen_model.clone(),
         }
     }
 
@@ -521,54 +440,46 @@ impl Assistant {
         self.decide_enabled = on;
         let persisted = if on { self.decide_model.as_str() } else { "off" };
         let _ = save_config_field(Role::Decide.model_field(), persisted);
-        self.sync_decide_route();
+        self.sync_decide_model();
     }
 
-    /// Switch any role's model (persisted; applies from the next request).
+    /// Switch a role's model (persisted; applies from the next request).
+    /// Returns the line for the user.
     pub fn set_role_model(&mut self, role: Role, m: &str) -> String {
         let m = m.trim();
         if m.is_empty() {
             return "model id is empty".to_string();
         }
+        if role == Role::Decide && m.eq_ignore_ascii_case("off") {
+            self.set_decide_enabled(false);
+            return "decisions model turned off".to_string();
+        }
+        if !llm::routable(m) {
+            return format!("{m} is not an {} model id (they read vendor/model, e.g. {})", llm::PROVIDER, role.default_model());
+        }
+        let _ = save_config_field(role.model_field(), m);
         match role {
-            Role::Act => self.set_model(m),
             Role::Decide => {
-                if m.eq_ignore_ascii_case("off") {
-                    self.set_decide_enabled(false);
-                    return "decisions model turned off".to_string();
-                }
                 self.decide_model = m.to_string();
                 self.decide_enabled = true;
-                let _ = save_config_field(Role::Decide.model_field(), m);
-                self.sync_decide_route();
-                let route = Route::for_model(m);
-                let spec = route.endpoint.spec();
-                if route.endpoint.spec().decisions_url.is_none() {
-                    format!("decisions model set to {m}, but {} has no decisions API", spec.label)
-                } else if !self.keys_present.has(route.endpoint) && !cfg!(test) {
-                    format!("decisions model switched to {m}, but config.json has no {} key yet ({})", spec.label, spec.key_field)
-                } else {
-                    format!("decisions model switched to {m}")
-                }
+                self.sync_decide_model();
+                format!("decisions model switched to {m}")
+            }
+            Role::Act => {
+                if let Ok(mut cur) = self.routes.act.lock() { *cur = m.to_string(); }
+                if !self.models.iter().any(|x| x == m) { self.models.push(m.to_string()); }
+                format!("model switched to {m} (the conversation continues)")
+            }
+            Role::Listen => {
+                self.listen_model = m.to_string();
+                format!("listening model switched to {m}")
             }
         }
     }
 
-    /// Switch the acting model (persisted; applies from the next request).
-    /// Returns the line for the chat.
+    /// Switch the chat model. Returns the line for the chat.
     pub fn set_model(&mut self, m: &str) -> String {
-        let route = Route::for_model(m);
-        let spec = route.endpoint.spec();
-        let missing_key = !self.keys_present.has(route.endpoint) && !cfg!(test);
-        self.act_overridden = true;
-        if let Ok(mut cur) = self.routes.act.lock() { *cur = route; }
-        let _ = save_config_field(Role::Act.model_field(), m);
-        if !self.models.iter().any(|x| x == m) { self.models.push(m.to_string()); }
-        if missing_key {
-            format!("model switched to {m}, but config.json has no {} key yet ({})", spec.label, spec.key_field)
-        } else {
-            format!("model switched to {m} (the conversation continues)")
-        }
+        self.set_role_model(Role::Act, m)
     }
 
     pub fn send_user(&mut self, text: String) {
@@ -589,10 +500,6 @@ impl Assistant {
         if let Some(tx) = &self.tx {
             let _ = tx.send(ToWorker::User(sent));
         }
-    }
-
-    pub fn phase_label(&self) -> String {
-        self.phase.as_ref().map_or_else(|| "Assistant · working".to_string(), RunPhase::label)
     }
 
     /// Answer a batch from `poll`: one result per call, in call order.
@@ -616,11 +523,6 @@ impl Assistant {
                     batches.push(batch);
                 }
                 FromWorker::Step(s) => self.turn.steps.push(s),
-                FromWorker::Models(list) => {
-                    for m in list.into_iter().filter(|m| is_chat_model(m)) {
-                        if !self.models.contains(&m) { self.models.push(m); }
-                    }
-                }
                 FromWorker::Done => {
                     self.busy = false;
                     self.phase = None;
@@ -645,17 +547,12 @@ impl Assistant {
     pub fn with_test_worker() -> (Self, Sender<FromWorker>, Receiver<ToWorker>) {
         let (tx_in, rx_in) = channel::<ToWorker>();
         let (tx_out, rx_out) = channel::<FromWorker>();
-        let mut a = Self::with_model(llm::DEEPSEEK_CHAT, false);
+        let mut a = Self::with_model(Role::Act.default_model(), false);
         a.key_set = true;
         a.tx = Some(tx_in);
         a.rx = Some(rx_out);
         (a, tx_out, rx_in)
     }
-}
-
-/// Chat-capable ids only (embedding models etc. stay out of the picker).
-fn is_chat_model(id: &str) -> bool {
-    ["chat", "reason", "flash", "v3", "v4"].iter().any(|k| id.contains(k))
 }
 
 fn system_prompt() -> String {
@@ -1037,8 +934,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_plugins",
-            "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
-            "parameters":{"type":"object","properties":{}}
+            "description":"List built-in units and installed CLAP/LV2 plugins organized by type (Instruments, Effects, MIDI FX, Utilities) and effect subcategory (Delay & Reverb, EQ & Filter, Dynamics, Drive & Amp, Modulation, Pitch & Spatial, Multi-FX, Analyzers, …). Pass optional type, category, format, or query to narrow large LV2 lists.",
+            "parameters":{"type":"object","properties":{"type":{"type":"string","enum":["all","instrument","effect","midi_fx","utility"],"description":"Filter by plugin type (default all)"},"category":{"type":"string","description":"Filter by subcategory (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"},"format":{"type":"string","enum":["all","builtin","clap","lv2"],"description":"Filter by plugin format (default all)"},"query":{"type":"string","description":"Optional search words matching name, author/vendor, uri/id, or category"},"limit":{"type":"integer","description":"Max items per section (default 24 unfiltered, 60 filtered)"}}}
         }},
         {"type":"function","function":{
             "name":"list_instruments",
@@ -1233,55 +1130,20 @@ pub(crate) fn tools() -> Value {
     ])
 }
 
-/// Which chat models can the DeepSeek key use? (once, for the picker)
-/// The chat models the picker offers. The Jev router is a chat-model router,
-/// not Jev's decision front (that runs before every request on its own): it
-/// is offered only where it is the default, with OpenRouter as the only key.
-/// The current model is always listed.
-fn picker_models(openrouter: bool, deepseek: bool, current: &str) -> Vec<String> {
-    let mut models: Vec<String> = Vec::new();
-    if openrouter && !deepseek {
-        models.push(llm::JEV_ROUTER.into());
-    }
-    models.extend([llm::DEEPSEEK_CHAT.to_string(), "deepseek-reasoner".to_string()]);
-    if !models.iter().any(|m| m == current) {
-        models.insert(0, current.to_string());
-    }
-    models
+/// The chat models the picker offers: the ones Settings lists, with the
+/// current model always among them.
+fn picker_models(current: &str) -> Vec<String> {
+    role_model_choices(Role::Act, current)
 }
 
-/// Model choices shown in Settings for `role`: the picker list plus known
-/// OpenRouter ids already used in code, keeping `current` present.
-pub fn role_model_choices(role: Role, keys: llm::Keys, current: &str) -> Vec<String> {
-    let mut list: Vec<String> = match role {
-        Role::Decide => vec![llm::JEV.to_string()],
-        Role::Act => {
-            let mut m = picker_models(keys.openrouter, keys.deepseek, current);
-            // Not the Jev router: `picker_models` already offers it where it is
-            // the default; beside DeepSeek it read as "turn Jev on" (rule 78).
-            for extra in [llm::CLAUDE_OPUS, llm::GEMINI_FLASH] {
-                if !m.iter().any(|x| x == extra) {
-                    m.push(extra.to_string());
-                }
-            }
-            m
-        }
-    };
+/// Model choices shown for `role`, keeping `current` present.
+pub fn role_model_choices(role: Role, current: &str) -> Vec<String> {
+    let mut list: Vec<String> = role.offered().iter().map(|m| m.to_string()).collect();
     let cur = current.trim();
     if !cur.is_empty() && !cur.eq_ignore_ascii_case("off") && !list.iter().any(|x| x == cur) {
         list.insert(0, cur.to_string());
     }
     list
-}
-
-fn fetch_deepseek_models() -> Option<Vec<String>> {
-    let key = Endpoint::DeepSeek.key()?;
-    let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
-    let url = format!("{}/models", Endpoint::DeepSeek.spec().base_url);
-    let v: Value = client.get(url).bearer_auth(key).send().ok()?.json().ok()?;
-    let ids: Vec<String> = v.get("data")?.as_array()?
-        .iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect();
-    (!ids.is_empty()).then_some(ids)
 }
 
 /// Check one tool call from the model against the tool table and return
@@ -1904,18 +1766,18 @@ fn settled_as(d: &llm::Decisions, user: &str) -> String {
 /// `kabelsalat jev-test`: ask the configured decisions model about sample
 /// requests and print what it decides, how sure it is and how long it took.
 pub fn run_jev_test() -> anyhow::Result<()> {
-    let route = Route::configured(Role::Decide);
-    let key = route.endpoint.key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", route.endpoint.spec().label))?;
+    let model = Role::Decide.model();
+    let key = llm::key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", llm::PROVIDER))?;
     let mut client = llm::Client::new(llm::HttpTransport::new().map_err(anyhow::Error::msg)?);
     let context = "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0), Surge (node 1), Delay (node 3), Master (node 2) · all rigs: 1 · Rig A, 2 · Rig B, 3 · YANES, 4 · Organ]";
     let mut ask = |request: &str| -> anyhow::Result<String> {
         let user = format!("{context}\n{request}");
-        let d = client.decide(&route, &key, &user, decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let d = client.decide(&model, &key, &user, decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let show = |q: &str| d.choice(q).map_or("refused".to_string(), |(c, p)| format!("{c} {p:.2}"));
         Ok(format!("  {:>5} ms  action {:<18} rig {:<10} effect {:<15} sound {:<11} {:<48} {request}  [{}]",
             d.ms, show("action"), show("rig"), show(EFFECT.key), show(SOUND.key), settled_as(&d, &user), d.model))
     };
-    println!("jev-test: {} on {}", route.model, route.endpoint.spec().label);
+    println!("jev-test: {model} on {}", llm::PROVIDER);
     for request in JEV_SAMPLES {
         println!("{}", ask(request)?);
     }
@@ -2015,7 +1877,7 @@ enum TurnEnd {
 fn worker<T: Transport>(
     mut client: llm::Client<T>,
     routes: Routes,
-    key_for: fn(Endpoint) -> Option<String>,
+    key_for: fn() -> Option<String>,
     rx: Receiver<ToWorker>,
     tx: Sender<FromWorker>,
 ) {
@@ -2033,8 +1895,8 @@ fn worker<T: Transport>(
             },
         };
         convo.start_turn(&user);
-        let jev_route = routes.decide.lock().ok().and_then(|d| d.clone());
-        let end = match jev_route.as_ref().and_then(|jev| decide_turn(&mut client, jev, key_for, &user, &mut convo, &rx, &tx)) {
+        let jev = routes.decide.lock().ok().and_then(|d| d.clone());
+        let end = match jev.as_deref().and_then(|jev| decide_turn(&mut client, jev, key_for, &user, &mut convo, &rx, &tx)) {
             Some(end) => end,
             None => run_turn(&mut client, &routes, key_for, &system, &tools, &mut convo, &rx, &tx),
         };
@@ -2079,14 +1941,14 @@ fn record_batch(convo: &mut Conversation, ids: &[Value], results: Vec<Option<Str
 /// request), from wherever the plan left off.
 fn decide_turn<T: Transport>(
     client: &mut llm::Client<T>,
-    jev: &Route,
-    key_for: fn(Endpoint) -> Option<String>,
+    jev: &str,
+    key_for: fn() -> Option<String>,
     user: &str,
     convo: &mut Conversation,
     rx: &Receiver<ToWorker>,
     tx: &Sender<FromWorker>,
 ) -> Option<TurnEnd> {
-    let key = key_for(jev.endpoint)?;
+    let key = key_for()?;
     let _ = tx.send(FromWorker::Phase(RunPhase::Deciding));
     let decision = client.decide(jev, &key, user, decision_questions()).ok()?;
     let _ = tx.send(FromWorker::Step(StepStat { ms: decision.ms, model: decision.model.clone(), attempts: decision.attempts, rejected: 0 }));
@@ -2127,7 +1989,7 @@ fn decide_turn<T: Transport>(
 fn run_turn<T: Transport>(
     client: &mut llm::Client<T>,
     routes: &Routes,
-    key_for: fn(Endpoint) -> Option<String>,
+    key_for: fn() -> Option<String>,
     system: &str,
     tools: &Value,
     convo: &mut Conversation,
@@ -2136,17 +1998,16 @@ fn run_turn<T: Transport>(
 ) -> TurnEnd {
     for step_idx in 0..MAX_STEPS {
         convo.fit(CONTEXT_BUDGET);
-        let route = routes.act.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT));
-        let spec = route.endpoint.spec();
-        let Some(key) = key_for(route.endpoint) else {
-            return TurnEnd::Failed(format!("no {} API key: add {} to {}", spec.label, spec.key_field, config_path().display()));
+        let model = routes.act.lock().map(|m| m.clone()).unwrap_or_else(|_| Role::Act.default_model().to_string());
+        let Some(key) = key_for() else {
+            return TurnEnd::Failed(format!("no {} API key: add {} to {}", llm::PROVIDER, llm::KEY_FIELD, config_path().display()));
         };
         let _ = tx.send(FromWorker::Phase(RunPhase::Thinking {
             step: step_idx + 1,
-            model: route.model.clone(),
+            model: model.clone(),
         }));
         let body = json!({ "messages": convo.request(system), "tools": tools, "tool_choice": "auto" });
-        let done = match client.chat(&route, &key, body) {
+        let done = match client.chat(&model, &key, body) {
             Ok(done) => done,
             Err(LlmError::Transient { message, .. }) => {
                 return TurnEnd::Failed(format!("{message} — gave up after {} attempts, try again in a moment", llm::MAX_ATTEMPTS));
@@ -2205,17 +2066,14 @@ fn assistant_message(message: &Value) -> Value {
 #[cfg(test)]
 mod tests {
 
-    /// The picker never offers the Jev router next to DeepSeek: picking it
-    /// looked like "turning Jev on" and made every chat step 2-8 s.
+    /// A model configured outside the offered list stays visible (and
+    /// switchable away from).
     #[test]
-    fn picker_offers_the_jev_router_only_without_a_deepseek_key() {
-        let both = picker_models(true, true, llm::DEEPSEEK_CHAT);
-        assert!(!both.iter().any(|m| m == llm::JEV_ROUTER), "{both:?}");
-        assert!(picker_models(true, false, llm::JEV_ROUTER).iter().any(|m| m == llm::JEV_ROUTER));
-        // A configured router stays visible (and switchable away from).
-        let cur = picker_models(true, true, llm::JEV_ROUTER);
-        assert_eq!(cur[0], llm::JEV_ROUTER);
-        assert!(cur.iter().any(|m| m == llm::DEEPSEEK_CHAT));
+    fn the_picker_always_lists_the_current_model() {
+        let cur = picker_models("mistralai/some-new-model");
+        assert_eq!(cur[0], "mistralai/some-new-model");
+        assert!(cur.iter().any(|m| m == Role::Act.default_model()));
+        assert_eq!(picker_models(Role::Act.default_model()).iter().filter(|m| *m == Role::Act.default_model()).count(), 1);
     }
     use super::*;
 
@@ -2268,22 +2126,22 @@ mod tests {
     /// Run the worker to the end of `inbox` on scripted model replies.
     /// Returns what it sent to the app and every request it made.
     fn drive(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>) -> (Vec<FromWorker>, Vec<Value>) {
-        drive_with(replies, inbox, None, |_| Some("test-key".to_string()))
+        drive_with(replies, inbox, None, || Some("test-key".to_string()))
     }
 
     /// The same with Jev in front: the first reply of each turn is its decision.
     fn drive_with_jev(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>) -> (Vec<FromWorker>, Vec<Value>) {
-        drive_with(replies, inbox, Some(Route::for_model(llm::JEV)), |_| Some("test-key".to_string()))
+        drive_with(replies, inbox, Some(llm::JEV.to_string()), || Some("test-key".to_string()))
     }
 
-    fn drive_with(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>, decide: Option<Route>, key_for: fn(Endpoint) -> Option<String>) -> (Vec<FromWorker>, Vec<Value>) {
+    fn drive_with(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>, decide: Option<String>, key_for: fn() -> Option<String>) -> (Vec<FromWorker>, Vec<Value>) {
         let probe = FakeTransport::new(replies);
         let (tx_in, rx_in) = channel();
         let (tx_out, rx_out) = channel();
         for msg in inbox { tx_in.send(msg).unwrap(); }
         drop(tx_in);
         let routes = Routes {
-            act: std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(llm::JEV_ROUTER))),
+            act: std::sync::Arc::new(std::sync::Mutex::new(llm::JEV_ROUTER.to_string())),
             decide: std::sync::Arc::new(std::sync::Mutex::new(decide)),
         };
         worker(llm::Client::new(probe.clone()), routes, key_for, rx_in, tx_out);
@@ -2524,17 +2382,15 @@ mod tests {
     }
 
     #[test]
-    fn run_phase_labels_name_route_and_action() {
-        assert_eq!(RunPhase::Deciding.label(), "Jev · deciding");
-        assert_eq!(
-            RunPhase::Thinking { step: 2, model: "deepseek-chat".into() }.label(),
-            "DeepSeek · step 2"
-        );
+    fn a_model_is_named_without_vendor_or_alias_mark() {
+        assert_eq!(short_model("anthropic/claude-haiku-5.5"), "claude-haiku-5.5");
+        assert_eq!(short_model("~deepseek/deepseek-flash-latest"), "deepseek-flash-latest");
+        assert_eq!(short_model("plain"), "plain");
     }
 
     #[test]
     fn a_missing_key_is_named_and_nothing_is_sent() {
-        let (events, requests) = drive_with(vec![], vec![user("hi")], None, |_| None);
+        let (events, requests) = drive_with(vec![], vec![user("hi")], None, || None);
         assert!(requests.is_empty());
         assert!(matches!(&events[..], [FromWorker::Error(e), FromWorker::Done] if e.contains("OpenRouter") && e.contains("openrouter_api_key")), "{events:?}");
     }
@@ -2973,19 +2829,19 @@ mod tests {
     }
 
     #[test]
-    fn role_model_choices_and_role_switching_update_routes() {
-        let keys = llm::Keys { openrouter: true, deepseek: true };
-        let act_choices = role_model_choices(Role::Act, keys, llm::DEEPSEEK_CHAT);
-        assert!(act_choices.iter().any(|m| m == llm::DEEPSEEK_CHAT));
-        assert!(act_choices.iter().any(|m| m == "deepseek-reasoner"));
-        assert!(!act_choices.iter().any(|m| m == llm::JEV_ROUTER), "no Jev router beside DeepSeek: {act_choices:?}");
-        assert!(role_model_choices(Role::Act, llm::Keys { openrouter: true, deepseek: false }, llm::JEV_ROUTER).iter().any(|m| m == llm::JEV_ROUTER));
-        assert!(act_choices.iter().any(|m| m == llm::CLAUDE_OPUS));
-        assert!(act_choices.iter().any(|m| m == llm::GEMINI_FLASH));
+    fn role_model_choices_and_role_switching_update_the_models() {
+        let act_choices = role_model_choices(Role::Act, Role::Act.default_model());
+        assert_eq!(act_choices[0], Role::Act.default_model());
+        for offered in [llm::CLAUDE_OPUS, llm::GEMINI_FLASH, llm::DEEPSEEK_FLASH, llm::JEV_ROUTER] {
+            assert!(act_choices.iter().any(|m| m == offered), "{offered}: {act_choices:?}");
+        }
 
         let mut a = Assistant::new();
         a.set_role_model(Role::Act, llm::CLAUDE_OPUS);
-        assert_eq!(a.route_for(Role::Act), Route { endpoint: Endpoint::OpenRouter, model: llm::CLAUDE_OPUS.into() });
+        assert_eq!(a.model_for(Role::Act), llm::CLAUDE_OPUS);
+        a.set_role_model(Role::Listen, "qwen/qwen3.8-omni-flash");
+        assert_eq!(a.model_for(Role::Listen), "qwen/qwen3.8-omni-flash");
+        assert_eq!(a.model(), llm::CLAUDE_OPUS, "the listening model is its own");
 
         a.set_decide_enabled(false);
         assert!(!a.decide_enabled());
@@ -2993,14 +2849,24 @@ mod tests {
         a.set_decide_enabled(true);
         assert!(a.decide_enabled());
         assert!(a.decides_first());
-        assert_eq!(a.route_for(Role::Decide), Route { endpoint: Endpoint::OpenRouter, model: llm::JEV.into() });
+        assert_eq!(a.model_for(Role::Decide), llm::JEV);
 
-        a.save_api_key(Endpoint::OpenRouter, "or-fake-for-test").unwrap();
-        assert!(a.keys().openrouter);
+        a.save_api_key("or-fake-for-test").unwrap();
         assert!(a.key_set);
-        a.remove_api_key(Endpoint::OpenRouter).unwrap();
-        assert!(!a.keys().openrouter);
+        a.remove_api_key().unwrap();
         assert!(!a.key_set);
+    }
+
+    /// The direct DeepSeek endpoint is gone: its ids ("deepseek-chat", no
+    /// vendor) would only fail at the first request.
+    #[test]
+    fn a_model_id_openrouter_cannot_route_is_refused_and_changes_nothing() {
+        let mut a = Assistant::new();
+        let before = a.model();
+        let line = a.set_model("deepseek-reasoner");
+        assert!(line.contains("not an OpenRouter model id"), "{line}");
+        assert_eq!(a.model(), before);
+        assert!(!a.models.iter().any(|m| m == "deepseek-reasoner"));
     }
 
     #[test]

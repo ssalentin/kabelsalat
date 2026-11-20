@@ -1045,7 +1045,7 @@ pub fn run_test() -> anyhow::Result<()> {
     g.reserve(8, 8);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let synth = g.add_node(
-        NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+        NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") },
         name_bytes("SYNTH"),
     );
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
@@ -1200,7 +1200,7 @@ fn record_stems_take(solo: Option<u8>) -> anyhow::Result<StemsTake> {
         let mut g = Graph::default();
         g.reserve(4, 4);
         let k = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let s = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes(name));
+        let s = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes(name));
         let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: k, port: 0 }, PortRef { node: s, port: 0 }, PortKind::Midi);
         g.connect_with_id(2, PortRef { node: s, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);

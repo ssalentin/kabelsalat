@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::control::{
-    name_bytes, name_str, AudioInChannel, DspKind, EdgeId, Graph, Lv2Uri, NodeId, NodeKind,
+    name_bytes, AudioInChannel, DspKind, EdgeId, Graph, Lv2Uri, NodeId, NodeKind,
     ParamId, PortKind, PortRef, Rig,
 };
 // Param ids are per-node; these mirror the engine's current knob table
@@ -412,13 +412,13 @@ impl Session {
         for s in &self.states {
             match self.graph.node(s.node) {
                 Some(n) => match &n.kind {
-                    NodeKind::Clap { plugin_id } if name_str(plugin_id) == s.plugin_id => {}
+                    NodeKind::Clap { plugin_id } if plugin_id.as_str() == s.plugin_id => {}
                     NodeKind::Clap { plugin_id } => bail!(
                         "The state blob for node {} was saved by '{}' but the node now \
                          hosts '{}'.",
                         s.node,
                         s.plugin_id,
-                        name_str(plugin_id)
+                        plugin_id.as_str()
                     ),
                     NodeKind::Lv2 { uri } if uri.as_str() == s.plugin_id => {}
                     NodeKind::Lv2 { uri } => bail!(
@@ -1306,7 +1306,7 @@ impl Template {
             eid += 1;
         };
         let surge = || NodeKind::Clap {
-            plugin_id: name_bytes(SURGE_ID),
+            plugin_id: crate::control::ClapId::new(SURGE_ID),
         };
 
         match self {
@@ -1798,7 +1798,7 @@ mod tests {
     fn mini_rig(name: &str, dev: Option<u32>) -> Rig {
         let mut g = Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SYNTH"));
+        let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SYNTH"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         assert!(g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi));
         assert!(g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio));

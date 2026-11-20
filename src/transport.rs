@@ -307,7 +307,7 @@ pub fn run_test() -> anyhow::Result<()> {
     g.reserve(8, 8);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let synth = g.add_node(
-        NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+        NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") },
         name_bytes("SYNTH"),
     );
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));

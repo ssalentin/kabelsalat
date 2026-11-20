@@ -393,10 +393,10 @@ impl PreviewApp {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(10)))
             .show(root, |ui| {
                 ui.heading("Assistant");
-                ui.label(egui::RichText::new("DeepSeek · bring your own key").small());
+                ui.label(egui::RichText::new("OpenRouter · bring your own key").small());
                 ui.add_space(6.0);
                 if !self.assistant.key_set {
-                    ui.label("Paste your DeepSeek API key:");
+                    ui.label("Paste your OpenRouter API key:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.key_input)
                             .password(true)
@@ -404,11 +404,8 @@ impl PreviewApp {
                     );
                     if ui.button("Save key").clicked() && !self.key_input.trim().is_empty() {
                         let k = self.key_input.trim().to_string();
-                        match assistant::save_key(&k) {
-                            Ok(()) => {
-                                self.assistant.key_saved();
-                                self.key_input.clear();
-                            }
+                        match self.assistant.save_api_key(&k) {
+                            Ok(()) => self.key_input.clear(),
                             Err(e) => self.assistant.history.push(assistant::ChatLine {
                                 role: "error".into(),
                                 text: format!("could not save key: {e}"),
@@ -417,7 +414,7 @@ impl PreviewApp {
                     }
                     ui.label(
                         egui::RichText::new(
-                            "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to api.deepseek.com.",
+                            "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to openrouter.ai.",
                         )
                         .small()
                         .italics(),

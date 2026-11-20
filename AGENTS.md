@@ -511,7 +511,7 @@ Learned so far (2026-11-15, UI polish pass):
 85. **Destructive confirms use `theme::danger_button(..., false)` (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text), never `theme::primary_button`:**
     `ACCENT_DEEP` belongs to non-destructive CTAs like `Send`; destructive confirms (`delete_rig`) must stay visually distinct (`agent_panel_defect1_danger_confirm_differs_from_send`).
 86. **Live agent status renders once under the running transcript turn, and read-only steps stay out of action chips:**
-    duplicating `phase_label()` in the header repeats the model route twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
+    duplicating the `live_status()` line in the header repeats the model twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
 87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`:**
     align `Confirm`/`Cancel` to the message text column (`78.0` px) (`agent_panel_defect6_confirm_aligns_with_the_transcript_column`).
 88. **A key shows lit for as long as it is held, from every source:** only
@@ -822,7 +822,7 @@ Learned so far (2026-11-15, UI polish pass):
     window sizes × three docks; `face_layout_tests` audits faces at the same
     sizes. See the result without the desktop:
     `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
-    (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
+    (CPU-rasterized real frames, drawn with the app's fonts).
 125. **UI scale follows the monitor the window is on:** the launch-time
     focused monitor's scale ran a window on the 1.0x external screen at the
     laptop's 1.6x (a 1368 px window laid out as 855 px). As a native Wayland
@@ -1167,6 +1167,110 @@ Learned so far (2026-11-15, UI polish pass):
     (`onsets_of_a_gated_low_chord_sit_on_the_gate_grid`). Before blaming
     timing, dump the measured signal of 40+ runs and look at how far the
     passing ones are from the threshold.
+167. **Chrome lines are snapped after the transform, never left soft:** the
+    rack's side rails were 14 pt rounded fills one whisper step lighter than
+    the chassis, on fractional edges, overhanging the units by 8 pt; the
+    user saw them as "drawn in paint". Structural chrome is snapped to
+    device pixels after `xf.rect` (`GuiRounding::round_to_pixels`) with a
+    `1/ppp` stroke, sits on the units' grid, and is recessed (darker), not a
+    raised lighter blob. Zoom into a 1.0x and a 1.6x shot before calling it
+    crisp (`draw_rails`).
+167. **A solo silences sources, never effects:** render step 2b asked
+    `strip_gains_of` for every effect, and a unit without a strip entry
+    counts as not soloed (rule 134), so a solo in a rig silenced every effect
+    of that rig, the soloed source's own chain included. Effects get no solo
+    flags (`run_effects`); only sources (instruments, Audio In, generators:
+    `mixer_sources`) are silenced by another's solo. Prove routing with the
+    noise probe (`noise_appears_exactly_where_it_is_routed`), not with
+    levels alone.
+168. **A delay plan counts every way audio travels, and aligns a return
+    with its sender:** sends are not cables, so the plan took an aux bus for
+    "no delay" and delayed the return of a whole-rig send twice (480 frames
+    against the dry 240); the next fix aligned the return with the rig the
+    bus is cabled to, so another rig's send came back 5 ms off its own dry
+    sound. A return lines up with whoever sent into the bus
+    (`pdc::compensation` takes the sends): a rig send needs nothing, a
+    source's send waits for its rig's latent units, a latent unit in the
+    bus's chain makes only the senders wait
+    (`a_bus_return_meets_the_dry_rig_in_phase`,
+    `a_send_from_another_rig_returns_in_phase_with_its_own_rig`). When two
+    fixes fail the same check, write down what both assumed and test that.
+167. **A new row in a sized panel brings its own height, or goes beside:**
+    the keyboard dock's MIDI strip (#101) took a 56 pt row out of a dock
+    sized for header + keys (20 % of the window), so the keys shrank from
+    146 to 86 pt and only the minimum was raised. When a panel gains an
+    element, check what the panel's size formula budgets; put controls
+    where there is room (header row, beside the main content) before
+    stacking a row onto it
+    (`the_midi_strip_leaves_the_keys_the_dock_height`).
+
+169. **Tests never list or write the user's sessions:** `sessions_dir()`
+    pointed at `~/kabelsalat-sessions` in tests too, so the session popover
+    and Library of every headless shot listed the user's real session names,
+    and a test autosave would have written there. Under `cfg(test)` it is a
+    per-process temp dir; check any new path helper the same way (rule 37).
+169. **A chip in a wrapping row goes through `theme::wrapped_chip_button`:**
+    `chip_button` draws inside `ui.scope`, whose child holds only the rest
+    of the line, so egui never moves it to the next one. The Plugins filter
+    row ran past a 760 px window, widened the sheet's content and pushed
+    the cards past its edge; with text wrapping on, the "LV2" chip broke
+    into one letter per line. In a wrapping layout `available_width()` is
+    the whole row: measure what is left as `max_rect().right() -
+    cursor().min.x` (`every_view_fits_small_windows`).
+170. **What kind of plugin something is comes from `plugins::entries`:**
+    the browser called every CLAP plugin an instrument, so Surge XT Effects
+    got a New rig button kabelsalat cannot honour. The Plugins view, the
+    insert picker, the assistant and MCP filter one classified list
+    (`PluginListFilter`); a new screen or tool uses it too, and only a
+    `clap_hostable` plugin gets a CLAP add button
+    (`clap_plugins_classify_into_instruments_effects_and_midi_fx`).
+
+170. **Every symbol the UI writes has a glyph:** Noto Sans has none of the
+    arrows, shapes and marks the UI uses (○ ● ◐ ▶ ✓ ← ⏎ ★ …), and egui's
+    bundled faces only some, so the REC button and others showed boxes in
+    the app and in headless shots (which also skipped the app's fonts).
+    `install_fonts` puts Noto Sans Symbols 2, Math and Symbols behind Noto
+    Sans in every family, `offline_shots::shot` installs them, and CI
+    installs `fonts-noto-core`. A new symbol must pass
+    `every_ui_symbol_has_a_glyph`; if no installed face has it, add a face
+    to `SYMBOL_FONTS`, never paint a box.
+
+173. **A stereo LV2 effect hears L and R apart:** `Lv2Plugin::process`
+    filled every audio input from the left channel, so every stereo LV2
+    effect (Dragonfly, LSP, ZL, x42, stereo Guitarix units) got L twice and
+    the right channel was lost. Inputs take L and R in port order; a mono
+    plugin takes L (`a_stereo_effect_hears_left_and_right_apart`, real
+    Carla Audio Gain, red before: right peak 0.50 from a left-only tone).
+
+174. **A plugin id is stored whole, never in a `Name`:** `Clap { plugin_id:
+    Name }` cut ids at 31 bytes, so Cardinal Synth
+    (`studio.kx.distrho.cardinal#synth`, 32) could never bind a voice, and
+    LSP's ids run to 55. CLAP ids are `ClapId` (128 bytes, saved as a
+    string; the old byte array still loads,
+    `a_session_saved_with_the_byte_array_id_still_loads`). Check the length
+    of a new plugin's real id (`kabelsalat scan-clap <bundle>`).
+175. **A catalog card's names come from the real package, and the test
+    fetches that package:** the Surge XT, Dexed and setBfree cards probed
+    for bundle names Arch never installs (`Surge XT.clap`, `Dexed.clap`,
+    `b_synth` without `.lv2`), so they read "not installed" unless the scan
+    had run. `catalog-install-test` downloads a distro card's package with
+    `pacman -Sp` (no root, nothing installed), unpacks it under `~/.cache`
+    and loads the card's first bundle from there; run it for every new or
+    changed card. Name the plugin package (`dexed-clap`), not a
+    metapackage that pulls in standalone and VST3 builds.
+176. **A plugin's output ports are as many as it declares:** the host
+    refused more than 8 (`[_; 8]` destructured for disjoint borrows), so
+    OneTrick CRYPTID (12 ports, one per drum) failed to load. Port buffers
+    are a `Vec` handed to clack with `iter_mut()`; only `main_out` is heard.
+177. **An LV2 lookup by URI matches the exact URI first:** `find_plugin`
+    took the first URI that *contains* the needle, so `…avldrums#BlondeBop`
+    resolved to `#BlondeBop` only because lilv happens to sort it before
+    `#BlondeBopHR`.
+178. **A sample player is tested in wall-clock time:** AVL Drumkits loads
+    its SoundFont on the LV2 worker thread, and a test that rendered as
+    fast as it could played the probe notes before any kit existed (peak
+    0.000 on all five kits). Render in real time until the worker is done
+    (`lv2_probe_chord` warms up for 3 s) before judging silence.
 
 ## Working on kabelsalat
 
@@ -1212,10 +1316,16 @@ Learned so far (2026-11-15, UI polish pass):
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
   `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `analysis-test [--save <dir>]` (spectra, master crackle, noise routing and
+  delay compensation through the engine without plugins; Surge adds a note),
   `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
   (calls the listening model; prints rankings and latency),
-  `catalog-install-test [id...]`
-  (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
+  `catalog-install-test [id...]` (downloads distro packages without
+  installing them, runs release and source routes in a scratch home, then
+  loads and plays every card; a card with no route for this CPU plays the
+  bundle you put in `~/.clap`/`~/.lv2` by hand; wind cards are also blown
+  with CC2; default: every card that is not a source build)
+  (`./target/debug/kabelsalat <name>`).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree

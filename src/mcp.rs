@@ -724,6 +724,22 @@ struct SetNodeBypassArgs {
     bypass: Option<bool>,
 }
 
+/// Arguments for `list_plugins`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ListPluginsArgs {
+    /// Filter by plugin type: "all", "instrument", "effect", "midi_fx", or "utility".
+    #[serde(rename = "type")]
+    plugin_type: Option<String>,
+    /// Filter by subcategory (e.g. "synth", "organ", "sampler", "delay_reverb", "eq_filter", "dynamics", "drive_amp", "modulation", "pitch_spatial", "multi_fx", "analyzer").
+    category: Option<String>,
+    /// Filter by format: "all", "builtin", "clap", or "lv2".
+    format: Option<String>,
+    /// Free-text search across name, author/vendor, id/uri, and category.
+    query: Option<String>,
+    /// Maximum CLAP / LV2 entries returned (default 60, max 300).
+    limit: Option<u64>,
+}
+
 /// Arguments for `add_insert` (#74).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AddInsertArgs {
@@ -1018,7 +1034,7 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
     match args.kind.to_ascii_lowercase().as_str() {
         "keys" => Ok(NodeKind::Keys),
         "clap" => Ok(NodeKind::Clap {
-            plugin_id: name_bytes(args.plugin_id.as_deref().unwrap_or(SURGE_ID)),
+            plugin_id: crate::control::ClapId::new(args.plugin_id.as_deref().unwrap_or(SURGE_ID)),
         }),
         "dsp" => {
             let dsp = args
@@ -1116,7 +1132,7 @@ fn graph_json(g: &Graph) -> Value {
             let kind = match &n.kind {
                 NodeKind::Keys => json!({"type": "keys"}),
                 NodeKind::Clap { plugin_id } => {
-                    json!({"type": "clap", "plugin_id": name_str(plugin_id)})
+                    json!({"type": "clap", "plugin_id": plugin_id.as_str()})
                 }
                 NodeKind::Dsp(k) => json!({"type": "dsp", "dsp": dsp_kind_str(k)}),
                 NodeKind::Lv2 { uri } => json!({"type": "lv2", "uri": uri.as_str()}),
@@ -3031,21 +3047,23 @@ impl McpServer {
         Self::ui_bridge_tool("list_channels", json!({ "filter": args.filter }))
     }
 
-    /// List installed CLAP and LV2 plugins.
-    #[tool(name = "list_plugins", description = "List installed CLAP and LV2 plugins (name, id/uri, features) available to host.")]
-    fn list_plugins(&self) -> Result<CallToolResult, McpError> {
+    /// List built-in units and installed CLAP and LV2 plugins, organized by type.
+    #[tool(name = "list_plugins", description = "List built-in units and installed CLAP/LV2 plugins organized by type (instrument, effect, midi_fx, utility) and subcategory (delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, analyzer, synth, organ, sampler, …). Optional filters: type, category, format, query, limit.")]
+    fn list_plugins(&self, Parameters(args): Parameters<ListPluginsArgs>) -> Result<CallToolResult, McpError> {
+        let filter_args = json!({
+            "type": args.plugin_type,
+            "category": args.category,
+            "format": args.format,
+            "query": args.query,
+            "limit": args.limit,
+        });
+        let filter = match crate::plugins::PluginListFilter::from_args(&filter_args) {
+            Ok(f) => f,
+            Err(e) => return tool_err(e),
+        };
         let clap = crate::host::list_clap_plugins();
         let lv2 = crate::lv2::discover();
-        let clap_json: Vec<_> = clap
-            .iter()
-            .map(|p| json!({"id": p.id, "name": p.name, "vendor": p.vendor, "features": p.features}))
-            .collect();
-        let lv2_json: Vec<_> = lv2
-            .iter()
-            .take(60)
-            .map(|p| json!({"uri": p.uri, "name": p.name, "num_ports": p.num_ports, "is_instrument": p.is_instrument, "is_midi_fx": p.is_midi_fx}))
-            .collect();
-        ok_json(json!({"clap": clap_json, "lv2_count": lv2.len(), "lv2": lv2_json}))
+        ok_json(crate::plugins::list_plugins_json(&clap, &lv2, &filter))
     }
 
     /// List the MIDI-effect units a rig can host.
@@ -3986,11 +4004,11 @@ mod tests {
         let mut g = Graph::default();
         g.reserve(8, 8);
         g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
         let organ = g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:organ") }, name_bytes("ORGAN"));
         g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:reverb") }, name_bytes("VERB"));
         g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
-        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument, is_midi_fx: false };
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument, ..Default::default() };
         let units = headless_instruments(&g, &[lv2("urn:test:organ", true), lv2("urn:test:reverb", false)]);
         assert_eq!(units.iter().map(|u| (u.node, u.name.as_str())).collect::<Vec<_>>(), [(surge, "SURGE"), (organ, "ORGAN")]);
         assert_eq!(units[1].instrument, crate::sounds::Instrument::Lv2("urn:test:organ".into()));
@@ -4221,5 +4239,27 @@ mod tests {
         let (server, _engine) = local_server();
         let res = server.list_channels(Parameters(ListChannelsArgs { filter: None }));
         assert!(format!("{res:?}").contains("mcp --attach"), "headless list_channels names the attach path: {res:?}");
+    }
+
+    #[test]
+    fn list_plugins_validates_and_filters_by_type_and_format() {
+        let (server, _engine) = local_server();
+        let bad = server.list_plugins(Parameters(ListPluginsArgs {
+            plugin_type: Some("nonsense".into()),
+            ..Default::default()
+        }));
+        assert!(serde_json::to_value(bad.unwrap()).unwrap()["isError"] == json!(true));
+
+        let fx = tool_json(&server.list_plugins(Parameters(ListPluginsArgs {
+            plugin_type: Some("effect".into()),
+            format: Some("builtin".into()),
+            ..Default::default()
+        })));
+        let builtins = fx["builtin"].as_array().unwrap();
+        assert!(builtins.iter().any(|b| b["name"] == "Delay"), "{fx}");
+        assert!(builtins.iter().any(|b| b["name"] == "Reverb"), "{fx}");
+        assert!(!builtins.iter().any(|b| b["name"] == "Metronome"), "Metronome is a utility, not an effect");
+        assert_eq!(fx["counts"]["instrument"], json!(0));
+        assert!(fx["effect_categories"]["delay_reverb"].as_u64().unwrap() >= 2);
     }
 }

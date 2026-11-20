@@ -3144,6 +3144,9 @@ struct DemoApp {
     stack_tall_h: f32,
     /// Every instrument's sound library, scanned off this thread (rule 46).
     sounds: crate::sounds::Libraries,
+    /// Bridge/MCP sound-tool calls waiting for a background library scan to
+    /// finish (with a deadline inside the bridge's 5 s timeout).
+    pending_ui_requests: Vec<(crate::bridge::UiRequest, std::time::Instant)>,
     /// Current patch per synth voice slot (None = Surge's init patch).
     /// A slot table like `rig_sources`.
     patch_names: Vec<Option<String>>,
@@ -3733,6 +3736,7 @@ impl DemoApp {
             stack_tall_h: 0.0,
             // Tests never scan the machine's patch folders.
             sounds: if cfg!(test) { crate::sounds::Libraries::blocking(|_| Default::default()) } else { crate::sounds::Libraries::installed() },
+            pending_ui_requests: Vec::new(),
             patch_names: Default::default(),
             sound_filter: String::new(),
             matrix_block_w: 0.0,
@@ -12036,12 +12040,26 @@ impl DemoApp {
     }
 
     /// Answer bridge/MCP requests for UI-owned tools (load_sound, …) with the
-    /// SAME exec_tool the in-app agent uses (rule 6 parity).
+    /// SAME exec_tool the in-app agent uses (rule 6 parity). Sound tools whose
+    /// library is being scanned in the background (e.g. after `vital-import`)
+    /// wait across frames until the scan lands instead of answering "try again".
     fn serve_ui_inbox(&mut self) {
         if self.bus.is_none() { return; }
         crate::bridge::UI_ATTACHED.store(true, std::sync::atomic::Ordering::Relaxed);
-        let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
-        for (tool, args, reply) in reqs {
+        let incoming = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
+        self.serve_ui_requests(incoming);
+    }
+
+    fn serve_ui_requests(&mut self, incoming: Vec<crate::bridge::UiRequest>) {
+        let now = std::time::Instant::now();
+        let fresh_deadline = now + std::time::Duration::from_secs(4);
+        let mut reqs = std::mem::take(&mut self.pending_ui_requests);
+        reqs.extend(incoming.into_iter().map(|r| (r, fresh_deadline)));
+        for ((tool, args, reply), deadline) in reqs {
+            if SOUND_TOOLS.contains(&tool.as_str()) && now < deadline && self.sound_scan_running(&args) {
+                self.pending_ui_requests.push(((tool, args, reply), deadline));
+                continue;
+            }
             let out = match tool.as_str() {
                 t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
@@ -30717,6 +30735,90 @@ mod ui_polish_agent_tests {
         assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == moved && *state == patch)), "{sent:?}");
         assert_eq!(app.capture_session("after").unwrap().plugin_state(moved).map(|s| &s.data), Some(&patch));
         let _ = std::fs::remove_dir_all(vital_test_patch().parent().unwrap());
+    }
+
+    fn cli_import_data_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ksalat-ui-vital-cli-{}", std::process::id())).join("data")
+    }
+
+    fn cli_import_sounds(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+        match instrument {
+            crate::sounds::Instrument::Lv2(uri) if uri == crate::vital::URI => crate::sounds::Library {
+                kind: "Vital patches".into(),
+                sounds: crate::vital::patches(&cli_import_data_dir()),
+                params: vec![],
+            },
+            other => test_sounds(other),
+        }
+    }
+
+    /// `kabelsalat vital-import` runs in another process and tells the app
+    /// nothing (#136): the running app's next `list_sounds` and `load_sound`
+    /// still have the imported patches.
+    #[test]
+    fn patches_imported_by_the_cli_reach_the_running_apps_sound_tools() {
+        let data = cli_import_data_dir();
+        let _ = std::fs::remove_dir_all(data.parent().unwrap());
+        std::fs::create_dir_all(data.join("Factory/Presets")).unwrap();
+        let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}}).to_string();
+        std::fs::write(data.join("Factory/Presets/Init.vital"), &patch).unwrap();
+        let bank = data.parent().unwrap().join("Electrowinds.vitalbank");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&bank).unwrap());
+            for name in ["Electrowinds/Presets/Woody.vital", "Electrowinds/Presets/Brass/Horn.vital"] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                std::io::Write::write_all(&mut zip, patch.as_bytes()).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(cli_import_sounds)
+            .watching(|_| crate::sounds::dirs_stamp(&cli_import_data_dir()));
+        let rigs = vec![instrument_rig("Winds", &[(NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, "VITALIUM")])];
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        for u in app.units.iter_mut().filter(|u| u.name == "VITALIUM") { u.lv2_inst = true; }
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+
+        let before = app.exec_tool("list_sounds", &serde_json::json!({"rig": 0}));
+        assert!(before.contains("Factory/Init") && !before.contains("Woody"), "{before}");
+
+        // The CLI's whole effect: `vital::import` into the data folder.
+        crate::vital::import(&bank, &data).unwrap();
+
+        let after = app.exec_tool("list_sounds", &serde_json::json!({"rig": 0}));
+        assert!(after.contains("Electrowinds/Woody") && after.contains("Electrowinds/Brass/Horn") && after.contains("Factory/Init"), "{after}");
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "horn", "rig": 0}));
+        assert!(out.starts_with("loaded 'Electrowinds/Brass/Horn' into Vitalium"), "{out}");
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { state, .. } if *state == patch.as_bytes())), "{sent:?}");
+
+        // The real running-app path: background-scanned library + MCP UI bridge
+        // (`serve_ui_inbox`). Even the very first `list_sounds` after a CLI
+        // import waits for the background rescan and returns the new patches.
+        app.sounds = crate::sounds::Libraries::background(cli_import_sounds)
+            .watching(|_| crate::sounds::dirs_stamp(&cli_import_data_dir()));
+        let bridge_call = |app: &mut DemoApp, tool: &str, args: serde_json::Value| -> String {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut first = vec![(tool.into(), args, tx)];
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.serve_ui_requests(std::mem::take(&mut first));
+                if let Ok(reply) = rx.try_recv() {
+                    return reply;
+                }
+                assert!(std::time::Instant::now() < deadline, "bridge {tool} never answered");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let first = bridge_call(&mut app, "list_sounds", serde_json::json!({"rig": 0}));
+        assert!(first.contains("Electrowinds/Woody") && !first.contains("Flute"), "{first}");
+        std::fs::write(data.join("Electrowinds/Presets/Flute.vital"), &patch).unwrap();
+        let refreshed = bridge_call(&mut app, "list_sounds", serde_json::json!({"rig": 0}));
+        assert!(refreshed.contains("Electrowinds/Flute") && refreshed.contains("Electrowinds/Woody"), "{refreshed}");
+
+        let _ = std::fs::remove_dir_all(data.parent().unwrap());
     }
 
     /// A Vital bank dropped on the window lands where Vitalium reads presets.

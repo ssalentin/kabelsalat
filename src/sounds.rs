@@ -151,6 +151,59 @@ pub fn scan(instrument: &Instrument) -> Library {
     }
 }
 
+/// What the folders an instrument's library is read from look like now: it
+/// changes when a patch file or folder is added, removed or renamed, so a
+/// kept library can tell that it is out of date (#136: `kabelsalat
+/// vital-import` wrote patches a running app never listed). Only the
+/// libraries users add files to are watched, and only folder listings are
+/// read, no file: this runs on every lookup.
+pub fn folder_stamp(instrument: &Instrument) -> Stamp {
+    match instrument.source() {
+        Source::VitalPatches => dirs_stamp(&crate::vital::data_dir()),
+        Source::OdinSoundbanks => dirs_stamp(&odin_soundbanks_dir()),
+        _ => Stamp::default(),
+    }
+}
+
+/// What [`folder_stamp`] answers.
+pub type Stamp = u64;
+
+/// The modification times and entry names of `root` and every folder below
+/// it, as one number. Hashing entry names as well as folder mtimes makes any
+/// added, removed or renamed file change the stamp immediately, even within a
+/// coarse filesystem clock tick, with no extra syscalls (`read_dir` already
+/// visits every entry).
+pub fn dirs_stamp(root: &std::path::Path) -> Stamp {
+    use std::hash::{Hash, Hasher};
+    fn walk(dir: &std::path::Path, depth: usize, hasher: &mut impl Hasher) {
+        let Ok(meta) = std::fs::metadata(dir) else { return };
+        dir.hash(hasher);
+        meta.modified().ok().hash(hasher);
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut names = Vec::new();
+        let mut subs = Vec::new();
+        for e in entries.flatten() {
+            names.push(e.file_name());
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                subs.push(e.path());
+            }
+        }
+        names.sort();
+        names.hash(hasher);
+        subs.sort();
+        for sub in subs {
+            walk(&sub, depth - 1, hasher);
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Deeper than any bank is laid out (`<bank>/Presets/<folder>/…`).
+    walk(root, 8, &mut hasher);
+    hasher.finish()
+}
+
 fn surge_library() -> Library {
     let sounds = crate::host::list_surge_patches().into_iter().map(|p| Sound {
         preferred: p.path.to_string_lossy().contains("patches_factory"),
@@ -502,7 +555,8 @@ pub enum Lookup {
 
 enum Slot {
     Scanning,
-    Ready(Arc<Library>),
+    /// The library, and what its folders looked like before it was read.
+    Ready(Arc<Library>, Stamp),
 }
 
 /// The libraries found so far, by instrument. Cheap to clone; clones share
@@ -511,6 +565,9 @@ enum Slot {
 pub struct Libraries {
     found: Arc<Mutex<HashMap<Instrument, Slot>>>,
     scan: fn(&Instrument) -> Library,
+    /// What the instrument's folders look like now; a kept library whose
+    /// stamp differs is read again.
+    stamp: fn(&Instrument) -> Stamp,
     /// Scan on a thread of its own (the app) or in the caller (tests, CLI).
     threaded: bool,
 }
@@ -518,33 +575,42 @@ pub struct Libraries {
 impl Libraries {
     /// The libraries installed on this machine, scanned in the background.
     pub fn installed() -> Self {
-        Self::background(scan)
+        Self::background(scan).watching(folder_stamp)
     }
 
     /// Libraries from `scan`, each read on a thread of its own.
     pub fn background(scan: fn(&Instrument) -> Library) -> Self {
-        Self { found: Default::default(), scan, threaded: true }
+        Self { found: Default::default(), scan, stamp: |_| Stamp::default(), threaded: true }
     }
 
     /// Libraries from `scan`, read in the caller: for tests on fakes and
     /// for callers that may block (the CLI, headless MCP).
     pub fn blocking(scan: fn(&Instrument) -> Library) -> Self {
-        Self { found: Default::default(), scan, threaded: false }
+        Self { found: Default::default(), scan, stamp: |_| Stamp::default(), threaded: false }
+    }
+
+    /// Read a library again when `stamp` says its folders changed.
+    pub fn watching(mut self, stamp: fn(&Instrument) -> Stamp) -> Self {
+        self.stamp = stamp;
+        self
     }
 
     pub fn get(&self, instrument: &Instrument) -> Lookup {
+        // Taken before the scan: files added while it runs make it stale.
+        let now = (self.stamp)(instrument);
         let mut found = self.found.lock().unwrap_or_else(|e| e.into_inner());
         match found.get(instrument) {
-            Some(Slot::Ready(library)) => return Lookup::Ready(library.clone()),
+            Some(Slot::Ready(library, read_at)) if *read_at == now => return Lookup::Ready(library.clone()),
             Some(Slot::Scanning) => return Lookup::Scanning,
-            None => {}
+            // Never read, or read before its folders changed.
+            Some(Slot::Ready(..)) | None => {}
         }
         if instrument.source() == Source::PresetParameter {
             return Lookup::AskPlugin;
         }
         if !self.threaded {
             let library = Arc::new((self.scan)(instrument));
-            found.insert(instrument.clone(), Slot::Ready(library.clone()));
+            found.insert(instrument.clone(), Slot::Ready(library.clone(), now));
             return Lookup::Ready(library);
         }
         found.insert(instrument.clone(), Slot::Scanning);
@@ -552,7 +618,7 @@ impl Libraries {
         let (cache, scan, key) = (self.found.clone(), self.scan, instrument.clone());
         let spawned = std::thread::Builder::new().name("kabelsalat-sounds".into()).spawn(move || {
             let library = Arc::new(scan(&key));
-            cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Slot::Ready(library));
+            cache.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Slot::Ready(library, now));
         });
         if spawned.is_err() {
             self.found.lock().unwrap_or_else(|e| e.into_inner()).remove(instrument);
@@ -568,7 +634,8 @@ impl Libraries {
     /// Keep a library that was read from the live plugin.
     pub fn insert(&self, instrument: Instrument, library: Library) -> Arc<Library> {
         let library = Arc::new(library);
-        self.found.lock().unwrap_or_else(|e| e.into_inner()).insert(instrument, Slot::Ready(library.clone()));
+        let stamp = (self.stamp)(&instrument);
+        self.found.lock().unwrap_or_else(|e| e.into_inner()).insert(instrument, Slot::Ready(library.clone(), stamp));
         library
     }
 }
@@ -745,6 +812,76 @@ mod tests {
         libraries.insert(chip.clone(), Library { kind: "presets".into(), sounds: vec![sound("", "SMS bass", false)], params: vec![] });
         let Lookup::Ready(told) = libraries.get(&chip) else { panic!("inserted") };
         assert_eq!(told.sounds[0].name, "SMS bass");
+    }
+
+    fn watched_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("ksalat-sounds-watched-{}", std::process::id()))
+    }
+
+    fn watched_scan(_: &Instrument) -> Library {
+        Library { kind: "Vital patches".into(), sounds: crate::vital::patches(&watched_dir()), params: vec![] }
+    }
+
+    fn watched_stamp(_: &Instrument) -> Stamp {
+        dirs_stamp(&watched_dir())
+    }
+
+    fn write_bank(file: &std::path::Path, patches: &[&str]) {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(file).unwrap());
+        let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}});
+        for name in patches {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, patch.to_string().as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    /// `kabelsalat vital-import` writes patches while the app runs (#136):
+    /// the kept library is read again once its folders changed, and only then.
+    #[test]
+    fn a_library_is_read_again_after_patches_were_imported_behind_its_back() {
+        let data = watched_dir();
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(data.join("Factory/Presets")).unwrap();
+        std::fs::write(data.join("Factory/Presets/Init.vital"), b"{}").unwrap();
+        let vital = Instrument::Lv2(crate::vital::URI.into());
+        let names = |l: &Library| l.sounds.iter().map(Sound::label).collect::<Vec<_>>();
+
+        let libraries = Libraries::blocking(watched_scan).watching(watched_stamp);
+        let Lookup::Ready(first) = libraries.get(&vital) else { panic!("scanned in the caller") };
+        assert_eq!(names(&first), ["Factory/Init"]);
+        let Lookup::Ready(again) = libraries.get(&vital) else { panic!("kept") };
+        assert!(Arc::ptr_eq(&first, &again), "unchanged folders are not read twice");
+
+        // What the CLI does: write the files, tell nobody.
+        let bank = data.with_extension("vitalbank");
+        write_bank(&bank, &["Winds/Presets/Woody.vital", "Winds/Presets/Reeds/Oboe.vital"]);
+        crate::vital::import(&bank, &data).unwrap();
+        let Lookup::Ready(after) = libraries.get(&vital) else { panic!("scanned in the caller") };
+        assert_eq!(names(&after), ["Factory/Init", "Winds/Woody", "Winds/Reeds/Oboe"]);
+
+        // The app scans on a thread: the stale library is not handed out,
+        // the caller is told to ask again until the new one is there.
+        let app = Libraries::background(watched_scan).watching(watched_stamp);
+        let ready = |l: &Libraries| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                match l.get(&vital) {
+                    Lookup::Ready(library) => return library,
+                    _ if std::time::Instant::now() > deadline => panic!("the scan thread never finished"),
+                    _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        };
+        assert_eq!(ready(&app).sounds.len(), 3);
+        // Adding a patch to an existing folder changes the stamp immediately,
+        // even without waiting for a filesystem mtime tick.
+        std::fs::write(data.join("Winds/Presets/Flute.vital"), b"{}").unwrap();
+        assert!(matches!(app.get(&vital), Lookup::Scanning), "an outdated library is never handed out");
+        assert_eq!(names(&ready(&app)), ["Factory/Init", "Winds/Flute", "Winds/Woody", "Winds/Reeds/Oboe"]);
+
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_file(&bank);
     }
 
     #[test]

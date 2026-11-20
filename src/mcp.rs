@@ -963,7 +963,7 @@ fn headless_sound_library(graph: &Graph, rig: Option<usize>, node: Option<NodeId
     let lv2 = if has_lv2 { crate::lv2::discover() } else { Vec::new() };
     let rig = rig.unwrap_or(0);
     let unit = crate::sounds::pick_unit(&headless_instruments(graph, &lv2), rig, &format!("Rig {}", rig + 1), node)?;
-    match LIBRARIES.get_or_init(|| crate::sounds::Libraries::blocking(crate::sounds::scan)).get(&unit.instrument) {
+    match LIBRARIES.get_or_init(|| crate::sounds::Libraries::blocking(crate::sounds::scan).watching(crate::sounds::folder_stamp)).get(&unit.instrument) {
         crate::sounds::Lookup::Ready(library) => Ok((unit, library)),
         _ => Err(format!("{}'s presets are read from the live plugin: attach to the running app (kabelsalat mcp --attach)", unit.name)),
     }

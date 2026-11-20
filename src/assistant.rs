@@ -905,8 +905,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_insert",
-            "description":"Add an effect at the end of a strip's insert chain (#74) — the chain is the rack cables, so the rack re-wires with it. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb) or kind=lv2 with uri= (an installed LV2 effect from list_plugins). source = the strip's source node id; omit source to add a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain.",
-            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"kind":{"type":"string","enum":["dsp","lv2"]},"dsp":{"type":"string","enum":["gain","pan","eq3","filter","limiter","saturation","delay","reverb"]},"uri":{"type":"string","description":"LV2 effect URI (list_plugins)"},"name":{"type":"string"}},"required":["kind"]}
+            "description":"Add an effect at the end of a strip's insert chain (#74) — the chain is the rack cables, so the rack re-wires with it. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb), kind=lv2 with uri= (an installed LV2 effect from list_plugins), or kind=clap with plugin_id= (an installed CLAP audio effect from list_plugins). source = the strip's source node id; omit source to add a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"kind":{"type":"string","enum":["dsp","lv2","clap"]},"dsp":{"type":"string","enum":["gain","pan","eq3","filter","limiter","saturation","delay","reverb"]},"uri":{"type":"string","description":"LV2 effect URI (list_plugins)"},"plugin_id":{"type":"string","description":"CLAP effect plugin_id (list_plugins)"},"name":{"type":"string"}},"required":["kind"]}
         }},
         {"type":"function","function":{
             "name":"remove_insert",

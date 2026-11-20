@@ -769,12 +769,14 @@ struct ListPluginsArgs {
 struct AddInsertArgs {
     /// The strip's source node id; omit for a MASTER insert.
     source: Option<NodeId>,
-    /// "dsp" (with dsp=…) or "lv2" (with uri=…).
+    /// "dsp" (with dsp=…), "lv2" (with uri=…), or "clap" (with plugin_id=…).
     kind: String,
     /// Built-in effect: gain, pan, eq3, filter, limiter, saturation, delay, reverb.
     dsp: Option<String>,
     /// LV2 effect URI (list_plugins).
     uri: Option<String>,
+    /// CLAP effect plugin_id (list_plugins).
+    plugin_id: Option<String>,
     /// Optional display name for the new unit.
     name: Option<String>,
 }
@@ -1620,7 +1622,9 @@ impl McpServer {
         // advance exactly once per accepted command and stay in sync.
         let rig = args.rig.unwrap_or(0);
         let wire = match &kind {
-            NodeKind::Clap { .. } => true,
+            NodeKind::Clap { plugin_id } => {
+                !crate::plugins::clap_id_is_effect(plugin_id.as_str(), &crate::host::list_clap_plugins())
+            }
             NodeKind::Lv2 { uri } => {
                 let lv2 = crate::lv2::discover();
                 let Some(p) = lv2.iter().find(|p| p.uri == uri.as_str()) else {
@@ -2808,12 +2812,13 @@ impl McpServer {
     }
 
     /// Add an insert to a strip's chain (#74).
-    #[tool(name = "add_insert", description = "Add an effect at the end of a strip's insert chain (#74) — the chain IS the rack cables, so the rack re-wires with it and the sound changes. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb) or kind=lv2 with uri= (an installed LV2 effect, see list_plugins). source = the strip's source node id; omit source for a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain. Needs the running app (kabelsalat mcp --attach).")]
+    #[tool(name = "add_insert", description = "Add an effect at the end of a strip's insert chain (#74) — the chain IS the rack cables, so the rack re-wires with it and the sound changes. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb), kind=lv2 with uri= (an installed LV2 effect, see list_plugins), or kind=clap with plugin_id= (an installed CLAP audio effect, see list_plugins). source = the strip's source node id; omit source for a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain. Needs the running app (kabelsalat mcp --attach).")]
     fn add_insert(&self, Parameters(args): Parameters<AddInsertArgs>) -> Result<CallToolResult, McpError> {
         let mut a = json!({"kind": args.kind});
         if let Some(s) = args.source { a["source"] = json!(s); }
         if let Some(d) = &args.dsp { a["dsp"] = json!(d); }
         if let Some(u) = &args.uri { a["uri"] = json!(u); }
+        if let Some(p) = &args.plugin_id { a["plugin_id"] = json!(p); }
         if let Some(n) = &args.name { a["name"] = json!(n); }
         if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
             return tool_err("add_insert needs the running app (kabelsalat mcp --attach): it edits the rack's cables");

@@ -73,8 +73,10 @@ agents are in [AGENTS.md](../AGENTS.md).
   MIDI flags (rule 72) and then their lv2core class, CLAP plugins by their
   declared features. The Plugins stage, the Mixer's insert picker, the in-app
   assistant and MCP `list_plugins` all filter this one list
-  (`PluginListFilter`), so they never disagree about a plugin. Only CLAP
-  instruments can be hosted; CLAP effects are listed and marked as such.
+  (`PluginListFilter`), so they never disagree about a plugin. Both CLAP
+  instruments and CLAP audio effects / utilities can be hosted (as rack units,
+  strip inserts, aux bus inserts and master inserts); CLAP note effects are
+  listed and marked as not hostable yet.
 - `sounds.rs` — one sound library per instrument a rig can hold. The
   instrument (`Instrument`: a CLAP id or an LV2 URI) is the key and
   `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge

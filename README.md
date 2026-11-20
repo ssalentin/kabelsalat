@@ -98,7 +98,7 @@ search the same taxonomy with `list_plugins`.
 <p align="center"><img src="docs/shots/plugins.png" width="85%" alt="The Plugins view organized by type (Instruments, Effects, MIDI FX, Utilities) with effect subcategory and format filters"/></p>
 
 ### Install instruments from the catalog
-**Plugins → Install** lists 20 hand-picked plugins that are known to work in
+**Plugins → Install** lists 22 hand-picked plugins that are known to work in
 kabelsalat, and **Install** fetches one for you: the Arch package where there is
 one, otherwise a pinned release or a build from source into `~/.clap` or
 `~/.lv2`. Synths: Surge XT, Dexed, Vitalium, Odin 2, OB-Xf (Oberheim), the
@@ -106,10 +106,12 @@ Juno-style Ultramaster KR-106, Six Sines (FM), JC303 (TB-303), YANES (chiptune)
 and Cardinal (modular). Keys and organs: setBfree, Aeolus, OneTrick KEYS
 (modelled piano). Bass and drums: OneTrick CHONK, OneTrick CRYPTID (FM drums),
 AVL Drumkits (sampled kits). Winds: Starbreath, modelled flutes, reeds and
-brass for a wind controller (freeware, x86-64 only). Also Floe (sample
-libraries), Guitarix and the x42 MIDI filters (chord, strum, mono legato, CC
-remap). A card says when a plugin has no build for your CPU, and links its
-source code and website.
+brass for a wind controller (freeware, x86-64 only). Effects and MIDI tools:
+Floe (sample libraries), Guitarix, Dragonfly Reverb (Hall, Room, Plate and Early
+Reflections CLAP reverbs), Airwindows Consolidated (hundreds of Chris Johnson's
+studio processors in one CLAP effect) and the x42 MIDI filters (chord, strum,
+mono legato, CC remap). A card says when a plugin has no build for your CPU, and
+links its source code and website.
 
 ### Put MIDI effects in front of an instrument
 A **MIDI strip** sits between your keys and the instrument and changes the notes

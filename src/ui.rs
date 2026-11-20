@@ -45,8 +45,9 @@ use clack_host::prelude::ClapId;
 use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
 use crate::matrix::{CcTarget, MixControl, SourceId};
 use crate::plugins::{
-    clap_hostable, clap_subtitle, classify_clap, classify_dsp, classify_lv2, format_list_plugins,
-    lv2_class_label, lv2_is_audio_insert, lv2_subtitle, matches_query, BuiltinAction, PluginFormat,
+    clap_hostable, clap_id_is_effect, clap_is_audio_insert, clap_is_instrument, clap_subtitle,
+    classify_clap, classify_dsp, classify_lv2, format_list_plugins, lv2_class_label,
+    lv2_is_audio_insert, lv2_subtitle, matches_query, BuiltinAction, PluginFormat,
     PluginListFilter, PluginSubtype, PluginType,
 };
 use crate::rope::{self, Rope};
@@ -741,6 +742,8 @@ struct Unit {
     rig: u8,
     /// LV2 instrument (vs effect) — matrix sink column. Classified in build_rack.
     lv2_inst: bool,
+    /// CLAP audio effect (vs instrument) — audio IN + OUT, effect column/insert.
+    clap_fx: bool,
     node_kind: UnitKind,
     name: String,
     sub: String,
@@ -928,7 +931,8 @@ fn knob_val(u: &Unit, param: u32, default: f32) -> f32 {
 /// MIX, other DSP → its first knob, everything else → 1.
 fn unit_out_gain(u: &Unit) -> f32 {
     match &u.node_kind {
-        UnitKind::Clap => 0.25 + knob_val(u, P_LEVEL, 0.85) * 0.75,
+        UnitKind::Clap if !u.clap_fx => 0.25 + knob_val(u, P_LEVEL, 0.85) * 0.75,
+        UnitKind::Clap => 1.0,
         UnitKind::Dsp(DspKind::Delay) => 0.15 + knob_val(u, P_MIX, 0.5) * 0.85,
         UnitKind::Dsp(_) => 0.15 + knob_val(u, 0, 0.5) * 0.85,
         _ => 1.0,
@@ -2038,6 +2042,7 @@ fn make_unit(node: &Node) -> Unit {
         node_id: node.id,
         rig: node.rig,
         lv2_inst: false,
+        clap_fx: false,
         node_kind,
         name,
         sub,
@@ -2053,6 +2058,29 @@ fn make_unit(node: &Node) -> Unit {
         device,
         channels,
         name_g: None, sub_g: None, back_g: None, label_fit_w: f32::INFINITY,
+    }
+}
+
+/// Configure a CLAP rack unit as an audio effect (`clap_fx = true`) or
+/// instrument (`clap_fx = false`): an effect has audio `IN` + `OUT` jacks and
+/// no synth `LEVEL` knob (its plugin main controls lead the row).
+fn set_unit_clap_fx(u: &mut Unit, fx: bool) {
+    if u.clap_fx == fx {
+        return;
+    }
+    u.clap_fx = fx;
+    if fx {
+        u.sub = "clap effect".into();
+        u.sub_g = None;
+        u.ins = [PortKind::Audio; 3];
+        u.jacks = [
+            (Dir::In, 0, 0.30, "IN"),
+            (Dir::Out, 0, 0.70, "OUT"),
+        ]
+        .into_iter()
+        .map(|(dir, port, xf, label)| Jack { dir, port, xf, label, label_g: None })
+        .collect();
+        u.knobs.retain(|k| !(k.source == KnobSource::BuiltIn && k.param == Some(P_LEVEL)));
     }
 }
 
@@ -2507,15 +2535,18 @@ impl BrowserCard {
                 };
                 (b.description.to_string(), b.id.to_string(), None, actions)
             }
-            Source::Clap(p) if clap_hostable(p) => (
-                clap_subtitle(p),
-                p.id.clone(),
-                None,
-                vec![
-                    ("New rig", NEW_RIG, BrowserAction::NewClapRig(p.id.clone(), name.clone())),
-                    ("Add to rig", RIG, BrowserAction::AddInstrument(NodeKind::Clap { plugin_id: crate::control::ClapId::new(&p.id) }, name.clone())),
-                ],
-            ),
+            Source::Clap(p) if clap_hostable(p) => {
+                let kind = NodeKind::Clap { plugin_id: crate::control::ClapId::new(&p.id) };
+                let actions = match e.ty() {
+                    PluginType::Instrument => vec![
+                        ("New rig", NEW_RIG, BrowserAction::NewClapRig(p.id.clone(), name.clone())),
+                        ("Add to rig", RIG, BrowserAction::AddInstrument(kind, name.clone())),
+                    ],
+                    PluginType::Effect | PluginType::Utility => effect(kind),
+                    PluginType::MidiFx => Vec::new(),
+                };
+                (clap_subtitle(p), p.id.clone(), None, actions)
+            }
             Source::Clap(p) => {
                 let note = if e.ty() == PluginType::MidiFx {
                     "CLAP MIDI effects not hostable yet"
@@ -3968,8 +3999,10 @@ impl DemoApp {
         // background scan: a discovery here took 1.3 s on every agent edit
         // adopted through build_rack. A scan still running reclassifies the
         // units when it lands (poll_plugin_scan).
-        if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
-            if !self.plugins_loaded {
+        if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. } | NodeKind::Clap { .. })) {
+            if !self.plugins_loaded
+                && graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. }))
+            {
                 self.start_plugin_scan(false);
             }
             self.classify_lv2_units();
@@ -4103,7 +4136,10 @@ impl DemoApp {
         for i in 0..self.units.len() {
             // Skip claimed units: another rig's synth must not open an
             // (invisible) column in this rig's view.
-            if claimed[i] || !matches!(self.units[i].node_kind, UnitKind::Clap | UnitKind::AudioIn) { continue; }
+            let u = &self.units[i];
+            let is_source = (matches!(u.node_kind, UnitKind::Clap) && !u.clap_fx)
+                || matches!(u.node_kind, UnitKind::AudioIn);
+            if claimed[i] || !is_source { continue; }
             let mut col = vec![i];
             claimed[i] = true;
             let mut cur = i;
@@ -4111,7 +4147,8 @@ impl DemoApp {
                 let next = self.cables.iter().find(|c| {
                     c.dying < 0.0 && c.kind == PortKind::Audio && c.src == cur
                         && !claimed[c.dst]
-                        && matches!(self.units[c.dst].node_kind, UnitKind::Dsp(_))
+                        && (matches!(self.units[c.dst].node_kind, UnitKind::Dsp(_))
+                            || self.units[c.dst].clap_fx)
                 }).map(|c| c.dst);
                 match next {
                     Some(d) => { claimed[d] = true; col.push(d); cur = d; }
@@ -4121,7 +4158,10 @@ impl DemoApp {
             cols.push(col);
         }
         for i in 0..self.units.len() {
-            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::Dsp(_) | UnitKind::Arp) {
+            if !claimed[i]
+                && (matches!(self.units[i].node_kind, UnitKind::Dsp(_) | UnitKind::Arp)
+                    || self.units[i].clap_fx)
+            {
                 claimed[i] = true;
                 cols.push(vec![i]);
             }
@@ -4196,7 +4236,7 @@ impl DemoApp {
     fn rig_source_badge(&self, rig: usize) -> (String, bool) {
         let r = rig as u8;
         let has_audio_in = self.units.iter().any(|u| u.rig == r && matches!(u.node_kind, UnitKind::AudioIn));
-        let has_midi_inst = self.units.iter().any(|u| u.rig == r && (matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst));
+        let has_midi_inst = self.units.iter().any(|u| u.rig == r && ((matches!(u.node_kind, UnitKind::Clap) && !u.clap_fx) || u.lv2_inst));
         if has_audio_in && !has_midi_inst {
             return ("IN".into(), true);
         }
@@ -7655,7 +7695,20 @@ impl DemoApp {
                         };
                         (NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name.unwrap_or(label))
                     }
-                    _ => return "add_insert needs kind=dsp (with dsp=…) or kind=lv2 (with uri=…)".into(),
+                    "clap" => {
+                        let pid = args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("");
+                        if pid.is_empty() { return "add_insert needs a plugin_id for kind=clap (see list_plugins)".into(); }
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_insert again in a few seconds".into();
+                        }
+                        let known = self.plugins_clap.iter().find(|p| p.id == pid && clap_is_audio_insert(p));
+                        let label = match known {
+                            Some(p) => p.name.clone(),
+                            None => return format!("add_insert: '{pid}' is not an installed CLAP audio effect (see list_plugins)"),
+                        };
+                        (NodeKind::Clap { plugin_id: crate::control::ClapId::new(pid) }, name.unwrap_or(label))
+                    }
+                    _ => return "add_insert needs kind=dsp (with dsp=…), kind=lv2 (with uri=…), or kind=clap (with plugin_id=…)".into(),
                 };
                 let res = match source {
                     Some(s) => self.strip_insert_edit(s, StripInsertEdit::Add { kind, name: label.clone() }),
@@ -8094,7 +8147,9 @@ impl DemoApp {
                     return format!("no rig {rig}: there are {n_rigs} (0..{}) — add one with add_rig", n_rigs - 1);
                 }
                 let wire = match &kind {
-                    Some(NodeKind::Clap { .. }) => true,
+                    Some(NodeKind::Clap { plugin_id }) => {
+                        !clap_id_is_effect(plugin_id.as_str(), &self.plugins_clap)
+                    }
                     Some(NodeKind::Lv2 { uri }) => {
                         if !self.plugin_lists_ready() {
                             return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
@@ -8196,7 +8251,7 @@ impl DemoApp {
                         let Some(plugin) = known else {
                             return format!("add_rig failed: no installed CLAP plugin with id '{id}' (see list_plugins)");
                         };
-                        if !clap_hostable(plugin) {
+                        if !clap_is_instrument(plugin) {
                             let ty = classify_clap(plugin).plugin_type().singular().to_ascii_lowercase();
                             return format!("add_rig failed: '{}' ({id}) is a CLAP {ty}, not a CLAP instrument", plugin.name);
                         }
@@ -8807,7 +8862,7 @@ impl DemoApp {
     /// plus arp units (a MIDI destination whose input routes by matrix rules).
     fn matrix_sinks(&self) -> Vec<usize> {
         self.units.iter().enumerate()
-            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst || matches!(u.node_kind, UnitKind::Arp))
+            .filter(|(_, u)| (matches!(u.node_kind, UnitKind::Clap) && !u.clap_fx) || u.lv2_inst || matches!(u.node_kind, UnitKind::Arp))
             .map(|(i, _)| i)
             .collect()
     }
@@ -10513,8 +10568,9 @@ impl DemoApp {
         // FX = a non-source, non-Keys, non-Master rack unit (an effect).
         let is_fx = |unit: usize| self.units.get(unit).map_or(false, |u| {
             u.rig == rig
-                && !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master | UnitKind::Clap | UnitKind::AudioIn)
-                && !u.lv2_inst
+                && (u.clap_fx
+                    || (!matches!(u.node_kind, UnitKind::Keys | UnitKind::Master | UnitKind::Clap | UnitKind::AudioIn)
+                        && !u.lv2_inst))
         });
         // Walk: every hop must be an FX unit with exactly one distinct audio
         // input (the previous node) and at most one distinct output, ending
@@ -10562,7 +10618,7 @@ impl DemoApp {
             let from = chain.last().map(|&unit| self.units[unit].node_id);
             let mut next = None;
             for (i, u) in self.units.iter().enumerate() {
-                if chain.contains(&i) || !matches!(u.node_kind, UnitKind::Dsp(_)) { continue; }
+                if chain.contains(&i) || !(matches!(u.node_kind, UnitKind::Dsp(_)) || u.clap_fx) { continue; }
                 let fed = match from {
                     None => self.cables.iter().any(|c| {
                         c.kind == PortKind::Audio && c.dying < 0.0 && c.dst == i && c.src != i
@@ -11894,7 +11950,7 @@ impl DemoApp {
         self.units.iter().filter_map(|u| {
             let clap = matches!(u.node_kind, UnitKind::Clap);
             let this_slot = clap.then(|| { slot += 1; slot - 1 });
-            if !clap && !u.lv2_inst { return None; }
+            if (!clap || u.clap_fx) && !u.lv2_inst { return None; }
             let instrument = crate::sounds::Instrument::of(&self.base_graph.node(u.node_id)?.kind)?;
             Some(crate::sounds::Unit { node: u.node_id, rig: if multi { u.rig as usize } else { 0 }, name: sentence_case(&u.name), instrument, slot: this_slot })
         }).collect()
@@ -13599,14 +13655,27 @@ impl DemoApp {
         }
     }
 
-    /// Mark the rack's LV2 units that the plugin scan calls instruments.
+    /// Mark the rack's LV2 units that the plugin scan calls instruments, and
+    /// the CLAP units that are audio effects (either by plugin scan / suffix
+    /// or because an audio edge feeds them).
     fn classify_lv2_units(&mut self) {
         for u in &mut self.units {
-            let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(u.node_id).map(|n| &n.kind) else { continue };
-            u.lv2_inst = self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
-            if u.lv2_inst {
-                u.sub = "lv2 synth".into();
-                u.sub_g = None;
+            match self.base_graph.node(u.node_id).map(|n| &n.kind) {
+                Some(NodeKind::Lv2 { uri }) => {
+                    u.lv2_inst = self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
+                    if u.lv2_inst {
+                        u.sub = "lv2 synth".into();
+                        u.sub_g = None;
+                    }
+                }
+                Some(NodeKind::Clap { plugin_id }) => {
+                    let fed_by_audio = self.base_graph.edges.iter().any(|e| {
+                        e.kind == CPortKind::Audio && e.to.node == u.node_id
+                    });
+                    let fx = clap_id_is_effect(plugin_id.as_str(), &self.plugins_clap) || fed_by_audio;
+                    set_unit_clap_fx(u, fx);
+                }
+                _ => {}
             }
         }
     }
@@ -16453,7 +16522,7 @@ impl DemoApp {
     /// of the active rig, else of any rig (an audio-only rig keeps the last
     /// playable MIDI rig targeted rather than going dead).
     fn kb_target_unit(&self) -> Option<usize> {
-        let inst = |u: &Unit| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst
+        let inst = |u: &Unit| (matches!(u.node_kind, UnitKind::Clap) && !u.clap_fx) || u.lv2_inst
             || self.base_graph.node(u.node_id).is_some_and(|n| crate::organ::is_organ(&n.kind));
         self.units.iter().position(|u| u.rig == self.active_rig as u8 && inst(u))
             .or_else(|| self.units.iter().position(|u| inst(u)))
@@ -19745,7 +19814,7 @@ impl DemoApp {
         self.units.iter().enumerate()
             .filter(|(_, u)| u.rig == rig)
             .filter(|(_, u)| match u.node_kind {
-                UnitKind::Clap => true,
+                UnitKind::Clap => !u.clap_fx,
                 UnitKind::AudioIn => true,
                 UnitKind::Keys | UnitKind::Master | UnitKind::MidiFx | UnitKind::Arp => false,
                 // Aux buses have their own group (`bus_units`).
@@ -21093,23 +21162,46 @@ impl DemoApp {
                             }
                             if !self.insert_builtin_only {
                                 if self.plugin_lists_ready() {
-                                    let mut lv2_fx: Vec<(&Lv2PluginInfo, PluginSubtype)> = self
-                                        .plugins_lv2
+                                    let mut fx_items: Vec<(PluginSubtype, String, String, NodeKind)> = self
+                                        .plugins_clap
                                         .iter()
-                                        .filter(|p| lv2_is_audio_insert(p))
+                                        .filter(|p| clap_is_audio_insert(p))
                                         .filter_map(|p| {
-                                            let sub = classify_lv2(p);
+                                            let sub = classify_clap(p);
                                             if self.insert_subtype.is_some_and(|s| s != sub) { return None; }
-                                            let cls = lv2_class_label(&p.lv2_class);
-                                            if !matches_query(&[&p.name, &p.author, &p.uri, cls, sub.plugin_type().label(), sub.label(), "lv2"], &filter) {
+                                            if !matches_query(&[&p.name, &p.vendor, &p.id, sub.plugin_type().label(), sub.label(), "clap"], &filter) {
                                                 return None;
                                             }
-                                            Some((p, sub))
+                                            Some((
+                                                sub,
+                                                p.name.clone(),
+                                                clap_subtitle(p),
+                                                NodeKind::Clap { plugin_id: crate::control::ClapId::new(&p.id) },
+                                            ))
                                         })
+                                        .chain(
+                                            self.plugins_lv2
+                                                .iter()
+                                                .filter(|p| lv2_is_audio_insert(p))
+                                                .filter_map(|p| {
+                                                    let sub = classify_lv2(p);
+                                                    if self.insert_subtype.is_some_and(|s| s != sub) { return None; }
+                                                    let cls = lv2_class_label(&p.lv2_class);
+                                                    if !matches_query(&[&p.name, &p.author, &p.uri, cls, sub.plugin_type().label(), sub.label(), "lv2"], &filter) {
+                                                        return None;
+                                                    }
+                                                    Some((
+                                                        sub,
+                                                        p.name.clone(),
+                                                        lv2_subtitle(p),
+                                                        NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) },
+                                                    ))
+                                                }),
+                                        )
                                         .collect();
-                                    lv2_fx.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase())));
+                                    fx_items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
                                     let mut last_sub: Option<PluginSubtype> = None;
-                                    for (p, sub) in lv2_fx {
+                                    for (sub, name, tip, kind) in fx_items {
                                         if shown > 200 { break; }
                                         if last_sub != Some(sub) {
                                             if shown > 0 { ui.add_space(6.0); }
@@ -21118,13 +21210,13 @@ impl DemoApp {
                                             last_sub = Some(sub);
                                         }
                                         shown += 1;
-                                        if theme::chip_button(ui, &p.name, false).on_hover_text(lv2_subtitle(p)).clicked() {
-                                            chosen = Some((NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) }, p.name.clone()));
+                                        if theme::chip_button(ui, &name, false).on_hover_text(tip).clicked() {
+                                            chosen = Some((kind, name));
                                         }
                                     }
                                 } else if filter.is_empty() {
                                     ui.add_space(4.0);
-                                    ui.label(egui::RichText::new("scanning installed LV2 effects in the background…").size(11.0).color(theme::INK_2));
+                                    ui.label(egui::RichText::new("scanning installed CLAP and LV2 effects in the background…").size(11.0).color(theme::INK_2));
                                 }
                             }
                             if shown == 0 {
@@ -21340,6 +21432,7 @@ impl DemoApp {
                     self.draw_scale_face(painter, ui);
                     self.draw_zone_octaves(painter, ui);
                 }
+                UnitKind::Clap if u.clap_fx => self.draw_dsp_display(painter, ui),
                 UnitKind::Clap => {
                     self.draw_surge_display(painter, ui);
                     self.draw_aeolus_face(painter, ui);
@@ -29811,11 +29904,11 @@ mod stage_views_tests {
         assert!(bg.iter().any(|t| t == "Limiter"), "built-in limiter in Dynamics: {bg:?}");
         assert!(!bg.iter().any(|t| t == "GxZita Reverb"), "reverb filtered out of Dynamics");
 
-        // Effects › Multi-FX: Surge XT Effects, marked not hostable, without a New rig button.
+        // Effects › Multi-FX: Surge XT Effects is hostable as a rig effect or Master FX, never as a New rig.
         app.plugin_subtype = Some(PluginSubtype::MultiFx);
         let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
         assert!(bg.iter().any(|t| t == "Surge XT Effects"), "CLAP FX under Multi-FX: {bg:?}");
-        assert!(bg.iter().any(|t| t == "CLAP audio effects not hostable yet"), "non-hostable note shown: {bg:?}");
+        assert!(bg.iter().any(|t| t == "Add to rig") && bg.iter().any(|t| t == "Master FX"), "CLAP FX has effect buttons: {bg:?}");
         assert!(!bg.iter().any(|t| t == "New rig"), "CLAP FX never gets a New rig button");
 
         // The format filter: Built-in shows the built-in delay and reverb, not the LV2 one.

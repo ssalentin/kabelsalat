@@ -567,6 +567,62 @@ pub static CATALOG: &[CatalogEntry] = &[
         data: None,
     },
     CatalogEntry {
+        id: "dragonfly-reverb",
+        name: "Dragonfly Reverb",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Effect,
+        description: "Concert hall, room, plate and early-reflections reverbs",
+        about: "Four stereo algorithmic reverbs built on Freeverb3 (Hall, Room, Plate and Early Reflections), packaged as native CLAP audio effects. Insert one on a synth or guitar strip, or put Hall on an aux bus and share it across your rigs with sends.",
+        license: "GPL-3.0-or-later",
+        homepage: Some("https://michaelwillis.github.io/dragonfly-reverb/"),
+        source: Source::GitHub("michaelwillis/dragonfly-reverb"),
+        routes: &[InstallRoute::DistroPackage { pkg: "dragonfly-reverb-clap" }],
+        home: Home::Clap,
+        clap_id: Some("michaelwillis.dragonfly.hall"),
+        lv2_uris: &[],
+        bundles: &[
+            "DragonflyHallReverb.clap",
+            "DragonflyRoomReverb.clap",
+            "DragonflyPlateReverb.clap",
+            "DragonflyEarlyReflections.clap",
+        ],
+        data: None,
+    },
+    CatalogEntry {
+        id: "airwindows",
+        name: "Airwindows Consolidated",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Effect,
+        description: "Hundreds of Chris Johnson's studio processors in one CLAP effect",
+        about: "Chris Johnson's entire Airwindows collection — console and tape saturation, reverbs (Galactic, Verbity, kPlate), delays, EQs, dynamics and spatial tools — wrapped into a single searchable CLAP audio effect by Paul Walker (Surge Synth Team).",
+        license: "GPL-3.0-or-later (DSP MIT)",
+        homepage: Some("https://www.airwindows.com"),
+        source: Source::GitHub("baconpaul/airwin2rack"),
+        routes: &[
+            InstallRoute::Release {
+                arch: "x86_64",
+                tag: "DAWPlugin",
+                url: "https://github.com/baconpaul/airwin2rack/releases/download/DAWPlugin/AirwindowsConsolidated-2026-11-15-59a227e-Linux.zip",
+                sha256: "32cb5d1f6cc39128fee901d9e2add7d22a3c9fb2fa67963281aa3c13f0d2d158",
+                artifact: "awcons-products/Airwindows Consolidated.clap",
+            },
+            InstallRoute::Source {
+                repo: "baconpaul/airwin2rack",
+                submodules: true,
+                build: &[
+                    &["cmake", "-B", "ignore/daw-plugin", "-DBUILD_JUCE_PLUGIN=TRUE", "-DCMAKE_BUILD_TYPE=Release"],
+                    &["cmake", "--build", "ignore/daw-plugin", "--config", "Release", "--target", "airwin-consolidated_CLAP"],
+                ],
+                artifact: "ignore/daw-plugin/src-juce/airwin-consolidated_artefacts/Release/CLAP/Airwindows Consolidated.clap",
+            },
+        ],
+        home: Home::Clap,
+        clap_id: Some("com.airwindows.consolidated"),
+        lv2_uris: &[],
+        bundles: &["Airwindows Consolidated.clap"],
+        data: None,
+    },
+    CatalogEntry {
         id: "x42-midifilter",
         name: "x42 MIDI filters",
         format: Format::Lv2,
@@ -1007,7 +1063,16 @@ fn fetch_and_play(entry: &CatalogEntry, route: &InstallRoute, dir: &Path) -> any
     let plugins = match *route {
         InstallRoute::DistroPackage { pkg } => {
             let unpacked = dir.join("pkg");
-            fetch_package(pkg, &unpacked, log)?;
+            if let Err(e) = fetch_package(pkg, &unpacked, log) {
+                if let Some(bundle) = hand_installed(entry) {
+                    log(format!("{e} — playing the copy installed by hand at {}", bundle.display()));
+                    return match entry.format {
+                        Format::Clap => play_clap_card(entry, &bundle),
+                        Format::Lv2 => play_lv2_card(entry, bundle.parent().expect("a bundle lies in a folder")),
+                    };
+                }
+                return Err(e);
+            }
             // What the install adds besides the package (Odin's patches).
             let user_steps: Vec<InstallCommand> = plan(entry, route, &cache, &home).into_iter().filter(|c| !c.changes_system).collect();
             run_commands(&user_steps, log).map_err(anyhow::Error::msg)?;
@@ -1090,6 +1155,13 @@ fn play_clap_card(entry: &CatalogEntry, bundle: &Path) -> anyhow::Result<()> {
     };
     let rate = 48_000.0;
     let (mut voice, main) = crate::host::ClapVoice::new_from_bundle(rate, bundle, &id)?;
+    if entry.plugin_type == crate::plugins::PluginType::Effect || voice.is_effect() {
+        let peak = clap_test_tone(&mut voice, rate, 512);
+        main.retire(voice);
+        println!("  {}: {id} loads from {}, effect, test tone peak {peak:.3}", entry.name, bundle.display());
+        anyhow::ensure!(peak >= 1e-3, "silent");
+        return Ok(());
+    }
     let mut buf = vec![0.0f32; 2 * 4800];
     let mut peak = 0.0f32;
     for n in PROBE_CHORD {
@@ -1111,6 +1183,25 @@ fn play_clap_card(entry: &CatalogEntry, bundle: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(hard > 2.0 * soft, "breath (CC2) does not shape the level");
     }
     Ok(())
+}
+
+/// Feed a CLAP effect a 220 Hz tone for half a second; return the output peak.
+fn clap_test_tone(voice: &mut crate::host::ClapVoice, rate: f64, block: usize) -> f32 {
+    let mut inp = vec![0.0f32; block * 2];
+    let mut out = vec![0.0f32; block * 2];
+    let mut peak = 0.0f32;
+    for b in 0..(rate as usize / block) {
+        for i in 0..block {
+            let s = (2.0 * std::f32::consts::PI * 220.0 * ((b * block + i) as f32 / rate as f32)).sin() * 0.5;
+            inp[i * 2] = s;
+            inp[i * 2 + 1] = s;
+        }
+        voice.process(&inp, &mut out, crate::transport::Transport::default());
+        if b > 20 {
+            peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+    }
+    peak
 }
 
 /// RMS of one held note at a soft and a full breath (CC2, how an EWI or
@@ -1278,7 +1369,7 @@ mod tests {
                 e.id
             );
         }
-        assert_eq!(CATALOG.len(), 20);
+        assert_eq!(CATALOG.len(), 22);
         assert_eq!(CATALOG[0].id, "setbfree", "setBfree is first per the spec");
     }
 
@@ -1514,5 +1605,27 @@ mod tests {
         assert_eq!(stars_label(3870), "3.9k");
         assert_eq!(stars_label(9999), "10k");
         assert_eq!(stars_label(12_345), "12k");
+    }
+
+    #[test]
+    fn dragonfly_reverb_and_airwindows_are_clap_effect_cards() {
+        let df = find("dragonfly-reverb").unwrap();
+        assert_eq!(df.format, Format::Clap);
+        assert_eq!(df.plugin_type, crate::plugins::PluginType::Effect);
+        assert_eq!(df.clap_id, Some("michaelwillis.dragonfly.hall"));
+        assert_eq!(route_for(df, "x86_64").unwrap().kind(), "distro");
+        assert_eq!(route_for(df, "aarch64").unwrap().kind(), "distro");
+
+        let aw = find("airwindows").unwrap();
+        assert_eq!(aw.format, Format::Clap);
+        assert_eq!(aw.plugin_type, crate::plugins::PluginType::Effect);
+        assert_eq!(aw.clap_id, Some("com.airwindows.consolidated"));
+        assert_eq!(route_for(aw, "x86_64").unwrap().kind(), "release");
+        assert_eq!(route_for(aw, "aarch64").unwrap().kind(), "source");
+        let cmds = plan(aw, route_for(aw, "x86_64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        assert_eq!(
+            cmds[6].argv,
+            ["cp", "-r", "/c/airwindows/unpacked/awcons-products/Airwindows Consolidated.clap", "/home/u/.clap/"]
+        );
     }
 }

@@ -86,6 +86,15 @@ impl Planner {
         let is_dsp = |i: usize| matches!(&nodes[i].kind, NodeKind::Dsp(k) if *k != DspKind::Metronome);
         let is_lv2 = |i: usize| matches!(nodes[i].kind, NodeKind::Lv2 { .. });
         let is_master = |i: usize| matches!(nodes[i].kind, NodeKind::MasterOut);
+        let is_clap_fx = |i: usize| {
+            matches!(nodes[i].kind, NodeKind::Clap { .. })
+                && graph.edges.iter().any(|e| {
+                    e.kind == PortKind::Audio
+                        && e.to.node == nodes[i].id
+                        && e.from.node != nodes[i].id
+                        && index(e.from.node).is_some_and(|s| !is_master(s))
+                })
+        };
         let is_bus = |i: usize| matches!(nodes[i].kind, NodeKind::Dsp(DspKind::Bus));
         let buses = (0..n).filter(|&i| is_bus(i)).count();
         ids.clear();
@@ -109,14 +118,19 @@ impl Planner {
         reset(inp, n * n, false);
         for e in graph.edges.iter().filter(|e| e.kind == PortKind::Audio) {
             let (Some(s), Some(d)) = (index(e.from.node), index(e.to.node)) else { continue };
-            if s != d && !is_master(s) && (is_dsp(d) || is_lv2(d) || is_master(d)) {
+            if s != d && !is_master(s) && (is_dsp(d) || is_lv2(d) || is_clap_fx(d) || is_master(d)) {
                 inp[d * n + s] = true;
             }
         }
         // When each node renders: sources first, then the effects in the
         // order `GraphEngine::next_effect` runs them (built-in DSP in graph
-        // order, then LV2), then the masters.
-        let effects = || (0..n).filter(|&i| is_dsp(i)).chain((0..n).filter(|&i| is_lv2(i)));
+        // order, then LV2, then CLAP effects), then the masters.
+        let effects = || {
+            (0..n)
+                .filter(|&i| is_dsp(i))
+                .chain((0..n).filter(|&i| is_lv2(i)))
+                .chain((0..n).filter(|&i| is_clap_fx(i)))
+        };
         reset(rank, n, 0);
         for m in (0..n).filter(|&m| is_master(m)) {
             rank[m] = usize::MAX;

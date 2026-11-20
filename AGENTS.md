@@ -1572,3 +1572,11 @@ Learned so far (2026-11-15, UI polish pass):
     with truncated labels, show `editor_status` inside the window, and have
     `toggle_pin` evict the last auto-selected `KnobSource::Main` knob when
     `MAX_PINS` is full (`pin_button_in_param_editor_replaces_main_knob_and_stays_clickable_for_long_names`).
+189. **`mixer_fader_rects` holds rig-bus faders only, and a column that loses its
+    fader reclaims the space for its companion section:** pushing the Kabelsalat
+    master mix fader into `mixer_fader_rects` broke `rig_switch_tests`
+    (`open_mixer` expects one per rig), and keeping Loudness in its own column
+    after moving the master fader out of Master out clipped `Match` at `760x520`
+    (`mixer_with_inserts_and_quick_knobs_fits_narrow_windows`). Fold companion
+    controls back into the vacated column and guard UI-toggled engine flags
+    (`master_mute`) with a sync grace deadline.

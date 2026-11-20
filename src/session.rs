@@ -121,6 +121,8 @@ pub struct Session {
     /// session says nothing about it (older files, templates, rig edits
     /// built from parts): a load then leaves the engine's target alone.
     pub master_target: Option<crate::meter::MasterTarget>,
+    /// Whether Kabelsalat's master mix to Master out is muted.
+    pub master_mute: bool,
     /// Virtual keyboard surface selection (#163): `None` = unspecified
     /// (older sessions/templates leave current mode alone), `Some(Auto)` or `Some(Pinned(..))`.
     pub keyboard_mode: Option<crate::keyboard::KeyboardMode>,
@@ -209,6 +211,7 @@ impl Session {
             sends: Vec::new(),
             bus_outs: Vec::new(),
             master_target: None,
+            master_mute: false,
             keyboard_mode: None,
             time_sig: None,
             midi_sources: Vec::new(),
@@ -228,6 +231,7 @@ impl Session {
             && self.sends == other.sends
             && self.bus_outs == other.bus_outs
             && self.master_target == other.master_target
+            && self.master_mute == other.master_mute
             && self.keyboard_mode == other.keyboard_mode
             && self.time_sig == other.time_sig
             && self.midi_sources == other.midi_sources
@@ -602,6 +606,7 @@ impl Session {
             sends: self.sends.clone(),
             bus_outs: self.bus_outs.clone(),
             master_target: self.master_target,
+            master_mute: self.master_mute,
             keyboard_mode: self.keyboard_mode,
             time_signature: self.time_sig,
             midi_sources: self.midi_sources.clone(),
@@ -646,6 +651,7 @@ impl Session {
             sends: manifest.sends,
             bus_outs: manifest.bus_outs,
             master_target: manifest.master_target,
+            master_mute: manifest.master_mute,
             keyboard_mode: manifest.keyboard_mode,
             // A hand-edited file cannot give the clock a bar it cannot count.
             time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
@@ -769,6 +775,9 @@ struct SessionFile {
     /// The master's loudness target (#12); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     master_target: Option<crate::meter::MasterTarget>,
+    /// Whether Kabelsalat's master mix is muted; older sessions default to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    master_mute: bool,
     /// Virtual keyboard surface selection (#163); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keyboard_mode: Option<crate::keyboard::KeyboardMode>,
@@ -1848,6 +1857,24 @@ mod tests {
         let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
         assert!(!json.contains("master_target"), "absent when unset: old readers stay happy");
         assert_eq!(Session::load(&pkg2).unwrap().master_target, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn master_mute_round_trips_and_defaults_false() {
+        let dir = std::env::temp_dir().join(format!("ksalat-mastermute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("muted.ksalat");
+        let mut s = Session::new("m", Graph::demo_patch());
+        s.master_mute = true;
+        s.save(&pkg).unwrap();
+        assert!(Session::load(&pkg).unwrap().master_mute);
+        s.master_mute = false;
+        let pkg2 = dir.join("unmuted.ksalat");
+        s.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
+        assert!(!json.contains("master_mute"), "absent when false: old readers stay happy");
+        assert!(!Session::load(&pkg2).unwrap().master_mute);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1056,6 +1056,7 @@ fn remap_session(
     let mut ns = crate::session::Session::new(s.name.clone(), graph);
     ns.rig_names = s.rig_names.clone(); // names follow their rig (#33)
     ns.master_target = s.master_target; // session-level, no node ids (#12)
+    ns.master_mute = s.master_mute;
     ns.keyboard_mode = s.keyboard_mode; // session-level, no node ids (#163)
     ns.time_sig = s.time_sig; // session-level too (#87)
     for p in s.params() {
@@ -2848,9 +2849,6 @@ struct VoiceRow {
     patch_name: Option<String>,
 }
 
-/// Width of the Mixer's loudness column beside Master out.
-const LOUDNESS_W: f32 = 152.0;
-
 /// A dB/LU value with a real minus sign and an explicit plus: "\u{2212}14", "+7.1".
 fn signed_db(v: f32, decimals: usize) -> String {
     let body = format!("{:.*}", decimals, v.abs());
@@ -3327,6 +3325,7 @@ struct DemoApp {
     /// Grace deadlines (`ui_time`) so echoes of direct UI edits never light
     /// up agent highlights.
     ui_mix_grace: [f32; 8],
+    ui_master_mute_grace: f32,
     /// Last frame's dt (peak-hold decay and strip animations read it).
     ui_dt: f32,
     ui_transport_grace: f32,
@@ -3528,6 +3527,8 @@ struct DemoApp {
     master_meter: crate::meter::MeterSnapshot,
     /// Mirrored loudness target of the master (#12), published with the meter.
     master_target: crate::meter::MasterTarget,
+    /// Whether Kabelsalat's master mix to Master out is muted.
+    master_mute: bool,
     /// The Mixer's loudness buttons as drawn this frame: 1 LU down, 1 LU up,
     /// Match (hit targets for tests and `scripts/click.sh`).
     master_target_rects: [Rect; 3],
@@ -3909,6 +3910,7 @@ impl DemoApp {
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
             ui_mix_grace: [-1.0; 8],
+            ui_master_mute_grace: -1.0,
             ui_dt: 1.0 / 60.0,
             ui_transport_grace: -1.0,
             ui_node_grace: std::collections::HashMap::new(),
@@ -4025,6 +4027,7 @@ impl DemoApp {
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
             master_target: crate::meter::MasterTarget::OFF,
+            master_mute: false,
             master_target_rects: [Rect::NOTHING; 3],
             listening: None,
             confirm_delete_rig: None,
@@ -5242,6 +5245,9 @@ impl DemoApp {
                 }
             }
             self.rig_mix = g.mix;
+            if now >= self.ui_master_mute_grace {
+                self.master_mute = g.master_mute;
+            }
             // Sends (issue #5): the engine's table is the truth (rule 33),
             // once a local edit's echo is back.
             if now >= self.ui_send_grace {
@@ -6582,6 +6588,7 @@ impl DemoApp {
         }
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
         s.master_target = Some(self.master_target);
+        s.master_mute = self.master_mute;
         s.keyboard_mode = Some(self.kb_mode);
         s.time_sig = Some(self.time_sig);
         // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
@@ -6825,6 +6832,7 @@ impl DemoApp {
         if let Some(target) = s.master_target {
             self.restore_master_target(target);
         }
+        self.set_master_mute(s.master_mute);
         if let Some(mode) = s.keyboard_mode {
             self.kb_mode = mode;
         }
@@ -6864,6 +6872,14 @@ impl DemoApp {
         if self.master_target != target {
             self.master_target = target;
             self.master_meter = crate::meter::MeterSnapshot::default();
+        }
+    }
+
+    fn set_master_mute(&mut self, muted: bool) {
+        self.master_mute = muted;
+        self.ui_master_mute_grace = self.ui_time + 0.6;
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetMasterMute { muted });
         }
     }
 
@@ -7020,6 +7036,7 @@ impl DemoApp {
         self.bus_outs.clear();
         self.strip_order.clear();
         self.strip_knobs.clear();
+        self.master_mute = false;
         self.mixer_knob_drag = None;
         self.begin_load_fade();
         self.sync_clap_slots(&merged, None);
@@ -7090,6 +7107,7 @@ impl DemoApp {
                 },
                 "meter": serde_json::to_value(self.master_meter).unwrap_or(serde_json::json!({})),
                 "master_target": self.master_target.readout(&self.master_meter),
+                "master_mute": self.master_mute,
                 "audio_in": self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::AudioIn)).map(|u| serde_json::json!({
                     "node": u.node_id,
                     "device": u.device,
@@ -21500,7 +21518,8 @@ impl DemoApp {
                                 w + gap
                             }).sum::<f32>()
                         };
-                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + 152.0 + LOUDNESS_W + 3.0 * gap;
+                        let kabelsalat_w = 15.0 + gap + STRIP_W + gap;
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + kabelsalat_w + 152.0 + gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
@@ -21626,18 +21645,16 @@ impl DemoApp {
                                         });
                                     });
                                 }
+                                // Kabelsalat master mix: one strip for everything coming
+                                // from kabelsalat to Master out, right after System audio.
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
+                                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                                self.kabelsalat_strip_ui(ui, fader_h);
                                 // Master out sits right after the last rig bus
                                 // (the sum they feed) — not pinned far away.
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                 ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
                                 self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
-                                // Loudness target (#12): its own column of the
-                                // master section, so it never pushes the fader
-                                // or falls under the fold of a short window.
-                                ui.vertical(|ui| {
-                                    ui.set_width(LOUDNESS_W);
-                                    self.master_target_ui(ui);
-                                });
                             });
                         });
                     });
@@ -22035,29 +22052,68 @@ impl DemoApp {
         }
     }
 
-    /// The master out strip (#72/#77): a full channel strip — dB fader
-    /// driving the master VOLUME, the labeled peak meter with peak hold and
-    /// clip, its own insert slots before the fixed limiter, and the output
-    /// device choice (#31).
-    #[allow(clippy::type_complexity)]
-    fn master_strip_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        fader_h: f32,
-        outputs: (Vec<crate::audio_out::OutputDevice>, Option<String>, Option<String>),
-        out_pick: &mut Option<Option<String>>,
-        edits: &mut Vec<PendingInsertEdit>,
-    ) {
-        let (outputs, out_current, out_wanted) = outputs;
+    /// Dedicated Kabelsalat master mix strip (#231): one fader, meter and
+    /// mute for everything coming from kabelsalat to Master out, right after
+    /// System audio.
+    fn kabelsalat_strip_ui(&mut self, ui: &mut egui::Ui, fader_h: f32) {
         let n = self.rig_count();
         // The fader drives the master unit in view (every master's VOLUME
         // knob is the same engine param).
         let master_knob = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Master)
             && (n <= 1 || u.rig == self.active_rig as u8))
             .and_then(|mi| self.units[mi].knob_index("VOLUME").map(|k| (mi, k)));
-        let mut gain = master_knob.map(|(mi, k)| self.units[mi].knobs[k].value);
+        let old_gain = master_knob.map(|(mi, k)| self.units[mi].knobs[k].value).unwrap_or(0.75);
+        let mut gain = old_gain;
         let fader_dest: Option<CcDest> = master_knob
             .and_then(|(mi, k)| self.units[mi].knobs[k].cc_target().map(|(p, t)| (self.units[mi].node_id, p, t)));
+        let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+        ui.vertical(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 36.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new("Kabelsalat").font(theme::medium_font(14.0)).color(theme::INK));
+                theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.14, theme::CREAM_DIM);
+            });
+            let (rule, _) = ui.allocate_exact_size(egui::vec2(STRIP_W, 5.0), egui::Sense::hover());
+            ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+            ui.add_space(4.0);
+            ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new("Master mix").size(13.0).color(theme::INK));
+                ui.label(egui::RichText::new(rigs).size(10.5).color(theme::INK_2))
+                    .on_hover_text("peak meter of everything kabelsalat plays");
+                ui.add_space(4.0);
+                let _ = self.strip_fader_ui(ui, MASTER_STRIP_KEY, &mut gain, self.meter, fader_h, fader_dest);
+                ui.add_space(2.0);
+                self.fader_readout_ui(ui, gain, 11.0, fader_dest)
+                    .on_hover_text("master volume · the last stage is the limiter, then warmth");
+                ui.add_space(2.0);
+                let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
+                        .color(if self.master_mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                    .fill(if self.master_mute { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
+                    .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                if ui.add(mb).on_hover_text("mute everything coming from kabelsalat to Master out").clicked() {
+                    self.set_master_mute(!self.master_mute);
+                }
+            });
+        });
+        if let Some((mu, vk)) = master_knob {
+            if (gain - old_gain).abs() > 1e-6 {
+                self.set_unit_knob(mu, vk, gain);
+            }
+        }
+    }
+
+    /// The master out strip (#72/#77): output device choice (#31), master
+    /// insert slots before the fixed limiter, recording arm, and aux bus
+    /// creation.
+    #[allow(clippy::type_complexity)]
+    fn master_strip_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _fader_h: f32,
+        outputs: (Vec<crate::audio_out::OutputDevice>, Option<String>, Option<String>),
+        out_pick: &mut Option<Option<String>>,
+        edits: &mut Vec<PendingInsertEdit>,
+    ) {
+        let (outputs, out_current, out_wanted) = outputs;
         ui.vertical(|ui| {
             ui.set_width(152.0);
             theme::section_label(ui, "Master out");
@@ -22098,76 +22154,6 @@ impl DemoApp {
             ui.label(egui::RichText::new(insert_note).size(10.5).color(theme::INK_2))
                 .on_hover_text("Master out → insert → … → limiter · warmth (fixed)");
             ui.add_space(6.0);
-            // Fader + meter share one row: the dB scale labels name the stops.
-            let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
-            let fr = Rect::from_min_size(area.min, egui::vec2(30.0, fader_h));
-            let mr = Rect::from_min_size(Pos2::new(area.right() - 14.0, area.top()), egui::vec2(14.0, fader_h));
-            let mut ph = self.mixer_peaks.entry(MASTER_STRIP_KEY).or_insert_with(PeakHold::new);
-            peak_hold_update(&mut ph, self.meter, self.ui_time, self.ui_dt);
-            let mut clip_clicked = false;
-            let clip = Rect::from_min_size(Pos2::new(mr.left(), mr.top() - 7.0), egui::vec2(mr.width(), 5.0));
-            let clip_resp = ui.interact(clip, egui::Id::unique("master_clip"), egui::Sense::click());
-            ui.painter().rect_filled(clip, 1.0, if ph.clip { theme::CLIP_RED } else { theme::METER_TRACK });
-            if clip_resp.clicked() { clip_clicked = true; }
-            if clip_resp.hovered() {
-                clip_resp.on_hover_text(if ph.clip { "0 dBFS reached — click to clear" } else { "clip light" });
-            }
-            let held = ph.held;
-            if clip_clicked { ph.clip = false; }
-            paint_meter(ui.painter(), mr, meter_db_pos(self.meter), 0.0);
-            if held > 0.02 {
-                let y = mr.bottom() - mr.height() * held.clamp(0.0, 1.0);
-                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(mr.left(), y - 1.0), egui::vec2(mr.width(), 2.0)), 1.0, theme::CHIP_ON);
-            }
-            self.mixer_meter_rects.push((MASTER_STRIP_KEY, mr));
-            // The dB fader (#72) drives the master VOLUME knob.
-            let cap_h = 12.0;
-            let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
-            ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
-            // Unity + −12 dB ticks (the meter's dB curve, rule 62).
-            for (g, len) in [(1.0f32, 6.0), (10f32.powf(-12.0 / 20.0), 4.0)] {
-                let y = y0 + (y1 - y0) * fader_pos(g);
-                ui.painter().line_segment([Pos2::new(fr.center().x - len, y), Pos2::new(fr.center().x + len, y)], Stroke::new(1.0, theme::CREAM_DIM));
-            }
-            if let Some((mu, vk)) = master_knob {
-                let _ = (mu, vk);
-                let fid = egui::Id::unique("master_fader");
-                let resp = ui.interact(fr, fid, egui::Sense::click_and_drag());
-                if resp.dragged() {
-                    let dy = resp.drag_delta().y;
-                    let mut pos = fader_pos(gain.unwrap_or(0.75)) - dy / (y0 - y1);
-                    if pos > UNITY_DETENT_POS { pos = 1.0; }
-                    gain = Some(fader_gain(pos));
-                }
-                if resp.double_clicked() { gain = Some(1.0); }
-                if let Some(g) = gain {
-                    let y = y0 + (y1 - y0) * fader_pos(g);
-                    ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
-                    let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
-                    ui.painter().rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
-                    ui.painter().line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
-                    self.mixer_learn_ui(ui, &resp, cap, fader_dest);
-                }
-                resp.on_hover_text("master volume · double-click: 0 dB · right-click: MIDI learn");
-            }
-            // The ends first; a mark too close to one already drawn is left out
-            // (a short meter put "0 dB", "−6" and "−12" on top of each other).
-            let mut drawn: Vec<f32> = Vec::new();
-            for db in [0.0f32, -48.0, -24.0, -12.0, -6.0] {
-                let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
-                if drawn.iter().any(|d| (d - y).abs() < 12.0) { continue; }
-                drawn.push(y);
-                let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
-                ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
-                    label, egui::FontId::monospace(9.5), theme::CREAM_DIM);
-            }
-            ui.add_space(6.0);
-            self.fader_readout_ui(ui, gain.unwrap_or(0.75), 11.0, fader_dest)
-                .on_hover_text("master volume · the last stage is the limiter, then warmth");
-            let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
-            ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
-                .on_hover_text("peak meter of everything kabelsalat plays");
-            ui.add_space(4.0);
             let arm_m = self.arm_master;
             let rmb = egui::Button::new(egui::RichText::new(if arm_m { "● ARM" } else { "○ ARM" }).size(11.0)
                     .color(if arm_m { theme::ON_ACCENT } else { theme::CREAM_MID }))
@@ -22185,10 +22171,14 @@ impl DemoApp {
             {
                 self.pending_bus_edit = Some(BusEdit::Add);
             }
+            // Loudness target (#12) sits right below Master out's controls now
+            // that the master fader lives in the Kabelsalat strip.
+            ui.add_space(8.0);
+            let (rule, _) = ui.allocate_exact_size(egui::vec2(144.0, 5.0), egui::Sense::hover());
+            ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+            ui.add_space(4.0);
+            self.master_target_ui(ui);
         });
-        if let (Some((mu, vk)), Some(g)) = (master_knob, gain) {
-            self.set_unit_knob(mu, vk, g);
-        }
     }
 
     /// The dB fader + its meter, shared by every strip (#72). `gain` is the
@@ -35746,6 +35736,33 @@ mod settings_and_dropdown_tests {
     }
 
     #[test]
+    fn kabelsalat_master_mix_strip_sits_after_system_audio_and_mutes_master() {
+        let (mut app, _rx) = app_with_system_audio();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+
+        let sys_r = texts.iter().find(|(t, _)| t == "System audio").expect("System audio heading").1;
+        let kab_r = texts.iter().find(|(t, _)| t == "Kabelsalat").expect("Kabelsalat heading").1;
+        let master_r = texts.iter().find(|(t, _)| t == "System default").expect("Master out output menu").1;
+        assert!(sys_r.right() < kab_r.left(), "Kabelsalat strip ({kab_r:?}) sits right after System audio ({sys_r:?})");
+        assert!(kab_r.right() < master_r.left(), "Kabelsalat strip ({kab_r:?}) sits before Master out ({master_r:?})");
+
+        let (_, meter) = app.mixer_meter_rects.iter().copied().find(|(k, _)| *k == MASTER_STRIP_KEY)
+            .expect("Kabelsalat master mix meter");
+        let in_strip = |r: &Rect| (r.center().x - meter.center().x).abs() < STRIP_W * 0.5;
+        assert!(texts.iter().any(|(t, r)| t == "Master mix" && in_strip(r)), "Master mix label in Kabelsalat strip");
+
+        let m_pos = texts.iter().filter(|(t, r)| t == "M" && in_strip(r) && r.top() > meter.bottom())
+            .map(|(_, r)| r.center()).next().expect("Kabelsalat strip mute button");
+        assert!(!app.master_mute);
+        click_at(&mut app, &ctx, size, m_pos);
+        assert!(app.master_mute, "clicking M mutes Kabelsalat master mix");
+        click_at(&mut app, &ctx, size, m_pos);
+        assert!(!app.master_mute, "clicking M again unmutes Kabelsalat master mix");
+    }
+
+    #[test]
     fn no_combobox_remains_and_all_three_dropdowns_use_themed_popup() {
         let src = include_str!("ui.rs");
         let combo = concat!("egui::", "ComboBox");
@@ -39245,7 +39262,7 @@ mod window_size_layout_tests {
     /// Text that leaves the window, is cut by its clip, or overlaps other
     /// text. Text a scroll area clips at its edge is scrolled, not broken,
     /// so a clip cut only counts outside `scrolled` regions.
-    fn audit(texts: &[Text], size: Vec2) -> Vec<String> {
+    fn audit(texts: &[Text], size: Vec2, scroll_x_clip: Option<f32>) -> Vec<String> {
         let screen = Rect::from_min_size(Pos2::ZERO, size);
         let mut bad = Vec::new();
         let vis: Vec<(&Text, Rect)> = texts.iter()
@@ -39253,7 +39270,15 @@ mod window_size_layout_tests {
             .filter(|(_, v)| v.width() > 0.5 && v.height() > 0.5)
             .collect();
         for (t, v) in &vis {
-            if !screen.expand(0.5).contains_rect(t.rect) {
+            let clipped_in_scroll_x = scroll_x_clip.is_some_and(|sx| {
+                t.clip.right() <= sx + 0.5
+                    && t.clip.right() < screen.right() - 0.5
+                    && t.rect.right() > t.clip.right() + 0.5
+                    && t.rect.left() >= screen.left() - 0.5
+                    && t.rect.top() >= screen.top() - 0.5
+                    && t.rect.bottom() <= screen.bottom() + 0.5
+            });
+            if !screen.expand(0.5).contains_rect(t.rect) && !clipped_in_scroll_x {
                 bad.push(format!("{:?} {:?} leaves the window", t.s, t.rect));
             } else if v.width() < t.rect.width() - 1.0 || v.height() < t.rect.height() - 1.0 {
                 bad.push(format!("{:?} {:?} cut by its clip {:?}", t.s, t.rect, t.clip));
@@ -39280,7 +39305,10 @@ mod window_size_layout_tests {
                 let ctx = egui::Context::default();
                 let size = Vec2::new(w, h);
                 let t = texts(&mut app, &ctx, size);
-                for v in audit(&t, size) { all.push(format!("[{w}x{h} {dname}] {v}")); }
+                let scroll_x_clip = (app.stage_view == StageView::Mixer).then(|| {
+                    app.stage_sheet_rects(Rect::from_min_size(Pos2::ZERO, size), 200.0).1.right()
+                });
+                for v in audit(&t, size, scroll_x_clip) { all.push(format!("[{w}x{h} {dname}] {v}")); }
                 if app.stage_view == StageView::Rack && app.rack_overflow != Vec2::ZERO {
                     let what = if app.rack_overflow.x > 0.0 { "rack overflows sideways" } else { "rack pans vertically" };
                     all.push(format!("[{w}x{h} {dname}] {what}: {:?}", app.rack_overflow));

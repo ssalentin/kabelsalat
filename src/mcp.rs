@@ -1460,6 +1460,12 @@ impl McpServer {
             .and_then(|p| p.lock().ok())
             .map(|g| g.master_target.readout(&g.meter))
             .unwrap_or_else(|| json!(null));
+        let master_mute = st
+            .graph_pub
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map(|g| g.master_mute)
+            .unwrap_or(false);
         let counters = crate::engine_info::EngineCounters::load();
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
@@ -1483,6 +1489,7 @@ impl McpServer {
             "active_rig": active_rig,
             "meter": meter,
             "master_target": master_target,
+            "master_mute": master_mute,
         }))
     }
 

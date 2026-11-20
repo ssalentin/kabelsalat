@@ -198,32 +198,33 @@ static PHRASES: [Phrase; 7] = [
     Phrase { kind: PhraseKind::Wind, title: "Two legato phrases with breaths", beats: 16.0, breath: true, notes: WIND },
 ];
 
-/// Words that name a kind of sound, most specific first: a "Bassoon" is a
-/// wind, "Keys/Organ 1" an organ, "Synth Bass Pluck" a bass. A cue matches
-/// a word it starts; cues of two letters ("ep", "b3") only a whole word.
-const CUES: &[(PhraseKind, &[&str])] = &[
-    (PhraseKind::Drums, &["drum", "perc", "kit"]),
-    (PhraseKind::Wind, &["flute", "sax", "brass", "reed", "wind", "breath", "starbreath", "bassoon", "oboe", "clarinet", "trumpet", "horn"]),
-    (PhraseKind::Organ, &["organ", "hammond", "drawbar", "tonewheel", "setbfree", "b3", "leslie"]),
-    (PhraseKind::Bass, &["bass"]),
+/// Words that tell a synth's sounds apart. What kind of instrument a rig
+/// is (bass, wind, drums, organ, piano) is the rig's type (#198,
+/// `keyboard::classify_instrument`); these only split a Synth rig.
+/// A cue matches a word it starts.
+const SYNTH_CUES: &[(PhraseKind, &[&str])] = &[
     (PhraseKind::Pad, &["pad"]),
     (PhraseKind::Lead, &["lead"]),
-    (PhraseKind::Keys, &["key", "piano", "ep", "rhodes", "wurli", "pluck", "clav"]),
 ];
 
-/// The phrase a sound gets: the words of its loaded patch, then of its
-/// plugin's name, then the keyboard class, then `Keys`.
-pub fn kind_for(class: KeyboardType, patch_label: Option<&str>, plugin_name: Option<&str>) -> PhraseKind {
-    [patch_label, plugin_name].into_iter().flatten().find_map(kind_in).unwrap_or(match class {
+/// The phrase a rig gets: its type decides, and a Synth rig plays a pad or
+/// lead phrase when its loaded patch (then its plugin's name) says so, else
+/// `Keys`.
+pub fn kind_for(ty: KeyboardType, patch_label: Option<&str>, plugin_name: Option<&str>) -> PhraseKind {
+    match ty {
+        KeyboardType::Piano | KeyboardType::ElectricPiano => PhraseKind::Keys,
         KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => PhraseKind::Organ,
-        KeyboardType::Piano | KeyboardType::Synth => PhraseKind::Keys,
-    })
+        KeyboardType::Bass => PhraseKind::Bass,
+        KeyboardType::Wind => PhraseKind::Wind,
+        KeyboardType::Drums => PhraseKind::Drums,
+        KeyboardType::Synth => [patch_label, plugin_name].into_iter().flatten().find_map(kind_in).unwrap_or(PhraseKind::Keys),
+    }
 }
 
 fn kind_in(text: &str) -> Option<PhraseKind> {
     let words = words(text);
-    let has = |cue: &str| words.iter().any(|w| if cue.len() <= 2 { w == cue } else { w.starts_with(cue) });
-    CUES.iter().find(|(_, cues)| cues.iter().any(|c| has(c))).map(|(k, _)| *k)
+    let has = |cue: &str| words.iter().any(|w| w.starts_with(cue));
+    SYNTH_CUES.iter().find(|(_, cues)| cues.iter().any(|c| has(c))).map(|(k, _)| *k)
 }
 
 /// Lower-case words split at anything but letters and digits, plus the
@@ -570,32 +571,46 @@ mod tests {
         assert!(at(8.2) > 0, "breath comes back with the second phrase");
     }
 
+    /// Real sound and plugin names go through the rig's type (the same
+    /// classification the keyboard and the rail use), then the phrase.
     #[test]
     fn real_sound_names_pick_their_phrase() {
-        use KeyboardType::*;
-        let cases: &[(KeyboardType, Option<&str>, Option<&str>, PhraseKind)] = &[
-            (Synth, Some("Basses/Sub Bass 1"), Some("Surge XT"), PhraseKind::Bass),
-            (Synth, Some("Pads/Warm Pad"), Some("Surge XT"), PhraseKind::Pad),
-            (Synth, Some("Leads/Saw Lead"), Some("Surge XT"), PhraseKind::Lead),
-            (Piano, Some("Keys/EP Suitcase"), Some("Surge XT"), PhraseKind::Keys),
-            (Synth, Some("Plucks/Pluck 1"), Some("Surge XT"), PhraseKind::Keys),
-            (Synth, Some("Winds/Flute"), Some("Surge XT"), PhraseKind::Wind),
-            (Synth, Some("Basses/Bassoon"), Some("Surge XT"), PhraseKind::Wind),
-            (JazzOrgan, Some("Keys/Organ 1"), Some("Surge XT"), PhraseKind::Organ),
-            (JazzOrgan, Some("Jimmy Smith"), Some("setBfree"), PhraseKind::Organ),
-            (JazzOrgan, None, Some("setBfree DSP Tonewheel Organ"), PhraseKind::Organ),
-            (PipeOrgan, None, Some("Aeolus"), PhraseKind::Organ),
-            (Synth, None, Some("AVL Drumkits"), PhraseKind::Drums),
-            (Synth, Some("Percussion/Metal Hit"), Some("Surge XT"), PhraseKind::Drums),
-            (Synth, None, Some("Starbreath"), PhraseKind::Wind),
-            (Synth, Some("SubBass"), None, PhraseKind::Bass),
-            (Synth, Some("Epic Strings"), Some("Surge XT"), PhraseKind::Keys),
-            (Piano, None, Some("Dexed"), PhraseKind::Keys),
-            (Synth, None, None, PhraseKind::Keys),
+        use crate::control::{ClapId, Lv2Uri, NodeKind};
+        let clap = |id: &str| NodeKind::Clap { plugin_id: ClapId::new(id) };
+        let surge = clap("org.surge-synth-team.surge-xt");
+        let cases: &[(NodeKind, Option<&str>, Option<&str>, PhraseKind)] = &[
+            (surge.clone(), Some("Basses/Sub Bass 1"), Some("Surge XT"), PhraseKind::Bass),
+            (surge.clone(), Some("Pads/Warm Pad"), Some("Surge XT"), PhraseKind::Pad),
+            (surge.clone(), Some("Leads/Saw Lead"), Some("Surge XT"), PhraseKind::Lead),
+            (surge.clone(), Some("Keys/EP Suitcase"), Some("Surge XT"), PhraseKind::Keys),
+            (surge.clone(), Some("Plucks/Pluck 1"), Some("Surge XT"), PhraseKind::Keys),
+            (surge.clone(), Some("Winds/Flute"), Some("Surge XT"), PhraseKind::Wind),
+            (surge.clone(), Some("Winds/Bassoon"), Some("Surge XT"), PhraseKind::Wind),
+            (surge.clone(), Some("Contrabassoon"), Some("Surge XT"), PhraseKind::Wind),
+            (surge.clone(), Some("Keys/Organ 1"), Some("Surge XT"), PhraseKind::Organ),
+            (surge.clone(), Some("Percussion/Metal Hit"), Some("Surge XT"), PhraseKind::Drums),
+            (surge.clone(), Some("Epic Strings"), Some("Surge XT"), PhraseKind::Keys),
+            (NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, Some("Jimmy Smith"), Some("setBfree DSP Tonewheel Organ"), PhraseKind::Organ),
+            (clap(crate::aeolus::AEOLUS_ID), None, Some("Aeolus"), PhraseKind::Organ),
+            (NodeKind::Lv2 { uri: Lv2Uri::new("http://gareus.org/oss/lv2/avldrums#BlackPearl") }, None, Some("AVL Drumkits"), PhraseKind::Drums),
+            (clap("org.starbreath.starbreath"), None, Some("Starbreath"), PhraseKind::Wind),
+            (clap("com.punklabs.onetrick.chonk"), None, Some("OneTrick CHONK"), PhraseKind::Bass),
+            (clap("com.digital-suburban.dexed"), None, Some("Dexed"), PhraseKind::Keys),
+            (surge.clone(), None, None, PhraseKind::Keys),
         ];
-        for &(class, patch, plugin, want) in cases {
-            assert_eq!(kind_for(class, patch, plugin), want, "{class:?} {patch:?} {plugin:?}");
+        for (kind, patch, plugin, want) in cases {
+            let ty = crate::keyboard::classify_instrument(kind, *patch, *plugin, &[]);
+            assert_eq!(kind_for(ty, *patch, *plugin), *want, "{kind:?} {patch:?} {plugin:?} ({ty:?})");
         }
+    }
+
+    /// A rig marked by hand plays its mark's phrase, whatever the patch says.
+    #[test]
+    fn a_marked_type_decides_the_phrase() {
+        assert_eq!(kind_for(KeyboardType::Drums, Some("Pads/Warm Pad"), Some("Surge XT")), PhraseKind::Drums);
+        assert_eq!(kind_for(KeyboardType::Wind, None, Some("Surge XT")), PhraseKind::Wind);
+        assert_eq!(kind_for(KeyboardType::ElectricPiano, Some("Leads/Saw Lead"), None), PhraseKind::Keys);
+        assert_eq!(kind_for(KeyboardType::Synth, Some("Leads/Saw Lead"), None), PhraseKind::Lead);
     }
 
     #[test]

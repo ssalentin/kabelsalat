@@ -767,14 +767,15 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"get_keyboard_state",
-            "description":"Read the virtual software keyboard dock state: open, expanded (fullscreen mode), auto vs pinned instrument mode (piano | jazz_organ | pipe_organ | synth), detected mode, target instrument, octave, sustain, swell, dual_manual, scale_fold, y_touch and synth_drag.",
+            "description":"Read the virtual software keyboard dock state: open, expanded (fullscreen mode), the active rig's instrument type (mode: piano | electric_piano | jazz_organ | pipe_organ | synth | bass | wind | drums), whether it is marked or follows its instrument (auto, marked), the detected type, rigs (every rig's 0-based index, name, type, detected type and marked), target instrument, octave, sustain, swell, dual_manual, scale_fold, y_touch and synth_drag.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_keyboard_mode",
-            "description":"Configure the virtual software keyboard dock: open/close it, toggle expanded/fullscreen performance view, switch between auto or a pinned instrument surface (piano | jazz_organ | pipe_organ | synth), or toggle surface options (dual_manual, scale_fold, y_touch, synth_drag: gliss|slide).",
+            "description":"Configure the virtual software keyboard dock: open/close it, toggle expanded/fullscreen performance view, mark a rig's instrument type or return it to auto (it follows its instrument), or toggle surface options (dual_manual, scale_fold, y_touch, synth_drag: gliss|slide). The keyboard plays the active rig's type.",
             "parameters":{"type":"object","properties":{
-                "mode":{"type":"string","description":"auto | piano | jazz_organ | pipe_organ | synth"},
+                "mode":{"type":"string","enum":["auto","piano","electric_piano","jazz_organ","pipe_organ","synth","bass","wind","drums"],"description":"The rig's type, or auto to follow its instrument"},
+                "rig":{"type":"integer","description":"0-based rig index (rig 0 = the first rig, Rig A); omit = the active rig"},
                 "open":{"type":"boolean","description":"Show (true) or hide (false) the keyboard dock"},
                 "expanded":{"type":"boolean","description":"Fullscreen/expanded GarageBand-style keyboard dock"},
                 "dual_manual":{"type":"boolean","description":"Jazz Organ: stack Upper (Ch 1) and Lower (Ch 2) manuals"},
@@ -1172,7 +1173,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"get_rigs",
-            "description":"List every rig (all of them, not just the one in view): index, name, MIDI device, units (node ids), mixer vol/pan/mute/solo, plus which rig is in view. Every rig sounds at once; get_graph nodes carry their rig index too.",
+            "description":"List every rig (all of them, not just the one in view): index, name, MIDI device, instrument type (type: piano | electric_piano | jazz_organ | pipe_organ | synth | bass | wind | drums, null without an instrument; type_marked: set by the player or set_keyboard_mode rather than detected), units (node ids), mixer vol/pan/mute/solo, plus which rig is in view. Every rig sounds at once; get_graph nodes carry their rig index too.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{

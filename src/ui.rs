@@ -1057,7 +1057,7 @@ fn remap_session(
     ns.rig_names = s.rig_names.clone(); // names follow their rig (#33)
     ns.master_target = s.master_target; // session-level, no node ids (#12)
     ns.master_mute = s.master_mute;
-    ns.keyboard_mode = s.keyboard_mode; // session-level, no node ids (#163)
+    ns.rig_types = s.rig_types.clone(); // marks follow their rig like names (#198)
     ns.time_sig = s.time_sig; // session-level too (#87)
     for p in s.params() {
         if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
@@ -1119,6 +1119,13 @@ fn remap_session(
 /// A multi-rig session in the id layout the engine's LoadRigs produces
 /// (split → merge). Gaps left by removed or added nodes shift a later rig's
 /// ids there, so everything keyed on node ids is remapped first.
+/// Rig marks without the unmarked tail: empty while no rig is marked, so a
+/// session that marks nothing says nothing (#198).
+fn trimmed_marks(mut marks: Vec<Option<crate::keyboard::KeyboardType>>) -> Vec<Option<crate::keyboard::KeyboardType>> {
+    while marks.last() == Some(&None) { marks.pop(); }
+    marks
+}
+
 fn canonical_rig_session(s: &crate::session::Session) -> crate::session::Session {
     if s.graph.nodes.iter().all(|n| n.rig == 0) {
         return s.clone();
@@ -2116,7 +2123,7 @@ fn make_unit(node: &Node) -> Unit {
             keys_jacks(node.split),
         ),
         NodeKind::Clap { .. } => (
-            UnitKind::Clap, "synth · clap".into(),
+            UnitKind::Clap, "clap instrument".into(),
             vec![PortKind::Midi], vec![PortKind::Audio],
             vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
@@ -2883,7 +2890,7 @@ fn sentence_first(s: &str) -> String {
 const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "set_param", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
-    "set_audio_output", "list_app_streams", "set_app_stream", "add_rig", "clone_rig",
+    "set_audio_output", "list_app_streams", "set_app_stream", "add_rig", "clone_rig", "delete_rig",
     "save_rig", "load_rig", "list_rig_presets", "load_template",
     "list_instruments", "install_instrument", "play_file", "stop_file",
     "set_scale", "set_arp",
@@ -3379,8 +3386,9 @@ struct DemoApp {
     /// Last frame's strip rects: [pitch wheel, mod wheel, sustain chip, VEL
     /// slider] (tests + hit-testing).
     kb_strip: [Rect; 4],
-    /// Adaptive virtual keyboard state (issue #163).
-    kb_mode: crate::keyboard::KeyboardMode,
+    /// Each rig's instrument-type mark by rig index (#198): `None` = the
+    /// rig follows its instrument. Saved as `Session::rig_types`.
+    rig_types: Vec<Option<crate::keyboard::KeyboardType>>,
     kb_expanded: bool,
     /// The expanded Jazz Organ's Leslie rotor: (angle, angular speed), so
     /// it spins up and down like the real one.
@@ -3390,6 +3398,11 @@ struct DemoApp {
     kb_sustained: [bool; 128],
     kb_last_vel: f32,
     kb_swell: f32,
+    kb_breath: f32,
+    kb_breath_target: crate::keyboard::BreathTarget,
+    kb_y_breath: bool,
+    kb_pad_vel: bool,
+    kb_fret_drag: Option<usize>,
     kb_dual_manual: bool,
     kb_scale_fold: bool,
     kb_synth_drag: crate::keyboard::SynthDragMode,
@@ -3407,8 +3420,14 @@ struct DemoApp {
     /// Channel of the held pointer note (the Lower Manual plays 1, #163).
     kb_drag_ch: u8,
     kb_drag_since: std::time::Instant,
-    /// Last frame's mode-switcher chip rects & expand toggle rect (tests).
-    kb_mode_rects: [Rect; 4],
+    /// Last frame's type chip rects, one per `KeyboardType::ALL` entry
+    /// (NOTHING while the header shows the compact type menu), and the
+    /// expand toggle rect (tests).
+    kb_mode_rects: [Rect; crate::keyboard::KeyboardType::ALL.len()],
+    /// The compact header's type menu button (narrow windows).
+    kb_type_menu_rect: Rect,
+    /// The bass neck the keyboard drew last (dock or console), for hit tests.
+    kb_fret_rect: Rect,
     kb_expand_rect: Rect,
     kb_deck_rect: Rect,
     /// Per-hardware-device activity LEDs for the matrix row headers.
@@ -3964,7 +3983,7 @@ impl DemoApp {
             kb_mod: 0.0,
             kb_sustain: false,
             kb_strip: [Rect::NOTHING; 4],
-            kb_mode: crate::keyboard::KeyboardMode::Auto,
+            rig_types: Vec::new(),
             kb_expanded: false,
             kb_rotor: (0.0, 0.0),
             kb_soft: false,
@@ -3972,6 +3991,11 @@ impl DemoApp {
             kb_sustained: [false; 128],
             kb_last_vel: 0.8,
             kb_swell: 0.85,
+            kb_breath: 0.75,
+            kb_breath_target: crate::keyboard::BreathTarget::Cc2,
+            kb_y_breath: true,
+            kb_pad_vel: true,
+            kb_fret_drag: None,
             kb_dual_manual: false,
             kb_scale_fold: false,
             kb_synth_drag: crate::keyboard::SynthDragMode::Gliss,
@@ -3986,7 +4010,9 @@ impl DemoApp {
             kb_drag_start_x: 0.0,
             kb_drag_ch: 0,
             kb_drag_since: std::time::Instant::now(),
-            kb_mode_rects: [Rect::NOTHING; 4],
+            kb_mode_rects: [Rect::NOTHING; crate::keyboard::KeyboardType::ALL.len()],
+            kb_type_menu_rect: Rect::NOTHING,
+            kb_fret_rect: Rect::NOTHING,
             kb_expand_rect: Rect::NOTHING,
             kb_deck_rect: Rect::NOTHING,
             hw_leds: Vec::new(),
@@ -6656,7 +6682,7 @@ impl DemoApp {
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
         s.master_target = Some(self.master_target);
         s.master_mute = self.master_mute;
-        s.keyboard_mode = Some(self.kb_mode);
+        s.rig_types = self.saved_rig_types();
         s.time_sig = Some(self.time_sig);
         // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
         // display order, keyed by node like every other session value.
@@ -6902,9 +6928,9 @@ impl DemoApp {
             self.restore_master_target(target);
         }
         self.set_master_mute(s.master_mute);
-        if let Some(mode) = s.keyboard_mode {
-            self.kb_mode = mode;
-        }
+        // A rack's rigs bring their own marks; one that states none follows
+        // its instruments (#198).
+        self.rig_types = s.rig_types.clone();
         // The same for the time signature (#87): a session that states none
         // keeps the clock's.
         if let Some(sig) = s.time_sig {
@@ -12545,36 +12571,19 @@ impl DemoApp {
         painter.layout_no_wrap(t, font, color)
     }
 
-    /// The first instrument unit of `rig`, and the demo phrase kind it calls
-    /// for (`None` when the rig has no instrument, e.g. the Guitar rig).
+    /// The demo phrase rig `rig` calls for: its type (#198, the mark or its
+    /// instrument's), refined by the loaded patch on a Synth rig. `None`
+    /// when the rig has no instrument (the Guitar rig).
     fn rig_demo_phrase(&self, rig: usize) -> Option<crate::demo::PhraseKind> {
-        let multi = self.rig_count() > 1;
-        let in_rig = |u: &Unit| if multi { u.rig as usize == rig } else { rig == 0 };
-        let is_inst = |u: &Unit| {
-            matches!(u.node_kind, UnitKind::Clap)
-                || u.lv2_inst
-                || self.base_graph.node(u.node_id).is_some_and(|n| crate::organ::is_organ(&n.kind))
-        };
-        let ti = self.units.iter().position(|u| in_rig(u) && is_inst(u))?;
+        let ti = self.rig_instrument_unit(rig)?;
+        let ty = self.rig_type(rig)?;
         let u = &self.units[ti];
-        let kind = &self.base_graph.node(u.node_id)?.kind;
         let patch = self.voice_slot_of_node(u.node_id).and_then(|s| self.patch_names.get(s)).cloned().flatten();
-        let (plugin, features) = match kind {
-            NodeKind::Clap { plugin_id } => {
-                let pid = plugin_id.as_str();
-                let name = self.plugin_display_name(pid).or_else(|| Some(sentence_case(&u.name)));
-                let feats = self.plugins_clap.iter().find(|p| p.id == pid).map(|p| p.features.clone()).unwrap_or_default();
-                (name, feats)
-            }
-            NodeKind::Lv2 { uri } => {
-                let name = self.plugins_lv2.iter().find(|p| p.uri == uri.as_str()).map(|p| p.name.clone())
-                    .or_else(|| Some(sentence_case(&u.name)));
-                (name, Vec::new())
-            }
-            _ => (None, Vec::new()),
-        };
-        let class = crate::keyboard::classify_instrument(kind, patch.as_deref(), plugin.as_deref(), &features);
-        Some(crate::demo::kind_for(class, patch.as_deref(), plugin.as_deref()))
+        let plugin = match self.base_graph.node(u.node_id).map(|n| &n.kind) {
+            Some(NodeKind::Clap { plugin_id }) => self.plugin_display_name(plugin_id.as_str()),
+            _ => None,
+        }.or_else(|| Some(sentence_case(&u.name)));
+        Some(crate::demo::kind_for(ty, patch.as_deref(), plugin.as_deref()))
     }
 
     /// Unified Left Rail (`Q`): owns the session's structural hierarchy (`Rigs`
@@ -12804,9 +12813,12 @@ impl DemoApp {
                                                     let (src_lbl, is_audio) = self.rig_source_badge(r_idx);
                                                     let phrase = self.rig_demo_phrase(r_idx);
                                                     let demo_on = self.demo_playing.is_some_and(|d| d.rig as usize == r_idx);
-                                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(row_w, 28.0), egui::Sense::hover());
-                                                    let demo_rect = Rect::from_min_size(Pos2::new(rect.left() + 6.0, rect.top() + 4.0), egui::vec2(20.0, 20.0));
-                                                    let more_rect = Rect::from_min_size(Pos2::new(rect.right() - 22.0, rect.top() + 4.0), egui::vec2(20.0, 20.0));
+                                                    let rig_ty = self.rig_type(r_idx);
+                                                    let rig_marked = self.rig_mark(r_idx).is_some();
+                                                    // Two lines: the name, and under it the rig's type (#198).
+                                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(row_w, 36.0), egui::Sense::hover());
+                                                    let demo_rect = Rect::from_min_size(Pos2::new(rect.left() + 6.0, rect.center().y - 10.0), egui::vec2(20.0, 20.0));
+                                                    let more_rect = Rect::from_min_size(Pos2::new(rect.right() - 22.0, rect.center().y - 10.0), egui::vec2(20.0, 20.0));
                                                     let body_rect = Rect::from_min_max(Pos2::new(demo_rect.right() + 2.0, rect.top()), Pos2::new(more_rect.left() - 2.0, rect.bottom()));
                                                     let body_resp = ui.interact(body_rect, egui::Id::unique(("nav_rig", r_idx)), egui::Sense::click());
                                                     let menu_open_here = self.nav_rig_menu.is_some_and(|(mr, _)| mr == r_idx);
@@ -12863,7 +12875,18 @@ impl DemoApp {
                                                         col,
                                                         (text_limit - text_x).max(16.0),
                                                     );
-                                                    ui.painter().galley(Pos2::new(text_x, rect.center().y - g.size().y * 0.5), g, col);
+                                                    let name_y = if rig_ty.is_some() { rect.top() + 4.0 } else { rect.center().y - g.size().y * 0.5 };
+                                                    let name_h = g.size().y;
+                                                    ui.painter().galley(Pos2::new(text_x, name_y), g, col);
+                                                    if let Some(t) = rig_ty {
+                                                        let (label, tcol) = if rig_marked {
+                                                            (format!("{} · MARKED", t.badge()), theme::CREAM_META)
+                                                        } else {
+                                                            (t.badge().to_string(), theme::CREAM_DIM)
+                                                        };
+                                                        let tg = Self::ellipsized(ui.painter(), &label, theme::medium_font(8.5), tcol, (text_limit - text_x).max(16.0));
+                                                        ui.painter().galley(Pos2::new(text_x, name_y + name_h + 1.0), tg, tcol);
+                                                    }
 
                                                     self.nav_row_rects.push((row.clone(), rect));
                                                     self.nav_rig_more_rects.push((r_idx, more_rect));
@@ -14041,6 +14064,7 @@ impl DemoApp {
                 .map(|u| serde_json::json!({"node": u.node_id, "name": u.name})).collect();
             serde_json::json!({
                 "rig": r, "name": self.rig_name(r), "device": self.rig_device_label(r),
+                "type": self.rig_type(r).map(|t| t.as_str()), "type_marked": self.rig_mark(r).is_some(),
                 "units": units, "vol": m.vol, "pan": m.pan, "mute": m.mute, "solo": m.solo,
             })
         }).collect();
@@ -14120,7 +14144,9 @@ impl DemoApp {
             let i = rigs.iter().position(|(k, _)| *k == Some(o))?;
             Some(new_bases[i] + (old - old_bases[o]))
         };
-        let ns = remap_session(&s, merged, remap);
+        let mut ns = remap_session(&s, merged, remap);
+        // Marks follow their rig; the new rig follows its instrument (#198).
+        ns.rig_types = trimmed_marks(rigs.iter().map(|(k, _)| k.and_then(|o| self.rig_mark(o))).collect());
         // Mixer follows its rig; the new rig starts at unity (applied after
         // the reload — build_rack resets the mixer).
         let mut mix = [crate::engine::RigMix::DEFAULT; 8];
@@ -14214,6 +14240,8 @@ impl DemoApp {
 
         let mut ns = remap_session(&s, merged, remap_existing);
         ns.rig_names = list.iter().map(|r| r.name.clone()).collect();
+        // The clone is the same kind of rig, mark included (#198).
+        ns.rig_types = trimmed_marks((0..list.len()).map(|i| self.rig_mark(if i == new_rig { rig } else { i })).collect());
         for p in s.params() {
             if let Some(nid) = remap_clone(p.node) {
                 ns.set_param(nid, p.param, p.value);
@@ -14431,6 +14459,8 @@ impl DemoApp {
             if node.rig as usize == rig { Some(old - base) } else { None }
         });
         rig_session.rig_names.clear();
+        // The preset keeps its rig's mark as its only entry (#198).
+        rig_session.rig_types = trimmed_marks(vec![self.rig_mark(rig)]);
         let midi_device = self.rig_snapshot.lock().ok()
             .and_then(|sn| sn.rigs.get(rig).and_then(|m| m.midi_device));
         let mut clap_meta = Vec::new();
@@ -14539,6 +14569,10 @@ impl DemoApp {
         let ns_preset = remap_session(&preset.session, merged.clone(), remap_preset);
         let mut combined = crate::session::Session::new("Rigs", merged);
         combined.rig_names = list.iter().map(|r| r.name.clone()).collect();
+        combined.rig_types = trimmed_marks(slots.iter().map(|slot| match *slot {
+            RigSlot::Existing(o) => self.rig_mark(o),
+            RigSlot::Preset => preset.session.rig_types.first().copied().flatten(),
+        }).collect());
         for src_sess in [&ns_existing, &ns_preset] {
             for p in src_sess.params() {
                 combined.set_param(p.node, p.param, p.value);
@@ -14940,8 +14974,9 @@ impl DemoApp {
                                     } else {
                                         " · out of song".to_string()
                                     };
+                                    let ty = self.rig_type(rig).map(|t| format!(" · {}", t.label())).unwrap_or_default();
                                     let chip = inline_rig_pill(ui, rig, &name, active, level, agent_t, active_max_w)
-                                        .on_hover_text(format!("{} · {name} ({dev}){zone_tip} · right-click for rig actions", rig + 1));
+                                        .on_hover_text(format!("{} · {name}{ty} ({dev}){zone_tip} · right-click for rig actions", rig + 1));
                                     if zone_active {
                                         let dot_col = if zone.live { theme::LIVE_TEAL } else { theme::MUTED };
                                         let dot_c = Pos2::new(chip.rect.right() - 4.5, chip.rect.top() + 4.5);
@@ -16402,9 +16437,13 @@ impl DemoApp {
         for u in &mut self.units {
             match self.base_graph.node(u.node_id).map(|n| &n.kind) {
                 Some(NodeKind::Lv2 { uri }) => {
-                    u.lv2_inst = self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
-                    if u.lv2_inst {
-                        u.sub = "lv2 synth".into();
+                    // An instrument's subtitle names the plugin, as a CLAP
+                    // unit's does; "synth" would contradict an organ or a
+                    // drum kit's rig type (#198).
+                    let inst = self.plugins_lv2.iter().find(|p| p.uri == uri.as_str() && p.is_instrument);
+                    u.lv2_inst = inst.is_some();
+                    if let Some(p) = inst {
+                        u.sub = p.name.clone();
                         u.sub_g = None;
                     }
                 }
@@ -17200,7 +17239,11 @@ impl DemoApp {
                                         let badge = format!(
                                             "{} · {}",
                                             e.format.label(),
-                                            if e.plugin_type == PluginType::Instrument { "INST" } else { "FX" }
+                                            match e.instrument {
+                                                Some(t) => t.badge(),
+                                                None if e.plugin_type == PluginType::Instrument => "INST",
+                                                None => "FX",
+                                            }
                                         );
                                         let badge_col = if e.plugin_type == PluginType::Instrument {
                                             theme::ACCENT_BRIGHT
@@ -17347,7 +17390,8 @@ impl DemoApp {
                                                 PluginFormat::Clap => "CLAP",
                                                 PluginFormat::Lv2 => "LV2",
                                             };
-                                            let badge = if show_sub_badge { format!("{fmt} · {}", e.sub.badge()) } else { fmt.to_string() };
+                                            // An instrument always names its type (#198).
+                                            let badge = if show_sub_badge || e.instrument_type().is_some() { format!("{fmt} · {}", e.badge()) } else { fmt.to_string() };
                                             let badge_col = match e.ty() {
                                                 PluginType::Instrument => theme::ACCENT_BRIGHT,
                                                 PluginType::Effect => theme::LIVE_TEAL,
@@ -18801,7 +18845,7 @@ impl DemoApp {
     /// the organ's `P_BASE` params, Aeolus's own state, the plugin's main
     /// controls — nothing here keeps a shadow copy of engine state.
     fn keyboard_panel_ui(&mut self, root: &mut egui::Ui) {
-        use crate::keyboard::KeyboardType;
+        use crate::keyboard::Surface;
         if self.kb_expanded {
             // Expanded: the instrument's own console fills the window.
             return self.keyboard_console_ui(root);
@@ -18815,21 +18859,27 @@ impl DemoApp {
         let avail = root.available_height();
         let need = self.rack_need_h();
         let keys_h = Self::keyboard_dock_h(win_h, avail, need);
-        let surface = self.kb_surface();
+        let ty = self.kb_type();
+        let surface = ty.surface();
         let target = self.kb_target_unit();
         let organ_unit = target.filter(|&u| self.is_organ_unit(u));
         let aeolus_unit = target.filter(|&u| self.is_aeolus_unit(u));
-        // The full deck (drawbars, X/Y pad) from the default 200 px dock up.
+        // The full deck (drawbars, X/Y pad, bass neck) from the default 200 px dock up.
         let deck_h = match surface {
-            KeyboardType::PipeOrgan => 58.0,
-            _ => if keys_h >= 196.0 { 64.0 } else { 40.0 },
+            Surface::PipeOrgan => 58.0,
+            Surface::Drums => 44.0,
+            Surface::Piano | Surface::ElectricPiano | Surface::JazzOrgan | Surface::Synth | Surface::Bass | Surface::Wind => {
+                if keys_h >= 196.0 { 64.0 } else { 40.0 }
+            }
         };
         let h = (keys_h + deck_h + 4.0).min((avail - need).max(KB_DOCK_MIN_H + deck_h + 4.0)).round();
         let cheek_w = match surface {
-            KeyboardType::Piano => 46.0,
-            KeyboardType::JazzOrgan => 96.0,
-            KeyboardType::PipeOrgan => 44.0,
-            KeyboardType::Synth => 80.0,
+            Surface::Piano | Surface::Drums => 46.0,
+            Surface::ElectricPiano => 56.0,
+            Surface::JazzOrgan => 96.0,
+            Surface::PipeOrgan => 44.0,
+            Surface::Wind => 52.0,
+            Surface::Synth | Surface::Bass => 80.0,
         };
         let mut kb_rect = Rect::NOTHING;
         let mut deck_rect = Rect::NOTHING;
@@ -18846,7 +18896,7 @@ impl DemoApp {
                     .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(root, |ui| {
-                self.kb_header(ui, surface, target, false);
+                self.kb_header(ui, ty, target, false);
                 ui.add_space(4.0);
                 // --- the surface's control deck ------------------------------
                 deck_rect = ui.allocate_ui_with_layout(
@@ -18854,15 +18904,19 @@ impl DemoApp {
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         match surface {
-                            KeyboardType::Piano => self.kb_deck_piano(ui, target, deck_h, &mut strip),
-                            KeyboardType::JazzOrgan => self.kb_deck_jazz(ui, organ_unit, deck_h),
-                            KeyboardType::PipeOrgan => self.kb_deck_pipe(ui, aeolus_unit, deck_h),
-                            KeyboardType::Synth => self.kb_deck_synth(ui, target, deck_h, &mut strip),
+                            Surface::Piano => self.kb_deck_piano(ui, target, deck_h, &mut strip),
+                            Surface::ElectricPiano => self.kb_deck_epiano(ui, target, deck_h, &mut strip),
+                            Surface::JazzOrgan => self.kb_deck_jazz(ui, organ_unit, deck_h),
+                            Surface::PipeOrgan => self.kb_deck_pipe(ui, aeolus_unit, deck_h),
+                            Surface::Synth => self.kb_deck_synth(ui, target, deck_h, &mut strip),
+                            Surface::Bass => self.kb_deck_bass(ui, target, deck_h, &mut strip),
+                            Surface::Wind => self.kb_deck_wind(ui, target, deck_h, &mut strip),
+                            Surface::Drums => self.kb_deck_drums(ui, target, deck_h, &mut strip),
                         }
                     },
                 ).response.rect;
                 ui.add_space(4.0);
-                // --- cheekblock + keybed -------------------------------------
+                // --- cheekblock + keybed / pads ------------------------------
                 let bed_h = ui.available_height().max(48.0);
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
@@ -18870,15 +18924,21 @@ impl DemoApp {
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             match surface {
-                                KeyboardType::Piano => self.kb_cheek_piano(ui, bed_h),
-                                KeyboardType::JazzOrgan => self.kb_cheek_jazz(ui, bed_h),
-                                KeyboardType::PipeOrgan => self.kb_cheek_swell(ui, bed_h),
-                                KeyboardType::Synth => self.kb_cheek_synth(ui, bed_h, &mut strip),
+                                Surface::Piano | Surface::Drums => self.kb_cheek_piano(ui, bed_h),
+                                Surface::ElectricPiano => self.kb_cheek_epiano(ui, bed_h, &mut strip),
+                                Surface::JazzOrgan => self.kb_cheek_jazz(ui, bed_h),
+                                Surface::PipeOrgan => self.kb_cheek_swell(ui, bed_h),
+                                Surface::Wind => self.kb_cheek_wind(ui, bed_h),
+                                Surface::Synth | Surface::Bass => self.kb_cheek_synth(ui, bed_h, &mut strip),
                             }
                         },
                     );
                     let (area, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), bed_h), egui::Sense::hover());
-                    kb_rect = self.kb_keybed(ui, area, surface, 8.0);
+                    kb_rect = if surface == Surface::Drums {
+                        self.kb_drum_pads(ui, area, 2, 8)
+                    } else {
+                        self.kb_keybed(ui, area, surface, 8.0)
+                    };
                 });
             });
         self.dock_rect = resp.response.rect;
@@ -18889,44 +18949,72 @@ impl DemoApp {
         self.assistant_input_rect = Rect::NOTHING;
     }
 
-    /// The keyboard's header row: surface chips (AUTO + the four), the
-    /// target badge, octave, chord readout, EXPAND/DOCK and close. The dock
-    /// and the expanded console share it.
-    fn kb_header(&mut self, ui: &mut egui::Ui, surface: crate::keyboard::KeyboardType, target: Option<usize>, expanded: bool) {
-        use crate::keyboard::{KeyboardMode, KeyboardType};
+    /// The keyboard's header row: the active rig's type (AUTO + one chip
+    /// per type, or one menu in a narrow window), the rig badge, octave,
+    /// chord readout, EXPAND/DOCK and close. The dock and the expanded
+    /// console share it.
+    fn kb_header(&mut self, ui: &mut egui::Ui, ty: crate::keyboard::KeyboardType, target: Option<usize>, expanded: bool) {
+        use crate::keyboard::KeyboardType;
         let octave = self.octave;
         let chord = crate::keyboard::detect_chord(&self.held_note_list());
+        let rig = self.active_rig;
+        let mark = self.rig_mark(rig);
+        // Chips, short chips or one menu, decided from the window (rule 64):
+        // what is left beside the title, AUTO and the right-hand controls.
+        let room = ui.ctx().content_rect().width() - if expanded { 640.0 } else { 520.0 };
+        let row_w = |short: bool| -> f32 {
+            KeyboardType::ALL.iter()
+                .map(|t| theme::chip_button_width(ui, if short { t.short_label() } else { t.label() }) + 2.0 + ui.spacing().item_spacing.x)
+                .sum()
+        };
+        let chips = if row_w(false) <= room { Some(false) } else if row_w(true) <= room { Some(true) } else { None };
+        self.kb_mode_rects = [Rect::NOTHING; KeyboardType::ALL.len()];
+        self.kb_type_menu_rect = Rect::NOTHING;
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 22.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 if expanded {
                     // The console names what it plays.
-                    let title = target.map(|t| sentence_case(&self.units[t].name)).unwrap_or_else(|| surface.label().to_string());
+                    let title = target.map(|t| sentence_case(&self.units[t].name)).unwrap_or_else(|| ty.label().to_string());
                     ui.label(egui::RichText::new(title).font(theme::medium_font(16.0)).color(theme::INK));
                     ui.add_space(14.0);
                 } else {
                     ui.label(egui::RichText::new("Keyboard").font(theme::medium_font(13.5)).color(theme::INK));
                     ui.add_space(6.0);
                 }
-                if theme::chip_button(ui, "AUTO", self.kb_mode == KeyboardMode::Auto)
-                    .on_hover_text("follow the active rig's instrument")
-                    .clicked()
-                {
-                    self.kb_set_mode(KeyboardMode::Auto);
-                }
-                ui.add_space(2.0);
-                for (i, t) in KeyboardType::ALL.iter().enumerate() {
-                    let pinned = self.kb_mode.pinned() == Some(*t);
-                    let label = if ui.available_width() < if expanded { 900.0 } else { 560.0 } { t.short_label() } else { t.label() };
-                    let r = theme::chip_button(ui, label, surface == *t);
-                    self.kb_mode_rects[i] = r.rect;
-                    let tip = if pinned { "pinned — click to return to AUTO" } else { "pin this keyboard surface" };
-                    if r.on_hover_text(tip).clicked() {
-                        self.kb_set_mode(if pinned { KeyboardMode::Auto } else { KeyboardMode::Pinned(*t) });
+                let mut pick: Option<Option<KeyboardType>> = None;
+                match chips {
+                    Some(short) => {
+                        if theme::chip_button(ui, "AUTO", mark.is_none())
+                            .on_hover_text("this rig follows its instrument")
+                            .clicked()
+                        {
+                            pick = Some(None);
+                        }
+                        ui.add_space(2.0);
+                        for (i, t) in KeyboardType::ALL.iter().enumerate() {
+                            let marked = mark == Some(*t);
+                            let r = theme::chip_button(ui, if short { t.short_label() } else { t.label() }, ty == *t);
+                            self.kb_mode_rects[i] = r.rect;
+                            let tip = if marked { format!("marked {} · click to follow the instrument again", t.label()) } else { format!("mark this rig as {}", t.label()) };
+                            if r.on_hover_text(tip).clicked() {
+                                pick = Some(if marked { None } else { Some(*t) });
+                            }
+                            ui.add_space(2.0);
+                        }
                     }
-                    ui.add_space(2.0);
+                    None => {
+                        let menu = theme::Dropdown::new("kb_type_menu", ty.label()).popup_min_width(150.0).show_ui(ui, |m| {
+                            if m.item(mark.is_none(), "Auto · follow the instrument") { pick = Some(None); }
+                            for t in KeyboardType::ALL {
+                                if m.item(mark == Some(t), t.label()) { pick = Some(Some(t)); }
+                            }
+                        });
+                        self.kb_type_menu_rect = menu.rect;
+                    }
                 }
+                if let Some(m) = pick { self.set_rig_mark(rig, m); }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::chip_button(ui, "×", false).on_hover_text("hide the keyboard (V)").clicked() {
                         self.release_kb_drag_note();
@@ -18954,10 +19042,10 @@ impl DemoApp {
                     }
                     if ui.available_width() > 130.0 {
                         ui.add_space(8.0);
-                        let badge = match (self.kb_mode, target) {
-                            (KeyboardMode::Auto, Some(t)) => format!("AUTO · {}", self.rig_name(self.units[t].rig as usize).to_uppercase()),
-                            (KeyboardMode::Auto, None) => "AUTO · NO INSTRUMENT".into(),
-                            _ => "PINNED".into(),
+                        let badge = match (mark, target) {
+                            (Some(_), _) => format!("MARKED · {}", self.rig_name(rig).to_uppercase()),
+                            (None, Some(t)) => format!("AUTO · {}", self.rig_name(self.units[t].rig as usize).to_uppercase()),
+                            (None, None) => "AUTO · NO INSTRUMENT".into(),
                         };
                         ui.label(egui::RichText::new(badge).size(10.5).color(theme::CREAM_DIM));
                     }
@@ -18969,8 +19057,8 @@ impl DemoApp {
     /// One keybed (two stacked manuals for a dual Jazz Organ) painted into
     /// `area` and played: press-and-hold, glissando, SLIDE bends. The dock
     /// and the expanded console share it; returns the (upper) bed.
-    fn kb_keybed(&mut self, ui: &mut egui::Ui, area: Rect, surface: crate::keyboard::KeyboardType, gap: f32) -> Rect {
-        use crate::keyboard::{KeyboardType, SynthDragMode};
+    fn kb_keybed(&mut self, ui: &mut egui::Ui, area: Rect, surface: crate::keyboard::Surface, gap: f32) -> Rect {
+        use crate::keyboard::{Surface, SynthDragMode};
         let note_leds = self.note_leds;
         let sustained = self.kb_sustained;
         let split = self.keys_unit.and_then(|k| self.shown_split(k));
@@ -18979,7 +19067,7 @@ impl DemoApp {
         let bed_resp = ui.interact(area, egui::Id::NULL.with("kb_bed"), egui::Sense::click_and_drag());
         // Dual manual: two stacked waterfall keybeds, Upper on
         // channel 0 and Lower on channel 1 (setBfree's manuals).
-        let dual = surface == KeyboardType::JazzOrgan && self.kb_dual_manual && area.height() >= 130.0;
+        let dual = surface == Surface::JazzOrgan && self.kb_dual_manual && area.height() >= 130.0;
         let (bed, lower) = if dual {
             let uh = ((area.height() - gap) * 0.5).round();
             let up = Rect::from_min_size(area.min, egui::vec2(area.width(), uh));
@@ -18988,7 +19076,8 @@ impl DemoApp {
         } else {
             (area, None)
         };
-        let folded = surface == KeyboardType::Synth && self.kb_scale_fold && scale.is_some();
+        let scale_surface = matches!(surface, Surface::Synth | Surface::Bass | Surface::Wind);
+        let folded = scale_surface && self.kb_scale_fold && scale.is_some();
         let fold_keys: Vec<crate::keyboard::FoldedKey> = if folded {
             let count = (((bed.width() - 12.0) / 38.0).floor() as usize).clamp(7, 21);
             crate::keyboard::folded_scale_keys(scale.unwrap(), base as u8, count)
@@ -19004,30 +19093,33 @@ impl DemoApp {
         };
         let painter = ui.painter().clone();
         let key_fill = match surface {
-            KeyboardType::Piano => Self::KB_IVORY,
-            KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => Self::KB_WATERFALL,
-            KeyboardType::Synth => Self::KB_SYNTH_KEY,
+            Surface::Piano => Self::KB_IVORY,
+            Surface::ElectricPiano => Color32::from_rgb(0xF1, 0xEC, 0xE1),
+            Surface::JazzOrgan | Surface::PipeOrgan => Self::KB_WATERFALL,
+            Surface::Synth | Surface::Bass | Surface::Wind | Surface::Drums => Self::KB_SYNTH_KEY,
         };
         let radius = match surface {
-            KeyboardType::Piano => 3.0,
-            KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => 1.0,
-            KeyboardType::Synth => 2.0,
+            Surface::Piano | Surface::ElectricPiano => 3.0,
+            Surface::JazzOrgan | Surface::PipeOrgan => 1.0,
+            Surface::Synth | Surface::Bass | Surface::Wind | Surface::Drums => 2.0,
         };
         // One keybed (the upper manual when dual): rails, keys,
         // scale marks, split divider — pure paint, no state.
         let paint_bed = |p: &egui::Painter, bed: Rect, ch_label: Option<&str>| {
             let lit = |semi: usize| note_leds[(base + semi).min(127)] > 0.02;
             let sus = |semi: usize| sustained[(base + semi).min(127)];
-            // The rail above the keys: crimson felt (piano),
-            // walnut-bronze (organs), a hairline (synth).
+            // The rail above the keys: crimson felt (piano), warm felt (E-Piano),
+            // walnut-bronze (organs), brass (wind), hairline (synth/bass).
             let rail = Rect::from_min_size(
                 Pos2::new(bed.left() + 6.0, bed.top() + 1.0),
                 egui::vec2(bed.width() - 12.0, 4.0),
             );
             let rail_col = match surface {
-                KeyboardType::Piano => Self::KB_FELT,
-                KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => theme::DRAWBAR_BROWN,
-                KeyboardType::Synth => theme::HAIRLINE,
+                Surface::Piano => Self::KB_FELT,
+                Surface::ElectricPiano => Color32::from_rgb(0x8A, 0x36, 0x24),
+                Surface::JazzOrgan | Surface::PipeOrgan => theme::DRAWBAR_BROWN,
+                Surface::Wind => Color32::from_rgb(0x9E, 0x7E, 0x45),
+                Surface::Synth | Surface::Bass | Surface::Drums => theme::HAIRLINE,
             };
             p.rect_filled(rail, 1.0, rail_col);
             if let Some(label) = ch_label {
@@ -19054,10 +19146,10 @@ impl DemoApp {
                 return;
             }
             let dim = |semi: usize| -> bool {
-                surface == KeyboardType::Synth && scale.is_some_and(|c| !crate::keyboard::note_in_scale(c, (base + semi) as u8).0)
+                scale_surface && scale.is_some_and(|c| !crate::keyboard::note_in_scale(c, (base + semi) as u8).0)
             };
             let root = |semi: usize| -> bool {
-                surface == KeyboardType::Synth && scale.is_some_and(|c| crate::keyboard::note_in_scale(c, (base + semi) as u8).1)
+                scale_surface && scale.is_some_and(|c| crate::keyboard::note_in_scale(c, (base + semi) as u8).1)
             };
             for wi in 0..Self::dock_whites(bed) {
                 let kr = Self::dock_key_rect(bed, wi);
@@ -19078,8 +19170,8 @@ impl DemoApp {
                         theme::alpha(Color32::WHITE, 0.0), theme::alpha(Color32::WHITE, if lit(semi) || sus(semi) { 0.2 } else { 0.1 }));
                 }
                 p.rect_stroke(kr, radius, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
-                // The piano's key-front lip.
-                if surface == KeyboardType::Piano && kr.height() >= 50.0 {
+                // The piano / e-piano key-front lip.
+                if matches!(surface, Surface::Piano | Surface::ElectricPiano) && kr.height() >= 50.0 {
                     let lip = Rect::from_min_max(Pos2::new(kr.left() + 1.0, kr.bottom() - 6.0), kr.max - egui::vec2(1.0, 1.0));
                     p.rect_filled(lip, 1.0, mix(fill, BLACK, 0.10));
                 }
@@ -19088,7 +19180,7 @@ impl DemoApp {
                 }
                 // C labels orient the player (never on the dual
                 // manuals' channel tags, never on tiny keys).
-                if ch_label.is_none() && surface != KeyboardType::JazzOrgan && surface != KeyboardType::PipeOrgan
+                if ch_label.is_none() && surface != Surface::JazzOrgan && surface != Surface::PipeOrgan
                     && semi % 12 == 0 && kr.width() >= 28.0 && kr.height() >= 54.0
                 {
                     let oct = (base + semi) as i32 / 12 - 1;
@@ -19165,15 +19257,27 @@ impl DemoApp {
             Self::dock_key_hit(bed, p).map(|s| (base + s, 0u8, ((p.y - bed.top()) / bed.height()).clamp(0.0, 1.0)))
         };
         let y_touch = self.kb_y_touch;
+        let y_breath = self.kb_y_breath;
         let hit_vel = move |yf: f32| -> f32 {
-            if surface == KeyboardType::Piano && y_touch { crate::keyboard::piano_y_velocity(yf) } else { 0.95 }
+            if matches!(surface, Surface::Piano | Surface::ElectricPiano) && y_touch {
+                crate::keyboard::piano_y_velocity(yf)
+            } else {
+                0.95
+            }
         };
         let any_bed = |p: Pos2| bed.contains(p) || lower.is_some_and(|lo| lo.contains(p));
         if bed_resp.is_pointer_button_down_on() {
             if let Some(p) = bed_resp.interact_pointer_pos() {
                 if any_bed(p) {
                     if let Some((semi, ch, yf)) = hit(p) {
-                        let sliding = surface == KeyboardType::Synth && self.kb_synth_drag == SynthDragMode::Slide;
+                        let sliding = scale_surface && self.kb_synth_drag == SynthDragMode::Slide;
+                        // Wind Y-BREATH: vertical position on the key continuously drives breath.
+                        if surface == Surface::Wind && y_breath {
+                            let b = crate::keyboard::wind_y_breath(yf);
+                            if (b - self.kb_breath).abs() > 0.008 {
+                                self.kb_send_breath(b);
+                            }
+                        }
                         match self.kb_drag_note {
                             None => {
                                 let vel = hit_vel(yf);
@@ -19220,7 +19324,7 @@ impl DemoApp {
             // keeps sounding for the rest of a click note.
             let ch = self.kb_drag_ch;
             if self.kb_drag_since.elapsed().as_millis() < CLICK_NOTE_MS as u128 {
-                if self.kb_sustain && surface == KeyboardType::Piano {
+                if self.kb_sustain && matches!(surface, Surface::Piano | Surface::ElectricPiano) {
                     self.kb_sustained[old.min(127)] = true;
                 }
                 self.note_offs.push((self.kb_drag_since + std::time::Duration::from_millis(CLICK_NOTE_MS), old, ch));
@@ -19232,10 +19336,13 @@ impl DemoApp {
             // Press and release within one frame: a click note.
             if let Some(p) = bed_resp.interact_pointer_pos() {
                 if let Some((semi, ch, yf)) = hit(p) {
+                    if surface == Surface::Wind && y_breath {
+                        self.kb_send_breath(crate::keyboard::wind_y_breath(yf));
+                    }
                     let vel = hit_vel(yf);
                     self.kb_last_vel = vel;
                     self.kb_press(semi, vel, ch);
-                    if self.kb_sustain && surface == KeyboardType::Piano {
+                    if self.kb_sustain && matches!(surface, Surface::Piano | Surface::ElectricPiano) {
                         self.kb_sustained[semi.min(127)] = true;
                     }
                     self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), semi, ch));
@@ -19259,21 +19366,28 @@ impl DemoApp {
         self.notes_down.iter().enumerate().filter(|(_, b)| **b != 0).map(|(i, _)| i as u8).collect()
     }
 
+    /// The first playable instrument of rig `rig`.
+    fn rig_instrument_unit(&self, rig: usize) -> Option<usize> {
+        self.units.iter().position(|u| u.rig as usize == rig && self.is_instrument_unit(u))
+    }
+
+    fn is_instrument_unit(&self, u: &Unit) -> bool {
+        (matches!(u.node_kind, UnitKind::Clap) && !u.clap_fx) || u.lv2_inst
+            || self.base_graph.node(u.node_id).is_some_and(|n| crate::organ::is_organ(&n.kind))
+    }
+
     /// The instrument unit the dock follows: the first playable instrument
     /// of the active rig, else of any rig (an audio-only rig keeps the last
     /// playable MIDI rig targeted rather than going dead).
     fn kb_target_unit(&self) -> Option<usize> {
-        let inst = |u: &Unit| (matches!(u.node_kind, UnitKind::Clap) && !u.clap_fx) || u.lv2_inst
-            || self.base_graph.node(u.node_id).is_some_and(|n| crate::organ::is_organ(&n.kind));
-        self.units.iter().position(|u| u.rig == self.active_rig as u8 && inst(u))
-            .or_else(|| self.units.iter().position(|u| inst(u)))
+        self.rig_instrument_unit(self.active_rig)
+            .or_else(|| self.units.iter().position(|u| self.is_instrument_unit(u)))
     }
 
-    /// Auto classification of the target instrument (no pin): dedicated
-    /// plugins first, then the loaded patch / plugin name, then CLAP features.
-    fn kb_detected(&self) -> crate::keyboard::KeyboardType {
+    /// What instrument unit `ti` is (#198): the catalog's dedicated type,
+    /// then the loaded patch, the plugin's name, its CLAP features.
+    fn unit_detected_type(&self, ti: usize) -> crate::keyboard::KeyboardType {
         use crate::keyboard::KeyboardType;
-        let Some(ti) = self.kb_target_unit() else { return KeyboardType::Synth };
         let u = &self.units[ti];
         let Some(kind) = self.base_graph.node(u.node_id).map(|n| &n.kind) else { return KeyboardType::Synth };
         let patch = self.voice_slot_of_node(u.node_id).and_then(|s| self.patch_names.get(s)).cloned().flatten();
@@ -19294,17 +19408,42 @@ impl DemoApp {
         crate::keyboard::classify_instrument(kind, patch.as_deref(), plugin.as_deref(), &features)
     }
 
-    /// The surface the dock renders: the manual pin, else the detection.
-    fn kb_surface(&self) -> crate::keyboard::KeyboardType {
-        self.kb_mode.pinned().unwrap_or_else(|| self.kb_detected())
+    /// The type the dock's instrument is, without a mark.
+    fn kb_detected(&self) -> crate::keyboard::KeyboardType {
+        self.kb_target_unit().map_or(crate::keyboard::KeyboardType::Synth, |u| self.unit_detected_type(u))
     }
 
-    /// Pin / unpin a surface. A change releases what the pointer holds first
-    /// (rule 41): the new surface may route elsewhere.
-    fn kb_set_mode(&mut self, mode: crate::keyboard::KeyboardMode) {
-        if mode == self.kb_mode { return; }
+    /// The type the dock plays: the active rig's mark, else its detection.
+    fn kb_type(&self) -> crate::keyboard::KeyboardType {
+        self.rig_mark(self.active_rig).unwrap_or_else(|| self.kb_detected())
+    }
+
+    /// Rig `rig`'s mark: the type the player or the agent gave it, `None`
+    /// while it follows its instrument.
+    fn rig_mark(&self, rig: usize) -> Option<crate::keyboard::KeyboardType> {
+        self.rig_types.get(rig).copied().flatten()
+    }
+
+    /// Rig `rig`'s type: its mark, else what its instrument is; `None` for
+    /// an unmarked rig without an instrument (an audio-in rig).
+    fn rig_type(&self, rig: usize) -> Option<crate::keyboard::KeyboardType> {
+        self.rig_mark(rig).or_else(|| self.rig_instrument_unit(rig).map(|u| self.unit_detected_type(u)))
+    }
+
+    /// The marks as a session stores them: empty while no rig is marked.
+    fn saved_rig_types(&self) -> Vec<Option<crate::keyboard::KeyboardType>> {
+        trimmed_marks((0..self.rig_count()).map(|r| self.rig_mark(r)).collect())
+    }
+
+    /// Mark rig `rig` as `mark` (`None` = follow its instrument again). A
+    /// change releases what the pointer holds first (rule 41): the rig's
+    /// keyboard surface changes under the held key.
+    fn set_rig_mark(&mut self, rig: usize, mark: Option<crate::keyboard::KeyboardType>) {
+        if self.rig_mark(rig) == mark { return; }
         self.release_kb_drag_note();
-        self.kb_mode = mode;
+        if self.rig_types.len() <= rig { self.rig_types.resize(rig + 1, None); }
+        self.rig_types[rig] = mark;
+        self.rig_types = trimmed_marks(std::mem::take(&mut self.rig_types));
     }
 
     /// Note-on from the dock, on a 0-based channel. Channel 0 takes the
@@ -19330,7 +19469,7 @@ impl DemoApp {
     /// teal (the plugin holds the sound on CC 64); the note-off still goes
     /// out, so lifting the pedal releases everything.
     fn kb_release(&mut self, semi: usize, ch: u8) {
-        if self.kb_sustain && self.kb_surface() == crate::keyboard::KeyboardType::Piano {
+        if self.kb_sustain && matches!(self.kb_type().surface(), crate::keyboard::Surface::Piano | crate::keyboard::Surface::ElectricPiano) {
             self.kb_sustained[semi.min(127)] = true;
         }
         self.current_source = SourceId::Keys;
@@ -19349,6 +19488,9 @@ impl DemoApp {
         if let Some(n) = self.kb_drag_note.take() {
             let ch = self.kb_drag_ch;
             self.kb_release(n, ch);
+        }
+        if let Some(n) = self.kb_fret_drag.take() {
+            self.kb_release(n, 0);
         }
         self.kb_reset_bend();
     }
@@ -19736,6 +19878,218 @@ impl DemoApp {
         });
     }
 
+    /// Electric Piano cheekblock: TREMOLO wheel (drives MOD / CC 1) with a
+    /// live pulsing indicator.
+    fn kb_cheek_epiano(&mut self, ui: &mut egui::Ui, h: f32, strip: &mut [Rect; 4]) {
+        ui.vertical(|ui| {
+            ui.add_space(((h - 56.0) * 0.5).max(0.0));
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                self.kb_wheel_ui(ui, "TREM", false, &mut strip[1]);
+            });
+        });
+    }
+
+    /// Wind cheekblock: a large vertical BREATH fader (CC 2 / CC 11 / AT).
+    fn kb_cheek_wind(&mut self, ui: &mut egui::Ui, h: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, h), egui::Sense::hover());
+        let track = Rect::from_min_max(Pos2::new(rect.center().x - 11.0, rect.top() + 6.0), Pos2::new(rect.center().x + 11.0, rect.bottom() - 16.0));
+        // Breath is a stream the player blows, not a control to learn.
+        if let Some(v) = self.kb_fader_at(ui, track, self.kb_breath, None) {
+            self.kb_send_breath(v);
+        }
+        let p = ui.painter();
+        // Teal breath glow over the filled bar.
+        let fill = Rect::from_min_max(
+            Pos2::new(track.left() + 2.0, track.bottom() - 2.0 - (track.height() - 4.0) * self.kb_breath.clamp(0.0, 1.0)),
+            track.max - egui::vec2(2.0, 2.0),
+        );
+        if fill.height() > 1.0 {
+            p.rect_filled(fill, 1.0, theme::LIVE_TEAL);
+        }
+        p.text(Pos2::new(rect.center().x, rect.bottom() - 8.0), egui::Align2::CENTER_CENTER,
+            self.kb_breath_target.short_label(), FontId::proportional(8.0), theme::LIVE_TEAL);
+    }
+
+    /// Playable General MIDI drum pad grid (2×8 in the dock, or 4×4 in the
+    /// console). Hit position sets velocity when `kb_pad_vel` is on.
+    pub(super) fn kb_drum_pads(&mut self, ui: &mut egui::Ui, area: Rect, rows: usize, cols: usize) -> Rect {
+        use crate::keyboard::{DrumGroup, DRUM_PADS};
+        let pad_gap = 6.0;
+        let inner = area.shrink(4.0);
+        let pw = ((inner.width() - pad_gap * (cols as f32 - 1.0)) / cols as f32).max(20.0);
+        let ph = ((inner.height() - pad_gap * (rows as f32 - 1.0)) / rows as f32).max(20.0);
+        let p = ui.painter().clone();
+        p.rect_filled(area, 4.0, Color32::from_rgb(0x10, 0x0F, 0x0E));
+        p.rect_stroke(area, 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+        for (idx, pad) in DRUM_PADS.iter().enumerate() {
+            let (r, c) = (idx / cols, idx % cols);
+            if r >= rows { break; }
+            let rect = Rect::from_min_size(
+                Pos2::new(inner.left() + c as f32 * (pw + pad_gap), inner.top() + r as f32 * (ph + pad_gap)),
+                egui::vec2(pw, ph),
+            );
+            let resp = ui.interact(rect, egui::Id::NULL.with(("kb_drum_pad", pad.note)), egui::Sense::click_and_drag())
+                .on_hover_text(format!("{} (MIDI {}): click to trigger; center = loud, rim = soft", pad.label, pad.note));
+            // A drum sounds when it is struck: on the press, not the release.
+            if Self::struck(ui, &resp) {
+                let vel = if self.kb_pad_vel {
+                    ui.input(|i| i.pointer.interact_pos()).map_or(0.9, |pos| {
+                        let nx = (pos.x - rect.left()) / rect.width().max(1.0);
+                        let ny = (pos.y - rect.top()) / rect.height().max(1.0);
+                        crate::keyboard::drum_pad_velocity(nx, ny)
+                    })
+                } else {
+                    0.95
+                };
+                self.kb_hit_drum(pad.note, vel);
+            }
+            let led = self.note_leds[pad.note as usize].clamp(0.0, 1.0);
+            let accent = match pad.group {
+                DrumGroup::Kick => theme::ACCENT,
+                DrumGroup::Snare => theme::CABLE_AMBER,
+                DrumGroup::Hat => theme::LIVE_TEAL,
+                DrumGroup::Tom => Color32::from_rgb(0xD6, 0x8A, 0x58),
+                DrumGroup::Cymbal => Color32::from_rgb(0xD8, 0xC0, 0x7A),
+                DrumGroup::Perc => Color32::from_rgb(0x9E, 0x8B, 0xC8),
+            };
+            let base_fill = if resp.hovered() { Color32::from_rgb(0x28, 0x26, 0x24) } else { Color32::from_rgb(0x1D, 0x1C, 0x1A) };
+            let fill = if led > 0.02 { mix(base_fill, accent, 0.25 + 0.55 * led) } else { base_fill };
+            p.rect_filled(rect, 4.0, fill);
+            p.rect_stroke(
+                rect,
+                4.0,
+                Stroke::new(if led > 0.02 { 1.8 } else { 1.0 }, if led > 0.02 { accent } else { alpha(accent, 0.45) }),
+                egui::StrokeKind::Inside,
+            );
+            // Corner group bar.
+            let bar = Rect::from_min_size(rect.left_top() + egui::vec2(5.0, 4.0), egui::vec2((pw - 10.0).min(24.0), 2.5));
+            p.rect_filled(bar, 1.0, if led > 0.02 { Color32::WHITE } else { accent });
+            let ink = if led > 0.45 { BLACK } else { theme::CREAM };
+            let sub_ink = if led > 0.45 { Color32::from_rgb(0x20, 0x1E, 0x1B) } else { theme::CREAM_DIM };
+            let fs = (ph * 0.28).clamp(8.5, 13.0);
+            p.text(Pos2::new(rect.center().x, rect.center().y - if ph >= 38.0 { 4.0 } else { 0.0 }),
+                egui::Align2::CENTER_CENTER, pad.short, theme::medium_font(fs), ink);
+            if ph >= 38.0 {
+                p.text(Pos2::new(rect.center().x, rect.bottom() - 8.0),
+                    egui::Align2::CENTER_CENTER, format!("{}", pad.note), FontId::proportional(8.5), sub_ink);
+            }
+        }
+        area
+    }
+
+    /// Playable 4-string bass fretboard painted into `area` (used in both the
+    /// dock deck and the full-window Bass console). Clicking/dragging plays
+    /// the string+fret; sounding notes from keys or MIDI light up on the neck.
+    pub(super) fn kb_bass_fretboard(&mut self, ui: &mut egui::Ui, area: Rect, frets: u8, large: bool) {
+        use crate::keyboard::{bass_fret_note, bass_note_position, BASS_INLAYS, BASS_STRINGS};
+        let p = ui.painter().clone();
+        let nut_w = if large { 34.0 } else { 20.0 };
+        let board = Rect::from_min_max(Pos2::new(area.left() + nut_w, area.top()), area.max);
+        self.kb_fret_rect = area;
+        let resp = ui.interact(area, egui::Id::NULL.with(("kb_bass_fret", large)), egui::Sense::click_and_drag())
+            .on_hover_text("4-string bass neck (G D A E): click or drag along a string to play");
+        // Rosewood fingerboard + nut.
+        p.rect_filled(area, 4.0, Color32::from_rgb(0x1A, 0x12, 0x0D));
+        p.rect_filled(board, 3.0, Color32::from_rgb(0x2E, 0x1E, 0x15));
+        p.rect_filled(Rect::from_min_max(Pos2::new(board.left() - 3.0, board.top() + 1.0), Pos2::new(board.left() + 1.0, board.bottom() - 1.0)),
+            1.0, Color32::from_rgb(0xE8, 0xE0, 0xCE));
+        let fw = board.width() / frets as f32;
+        // Fret wires + pearloid inlays.
+        for f in 1..=frets {
+            let x = board.left() + f as f32 * fw;
+            p.line_segment([Pos2::new(x, board.top() + 2.0), Pos2::new(x, board.bottom() - 2.0)],
+                Stroke::new(if large { 1.6 } else { 1.0 }, Color32::from_rgb(0x98, 0x92, 0x86)));
+            if BASS_INLAYS.contains(&f) {
+                let mx = x - fw * 0.5;
+                let r = if large { 4.2 } else { 2.0 };
+                let col = alpha(Color32::from_rgb(0xE6, 0xDF, 0xCE), 0.35);
+                if f == 12 {
+                    p.circle_filled(Pos2::new(mx, board.top() + board.height() * 0.28), r, col);
+                    p.circle_filled(Pos2::new(mx, board.top() + board.height() * 0.72), r, col);
+                } else {
+                    p.circle_filled(Pos2::new(mx, board.center().y), r, col);
+                }
+            }
+            if large && (f == 3 || f == 5 || f == 7 || f == 9 || f == 12 || f == 15) {
+                p.text(Pos2::new(x - fw * 0.5, board.bottom() - 8.0), egui::Align2::CENTER_CENTER,
+                    f.to_string(), FontId::proportional(8.5), alpha(theme::CREAM_DIM, 0.75));
+            }
+        }
+        // Collect sounding note positions on the neck.
+        let mut active_pos: Vec<(usize, u8, f32)> = Vec::new();
+        for (note, &led) in self.note_leds.iter().enumerate() {
+            if led > 0.02 {
+                if let Some((si, fr)) = bass_note_position(note as u8, frets) {
+                    active_pos.push((si, fr, led.min(1.0)));
+                }
+            }
+        }
+        // Four strings (G thin at top, E thick at bottom).
+        let sh = area.height() / 4.0;
+        let wobble = self.ui_time * 42.0;
+        for (si, &(name, _)) in BASS_STRINGS.iter().enumerate() {
+            let y = area.top() + sh * (si as f32 + 0.5);
+            let thick = (if large { 1.6 } else { 1.0 }) + si as f32 * if large { 0.85 } else { 0.45 };
+            let str_led = active_pos.iter().filter(|(s, _, _)| *s == si).map(|(_, _, l)| *l).fold(0.0f32, f32::max);
+            let dy = if str_led > 0.02 { (wobble + si as f32 * 1.7).sin() * str_led * if large { 2.2 } else { 1.0 } } else { 0.0 };
+            let col = if str_led > 0.02 { mix(Color32::from_rgb(0xC8, 0xBE, 0xAC), theme::ACCENT, 0.65 * str_led) } else { Color32::from_rgb(0xB4, 0xAC, 0x9C) };
+            p.line_segment([Pos2::new(board.left(), y + dy), Pos2::new(board.right() - 2.0, y - dy * 0.5)], Stroke::new(thick, col));
+            p.text(Pos2::new(area.left() + nut_w * 0.45, y), egui::Align2::CENTER_CENTER,
+                name, theme::medium_font(if large { 11.5 } else { 8.5 }), if str_led > 0.02 { theme::ACCENT } else { theme::CREAM_META });
+        }
+        // Draw glowing markers for active notes.
+        for (si, fr, led) in active_pos {
+            let y = area.top() + sh * (si as f32 + 0.5);
+            let x = if fr == 0 { board.left() - 2.0 } else { board.left() + (fr as f32 - 0.5) * fw };
+            let rad = if large { 8.5 } else { 4.2 };
+            p.circle_filled(Pos2::new(x, y), rad + 3.0, alpha(theme::ACCENT, 0.25 * led));
+            p.circle_filled(Pos2::new(x, y), rad, theme::ACCENT);
+            if large {
+                let note = bass_fret_note(si, fr);
+                let label = crate::keyboard::detect_chord(&[note]).unwrap_or_default();
+                p.text(Pos2::new(x, y), egui::Align2::CENTER_CENTER, label, theme::medium_font(8.0), BLACK);
+            }
+        }
+        p.rect_stroke(area, 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+
+        // Pointer interaction: press and drag along the fretboard.
+        let hit_fret = |pos: Pos2| -> Option<usize> {
+            if !area.contains(pos) { return None; }
+            let si = (((pos.y - area.top()) / sh).floor() as isize).clamp(0, 3) as usize;
+            let fret = if pos.x < board.left() {
+                0
+            } else {
+                (((pos.x - board.left()) / fw).floor() as isize + 1).clamp(1, frets as isize) as u8
+            };
+            Some(bass_fret_note(si, fret) as usize)
+        };
+        if resp.is_pointer_button_down_on() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some(note) = hit_fret(pos) {
+                    if self.kb_fret_drag != Some(note) {
+                        if let Some(old) = self.kb_fret_drag.take() {
+                            self.kb_release(old, 0);
+                        }
+                        self.kb_last_vel = 0.9;
+                        self.kb_press(note, 0.9, 0);
+                        self.kb_fret_drag = Some(note);
+                    }
+                }
+            }
+        } else if let Some(old) = self.kb_fret_drag.take() {
+            self.kb_release(old, 0);
+        } else if resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some(note) = hit_fret(pos) {
+                    self.kb_last_vel = 0.9;
+                    self.kb_press(note, 0.9, 0);
+                    self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), note, 0));
+                }
+            }
+        }
+    }
+
     /// Piano deck: DAMPER + SOFT pedals, Y-TOUCH, VEL, and the loaded patch's
     /// own main controls as tone/space knobs (a Rhodes' tremolo, a Wurli's
     /// drive — whatever the plugin names, rule 89).
@@ -20076,17 +20430,205 @@ impl DemoApp {
         strip[3] = self.kb_vel_slider(ui, 90.0);
     }
 
+    /// Electric Piano deck: DAMPER, Y-TOUCH, TREMOLO (CC 1 mod wheel shortcut),
+    /// VEL, and the loaded patch's main controls.
+    fn kb_deck_epiano(&mut self, ui: &mut egui::Ui, target: Option<usize>, deck_h: f32, strip: &mut [Rect; 4]) {
+        let damper = theme::chip_button(ui, "DAMPER", self.kb_sustain)
+            .on_hover_text("sustain pedal (CC 64): released tines keep ringing until the pedal lifts");
+        strip[2] = damper.rect;
+        if damper.clicked() { self.kb_toggle_sustain(); }
+        ui.add_space(6.0);
+        if theme::chip_button(ui, "Y-TOUCH", self.kb_y_touch)
+            .on_hover_text("vertical hit position sets velocity: top = soft bell, bottom = bark")
+            .clicked()
+        {
+            self.kb_y_touch = !self.kb_y_touch;
+        }
+        ui.add_space(6.0);
+        let trem_on = self.kb_mod > 0.05;
+        if theme::chip_button(ui, "TREM", trem_on)
+            .on_hover_text("toggle vibrato/tremolo via Mod Wheel (CC 1)")
+            .clicked()
+        {
+            self.kb_mod = if trem_on { 0.0 } else { 0.65 };
+            self.kb_cc(1, (self.kb_mod * 127.0).round() as u8);
+            self.kb_strip_pulse(0.6);
+        }
+        ui.add_space(8.0);
+        strip[3] = self.kb_vel_slider(ui, 100.0);
+        if let Some(t) = target {
+            let mains: Vec<(String, f32)> = self.units[t].knobs.iter()
+                .filter(|k| k.source != KnobSource::BuiltIn)
+                .take(4)
+                .map(|k| (k.label.clone(), k.display_value))
+                .collect();
+            for (label, v) in mains {
+                ui.add_space(6.0);
+                let dest = self.kb_main_dest(Some(t), &label);
+                if let Some(nv) = self.kb_mini_knob(ui, 34.0, deck_h - 4.0, &label, v, dest) {
+                    if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && k.source != KnobSource::BuiltIn) {
+                        k.set_immediate(nv);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bass deck: playable 4-string mini-fretboard, SCALE, GLISS/SLIDE, SUSTAIN,
+    /// VEL and plugin tone controls.
+    fn kb_deck_bass(&mut self, ui: &mut egui::Ui, target: Option<usize>, deck_h: f32, strip: &mut [Rect; 4]) {
+        use crate::keyboard::SynthDragMode;
+        if ui.available_width() > 420.0 {
+            let neck_w = (ui.available_width() * 0.36).clamp(180.0, 340.0);
+            let (neck_r, _) = ui.allocate_exact_size(egui::vec2(neck_w, (deck_h - 4.0).max(34.0)), egui::Sense::hover());
+            self.kb_bass_fretboard(ui, neck_r, 12, false);
+            ui.add_space(8.0);
+        }
+        let scale = self.keys_unit.and_then(|k| self.keys_scale(k));
+        let chip = theme::chip_button(ui, "SCALE", scale.is_some());
+        let chip_rect = chip.rect;
+        if chip.on_hover_text("scale snap + key of the Keys unit").clicked() {
+            self.scale_menu = Some(ScaleMenu { unit: self.keys_idx(), pos: Pos2::new(chip_rect.left(), chip_rect.bottom()) });
+        }
+        ui.add_space(4.0);
+        if theme::chip_button(ui, self.kb_synth_drag.label(), self.kb_synth_drag == SynthDragMode::Slide)
+            .on_hover_text("horizontal drag: GLISS slides note-to-note, SLIDE bends the held bass note")
+            .clicked()
+        {
+            self.kb_synth_drag = match self.kb_synth_drag {
+                SynthDragMode::Gliss => SynthDragMode::Slide,
+                SynthDragMode::Slide => SynthDragMode::Gliss,
+            };
+        }
+        ui.add_space(4.0);
+        let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain).on_hover_text("hold pedal (CC 64)");
+        strip[2] = sus.rect;
+        if sus.clicked() { self.kb_toggle_sustain(); }
+        ui.add_space(6.0);
+        strip[3] = self.kb_vel_slider(ui, 84.0);
+        if let Some(t) = target {
+            let mains: Vec<(String, f32)> = self.units[t].knobs.iter()
+                .filter(|k| k.source != KnobSource::BuiltIn)
+                .take(3)
+                .map(|k| (k.label.clone(), k.display_value))
+                .collect();
+            for (label, v) in mains {
+                if ui.available_width() < 40.0 { break; }
+                ui.add_space(4.0);
+                let dest = self.kb_main_dest(Some(t), &label);
+                if let Some(nv) = self.kb_mini_knob(ui, 34.0, deck_h - 4.0, &label, v, dest) {
+                    if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && k.source != KnobSource::BuiltIn) {
+                        k.set_immediate(nv);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wind deck: breath target selector (CC2 / CC11 / AT), Y-BREATH, SCALE,
+    /// GLISS/SLIDE, VEL and plugin controls.
+    fn kb_deck_wind(&mut self, ui: &mut egui::Ui, target: Option<usize>, deck_h: f32, strip: &mut [Rect; 4]) {
+        use crate::keyboard::{BreathTarget, SynthDragMode};
+        for bt in BreathTarget::ALL {
+            if theme::chip_button(ui, bt.short_label(), self.kb_breath_target == bt)
+                .on_hover_text(format!("send breath as {}", bt.label()))
+                .clicked()
+            {
+                self.kb_breath_target = bt;
+                self.kb_send_breath(self.kb_breath);
+            }
+            ui.add_space(2.0);
+        }
+        ui.add_space(6.0);
+        if theme::chip_button(ui, "Y-BREATH", self.kb_y_breath)
+            .on_hover_text("vertical position on a key drives breath live (top = soft, bottom = full)")
+            .clicked()
+        {
+            self.kb_y_breath = !self.kb_y_breath;
+        }
+        ui.add_space(6.0);
+        let scale = self.keys_unit.and_then(|k| self.keys_scale(k));
+        let chip = theme::chip_button(ui, "SCALE", scale.is_some());
+        let chip_rect = chip.rect;
+        if chip.on_hover_text("scale snap + key of the Keys unit").clicked() {
+            self.scale_menu = Some(ScaleMenu { unit: self.keys_idx(), pos: Pos2::new(chip_rect.left(), chip_rect.bottom()) });
+        }
+        ui.add_space(4.0);
+        if theme::chip_button(ui, self.kb_synth_drag.label(), self.kb_synth_drag == SynthDragMode::Slide)
+            .on_hover_text("horizontal drag: GLISS slides note-to-note, SLIDE bends pitch")
+            .clicked()
+        {
+            self.kb_synth_drag = match self.kb_synth_drag {
+                SynthDragMode::Gliss => SynthDragMode::Slide,
+                SynthDragMode::Slide => SynthDragMode::Gliss,
+            };
+        }
+        ui.add_space(6.0);
+        strip[3] = self.kb_vel_slider(ui, 84.0);
+        if let Some(t) = target {
+            let mains: Vec<(String, f32)> = self.units[t].knobs.iter()
+                .filter(|k| k.source != KnobSource::BuiltIn)
+                .take(4)
+                .map(|k| (k.label.clone(), k.display_value))
+                .collect();
+            for (label, v) in mains {
+                if ui.available_width() < 40.0 { break; }
+                ui.add_space(4.0);
+                let dest = self.kb_main_dest(Some(t), &label);
+                if let Some(nv) = self.kb_mini_knob(ui, 34.0, deck_h - 4.0, &label, v, dest) {
+                    if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && k.source != KnobSource::BuiltIn) {
+                        k.set_immediate(nv);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drums deck: HIT-VEL toggle (pad hit position sets velocity), VEL slider,
+    /// and the kit's main controls.
+    fn kb_deck_drums(&mut self, ui: &mut egui::Ui, target: Option<usize>, deck_h: f32, strip: &mut [Rect; 4]) {
+        if theme::chip_button(ui, "HIT-VEL", self.kb_pad_vel)
+            .on_hover_text("hit position on a pad sets velocity: center = loud, edge = soft")
+            .clicked()
+        {
+            self.kb_pad_vel = !self.kb_pad_vel;
+        }
+        ui.add_space(8.0);
+        strip[3] = self.kb_vel_slider(ui, 110.0);
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("GM 36–56").size(10.5).color(theme::CREAM_DIM));
+        if let Some(t) = target {
+            let mains: Vec<(String, f32)> = self.units[t].knobs.iter()
+                .filter(|k| k.source != KnobSource::BuiltIn)
+                .take(4)
+                .map(|k| (k.label.clone(), k.display_value))
+                .collect();
+            for (label, v) in mains {
+                if ui.available_width() < 40.0 { break; }
+                ui.add_space(6.0);
+                let dest = self.kb_main_dest(Some(t), &label);
+                if let Some(nv) = self.kb_mini_knob(ui, 34.0, deck_h - 4.0, &label, v, dest) {
+                    if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && k.source != KnobSource::BuiltIn) {
+                        k.set_immediate(nv);
+                    }
+                }
+            }
+        }
+    }
+
     /// The dock state the agent reads (`get_keyboard_state`).
     fn keyboard_state_json(&self) -> serde_json::Value {
-        let surface = self.kb_surface();
         let target = self.kb_target_unit();
+        let mark = self.rig_mark(self.active_rig);
+        let rigs: Vec<serde_json::Value> = (0..self.rig_count()).map(|r| self.rig_type_json(r)).collect();
         serde_json::json!({
             "open": self.dock == DockView::Keyboard,
             "expanded": self.kb_expanded,
-            "auto": self.kb_mode == crate::keyboard::KeyboardMode::Auto,
-            "mode": surface.as_str(),
-            "pinned": self.kb_mode.pinned().map(|t| t.as_str()),
+            "auto": mark.is_none(),
+            "marked": mark.is_some(),
+            "mode": self.kb_type().as_str(),
             "detected_mode": self.kb_detected().as_str(),
+            "rigs": rigs,
             "target": target.map(|u| self.units[u].node_id),
             "target_name": target.map(|u| sentence_case(&self.units[u].name)),
             "rig": self.active_rig,
@@ -20094,6 +20636,10 @@ impl DemoApp {
             "damper": self.kb_sustain,
             "soft": self.kb_soft,
             "swell": self.kb_swell,
+            "breath": self.kb_breath,
+            "breath_target": self.kb_breath_target.as_str(),
+            "y_breath": self.kb_y_breath,
+            "pad_vel": self.kb_pad_vel,
             "leslie": crate::organ::step_name(crate::organ::P_LESLIE, self.kb_organ_value(crate::organ::P_LESLIE)),
             "dual_manual": self.kb_dual_manual,
             "scale_fold": self.kb_scale_fold,
@@ -20103,18 +20649,41 @@ impl DemoApp {
         })
     }
 
+    /// One rig's type as the agent reads it (`get_keyboard_state`, `get_rigs`).
+    fn rig_type_json(&self, rig: usize) -> serde_json::Value {
+        let detected = self.rig_instrument_unit(rig).map(|u| self.unit_detected_type(u));
+        serde_json::json!({
+            "rig": rig,
+            "name": self.rig_name(rig),
+            "type": self.rig_type(rig).map(|t| t.as_str()),
+            "detected": detected.map(|t| t.as_str()),
+            "marked": self.rig_mark(rig).is_some(),
+        })
+    }
+
     /// The agent's `set_keyboard_mode`: every option the dock offers, with
     /// the same validation the headless MCP uses.
     fn apply_keyboard_mode_tool(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
-        if let Some(m) = args.get("mode").and_then(|v| v.as_str()) {
-            let mode = crate::keyboard::KeyboardMode::parse(m)
-                .ok_or_else(|| format!("unknown keyboard mode '{m}' (use auto, piano, jazz_organ, pipe_organ, or synth)"))?;
-            self.kb_set_mode(mode);
-        }
-        if let Some(d) = args.get("synth_drag").and_then(|v| v.as_str()) {
-            self.kb_synth_drag = crate::keyboard::SynthDragMode::parse(d)
-                .ok_or_else(|| format!("unknown synth_drag '{d}' (use gliss or slide)"))?;
-        }
+        // Validate everything before changing anything: a refused call
+        // changes nothing.
+        let mode = args.get("mode").and_then(|v| v.as_str())
+            .map(|m| crate::keyboard::KeyboardMode::parse(m).ok_or_else(|| format!("unknown keyboard mode '{m}' (use {})", crate::keyboard::KeyboardMode::CHOICES)))
+            .transpose()?;
+        let rig = match args.get("rig") {
+            None | Some(serde_json::Value::Null) => self.active_rig,
+            Some(v) => {
+                let n = self.rig_count();
+                match v.as_u64() {
+                    Some(r) if (r as usize) < n => r as usize,
+                    _ => return Err(format!("no rig {v}: rig is 0-based and there are {n} (0..{})", n - 1)),
+                }
+            }
+        };
+        let drag = args.get("synth_drag").and_then(|v| v.as_str())
+            .map(|d| crate::keyboard::SynthDragMode::parse(d).ok_or_else(|| format!("unknown synth_drag '{d}' (use gliss or slide)")))
+            .transpose()?;
+        if let Some(mode) = mode { self.set_rig_mark(rig, mode.pinned()); }
+        if let Some(d) = drag { self.kb_synth_drag = d; }
         if let Some(open) = args.get("open").and_then(|v| v.as_bool()) {
             if open {
                 self.dock = DockView::Keyboard;
@@ -20151,6 +20720,43 @@ impl DemoApp {
                 b.send(Command::Cc { source: SourceId::Keys, channel: 0, cc, value })
             });
         }
+    }
+
+    /// One keyboard-strip channel pressure (aftertouch) message, out as the Keys source.
+    fn kb_pressure(&mut self, value: u8) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().map(|mut b| {
+                b.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value })
+            });
+        }
+    }
+
+    /// Update the Wind breath controller (`0.0..=1.0`) and send CC 2, CC 11, or
+    /// Channel Pressure according to `kb_breath_target`.
+    fn kb_send_breath(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        self.kb_breath = v;
+        let midi = (v * 127.0).round() as u8;
+        match self.kb_breath_target {
+            crate::keyboard::BreathTarget::Cc2 => self.kb_cc(2, midi),
+            crate::keyboard::BreathTarget::Cc11 => self.kb_cc(11, midi),
+            crate::keyboard::BreathTarget::Aftertouch => self.kb_pressure(midi),
+        }
+        self.kb_strip_pulse(0.25 + v * 0.55);
+    }
+
+    /// Whether the primary button went down on `resp` this frame (a pad or
+    /// drum sounds on the press; `clicked()` waits for the release).
+    pub(super) fn struck(ui: &egui::Ui, resp: &egui::Response) -> bool {
+        resp.contains_pointer() && ui.input(|i| i.pointer.primary_pressed())
+    }
+
+    /// Trigger one percussive GM drum hit with velocity `vel`.
+    fn kb_hit_drum(&mut self, note: u8, vel: f32) {
+        let vel = vel.clamp(0.05, 1.0);
+        self.kb_last_vel = vel;
+        self.kb_press(note as usize, vel, 0);
+        self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), note as usize, 0));
     }
 
     /// One keyboard-strip pitch bend (signed 14-bit, 0 = center).
@@ -20271,7 +20877,7 @@ impl DemoApp {
     }
 
     /// Clap unit subtitles name what is really loaded: "Surge XT · Wurli"
-    /// (plugin · patch), not the generic "synth · clap" (user). Cheap per
+    /// (plugin · patch), not the generic "clap instrument" (user). Cheap per
     /// frame: a few string compares; the galley is rebuilt only on change.
     fn refresh_instrument_subs(&mut self) {
         if self.plugins_clap.is_empty() && !self.plugins_loaded && !cfg!(test)
@@ -30785,10 +31391,16 @@ mod rig_switch_tests {
             RuleEdit { transpose: 7, key_hi: 84, ..RuleEdit::default() },
         );
 
+        // A non-default mark on rig 0, none on rig 1 (#198, rule 59).
+        app.set_rig_mark(0, Some(crate::keyboard::KeyboardType::Wind));
+
         // Clone rig 0 via agent tool (default name = "Lead Stack Copy").
         let res = app.exec_tool("clone_rig", &serde_json::json!({"rig": 0}));
         assert!(res.contains("Lead Stack Copy"), "{res}");
         assert_eq!(app.rig_count(), 3);
+        assert_eq!(app.rig_mark(2), Some(crate::keyboard::KeyboardType::Wind), "the clone keeps its source's mark");
+        assert_eq!(app.rig_mark(0), Some(crate::keyboard::KeyboardType::Wind));
+        assert_eq!(app.rig_mark(1), None);
         assert_eq!(app.active_rig, 2);
         assert_eq!(app.rig_name(0), "Lead Stack");
         assert_eq!(app.rig_name(1), "Pad");
@@ -32110,7 +32722,8 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
         let u = app.units.iter().find(|u| u.lv2_inst).expect("Vitalium unit");
         assert!(u.lv2_inst, "Vitalium must be classified as lv2_inst");
-        assert_eq!(u.sub, "lv2 synth", "Vitalium subtitle must be lv2 synth");
+        let scanned = lv2_discover().into_iter().find(|p| p.uri == "urn:distrho:vitalium").map(|p| p.name).unwrap();
+        assert_eq!(u.sub, scanned, "Vitalium's subtitle names the plugin");
         let node_id = u.node_id;
         app.toggle_lv2_editor(node_id, "urn:distrho:vitalium", "VITALIUM");
         assert!(app.editor_open);
@@ -32142,7 +32755,7 @@ mod split_bpm_tests {
         app.poll_plugin_scan();
         let u = &app.units[organ(&app)];
         assert!(u.lv2_inst, "a landing scan reclassifies the loaded rack");
-        assert_eq!(u.sub, "lv2 synth");
+        assert_eq!(u.sub, "Organ", "the subtitle names the plugin");
     }
 
     #[test]
@@ -35215,11 +35828,11 @@ mod ui_polish_agent_tests {
     /// shrank from 146 to 86 pt at 1600x1000; the deck took them to 77.
     #[test]
     fn the_midi_strip_leaves_the_keys_the_dock_height() {
-        use crate::keyboard::{KeyboardMode, KeyboardType};
+        use crate::keyboard::KeyboardType;
         for surface in KeyboardType::ALL {
             let mut app = DemoApp::new_with_sink(None);
             app.dock = DockView::Keyboard;
-            app.kb_mode = KeyboardMode::Pinned(surface);
+            app.rig_types = vec![Some(surface)];
             let ctx = egui::Context::default();
             for size in [Vec2::new(1600.0, 1000.0), Vec2::new(1280.0, 800.0), Vec2::new(760.0, 520.0), Vec2::new(781.0, 468.0)] {
                 for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
@@ -41121,7 +41734,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 24] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 32] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("two rigs", &|a| a.load_multi_rig_demo()),
@@ -41148,13 +41761,22 @@ mod window_size_layout_tests {
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("sessions-installed", &|a| { a.stage_view = StageView::Sessions; template_plugins_installed(a) }),
             ("settings", &|a| a.stage_view = StageView::Settings),
-            ("piano keyboard", &|a| a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::Piano)),
-            ("jazz organ keyboard", &|a| { a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::JazzOrgan); a.kb_dual_manual = true }),
-            ("pipe organ keyboard", &|a| a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::PipeOrgan)),
-            ("piano console", &|a| { a.kb_expanded = true; a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::Piano) }),
-            ("jazz organ console", &|a| { a.kb_expanded = true; a.kb_dual_manual = true; a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::JazzOrgan) }),
-            ("pipe organ console", &|a| { a.kb_expanded = true; a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::PipeOrgan) }),
-            ("synth console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::Synth) }),
+            ("piano keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::Piano)]),
+            ("jazz organ keyboard", &|a| { a.rig_types = vec![Some(crate::keyboard::KeyboardType::JazzOrgan)]; a.kb_dual_manual = true }),
+            ("pipe organ keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::PipeOrgan)]),
+            ("piano console", &|a| { a.kb_expanded = true; a.rig_types = vec![Some(crate::keyboard::KeyboardType::Piano)] }),
+            ("jazz organ console", &|a| { a.kb_expanded = true; a.kb_dual_manual = true; a.rig_types = vec![Some(crate::keyboard::KeyboardType::JazzOrgan)] }),
+            ("pipe organ console", &|a| { a.kb_expanded = true; a.rig_types = vec![Some(crate::keyboard::KeyboardType::PipeOrgan)] }),
+            ("synth console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.rig_types = vec![Some(crate::keyboard::KeyboardType::Synth)] }),
+            // #198: every type's header, docked and expanded.
+            ("e-piano keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::ElectricPiano)]),
+            ("bass keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::Bass)]),
+            ("wind keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::Wind)]),
+            ("drums keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::Drums)]),
+            ("e-piano console", &|a| { a.kb_expanded = true; a.rig_types = vec![Some(crate::keyboard::KeyboardType::ElectricPiano)] }),
+            ("bass console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.rig_types = vec![Some(crate::keyboard::KeyboardType::Bass)] }),
+            ("wind console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.rig_types = vec![Some(crate::keyboard::KeyboardType::Wind)] }),
+            ("drums console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.rig_types = vec![Some(crate::keyboard::KeyboardType::Drums)] }),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
@@ -41167,10 +41789,11 @@ mod window_size_layout_tests {
 /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`.
 #[cfg(test)]
 mod instrument_keyboard_tests {
-    //! #163: the dock's four instrument surfaces, driven through real frames.
+    //! #163: the dock's instrument surfaces, and (#198) each rig's type,
+    //! driven through real frames.
     use super::*;
     use crate::control::PortKind as CPortKind;
-    use crate::keyboard::{KeyboardMode, KeyboardType};
+    use crate::keyboard::{KeyboardType, Surface};
 
     const SIZE: Vec2 = Vec2 { x: 1600.0, y: 1000.0 };
 
@@ -41222,34 +41845,210 @@ mod instrument_keyboard_tests {
         Pos2::new(r.center().x, r.bottom() - 8.0)
     }
 
+    fn clap(id: &str) -> NodeKind { NodeKind::Clap { plugin_id: crate::control::ClapId::new(id) } }
+
     #[test]
-    fn the_dock_surface_follows_the_rigs_instrument() {
-        for (kind, want) in [
-            (None, KeyboardType::Synth), // the default rig plays Surge XT
-            (Some(organ()), KeyboardType::JazzOrgan),
-            (Some(aeolus()), KeyboardType::PipeOrgan),
+    fn the_dock_follows_the_rigs_instrument_type() {
+        for (kind, want, surface) in [
+            (None, KeyboardType::Synth, Surface::Synth), // the default rig plays Surge XT
+            (Some(organ()), KeyboardType::JazzOrgan, Surface::JazzOrgan),
+            (Some(aeolus()), KeyboardType::PipeOrgan, Surface::PipeOrgan),
+            (Some(clap("com.punklabs.onetrick.keys")), KeyboardType::Piano, Surface::Piano),
+            (Some(clap("com.punklabs.onetrick.chonk")), KeyboardType::Bass, Surface::Bass),
+            (Some(clap("org.starbreath.starbreath")), KeyboardType::Wind, Surface::Wind),
+            (Some(clap("com.punklabs.onetrick.cryptid")), KeyboardType::Drums, Surface::Drums),
         ] {
             let (app, _) = rack_with(kind.clone());
-            assert_eq!(app.kb_mode, KeyboardMode::Auto);
-            assert_eq!(app.kb_surface(), want, "{kind:?}");
+            assert_eq!(app.rig_mark(0), None);
+            assert_eq!(app.kb_type(), want, "{kind:?}");
+            assert_eq!(app.kb_type().surface(), surface, "{kind:?}: each type has its own surface");
+            assert_eq!(app.rig_type(0), Some(want), "the rail names the same type");
         }
     }
 
+    /// A chip marks the active rig, a second click returns it to AUTO; every
+    /// type has its chip in a wide window.
     #[test]
-    fn a_surface_chip_pins_it_and_a_second_click_returns_to_auto() {
+    fn a_type_chip_marks_the_rig_and_a_second_click_returns_to_auto() {
         let (mut app, _) = rack_with(None);
         let ctx = egui::Context::default();
         for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
-        let piano = app.kb_mode_rects[0];
-        assert!(piano.is_positive(), "chips laid out: {:?}", app.kb_mode_rects);
-        click(&mut app, &ctx, piano.center());
-        assert_eq!(app.kb_mode, KeyboardMode::Pinned(KeyboardType::Piano));
-        assert_eq!(app.kb_surface(), KeyboardType::Piano);
+        assert!(app.kb_mode_rects.iter().all(|r| r.is_positive()), "a chip per type: {:?}", app.kb_mode_rects);
+        for (i, t) in KeyboardType::ALL.into_iter().enumerate() {
+            let chip = app.kb_mode_rects[i].center();
+            click(&mut app, &ctx, chip);
+            assert_eq!(app.rig_mark(0), Some(t), "chip {i} marks the rig");
+            assert_eq!(app.kb_type(), t);
+            frame(&mut app, &ctx, vec![]);
+        }
+        let drums = app.kb_mode_rects[7];
+        click(&mut app, &ctx, drums.center());
+        assert_eq!(app.rig_mark(0), None, "a second click returns to AUTO");
+        assert_eq!(app.kb_type(), KeyboardType::Synth, "back to what the rig plays");
         frame(&mut app, &ctx, vec![]);
-        let piano = app.kb_mode_rects[0];
-        click(&mut app, &ctx, piano.center());
-        assert_eq!(app.kb_mode, KeyboardMode::Auto);
-        assert_eq!(app.kb_surface(), KeyboardType::Synth, "back to what the rig plays");
+        let ep = app.kb_mode_rects[1].center();
+        click(&mut app, &ctx, ep);
+        assert_eq!(app.rig_mark(0), Some(KeyboardType::ElectricPiano));
+    }
+
+    /// #198: a drum pad sounds on the press, as a drum does, not after the
+    /// release of a click.
+    #[test]
+    fn a_drum_pad_sounds_when_it_is_pressed() {
+        let (mut app, log) = rack_with(Some(clap("com.punklabs.onetrick.cryptid")));
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.kb_type(), KeyboardType::Drums);
+        // The dock lays the 16 pads out 2×8; KICK (GM 36) opens the lower row.
+        let (rows, cols) = (2usize, 8usize);
+        let kick = crate::keyboard::DRUM_PADS.iter().position(|p| p.note == 36).unwrap();
+        let inner = app.dock_kb_rect.shrink(4.0);
+        let pw = (inner.width() - 6.0 * (cols as f32 - 1.0)) / cols as f32;
+        let ph = (inner.height() - 6.0 * (rows as f32 - 1.0)) / rows as f32;
+        let at = Pos2::new(inner.left() + (kick % cols) as f32 * (pw + 6.0) + pw * 0.5, inner.top() + (kick / cols) as f32 * (ph + 6.0) + ph * 0.5);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut app, &ctx, vec![button(at, true)]);
+        assert!(log.lock().unwrap().contains(&(36, true)), "the kick sounds on the press: {:?}", log.lock().unwrap());
+        frame(&mut app, &ctx, vec![button(at, false)]);
+        assert_eq!(log.lock().unwrap().iter().filter(|e| **e == (36, true)).count(), 1, "one hit, not a second on the release");
+    }
+
+    /// #198: the bass neck plays the note of the string and fret pressed,
+    /// and lets it go on release.
+    #[test]
+    fn the_bass_neck_plays_the_string_and_fret_pressed() {
+        let (mut app, log) = rack_with(Some(clap("com.punklabs.onetrick.chonk")));
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.kb_type(), KeyboardType::Bass);
+        let neck = app.kb_fret_rect;
+        assert!(neck.is_positive(), "the dock draws a neck: {neck:?}");
+        // The dock's neck: a 20 pt nut, 12 frets, the four strings G D A E
+        // top to bottom. Fret 3 of the A string is C2 (MIDI 36).
+        let fw = (neck.width() - 20.0) / 12.0;
+        let at = Pos2::new(neck.left() + 20.0 + 2.5 * fw, neck.top() + neck.height() * 2.5 / 4.0);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut app, &ctx, vec![button(at, true)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(log.lock().unwrap().contains(&(36, true)), "A string, fret 3: {:?}", log.lock().unwrap());
+        frame(&mut app, &ctx, vec![button(at, false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(log.lock().unwrap().contains(&(36, false)), "released with the button: {:?}", log.lock().unwrap());
+    }
+
+    /// In a narrow window the eight chips give way to one menu that marks
+    /// the rig the same way.
+    #[test]
+    fn a_narrow_window_marks_the_rig_from_the_type_menu() {
+        let (mut app, _) = rack_with(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(781.0, 950.0);
+        let run = |app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(t); // popups past their fade-in (rule 101)
+            raw.events = events;
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear(); // rule 11
+            out
+        };
+        let mut t = 0.0;
+        for _ in 0..3 { t += 1.0; run(&mut app, &ctx, vec![], t); }
+        assert!(app.kb_mode_rects.iter().all(|r| *r == Rect::NOTHING), "no chips: {:?}", app.kb_mode_rects);
+        let menu = app.kb_type_menu_rect;
+        assert!(menu.is_positive() && app.dock_rect.contains_rect(menu), "the menu sits in the header: {menu:?}");
+        // A click is a short press: egui drops one held past its click time.
+        for ev in [egui::Event::PointerMoved(menu.center()), button(menu.center(), true), button(menu.center(), false)] {
+            t += 0.1;
+            run(&mut app, &ctx, vec![ev], t);
+        }
+        assert!(egui::Popup::is_any_open(&ctx), "the menu opened");
+        // Find the "Drums" row in what the popup painted, and click it.
+        t += 1.0;
+        let out = run(&mut app, &ctx, vec![], t);
+        let mut row = None;
+        for cs in &out.shapes {
+            if let Shape::Text(tx) = &cs.shape {
+                if tx.galley.text() == "Drums" { row = Some(tx.galley.rect.translate(tx.pos.to_vec2()).center()); }
+            }
+        }
+        let row = row.expect("the menu lists Drums");
+        for ev in [egui::Event::PointerMoved(row), button(row, true), button(row, false)] {
+            t += 0.1;
+            run(&mut app, &ctx, vec![ev], t);
+        }
+        assert_eq!(app.rig_mark(0), Some(KeyboardType::Drums));
+    }
+
+    /// #198: the type belongs to the rig. Marking rig A leaves rig B on
+    /// its own instrument's type, and the dock plays the rig in view.
+    #[test]
+    fn marking_one_rig_leaves_the_other_on_its_own_type() {
+        let (mut app, _) = rack_with(None);
+        app.edit_rigs_with(None, Some("Church"), Some((crate::aeolus::AEOLUS_ID, "Aeolus")));
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.rig_type(0), Some(KeyboardType::Synth));
+        assert_eq!(app.rig_type(1), Some(KeyboardType::PipeOrgan));
+        app.set_rig_mark(0, Some(KeyboardType::Bass));
+        assert_eq!(app.rig_type(0), Some(KeyboardType::Bass));
+        assert_eq!(app.rig_type(1), Some(KeyboardType::PipeOrgan), "rig B keeps its own type");
+        assert_eq!(app.rig_mark(1), None);
+        app.set_active_rig(1);
+        assert_eq!(app.kb_type(), KeyboardType::PipeOrgan, "the dock plays the rig in view");
+        app.set_active_rig(0);
+        assert_eq!(app.kb_type(), KeyboardType::Bass);
+    }
+
+    /// Rules 59, 65, 106: a mark follows its rig through a rig add, the
+    /// delete of another rig, an undo of a later job and a session round
+    /// trip.
+    #[test]
+    fn a_rig_mark_survives_rig_edits_undo_and_a_session_round_trip() {
+        let (mut app, _) = rack_with(None);
+        app.exec_tool("add_rig", &serde_json::json!({"name": "B"}));
+        app.exec_tool("add_rig", &serde_json::json!({"name": "C"}));
+        assert_eq!(app.rig_count(), 3);
+        app.submit_chat("mark".into());
+        let out = app.exec_tool("set_keyboard_mode", &serde_json::json!({"rig": 2, "mode": "wind"}));
+        assert!(!out.starts_with("error"), "{out}");
+        assert_eq!(app.rig_mark(2), Some(KeyboardType::Wind));
+        app.submit_chat("one more rig".into());
+        app.exec_tool("add_rig", &serde_json::json!({"name": "D"}));
+        assert_eq!(app.rig_mark(2), Some(KeyboardType::Wind), "a rig add keeps the mark");
+        assert_eq!(app.rig_mark(3), None, "the new rig follows its instrument");
+        app.exec_tool("undo", &serde_json::json!({}));
+        assert_eq!(app.rig_count(), 3, "the rig add was undone");
+        assert_eq!(app.rig_mark(2), Some(KeyboardType::Wind), "undoing the later job keeps the mark");
+        app.edit_rigs(Some(0));
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.rig_name(1), "C");
+        assert_eq!(app.rig_mark(1), Some(KeyboardType::Wind), "the mark moved with its rig");
+        assert_eq!(app.rig_mark(0), None);
+        let s = app.capture_session("kb").unwrap();
+        assert_eq!(s.rig_types, vec![None, Some(KeyboardType::Wind)]);
+        let (mut other, _) = rack_with(None);
+        other.apply_session(&s).unwrap();
+        assert_eq!(other.rig_mark(1), Some(KeyboardType::Wind));
+        assert_eq!(other.rig_type(1), Some(KeyboardType::Wind));
+        // A rack that marks nothing leaves no mark behind.
+        other.apply_session(&crate::session::Session::new("plain", crate::control::standard_rig_graph(true))).unwrap();
+        assert!(other.rig_types.is_empty());
+    }
+
+    /// A rig saved as a preset keeps its mark when it is loaded into
+    /// another session.
+    #[test]
+    fn a_rig_preset_carries_its_mark() {
+        let (mut app, _) = rack_with(None);
+        app.set_rig_mark(0, Some(KeyboardType::Drums));
+        let preset = app.capture_rig_preset(0, "Kit").unwrap();
+        let (mut other, _) = rack_with(None);
+        other.set_rig_mark(0, Some(KeyboardType::Piano));
+        let rig = other.apply_rig_preset(&preset, None).unwrap();
+        assert_eq!(rig, 1);
+        assert_eq!(other.rig_mark(0), Some(KeyboardType::Piano), "the existing rig keeps its mark");
+        assert_eq!(other.rig_mark(1), Some(KeyboardType::Drums), "the loaded rig brings its own");
     }
 
     /// Press-and-hold: the note sounds as long as the pointer is down,
@@ -41259,7 +42058,7 @@ mod instrument_keyboard_tests {
     fn a_held_dock_key_sounds_until_the_pointer_lifts() {
         for kind in [None, Some(organ()), Some(aeolus())] {
             let (mut app, log) = rack_with(kind.clone());
-            app.kb_mode = KeyboardMode::Pinned(KeyboardType::Piano);
+            app.rig_types = vec![Some(KeyboardType::Piano)];
             let ctx = egui::Context::default();
             for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
             let p = white_key(&app, 2);
@@ -41284,7 +42083,7 @@ mod instrument_keyboard_tests {
         let (mut app, log) = rack_with(Some(organ()));
         let ctx = egui::Context::default();
         for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
-        assert_eq!(app.kb_surface(), KeyboardType::JazzOrgan);
+        assert_eq!(app.kb_type(), KeyboardType::JazzOrgan);
         let from = white_key(&app, 0);
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(from)]);
         frame(&mut app, &ctx, vec![button(from, true)]);
@@ -41309,8 +42108,9 @@ mod instrument_keyboard_tests {
     /// pin, a rig switch, closing the dock) releases it first.
     #[test]
     fn a_held_dock_key_is_released_before_the_surface_or_dock_changes() {
-        let changes: [(&str, &dyn Fn(&mut DemoApp)); 3] = [
-            ("pin", &|a| a.kb_set_mode(KeyboardMode::Pinned(KeyboardType::JazzOrgan))),
+        let changes: [(&str, &dyn Fn(&mut DemoApp)); 4] = [
+            ("mark", &|a| a.set_rig_mark(0, Some(KeyboardType::JazzOrgan))),
+            ("tool mark", &|a| { a.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "drums"})); }),
             ("close", &|a| a.toggle_dock(DockView::Keyboard)),
             ("tool", &|a| { a.exec_tool("set_keyboard_mode", &serde_json::json!({"open": false})); }),
         ];
@@ -41330,41 +42130,48 @@ mod instrument_keyboard_tests {
     }
 
     /// Agent parity (rules 6, 23): the agent reads and sets what the
-    /// header chips and EXPAND set, and a bad mode is refused, not guessed.
+    /// header chips and EXPAND set, on the active rig or a named one, and a
+    /// bad mode or rig is refused, not guessed, and changes nothing.
     #[test]
-    fn the_keyboard_tools_pin_expand_and_report() {
+    fn the_keyboard_tools_mark_expand_and_report() {
         let (mut app, _) = rack_with(Some(organ()));
         app.dock = DockView::None;
         let ctx = egui::Context::default();
         let out = app.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "pipe_organ", "expanded": true}));
         assert!(!out.starts_with("error"), "{out}");
-        assert_eq!(app.kb_mode, KeyboardMode::Pinned(KeyboardType::PipeOrgan));
+        assert_eq!(app.rig_mark(0), Some(KeyboardType::PipeOrgan));
         assert_eq!(app.dock, DockView::Keyboard, "expanding opens the dock");
         assert!(app.kb_expanded);
         for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
         assert!(app.dock_rect.height() > SIZE.y * 0.7, "expanded takes the stage: {:?}", app.dock_rect);
         let state: serde_json::Value = serde_json::from_str(&app.exec_tool("get_keyboard_state", &serde_json::json!({}))).unwrap();
         assert_eq!(state["mode"], "pipe_organ", "{state}");
+        assert_eq!(state["marked"], true, "{state}");
         assert_eq!(state["detected_mode"], "jazz_organ", "{state}");
         assert_eq!(state["expanded"], true, "{state}");
-        let out = app.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "theremin"}));
-        assert!(out.starts_with("error"), "{out}");
-        assert_eq!(app.kb_mode, KeyboardMode::Pinned(KeyboardType::PipeOrgan), "a refused call changes nothing");
+        assert_eq!(state["rigs"][0]["type"], "pipe_organ", "{state}");
+        assert_eq!(state["rigs"][0]["detected"], "jazz_organ", "{state}");
+        for bad in [serde_json::json!({"mode": "theremin"}), serde_json::json!({"mode": "piano", "rig": 5}), serde_json::json!({"mode": "piano", "synth_drag": "wobble"})] {
+            let out = app.exec_tool("set_keyboard_mode", &bad);
+            assert!(out.starts_with("error"), "{bad}: {out}");
+            assert_eq!(app.rig_mark(0), Some(KeyboardType::PipeOrgan), "{bad}: a refused call changes nothing");
+        }
         app.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "auto", "expanded": false}));
-        assert_eq!(app.kb_surface(), KeyboardType::JazzOrgan);
+        assert_eq!(app.rig_mark(0), None);
+        assert_eq!(app.kb_type(), KeyboardType::JazzOrgan);
         for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
         assert!(app.dock_rect.height() < SIZE.y * 0.5, "docked again: {:?}", app.dock_rect);
-    }
-
-    #[test]
-    fn the_pinned_surface_travels_with_the_session() {
-        let (mut app, _) = rack_with(None);
-        app.kb_set_mode(KeyboardMode::Pinned(KeyboardType::Piano));
-        let s = app.capture_session("kb").unwrap();
-        assert_eq!(s.keyboard_mode, Some(KeyboardMode::Pinned(KeyboardType::Piano)));
-        let (mut other, _) = rack_with(None);
-        other.apply_session(&s).unwrap();
-        assert_eq!(other.kb_mode, KeyboardMode::Pinned(KeyboardType::Piano));
+        // A named rig: rig 1 is marked, the active rig 0 keeps following.
+        app.exec_tool("add_rig", &serde_json::json!({"name": "Kit"}));
+        app.set_active_rig(0);
+        let out = app.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "drums", "rig": 1}));
+        assert!(!out.starts_with("error"), "{out}");
+        assert_eq!(app.rig_mark(1), Some(KeyboardType::Drums));
+        assert_eq!(app.rig_mark(0), None);
+        let rigs: serde_json::Value = serde_json::from_str(&app.exec_tool("get_rigs", &serde_json::json!({}))).unwrap();
+        assert_eq!(rigs["rigs"][0]["type"], "jazz_organ", "{rigs}");
+        assert_eq!(rigs["rigs"][1]["type"], "drums", "{rigs}");
+        assert_eq!(rigs["rigs"][1]["type_marked"], true, "{rigs}");
     }
 }
 
@@ -41511,7 +42318,7 @@ mod offline_shots {
     #[test]
     #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat keyboard_surface_shots -- --ignored"]
     fn keyboard_surface_shots() {
-        use crate::keyboard::{KeyboardMode, KeyboardType};
+        use crate::keyboard::KeyboardType;
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
         let rig = |app: &mut DemoApp, kind: NodeKind, name: &str| {
@@ -41535,18 +42342,30 @@ mod offline_shots {
                 a.aeolus_poll_at = a.ui_time + 1e6; // no live plugin to poll in a shot
             }
         };
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 11] = [
+        let clap = |id: &str| NodeKind::Clap { plugin_id: crate::control::ClapId::new(id) };
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 19] = [
+            // #198 phase 1: the four new types, detected from their catalog
+            // plugin and drawn with the interim surface.
+            ("electric-piano", &|a| a.rig_types = vec![Some(KeyboardType::ElectricPiano)]),
+            ("electric-piano-expanded", &|a| { a.rig_types = vec![Some(KeyboardType::ElectricPiano)]; a.kb_expanded = true }),
+            // A bass plays in its own register: the held chord lands on the neck.
+            ("bass", &|a| { rig(a, clap("com.punklabs.onetrick.chonk"), "CHONK"); mains(a); a.octave = 2 }),
+            ("bass-expanded", &|a| { rig(a, clap("com.punklabs.onetrick.chonk"), "CHONK"); mains(a); a.octave = 2; a.kb_expanded = true }),
+            ("wind", &|a| { rig(a, clap("org.starbreath.starbreath"), "STARBREATH"); mains(a) }),
+            ("wind-expanded", &|a| { rig(a, clap("org.starbreath.starbreath"), "STARBREATH"); mains(a); a.kb_expanded = true }),
+            ("drums", &|a| { rig(a, clap("com.punklabs.onetrick.cryptid"), "CRYPTID"); mains(a) }),
+            ("drums-expanded", &|a| { rig(a, clap("com.punklabs.onetrick.cryptid"), "CRYPTID"); mains(a); a.kb_expanded = true }),
             ("synth", &|a| mains(a)),
             ("synth-expanded", &|a| { mains(a); a.kb_expanded = true }),
             ("jazz-organ-expanded", &|a| { rig(a, organ(), "ORGAN"); a.kb_expanded = true }),
             ("jazz-organ-dual-expanded", &|a| { rig(a, organ(), "ORGAN"); a.kb_dual_manual = true; a.kb_expanded = true }),
-            ("piano", &|a| a.kb_mode = KeyboardMode::Pinned(KeyboardType::Piano)),
-            ("piano-expanded", &|a| { a.kb_mode = KeyboardMode::Pinned(KeyboardType::Piano); a.kb_expanded = true; a.kb_sustain = true }),
+            ("piano", &|a| a.rig_types = vec![Some(KeyboardType::Piano)]),
+            ("piano-expanded", &|a| { a.rig_types = vec![Some(KeyboardType::Piano)]; a.kb_expanded = true; a.kb_sustain = true }),
             ("jazz-organ", &|a| rig(a, organ(), "ORGAN")),
             ("jazz-organ-dual", &|a| { rig(a, organ(), "ORGAN"); a.kb_dual_manual = true }),
             ("pipe-organ", &|a| { rig(a, aeolus(), "AEOLUS"); chorus(a) }),
             ("pipe-organ-expanded", &|a| { rig(a, aeolus(), "AEOLUS"); chorus(a); a.kb_expanded = true }),
-            ("pipe-organ-preview-expanded", &|a| { a.kb_mode = KeyboardMode::Pinned(KeyboardType::PipeOrgan); a.kb_expanded = true }),
+            ("pipe-organ-preview-expanded", &|a| { a.rig_types = vec![Some(KeyboardType::PipeOrgan)]; a.kb_expanded = true }),
         ];
         let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();
         // KABELSALAT_SHOTS_SIZES=781x950,1576x468 renders other window sizes.
@@ -42362,6 +43181,14 @@ mod navigator_tests {
             app.rail_tab = RailTab::Rigs;
             app.demo_playing = playing;
             super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join(format!("{name}.png")));
+        }
+        // #198: each rig row names its type; a mark says so.
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(781.0, 950.0)] {
+            let (mut app, _) = two_rigs_with_inserts(true);
+            app.nav_open = true;
+            app.rail_tab = RailTab::Rigs;
+            app.set_rig_mark(1, Some(crate::keyboard::KeyboardType::Drums));
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("rail-rig-types-{}x{}.png", size.x, size.y)));
         }
     }
 

@@ -6,6 +6,7 @@
 //! filter and search plugins identically.
 
 use crate::control::DspKind;
+use crate::keyboard::{KeyboardType, PluginRef};
 use crate::host::ClapPluginInfo;
 use crate::lv2::Lv2PluginInfo;
 
@@ -74,9 +75,12 @@ impl PluginType {
 pub enum PluginSubtype {
     // Instruments
     Synth,
+    Piano,
     Organ,
-    Sampler,
+    Bass,
+    Wind,
     Drum,
+    Sampler,
     InstrumentOther,
 
     // Audio effects (ordered by studio workflow)
@@ -104,11 +108,27 @@ pub enum PluginSubtype {
 impl PluginSubtype {
     pub const INSTRUMENT_ALL: &'static [PluginSubtype] = &[
         PluginSubtype::Synth,
+        PluginSubtype::Piano,
         PluginSubtype::Organ,
-        PluginSubtype::Sampler,
+        PluginSubtype::Bass,
+        PluginSubtype::Wind,
         PluginSubtype::Drum,
+        PluginSubtype::Sampler,
         PluginSubtype::InstrumentOther,
     ];
+
+    /// The browser group of an instrument type: one per type, the two
+    /// pianos and the two organs each share one.
+    pub const fn of_instrument(t: KeyboardType) -> Self {
+        match t {
+            KeyboardType::Synth => Self::Synth,
+            KeyboardType::Piano | KeyboardType::ElectricPiano => Self::Piano,
+            KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => Self::Organ,
+            KeyboardType::Bass => Self::Bass,
+            KeyboardType::Wind => Self::Wind,
+            KeyboardType::Drums => Self::Drum,
+        }
+    }
 
     pub const EFFECT_ALL: &'static [PluginSubtype] = &[
         PluginSubtype::DelayReverb,
@@ -145,9 +165,14 @@ impl PluginSubtype {
 
     pub const fn plugin_type(self) -> PluginType {
         match self {
-            Self::Synth | Self::Organ | Self::Sampler | Self::Drum | Self::InstrumentOther => {
-                PluginType::Instrument
-            }
+            Self::Synth
+            | Self::Piano
+            | Self::Organ
+            | Self::Bass
+            | Self::Wind
+            | Self::Drum
+            | Self::Sampler
+            | Self::InstrumentOther => PluginType::Instrument,
             Self::DelayReverb
             | Self::EqFilter
             | Self::Dynamics
@@ -167,7 +192,10 @@ impl PluginSubtype {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Synth => "Synths",
+            Self::Piano => "Pianos",
             Self::Organ => "Organs",
+            Self::Bass => "Basses",
+            Self::Wind => "Winds",
             Self::Sampler => "Samplers",
             Self::Drum => "Drums",
             Self::InstrumentOther => "Other instruments",
@@ -193,7 +221,10 @@ impl PluginSubtype {
     pub const fn badge(self) -> &'static str {
         match self {
             Self::Synth => "SYNTH",
+            Self::Piano => "PIANO",
             Self::Organ => "ORGAN",
+            Self::Bass => "BASS",
+            Self::Wind => "WIND",
             Self::Sampler => "SAMPLER",
             Self::Drum => "DRUM",
             Self::InstrumentOther => "INST",
@@ -218,7 +249,10 @@ impl PluginSubtype {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Synth => "synth",
+            Self::Piano => "piano",
             Self::Organ => "organ",
+            Self::Bass => "bass",
+            Self::Wind => "wind",
             Self::Sampler => "sampler",
             Self::Drum => "drum",
             Self::InstrumentOther => "instrument",
@@ -250,7 +284,10 @@ impl PluginSubtype {
             .collect();
         match words.join("_").as_str() {
             "synth" | "synths" | "synthesizer" | "wavetable" | "fm" => Some(Self::Synth),
+            "piano" | "pianos" | "keys" | "electric_piano" | "epiano" => Some(Self::Piano),
             "organ" | "organs" => Some(Self::Organ),
+            "bass" | "basses" => Some(Self::Bass),
+            "wind" | "winds" | "woodwind" | "brass" => Some(Self::Wind),
             "sampler" | "samplers" => Some(Self::Sampler),
             "drum" | "drums" | "drum_machine" | "percussion" => Some(Self::Drum),
             "instrument" | "instrument_other" | "other_instruments" => Some(Self::InstrumentOther),
@@ -380,15 +417,8 @@ pub fn classify_clap(p: &ClapPluginInfo) -> PluginSubtype {
             && !has("audio-effect")
             && !has("note-effect"));
     if is_inst {
-        return if has("organ") || name_low.contains("organ") || id_low.contains("aeolus") {
-            PluginSubtype::Organ
-        } else if has("sampler") || name_low.contains("sampler") || id_low.contains("floe") {
-            PluginSubtype::Sampler
-        } else if has("drum") || has("drum-machine") || name_low.contains("drum") {
-            PluginSubtype::Drum
-        } else {
-            PluginSubtype::Synth
-        };
+        let sampler = has("sampler") || name_low.contains("sampler") || id_low.contains("floe");
+        return instrument_subtype(clap_instrument_type(p), sampler);
     }
     if has("note-effect") {
         return if name_low.contains("arp") || name_low.contains("chord") || has("arpeggiator") {
@@ -433,7 +463,25 @@ pub fn classify_clap(p: &ClapPluginInfo) -> PluginSubtype {
     }
     // A plugin that declares no CLAP feature at all is hosted as an
     // instrument, as before this taxonomy existed.
-    PluginSubtype::Synth
+    instrument_subtype(clap_instrument_type(p), false)
+}
+
+/// The instrument type a CLAP plugin has before a sound is loaded: the
+/// keyboard's classification (#198), so a rig of it and its card agree.
+pub fn clap_instrument_type(p: &ClapPluginInfo) -> KeyboardType {
+    crate::keyboard::classify_plugin(Some(PluginRef::Clap(&p.id)), Some(&p.name), &p.features)
+}
+
+/// [`clap_instrument_type`] for an LV2 plugin.
+pub fn lv2_instrument_type(p: &Lv2PluginInfo) -> KeyboardType {
+    crate::keyboard::classify_plugin(Some(PluginRef::Lv2(&p.uri)), Some(&p.name), &[])
+}
+
+/// An instrument's browser group: its type's, except that a sampler (a
+/// plugin of no more specific type that declares or names sampling) keeps
+/// its own group.
+fn instrument_subtype(t: KeyboardType, sampler: bool) -> PluginSubtype {
+    if sampler && t == KeyboardType::Synth { PluginSubtype::Sampler } else { PluginSubtype::of_instrument(t) }
 }
 
 /// Is this CLAP plugin an instrument (synth, organ, sampler, drum machine)?
@@ -477,18 +525,10 @@ pub fn clap_id_is_effect(id: &str, scanned: &[ClapPluginInfo]) -> bool {
 pub fn classify_lv2(p: &Lv2PluginInfo) -> PluginSubtype {
     let name = p.name.to_ascii_lowercase();
     let words = NameWords::new(&name);
-    let uri = p.uri.to_ascii_lowercase();
 
     if p.is_instrument {
-        return if words.any(&["organ", "tonewheel"]) || uri.contains("b_synth") {
-            PluginSubtype::Organ
-        } else if words.any(&["sampler", "sfizz", "fluidsynth", "multisampler"]) {
-            PluginSubtype::Sampler
-        } else if words.any(&["drum", "drums", "drumkit"]) {
-            PluginSubtype::Drum
-        } else {
-            PluginSubtype::Synth
-        };
+        let sampler = words.any(&["sampler", "sfizz", "fluidsynth", "multisampler"]);
+        return instrument_subtype(lv2_instrument_type(p), sampler);
     }
     if p.is_midi_fx {
         return if words.any(&["arp", "arpeggiator", "chord", "chords"]) {
@@ -704,6 +744,27 @@ impl Entry<'_> {
         }
     }
 
+    /// An instrument's type (#198), the one a rig of it starts with.
+    pub fn instrument_type(&self) -> Option<KeyboardType> {
+        if self.ty() != PluginType::Instrument {
+            return None;
+        }
+        match self.source {
+            Source::Builtin(_) => None,
+            Source::Clap(p) => Some(clap_instrument_type(p)),
+            Source::Lv2(p) => Some(lv2_instrument_type(p)),
+        }
+    }
+
+    /// The card's category badge: an instrument's type ("PIPE ORGAN",
+    /// "DRUMS"), a sampler's or any other plugin's subcategory.
+    pub fn badge(&self) -> &'static str {
+        match self.instrument_type() {
+            Some(t) if self.sub != PluginSubtype::Sampler => t.badge(),
+            _ => self.sub.badge(),
+        }
+    }
+
     /// Whether kabelsalat can put this plugin on the rack today.
     pub fn hostable(&self) -> bool {
         match self.source {
@@ -772,7 +833,7 @@ impl PluginListFilter {
             .map(|raw| {
                 PluginSubtype::parse(raw).ok_or_else(|| {
                     format!(
-                        "unknown category '{raw}' (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"
+                        "unknown category '{raw}' (e.g. synth, piano, organ, bass, wind, drum, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"
                     )
                 })
             })
@@ -835,7 +896,10 @@ pub fn format_list_plugins(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filte
             out.push_str(&format!("  categories: {}\n", subs.join(", ")));
         }
         for e in section.iter().take(cap) {
-            let sub = e.sub.label();
+            let sub = match e.instrument_type() {
+                Some(t) => format!("{} · type {}", e.sub.label(), t.as_str()),
+                None => e.sub.label().to_string(),
+            };
             let line = match e.source {
                 Source::Builtin(b) => format!("[built-in · {sub}] {} ({}) — {}", b.name, b.id, b.description),
                 Source::Clap(p) => {
@@ -881,6 +945,9 @@ pub fn list_plugins_json(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filter:
         item["type"] = serde_json::json!(e.ty().slug());
         item["category"] = serde_json::json!(e.sub.slug());
         item["category_label"] = serde_json::json!(e.sub.label());
+        if let Some(t) = e.instrument_type() {
+            item["instrument_type"] = serde_json::json!(t.as_str());
+        }
         item
     };
     let mut builtin = Vec::new();
@@ -983,6 +1050,59 @@ mod tests {
         assert_eq!(classify_clap(&scope), PluginSubtype::Analyzer);
         assert!(clap_hostable(&scope));
         assert!(clap_is_audio_insert(&scope));
+    }
+
+    /// #198: an instrument's browser group follows its type, and its card
+    /// names that type.
+    #[test]
+    fn an_instruments_subtype_and_badge_follow_its_type() {
+        let cases = [
+            (clap("com.punklabs.onetrick.cryptid", "OneTrick CRYPTID", &["instrument", "synthesizer"]), PluginSubtype::Drum, "DRUMS"),
+            (clap("com.punklabs.onetrick.keys", "OneTrick KEYS", &["instrument", "synthesizer"]), PluginSubtype::Piano, "PIANO"),
+            (clap("com.punklabs.onetrick.chonk", "OneTrick CHONK", &["instrument", "synthesizer"]), PluginSubtype::Bass, "BASS"),
+            (clap("org.starbreath.starbreath", "Starbreath", &["instrument", "synthesizer"]), PluginSubtype::Wind, "WIND"),
+            (clap("com.ArthurBenilov.Aeolus", "Aeolus", &["instrument"]), PluginSubtype::Organ, "PIPE ORGAN"),
+            (clap("org.example.drums", "Beat Box", &["instrument", "drum-machine"]), PluginSubtype::Drum, "DRUMS"),
+            (clap("com.floe-audio.floe", "Floe", &["instrument", "sampler"]), PluginSubtype::Sampler, "SAMPLER"),
+            (clap("org.surge-synth-team.surge-xt", "Surge XT", &["instrument", "synthesizer"]), PluginSubtype::Synth, "SYNTH"),
+        ];
+        for (p, sub, badge) in cases {
+            assert_eq!(classify_clap(&p), sub, "{}", p.name);
+            let all = [p.clone()];
+            let e = entries(&all, &[]).into_iter().find(|e| e.name() == p.name).unwrap();
+            assert_eq!(e.badge(), badge, "{}", p.name);
+        }
+        let organ = lv2("http://gareus.org/oss/lv2/b_synth", "setBfree DSP Tonewheel Organ", "InstrumentPlugin", true, false);
+        let lv2s = [organ];
+        let e = entries(&[], &lv2s).into_iter().find(|e| e.format() == PluginFormat::Lv2).unwrap();
+        assert_eq!((e.sub, e.badge(), e.instrument_type()), (PluginSubtype::Organ, "JAZZ ORGAN", Some(KeyboardType::JazzOrgan)));
+        let json = list_plugins_json(&[], &lv2s, &PluginListFilter::default());
+        assert_eq!(json["lv2"][0]["instrument_type"], "jazz_organ", "{json}");
+    }
+
+    /// #198: the Plugins browser and the keyboard can never disagree about
+    /// a catalog instrument. A rig of it gets the type the browser groups
+    /// it under, for every card, from its real plugin identity.
+    #[test]
+    fn the_browser_and_the_keyboard_agree_on_every_catalog_instrument() {
+        for e in crate::catalog::CATALOG.iter().filter(|e| e.instrument.is_some()) {
+            let name = e.name.to_string();
+            let (node, sub) = match (e.clap_id, e.lv2_uris.first()) {
+                (Some(id), _) => (
+                    crate::control::NodeKind::Clap { plugin_id: crate::control::ClapId::new(id) },
+                    classify_clap(&clap(id, &name, &["instrument", "synthesizer"])),
+                ),
+                (None, Some(uri)) => (
+                    crate::control::NodeKind::Lv2 { uri: crate::control::Lv2Uri::new(uri) },
+                    classify_lv2(&lv2(uri, &name, "InstrumentPlugin", true, false)),
+                ),
+                (None, None) => panic!("{}: an instrument card names its plugin", e.id),
+            };
+            let rig = crate::keyboard::classify_instrument(&node, None, Some(&name), &[]);
+            let groups = sub == PluginSubtype::of_instrument(rig) || (sub == PluginSubtype::Sampler && rig == KeyboardType::Synth);
+            assert!(groups, "{}: the keyboard says {rig:?}, the browser {sub:?}", e.id);
+            assert_eq!(Some(rig), e.instrument, "{}: a rig of it has the card's type", e.id);
+        }
     }
 
     #[test]

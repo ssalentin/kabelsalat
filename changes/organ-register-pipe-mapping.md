@@ -1,0 +1,2 @@
+### Fixed
+- **Pipe organ register-to-pipe mapping and bass compass:** the Pipe Organ console's pipe facade now spans the full 8-octave compass (C0–C8) with C-octave markings on the impost and maps every drawn stop's pitch offsets (32', 16', 8', 5⅓', 4', 2⅔', 2', 1⅗', 1⅓', 1' and multi-rank mixtures, with flue vs reed glow) across all 128 MIDI notes, so lower tones and sub-octave stops light dedicated bass pipes and silent registrations keep the pipes dark.

@@ -235,6 +235,53 @@ pub fn with_coupler(state: &[u8], division: usize, link: usize, on: bool) -> Opt
     Some(v.to_string().into_bytes())
 }
 
+/// Sounding pitch offset(s) in semitones relative to 8' unison (`0`) for a
+/// stop in [`DIVISIONS`]. Single-rank stops return one offset (`32'` → `-24`,
+/// `16'` → `-12`, `8'` → `0`, `5 1/3'` → `+7`, `4'` → `+12`, `2 2/3'` → `+19`,
+/// `2'` → `+24`, `1 3/5'` → `+28`, `1 1/3'` → `+31`, `1'` → `+36`);
+/// compound stops (mixtures, sesquialtera, cornet, cymbel) return all their
+/// harmonic ranks.
+pub fn stop_semitones(stop: &str) -> &'static [i8] {
+    match stop {
+        "Sesquialtera\nII" => &[19, 28],
+        "Mixture\nIII" => &[24, 31, 36],
+        "Mixture\nIV" => &[19, 24, 31, 36],
+        "Fourniture\nIV" => &[24, 31, 36, 43],
+        "Cornet\nV" => &[0, 12, 19, 24, 28],
+        "Mixture\nV" => &[24, 31, 36, 43, 48],
+        "Cymbel\nVII" => &[24, 31, 36, 43, 48, 55, 60],
+        _ => {
+            // Single-rank stops carry their footage at the end ("Open Diapason\n8",
+            // "Harmonic\nFlute 8", "Nazard\n2 2/3", "Bombarde\n32", ...).
+            let foot = stop.split_once('\n').map(|(_, s)| s).unwrap_or(stop);
+            let foot = foot.strip_prefix("Flute ").unwrap_or(foot).trim();
+            match foot {
+                "32" => &[-24],
+                "16" => &[-12],
+                "8" => &[0],
+                "5 1/3" => &[7],
+                "4" => &[12],
+                "2 2/3" => &[19],
+                "2" => &[24],
+                "1 3/5" => &[28],
+                "1 1/3" => &[31],
+                "1" => &[36],
+                _ => &[0],
+            }
+        }
+    }
+}
+
+/// Whether a stop in [`DIVISIONS`] is a reed register (as opposed to a flue
+/// principal, flute, or string).
+pub fn is_reed(stop: &str) -> bool {
+    let head = stop.split('\n').next().unwrap_or(stop);
+    matches!(
+        head,
+        "Bombarde" | "Trombone" | "Bassoon" | "Trumpet" | "Cornopean" | "Oboe" | "Vox Humana" | "Cromorne"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +364,33 @@ mod tests {
         let s = with_coupler(&s, 3, 2, true).unwrap();
         assert_eq!(couplers(&s), Some([0, 0, 0b01, 0b100]));
         assert_eq!(with_coupler(&s, 0, 0, true), None, "Manual III has no couplers");
+    }
+
+    #[test]
+    fn every_stop_maps_to_its_sounding_register_offsets() {
+        for div in &DIVISIONS {
+            for &stop in div.stops {
+                let offs = stop_semitones(stop);
+                assert!(!offs.is_empty(), "{}: {stop:?} has no offsets", div.name);
+            }
+        }
+        assert_eq!(stop_semitones("Bombarde\n32"), &[-24]);
+        assert_eq!(stop_semitones("Double Open Diapason\n16"), &[-12]);
+        assert_eq!(stop_semitones("Harmonic\nFlute 8"), &[0]);
+        assert_eq!(stop_semitones("Twelfth\n5 1/3"), &[7]);
+        assert_eq!(stop_semitones("Principal\n4"), &[12]);
+        assert_eq!(stop_semitones("Nazard\n2 2/3"), &[19]);
+        assert_eq!(stop_semitones("Fifteenth\n2"), &[24]);
+        assert_eq!(stop_semitones("Tierce\n1 3/5"), &[28]);
+        assert_eq!(stop_semitones("Larigot\n1 1/3"), &[31]);
+        assert_eq!(stop_semitones("Sifflet\n1"), &[36]);
+        assert_eq!(stop_semitones("Sesquialtera\nII"), &[19, 28]);
+        assert_eq!(stop_semitones("Mixture\nIII"), &[24, 31, 36]);
+        assert_eq!(stop_semitones("Cornet\nV"), &[0, 12, 19, 24, 28]);
+        assert!(is_reed("Bombarde\n32"));
+        assert!(is_reed("Trumpet\n8"));
+        assert!(is_reed("Vox Humana\n8"));
+        assert!(!is_reed("Open Diapason\n8"));
+        assert!(!is_reed("Mixture\nIII"));
     }
 }

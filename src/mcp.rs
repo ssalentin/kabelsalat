@@ -1837,9 +1837,13 @@ impl McpServer {
         let target_is_knob = args.target.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("knob"));
         let param = if let Some(ref name) = args.name {
             match Self::resolve_headless_knob(&node_kind, name) {
-                Ok(p) => p,
-                Err(_) if is_clap => {
+                Ok((p, crate::matrix::CcTarget::Knob)) => p,
+                // A pedal or wheel name ("swell") is a MIDI CC the keys send, not a parameter.
+                Ok(_) | Err(_) if is_clap => {
                     return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+                }
+                Ok((cc, _)) => {
+                    return tool_err(format!("'{name}' is MIDI CC {cc}, not a parameter — map a controller to it with set_cc_map"));
                 }
                 Err(e) => return tool_err(e),
             }
@@ -4283,6 +4287,13 @@ mod tests {
         assert_eq!(out["main_controls"][1]["knob"], json!("RESO"));
         let labels: Vec<&str> = out["knobs"].as_array().unwrap().iter().map(|k| k["label"].as_str().unwrap()).collect();
         assert_eq!(labels, ["CUTOFF", "RESO"], "the knobs the app's face shows");
+        // set_param by a main control's name sets it; a pedal name is a MIDI CC,
+        // never sent as that number's parameter.
+        let set = |name: &str| -> SetParamArgs { serde_json::from_value(json!({"node": node, "name": name, "normalized": 0.5})).unwrap() };
+        assert_eq!(tool_json(&server.set_param(Parameters(set("filter cutoff"))))["param"], json!(7));
+        let swell = serde_json::to_value(server.set_param(Parameters(set("swell"))).unwrap()).unwrap();
+        assert_eq!(swell["isError"], json!(true), "{swell}");
+        assert!(swell.to_string().contains("MIDI CC 11") && swell.to_string().contains("set_cc_map"), "{swell}");
         // A node without a plugin has none, and says so with an empty list.
         let delay = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None })));
         assert_eq!(delay["main_controls"], json!([]));

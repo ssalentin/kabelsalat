@@ -1586,3 +1586,10 @@ Learned so far (2026-11-15, UI polish pass):
     pedals a sustain learn sat 1.5 s in range capture instead of binding on
     its first CC. Both ask `cc_dest_is_switch`; a new on/off destination is
     added there (`a_learned_sustain_pedal_is_a_switch_and_binds_on_the_first_cc`).
+191. **A parameter tool never sends a MIDI CC name as a parameter id:**
+    `resolve_unit_knob`/`resolve_headless_knob` answer "swell" with
+    `(11, MidiCc)`, and #251's `set_param` took the number alone, so it would
+    have set parameter 11 of the organ. `set_param` skips MidiCc hits, falls
+    back to the plugin's own parameter list, and refuses with "MIDI CC 11 …
+    set_cc_map" (`set_param_never_sends_a_pedal_name_as_a_parameter_id`).
+    A resolver that returns a target is matched on it at every call site.

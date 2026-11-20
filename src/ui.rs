@@ -10064,6 +10064,9 @@ impl DemoApp {
                 Ok(CcTarget::Mix) => {
                     return "error: set_param does not edit mixer strips — use set_rig_mix or set_strip_mix".into();
                 }
+                Ok(CcTarget::MidiCc | CcTarget::ChannelPressure) => {
+                    return "error: set_param sets parameters, not MIDI messages — map a controller with set_cc_map".into();
+                }
                 Ok(parsed) => Some(parsed),
                 Err(e) => return format!("error: {e}"),
             },
@@ -10085,6 +10088,8 @@ impl DemoApp {
                 // If caller explicitly asked for target="plugin" on a CLAP node,
                 // don't match the rack's built-in LEVEL knob (CcTarget::Knob).
                 !(is_clap && explicit_target == Some(CcTarget::PluginParam) && tgt == CcTarget::Knob)
+                    // A pedal or wheel name ("swell") is a MIDI CC the keys send, not a parameter.
+                    && tgt != CcTarget::MidiCc
             });
             if let Some((id, tgt)) = knob_hit {
                 (id, tgt)
@@ -10126,7 +10131,10 @@ impl DemoApp {
                 };
                 match found {
                     Some(id) => (id, if is_clap { CcTarget::PluginParam } else { CcTarget::Knob }),
-                    None => return format!("error: no parameter '{name}' on {unit_display} (call list_params(node={node}) to inspect)"),
+                    None => return match crate::matrix::parse_midi_cc_name(name) {
+                        Some(cc) => format!("error: '{name}' is MIDI CC {cc}, not a parameter of {unit_display} — map a controller to it with set_cc_map"),
+                        None => format!("error: no parameter '{name}' on {unit_display} (call list_params(node={node}) to inspect)"),
+                    },
                 }
             }
         } else if let Some(id) = param_arg {
@@ -38803,6 +38811,19 @@ mod instrument_midi_learn_tests {
         settle_learn(&mut app, &ctx);
         assert_eq!(crate::organ::drawbar_position(app.kb_organ_value(crate::organ::drawbar_param(2))), 4,
             "hardware CC synced 8' drawbar to position 4");
+    }
+
+    #[test]
+    fn set_param_never_sends_a_pedal_name_as_a_parameter_id() {
+        let (mut app, _ctx, mut drain, organ) = organ_console_app();
+        while drain.pop().is_some() {}
+        let out = app.exec_tool("set_param", &serde_json::json!({"node": organ, "name": "swell", "normalized": 0.5}));
+        assert!(out.starts_with("error:") && out.contains("MIDI CC 11") && out.contains("set_cc_map"), "{out}");
+        let out = app.exec_tool("set_param", &serde_json::json!({"node": organ, "param": 11, "target": "cc", "normalized": 0.5}));
+        assert!(out.starts_with("error:"), "{out}");
+        let mut cmds = Vec::new();
+        while let Some(c) = drain.pop() { cmds.push(c); }
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SetParam { param: 11, .. })), "{cmds:?}");
     }
 
     #[test]

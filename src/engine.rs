@@ -950,6 +950,15 @@ pub struct RigMix {
 
 impl RigMix {
     pub const DEFAULT: Self = Self { vol: 1.0, pan: 0.0, mute: false, solo: false };
+
+    /// Rig solo is exclusive: soloing `rig` clears every other rig's solo.
+    /// The engine (`SetRigMix`) and the UI mirror both apply it, so every
+    /// caller (strip button, CC, agent, MCP, CLI) gets one soloed rig.
+    pub fn solo_only(mix: &mut [RigMix], rig: usize) {
+        for (i, m) in mix.iter_mut().enumerate() {
+            if i != rig { m.solo = false; }
+        }
+    }
 }
 
 impl Default for RigMix {
@@ -3250,6 +3259,7 @@ impl GraphEngine {
         if let Some(p) = e.pan { m.pan = p.clamp(-1.0, 1.0); }
         if let Some(b) = e.mute { m.mute = b; }
         if let Some(b) = e.solo { m.solo = b; }
+        if e.solo == Some(true) { RigMix::solo_only(&mut self.rig_mix, (rig as usize).min(7)); }
         self.mix_dirty = true;
     }
 
@@ -6130,6 +6140,32 @@ mod tests {
         let b_gain = super::strip_gains_of(&strips, &g, b, &solo).expect("the soloed source has a gain");
         assert!(b_gain.0 > 0.99 && b_gain.1 > 0.99, "the soloed source plays: {b_gain:?}");
         assert_eq!(super::strip_gains_of(&[], &g, a, &[false; 8]), None, "no solo, no entry: untouched path");
+    }
+
+    /// Rig solo is exclusive: soloing rig 1 un-solos rig 0, in the engine
+    /// and in what it publishes. Un-soloing touches no other rig.
+    #[test]
+    fn soloing_a_rig_unsolos_every_other_rig() {
+        use crate::control::{command_bus, Command, Graph};
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let mut buf = vec![0.0f32; 64 * 2];
+        let solo = |rig, on| Command::SetRigMix { rig, vol: None, pan: None, mute: None, solo: Some(on) };
+        bus.send(solo(0, true));
+        engine.render(&mut buf, 2);
+        assert!(engine.rig_mix[0].solo);
+        bus.send(Command::SetRigMix { rig: 0, vol: Some(0.4), pan: None, mute: Some(true), solo: None });
+        bus.send(solo(1, true));
+        engine.render(&mut buf, 2);
+        assert!(!engine.rig_mix[0].solo, "rig 0 is no longer soloed");
+        assert!(engine.rig_mix[1].solo, "rig 1 is soloed");
+        assert_eq!(engine.rig_mix[0], super::RigMix { vol: 0.4, pan: 0.0, mute: true, solo: false }, "only rig 0's solo changed");
+        assert_eq!(pub_.lock().unwrap().mix[0].solo, false, "the published mix shows rig 0 un-soloed");
+        bus.send(solo(2, false));
+        engine.render(&mut buf, 2);
+        assert!(engine.rig_mix[1].solo, "un-soloing another rig leaves rig 1 soloed");
     }
 
     use crate::matrix::{CcTarget, Matrix, MidiMsg, SourceId};

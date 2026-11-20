@@ -1085,8 +1085,9 @@ pub enum Command {
     RenameRig { rig: u8, name: Name },
     /// Per-rig mixer (AUM overview strip): volume (0..1), pan (-1..1),
     /// mute/solo. Applied at the rig's MasterOut when summing to the physical
-    /// output. Omitted fields keep their current value. Solo mutes every
-    /// non-solo rig; resets on graph loads.
+    /// output. Omitted fields keep their current value. Solo is exclusive:
+    /// `solo: Some(true)` clears every other rig's solo, and the soloed rig
+    /// mutes all others. Resets on graph loads.
     SetRigMix {
         rig: u8,
         vol: Option<f32>,

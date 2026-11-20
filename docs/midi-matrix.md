@@ -51,9 +51,13 @@ Per event, each matching rule applies, in order:
      (`velocity > 0`). Note-offs bypass it so a note can always be released.
    - **Velocity-0 note-ons are normalized to `NoteOff`** (MIDI convention)
      and bypass the velocity filter.
-4. **CC** — an **empty `cc_map` is transparent** (all CCs pass). A non-empty
-   map is a **whitelist**: only mapped controllers pass, forwarded
-   **unchanged** (CC7 stays CC7). The cc→param binding is rule metadata
+4. **CC** — an **empty `cc_map` is transparent** (all CCs pass). A map with
+   parameter bindings (`PluginParam`, `Knob`, `Mix`) is a **whitelist**: only
+   mapped controllers pass, forwarded **unchanged** (CC7 stays CC7). A
+   `ChannelPressure` binding (used by wind-controller profiles for CC 2
+   breath) forwards channel aftertouch alongside the CC without turning the
+   map into a whitelist, so glide, sustain and other performance CCs keep
+   passing through. The cc→param binding is rule metadata
    (`rule.param_for_cc(cc)`) that the destination applies — see integration
    below. Key/velocity ranges never apply to CCs.
 5. **Poly aftertouch** presses one played key, so it takes that key's path:

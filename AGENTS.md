@@ -175,10 +175,11 @@ and never passed off as tested.**
   Do not open one by hand for a PR. A PR that merged without a valid section
   gets an issue anyway, asking for the steps: settle it from the PR's diff.
   A check that belongs to no PR uses the "Bench test" issue template.
-- **A bench test does not hold the merge; it holds the release.** PRs still
-  merge on green CI. `prepare-release.yml` refuses while an issue labelled
-  `bench` or `bench-failed` is open; releasing anyway (`-f skip_bench=true`)
-  is the user's call, never an agent's.
+- **A bench test does not hold the merge; it holds the release.** `bench-check`
+  runs only on release PRs (`release-*`, via `bench.py gate`), never on regular
+  PRs, so regular PRs merge automatically on green CI. `prepare-release.yml`
+  also refuses while an issue labelled `bench` or `bench-failed` is open;
+  releasing anyway (`-f skip_bench=true`) is the user's call, never an agent's.
 - **Prefer a test the server can run.** Before you write a bench test, ask
   whether the same thing can be checked headless: raw MIDI bytes, the
   offline engine, a rendered file. A bench test is for what truly needs the

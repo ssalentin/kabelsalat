@@ -58,9 +58,9 @@ them, under `## Bench test`: `none: <reason>`, or a `Needs:` line (`audio`,
 `.github/workflows/bench.yml` runs `scripts/ci/bench.py` (self-tested on a
 real PR body, `--selftest`):
 
-- `bench-check` fails a PR whose section is missing or malformed. It runs
-  when the PR is opened or its description is edited, and is advisory like
-  `readme-check`.
+- `bench-check` runs only on release PRs (`release-*`) and runs
+  `bench.py gate`, failing while any `bench` or `bench-failed` issue is
+  open. Regular PRs skip it so they merge automatically on green CI.
 - `bench-issue` runs when a PR merges and opens one issue labelled `bench`,
   `bench:<need>` and the PR's area labels, with the steps and the merge
   commit. A PR that merged without a valid section gets an issue asking for

@@ -30540,6 +30540,8 @@ mod split_bpm_tests {
         rclick(&mut app, &ctx, level_pos);
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(2), 0, 74, 64));
         frame(&mut app, &ctx, vec![]);
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(&mut app, &ctx, vec![]);
 
         // Right-click bound knob opens the menu with "MIDI learn again" and "Clear MIDI map".
         // The egui Area needs one extra frame after the sizing pass to paint.
@@ -30558,6 +30560,8 @@ mod split_bpm_tests {
 
         // Send CC 14 from Hardware(1): replaces old Hardware(2) CC 74 binding.
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 14, 90));
+        frame(&mut app, &ctx, vec![]);
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
         let texts = frame(&mut app, &ctx, vec![]);
         assert!(texts.iter().any(|t| t == "CC 14"), "replaced tag painted: {texts:?}");
         assert!(!app.rule_edits.contains_key(&(SourceId::Hardware(2), 1)), "old binding cleared");

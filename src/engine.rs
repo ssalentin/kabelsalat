@@ -2380,6 +2380,33 @@ impl GraphEngine {
         }
     }
 
+    /// The master insert chain (#77), in signal order, as effect indices
+    /// (`fx_node`): the effect a MasterOut's OUT cable feeds, then the one
+    /// that effect feeds, and so on. These run in the master stage on the
+    /// mix and nowhere else. Allocation-free.
+    fn master_inserts(&self) -> ([usize; MAX_MASTER_INSERTS], usize) {
+        let mut chain = [usize::MAX; MAX_MASTER_INSERTS];
+        let mut n = 0usize;
+        let n_fx = self.dsp.len() + self.lv2.len();
+        while n < MAX_MASTER_INSERTS {
+            let next = (0..n_fx).find(|f| {
+                let node = self.fx_node(*f);
+                !chain[..n].contains(f)
+                    && if n == 0 {
+                        self.graph.nodes.iter().any(|m| {
+                            matches!(m.kind, NodeKind::MasterOut) && self.graph.has_route(m.id, node, PortKind::Audio)
+                        })
+                    } else {
+                        self.graph.has_route(self.fx_node(chain[n - 1]), node, PortKind::Audio)
+                    }
+            });
+            let Some(f) = next else { break };
+            chain[n] = f;
+            n += 1;
+        }
+        (chain, n)
+    }
+
     /// Node of effect `f` (DSP slots first, then LV2 slots).
     fn fx_node(&self, f: usize) -> NodeId {
         if f < self.dsp.len() { self.dsp[f].node } else { self.lv2[f - self.dsp.len()].node }
@@ -4542,12 +4569,15 @@ impl GraphEngine {
         // 2b. Effects in signal-flow order (`run_effects`). Built-in effects
         // used to hear only CLAP voices and audio inputs, and LV2 ran after
         // them, so setBfree → Drive and Delay → Reverb were silent. A bus and
-        // its insert chain wait for the rig sums below.
+        // its insert chain wait for the rig sums below, and a master insert
+        // for the mix: run here too, on the silence a MasterOut is as a
+        // source, a Delay or Limiter advanced its state twice a block (#154).
         let mut bus = std::mem::take(&mut self.lv2_in);
         let n_dsp = self.dsp.len();
+        let (inserts, n_ins) = self.master_inserts();
         self.fx_done.clear();
         for f in 0..n_dsp + self.lv2.len() {
-            let later = self.fx_is_bus(f) || self.fx_after_bus[f];
+            let later = self.fx_is_bus(f) || self.fx_after_bus[f] || inserts[..n_ins].contains(&f);
             self.fx_done.push(later || (f < n_dsp && self.dsp[f].kind == DspKind::Metronome));
         }
         self.run_effects(&mut bus, frames, &solo_rigs, Some(&mut taps));
@@ -4751,43 +4781,29 @@ impl GraphEngine {
             // order, BEFORE the fixed limiter + warmth. The cables stay the
             // truth — an insert is exactly an audio edge out of a master.
             // Allocation-free: a fixed stack table, linear scans.
-            let mut inserts = [(NodeId::MAX, false); MAX_MASTER_INSERTS];
-            let mut n_ins = 0usize;
-            loop {
-                if n_ins >= MAX_MASTER_INSERTS { break; }
-                let mut next = None;
-                for f in 0..(self.dsp.len() + self.lv2.len()) {
-                    let (node, is_dsp) = if f < self.dsp.len() {
-                        (self.dsp[f].node, true)
-                    } else {
-                        (self.lv2[f - self.dsp.len()].node, false)
-                    };
-                    if inserts[..n_ins].iter().any(|(n, _)| *n == node) { continue; }
-                    let fed = if n_ins == 0 {
-                        masters[..n_masters].iter().any(|&m| self.graph.has_route(m, node, PortKind::Audio))
-                    } else {
-                        self.graph.has_route(inserts[n_ins - 1].0, node, PortKind::Audio)
-                    };
-                    if fed { next = Some((node, is_dsp)); break; }
-                }
-                match next {
-                    Some(x) => inserts[n_ins] = x,
-                    None => break,
-                }
-                n_ins += 1;
-            }
-            for &(node, is_dsp) in inserts.iter().take(n_ins) {
-                if strip_bypassed(&self.strips, node) { continue; }
-                if is_dsp {
-                    let Some(d) = self.dsp.iter_mut().find(|d| d.node == node) else { continue };
+            for &f in &inserts[..n_ins] {
+                let node_t0 = std::time::Instant::now();
+                let node = self.fx_node(f);
+                // A bypassed insert passes the mix on unchanged; its buffer
+                // still carries it, which is what its cable shows.
+                let bypassed = strip_bypassed(&self.strips, node);
+                if f < n_dsp {
+                    let d = &mut self.dsp[f];
                     d.buf[..n2].copy_from_slice(&acc[..n2]);
-                    d.proc.process(&mut d.buf[..n2], frames);
-                    acc.copy_from_slice(&d.buf[..n2]);
+                    if !bypassed {
+                        d.proc.process(&mut d.buf[..n2], frames);
+                        acc.copy_from_slice(&d.buf[..n2]);
+                    }
                 } else {
-                    let Some(slot) = self.lv2.iter_mut().find(|s| s.node == node) else { continue };
-                    slot.plugin.process(&acc[..n2], &mut slot.buf[..n2], frames);
-                    acc.copy_from_slice(&slot.buf[..n2]);
+                    let slot = &mut self.lv2[f - n_dsp];
+                    if bypassed {
+                        slot.buf[..n2].copy_from_slice(&acc[..n2]);
+                    } else {
+                        slot.plugin.process(&acc[..n2], &mut slot.buf[..n2], frames);
+                        acc.copy_from_slice(&slot.buf[..n2]);
+                    }
                 }
+                self.node_timer.record(node, node_t0.elapsed());
             }
             let drive = 1.0 + self.master_warm * 3.0;
             let vol = self.master_vol;

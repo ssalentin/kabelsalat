@@ -1070,14 +1070,14 @@ pub fn run_test() -> anyhow::Result<()> {
     engine.render(&mut buf, 2);
     reference.extend_from_slice(&buf);
     for &n in &[60u8, 64, 67] {
-        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     }
     for _ in 0..(2.0 * SR / BLOCK as f64) as usize {
         engine.render(&mut buf, 2);
         reference.extend_from_slice(&buf);
     }
     for &n in &[60u8, 64, 67] {
-        bus.send(Command::NoteOff { note: n, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note: n, source: SourceId::Keys, channel: 0 });
     }
     for _ in 0..(0.5 * SR / BLOCK as f64) as usize {
         engine.render(&mut buf, 2);
@@ -1241,14 +1241,14 @@ fn record_stems_take(solo: Option<u8>) -> anyhow::Result<StemsTake> {
     bus.send(Command::RecordStart);
     engine.render(&mut buf, 2);
     master_ref.extend_from_slice(&buf);
-    bus.send(Command::NoteOn { note: 72, velocity: 0.9, source: SourceId::Keys });
-    bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Hardware(0) });
+    bus.send(Command::NoteOn { note: 72, velocity: 0.9, source: SourceId::Keys, channel: 0 });
+    bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Hardware(0), channel: 0 });
     for _ in 0..(1.0 * SR / BLOCK as f64) as usize {
         engine.render(&mut buf, 2);
         master_ref.extend_from_slice(&buf);
     }
-    bus.send(Command::NoteOff { note: 72, source: SourceId::Keys });
-    bus.send(Command::NoteOff { note: 48, source: SourceId::Hardware(0) });
+    bus.send(Command::NoteOff { note: 72, source: SourceId::Keys, channel: 0 });
+    bus.send(Command::NoteOff { note: 48, source: SourceId::Hardware(0), channel: 0 });
     for _ in 0..(0.3 * SR / BLOCK as f64) as usize {
         engine.render(&mut buf, 2);
         master_ref.extend_from_slice(&buf);

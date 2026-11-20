@@ -190,6 +190,51 @@ pub fn with_stop(state: &[u8], division: usize, stop: usize, on: bool) -> Option
     Some(v.to_string().into_bytes())
 }
 
+/// Whether `division`'s tremulant is enabled in `state`.
+pub fn tremulant(state: &[u8], division: usize) -> Option<bool> {
+    let v: Value = serde_json::from_slice(state).ok()?;
+    v.get("divisions")?.get(division)?.get("tremulant_enabled")?.as_bool()
+}
+
+/// `state` with `division`'s tremulant set to `on`.
+pub fn with_tremulant(state: &[u8], division: usize, on: bool) -> Option<Vec<u8>> {
+    if division >= DIVISIONS.len() { return None; }
+    let mut v: Value = serde_json::from_slice(state).ok()?;
+    let div = v.get_mut("divisions")?.get_mut(division)?;
+    div["tremulant_enabled"] = Value::Bool(on);
+    Some(v.to_string().into_bytes())
+}
+
+/// Bitmask of enabled couplers per division (bit `j` = `DIVISIONS[d].links[j]`).
+pub fn couplers(state: &[u8]) -> Option<[u8; 4]> {
+    let v: Value = serde_json::from_slice(state).ok()?;
+    let divisions = v.get("divisions")?.as_array()?;
+    if divisions.len() != DIVISIONS.len() { return None; }
+    let mut out = [0u8; 4];
+    for ((d, div), bits) in divisions.iter().zip(&DIVISIONS).zip(&mut out) {
+        let Some(links) = d.get("links").and_then(Value::as_array) else { continue };
+        for l in links {
+            let Some(name) = l.get("division").and_then(Value::as_str) else { continue };
+            if let Some(i) = div.links.iter().position(|n| *n == name) {
+                if l.get("enabled").and_then(Value::as_bool) == Some(true) {
+                    *bits |= 1 << i;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `state` with one coupler (`DIVISIONS[division].links[link]`) toggled.
+pub fn with_coupler(state: &[u8], division: usize, link: usize, on: bool) -> Option<Vec<u8>> {
+    let target = *DIVISIONS.get(division)?.links.get(link)?;
+    let mut v: Value = serde_json::from_slice(state).ok()?;
+    let links = v.get_mut("divisions")?.get_mut(division)?.get_mut("links")?.as_array_mut()?;
+    let entry = links.iter_mut().find(|l| l.get("division").and_then(Value::as_str) == Some(target))?;
+    entry["enabled"] = Value::Bool(on);
+    Some(v.to_string().into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +302,20 @@ mod tests {
     fn only_aeolus_starts_with_a_registration() {
         assert!(initial_state(AEOLUS_ID).is_some());
         assert!(initial_state("org.surge-synth-team.surge-xt").is_none());
+    }
+
+    #[test]
+    fn tremulant_and_couplers_toggle_and_read_back() {
+        let start = state(default_registration());
+        assert_eq!(tremulant(&start, 2), Some(false));
+        let s = with_tremulant(&start, 2, true).unwrap();
+        assert_eq!(tremulant(&s, 2), Some(true));
+        assert_eq!(tremulant(&s, 0), Some(false));
+        assert_eq!(couplers(&s), Some([0, 0, 0, 0]));
+        // Manual I (div 2) links[0] = Manual II, links[1] = Manual III.
+        let s = with_coupler(&s, 2, 0, true).unwrap();
+        let s = with_coupler(&s, 3, 2, true).unwrap();
+        assert_eq!(couplers(&s), Some([0, 0, 0b01, 0b100]));
+        assert_eq!(with_coupler(&s, 0, 0, true), None, "Manual III has no couplers");
     }
 }

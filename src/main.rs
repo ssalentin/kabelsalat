@@ -27,6 +27,7 @@ mod engine_info;
 mod guitar;
 mod host;
 mod juce;
+mod keyboard;
 mod listen;
 mod llm;
 mod lv2;

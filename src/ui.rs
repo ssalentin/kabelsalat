@@ -156,10 +156,8 @@ const FLIP_SECS: f32 = 0.35;
 
 const WHITE_SEMI: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
 const BLACK_SEMI: [usize; 5] = [1, 3, 6, 8, 10];
-/// Width of one MIDI-strip wheel in the keyboard dock, and of the wheel
-/// column left of the keys (two wheels, their gap and the gap to the keys).
-const KB_WHEEL_W: f32 = 26.0;
-const KB_WHEELS_W: f32 = 2.0 * KB_WHEEL_W + 10.0 + 12.0;
+/// The keyboard dock's playable minimum: header + keys of at least 58 px.
+const KB_DOCK_MIN_H: f32 = 112.0;
 const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black key follows
 
 // ---------------------------------------------------------------------------
@@ -168,6 +166,8 @@ const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black k
 
 // alpha/mix live in the theme module (single source for the Signal palette).
 use crate::theme::{alpha, mix};
+
+mod console;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -499,9 +499,9 @@ impl HwDirect {
         let Some(bus) = guard.as_ref() else { return false };
         let kv = f32::from_bits(self.keys_vel.load(Ordering::Relaxed));
         let cmd = if ev.velocity > 0.0 {
-            Command::NoteOn { note: ev.note, velocity: (ev.velocity * (0.35 + kv * 0.65)).clamp(0.0, 1.0), source: ev.source }
+            Command::NoteOn { note: ev.note, velocity: (ev.velocity * (0.35 + kv * 0.65)).clamp(0.0, 1.0), source: ev.source, channel: 0 }
         } else {
-            Command::NoteOff { note: ev.note, source: ev.source }
+            Command::NoteOff { note: ev.note, source: ev.source, channel: 0 }
         };
         let ok = bus.lock().map(|mut b| b.send(cmd)).unwrap_or(false);
         crate::bridge::record_midi_latency(ev.created.elapsed().as_micros() as u32);
@@ -686,11 +686,15 @@ const AEOLUS_POLL_SECS: f32 = 1.0;
 struct AeolusFace {
     drawn: Option<[u32; 4]>,
     division: usize,
+    tremulant: [bool; 4],
+    couplers: [u8; 4],
 }
 
 impl Default for AeolusFace {
     /// Manual I, where the registration a fresh Aeolus starts with sits.
-    fn default() -> Self { AeolusFace { drawn: None, division: 2 } }
+    fn default() -> Self {
+        AeolusFace { drawn: None, division: 2, tremulant: [false; 4], couplers: [0; 4] }
+    }
 }
 
 /// Where an Aeolus face lays out its division tabs and the stops of the
@@ -1004,6 +1008,7 @@ fn remap_session(
     let mut ns = crate::session::Session::new(s.name.clone(), graph);
     ns.rig_names = s.rig_names.clone(); // names follow their rig (#33)
     ns.master_target = s.master_target; // session-level, no node ids (#12)
+    ns.keyboard_mode = s.keyboard_mode; // session-level, no node ids (#163)
     for p in s.params() {
         if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
     }
@@ -2681,6 +2686,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "list_channels",
     "get_midi_clock", "set_midi_clock",
     "get_master_target", "set_master_target",
+    "get_keyboard_state", "set_keyboard_mode",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3141,6 +3147,38 @@ struct DemoApp {
     /// Last frame's strip rects: [pitch wheel, mod wheel, sustain chip, VEL
     /// slider] (tests + hit-testing).
     kb_strip: [Rect; 4],
+    /// Adaptive virtual keyboard state (issue #163).
+    kb_mode: crate::keyboard::KeyboardMode,
+    kb_expanded: bool,
+    /// The expanded Jazz Organ's Leslie rotor: (angle, angular speed), so
+    /// it spins up and down like the real one.
+    kb_rotor: (f32, f32),
+    kb_soft: bool,
+    kb_y_touch: bool,
+    kb_sustained: [bool; 128],
+    kb_last_vel: f32,
+    kb_swell: f32,
+    kb_dual_manual: bool,
+    kb_scale_fold: bool,
+    kb_synth_drag: crate::keyboard::SynthDragMode,
+    /// Preview state when viewing Jazz/Pipe Organ without a hosted setBfree/Aeolus unit.
+    kb_preview_drawbars: [u8; crate::organ::DRAWBARS],
+    kb_preview_leslie: usize,
+    kb_preview_perc: usize,
+    kb_preview_pipe_div: usize,
+    kb_preview_pipe_drawn: [u32; 4],
+    kb_preview_pipe_trem: [bool; 4],
+    kb_preview_pipe_couplers: [u8; 4],
+    /// Currently held pointer note on the virtual keybed (press-and-hold / gliss).
+    kb_drag_note: Option<usize>,
+    kb_drag_start_x: f32,
+    /// Channel of the held pointer note (the Lower Manual plays 1, #163).
+    kb_drag_ch: u8,
+    kb_drag_since: std::time::Instant,
+    /// Last frame's mode-switcher chip rects & expand toggle rect (tests).
+    kb_mode_rects: [Rect; 4],
+    kb_expand_rect: Rect,
+    kb_deck_rect: Rect,
     /// Per-hardware-device activity LEDs for the matrix row headers.
     hw_leds: Vec<f32>,
     /// Motion (design polish): staged fade-in after a template/session load.
@@ -3306,7 +3344,7 @@ struct DemoApp {
     chat_input: String,
     octave: u8,
     held_keys: Vec<(Key, usize)>,
-    note_offs: Vec<(std::time::Instant, usize)>,
+    note_offs: Vec<(std::time::Instant, usize, u8)>,
     /// Hardware notes for the UI (key LEDs, cable pulses). `true` = the MIDI
     /// thread already sent it to the engine (`hw_direct`), so the frame only
     /// animates it.
@@ -3652,6 +3690,31 @@ impl DemoApp {
             kb_mod: 0.0,
             kb_sustain: false,
             kb_strip: [Rect::NOTHING; 4],
+            kb_mode: crate::keyboard::KeyboardMode::Auto,
+            kb_expanded: false,
+            kb_rotor: (0.0, 0.0),
+            kb_soft: false,
+            kb_y_touch: true,
+            kb_sustained: [false; 128],
+            kb_last_vel: 0.8,
+            kb_swell: 0.85,
+            kb_dual_manual: false,
+            kb_scale_fold: false,
+            kb_synth_drag: crate::keyboard::SynthDragMode::Gliss,
+            kb_preview_drawbars: crate::organ::DEFAULT_DRAWBARS,
+            kb_preview_leslie: 1,
+            kb_preview_perc: 1,
+            kb_preview_pipe_div: 2,
+            kb_preview_pipe_drawn: [0, 0, 0b100_1010, 0],
+            kb_preview_pipe_trem: [false; 4],
+            kb_preview_pipe_couplers: [0; 4],
+            kb_drag_note: None,
+            kb_drag_start_x: 0.0,
+            kb_drag_ch: 0,
+            kb_drag_since: std::time::Instant::now(),
+            kb_mode_rects: [Rect::NOTHING; 4],
+            kb_expand_rect: Rect::NOTHING,
+            kb_deck_rect: Rect::NOTHING,
             hw_leds: Vec::new(),
             load_fade: 1.0,
             unit_hover: Vec::new(),
@@ -3917,6 +3980,10 @@ impl DemoApp {
         self.nav_pan_target = None;
         self.mixer_scroll_target = None;
         self.mixer_flash = None;
+        // The dock's held pointer note goes with the old rack (rule 41):
+        // release it out loud, then forget it and the teal sustain marks.
+        self.release_kb_drag_note();
+        self.kb_sustained = [false; 128];
         let live_nodes: std::collections::HashSet<u32> = self.units.iter().map(|u| u.node_id).collect();
         self.nav_folded.retain(|id| live_nodes.contains(id));
         self.graph_sig.clear(); // force shared-graph re-mirror
@@ -4043,6 +4110,9 @@ impl DemoApp {
         let n = self.rig_count();
         let rig = rig.min(n.saturating_sub(1));
         if rig == self.active_rig { return; }
+        // The dock's surface follows the rig in AUTO: release what the
+        // pointer holds before the routing changes (rule 41, #163).
+        self.release_kb_drag_note();
         self.active_rig = rig;
         self.compute_groups();
         // Interaction state referenced the old view's geometry.
@@ -5458,6 +5528,13 @@ impl DemoApp {
             "list_channels" => "List channels".into(),
             "measure_mix" => "Measure mix".into(),
             "get_master_target" => "Read loudness target".into(),
+            "get_keyboard_state" => "Read keyboard state".into(),
+            "set_keyboard_mode" => match args.get("mode").and_then(|v| v.as_str()) {
+                Some(m) => format!("Keyboard → {m}"),
+                None if args.get("expanded").and_then(|v| v.as_bool()) == Some(true) => "Expand keyboard".into(),
+                None if args.get("expanded").and_then(|v| v.as_bool()) == Some(false) => "Dock keyboard".into(),
+                None => "Configure keyboard".into(),
+            },
             "set_master_target" => match crate::meter::parse_target(
                 args.get("target").and_then(|v| v.as_str()),
                 args.get("lufs").and_then(|v| v.as_f64()).or_else(|| args.get("target").and_then(|v| v.as_f64())),
@@ -6043,7 +6120,11 @@ impl DemoApp {
         if d == DockView::Assistant && !self.assistant_enabled {
             return;
         }
+        self.release_kb_drag_note();
         self.dock = if self.dock == d { DockView::None } else { d };
+        if self.dock != DockView::Keyboard {
+            self.kb_expanded = false;
+        }
         if self.dock == DockView::Assistant {
             self.focus_chat_request = true;
         }
@@ -6133,6 +6214,7 @@ impl DemoApp {
         }
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
         s.master_target = Some(self.master_target);
+        s.keyboard_mode = Some(self.kb_mode);
         // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
         // display order, keyed by node like every other session value.
         for u in &self.units {
@@ -6369,6 +6451,9 @@ impl DemoApp {
         // that says nothing (template, older file) leaves it as it is.
         if let Some(target) = s.master_target {
             self.restore_master_target(target);
+        }
+        if let Some(mode) = s.keyboard_mode {
+            self.kb_mode = mode;
         }
         Ok(())
     }
@@ -6643,6 +6728,16 @@ impl DemoApp {
                     .unwrap_or_else(|e| format!("meter: {e}"))
             }
             "get_master_target" => self.master_target.readout(&self.master_meter).to_string(),
+            "get_keyboard_state" => self.keyboard_state_json().to_string(),
+            "set_keyboard_mode" => match self.apply_keyboard_mode_tool(args) {
+                Ok(out) => {
+                    let label = self.human_tool_label(name, args);
+                    let nodes: Vec<u32> = self.keys_unit.and_then(|k| self.units.get(k)).map(|u| vec![u.node_id]).unwrap_or_default();
+                    self.agent_activity.record(origin, label, nodes, now);
+                    out.to_string()
+                }
+                Err(e) => format!("error: {e}"),
+            },
             "set_master_target" => {
                 let preset = args.get("target").and_then(|v| v.as_str());
                 let number = args.get("lufs").and_then(|v| v.as_f64())
@@ -6667,6 +6762,7 @@ impl DemoApp {
                 self.note_offs.push((
                     std::time::Instant::now() + std::time::Duration::from_millis(ms),
                     semi,
+                    0,
                 ));
                 if let Some(k) = self.keys_unit.and_then(|u| self.units.get(u)).map(|u| u.node_id) {
                     self.agent_activity.record(origin, format!("Play note {note}"), vec![k], now);
@@ -15567,7 +15663,7 @@ impl DemoApp {
     /// rack can spare (rule 22). Whole pixels, so a resize does not jitter
     /// the layout.
     fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
-        const MIN_H: f32 = 112.0;
+        const MIN_H: f32 = KB_DOCK_MIN_H;
         const MAX_H: f32 = 300.0;
         let spare = (avail_h - rack_need_h).max(MIN_H);
         (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
@@ -15585,18 +15681,47 @@ impl DemoApp {
             .map(Self::dock_white_semi)
     }
 
-    /// Full-width playable software keyboard (GitHub #9): the Keys unit's octave
-    /// moved to the bottom dock. Plays through the same `fire_keys` path, lights
-    /// the same `key_leds`, and the Keys unit stays unchanged in the rack.
+    /// Full-width instrument-adaptive software keyboard (#163, GitHub #9):
+    /// one dock, four surfaces (Piano / Jazz Organ / Pipe Organ / Synth) that
+    /// follow the active rig's instrument or a manual pin. Keys are true
+    /// press-and-hold (NoteOn on pointer-down, NoteOff on pointer-up), the
+    /// piano reads velocity from the hit's Y position, organs glissando across
+    /// the waterfall, and the synth bends or slides per its DRAG mode. Every
+    /// control is a thin view over the control plane: the Keys unit's VEL,
+    /// the organ's `P_BASE` params, Aeolus's own state, the plugin's main
+    /// controls — nothing here keeps a shadow copy of engine state.
     fn keyboard_panel_ui(&mut self, root: &mut egui::Ui) {
-        let h = Self::keyboard_dock_h(root.ctx().content_rect().height(), root.available_height(), self.rack_need_h());
-        let note_leds = self.note_leds;
-        let split = self.keys_unit.and_then(|k| self.shown_split(k));
-        let octave = self.octave;
-        let base = 12 * (octave as usize + 1); // the laptop keys' lowest note
-        let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0 - KB_WHEELS_W, 1.0)));
-        let mut note: Option<usize> = None;
+        use crate::keyboard::KeyboardType;
+        if self.kb_expanded {
+            // Expanded: the instrument's own console fills the window.
+            return self.keyboard_console_ui(root);
+        }
+        let win_h = root.ctx().content_rect().height();
+        // Docked: header + keys as `keyboard_dock_h` sizes them, then the
+        // instrument's deck on top of that, never out of the keys (#164),
+        // and only what the rack spares (rule 22). With no room to spare the
+        // dock keeps the playable minimum plus the deck, and the rack pans.
+        let avail = root.available_height();
+        let need = self.rack_need_h();
+        let keys_h = Self::keyboard_dock_h(win_h, avail, need);
+        let surface = self.kb_surface();
+        let target = self.kb_target_unit();
+        let organ_unit = target.filter(|&u| self.is_organ_unit(u));
+        let aeolus_unit = target.filter(|&u| self.is_aeolus_unit(u));
+        // The full deck (drawbars, X/Y pad) from the default 200 px dock up.
+        let deck_h = match surface {
+            KeyboardType::PipeOrgan => 58.0,
+            _ => if keys_h >= 196.0 { 64.0 } else { 40.0 },
+        };
+        let h = (keys_h + deck_h + 4.0).min((avail - need).max(KB_DOCK_MIN_H + deck_h + 4.0)).round();
+        let cheek_w = match surface {
+            KeyboardType::Piano => 46.0,
+            KeyboardType::JazzOrgan => 96.0,
+            KeyboardType::PipeOrgan => 44.0,
+            KeyboardType::Synth => 80.0,
+        };
         let mut kb_rect = Rect::NOTHING;
+        let mut deck_rect = Rect::NOTHING;
         let mut strip = [Rect::NOTHING; 4];
         // exact_size, not default_size: egui keeps a panel's first size, so
         // the dock never followed a window resize (#23).
@@ -15610,102 +15735,1239 @@ impl DemoApp {
                     .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(root, |ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 22.0),
+                self.kb_header(ui, surface, target, false);
+                ui.add_space(4.0);
+                // --- the surface's control deck ------------------------------
+                deck_rect = ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), deck_h),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        ui.label(egui::RichText::new("Software Keyboard").font(theme::medium_font(13.5)).color(theme::INK));
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(format!("C{octave}–C{} · laptop keys play notes", octave as usize + n_oct))
-                            .size(11.5).color(theme::INK_2));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::chip_button(ui, "×", false).on_hover_text("hide the keyboard (V)").clicked() {
-                                self.dock = DockView::None;
-                            }
-                            // The MIDI strip's horizontal controls (GitHub #97)
-                            // share the header row; the wheels stand beside the
-                            // keys. A strip row of its own took its height from
-                            // the keys.
-                            ui.add_space(14.0);
-                            self.kb_vel_ui(ui, &mut strip[3]);
-                            ui.add_space(14.0);
-                            let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain)
-                                .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts");
-                            strip[2] = sus.rect;
-                            if sus.clicked() {
-                                self.kb_sustain = !self.kb_sustain;
-                                self.kb_cc(64, if self.kb_sustain { 127 } else { 0 });
-                                self.kb_strip_pulse(0.85);
-                            }
-                        });
+                        match surface {
+                            KeyboardType::Piano => self.kb_deck_piano(ui, target, deck_h, &mut strip),
+                            KeyboardType::JazzOrgan => self.kb_deck_jazz(ui, organ_unit, deck_h),
+                            KeyboardType::PipeOrgan => self.kb_deck_pipe(ui, aeolus_unit, deck_h),
+                            KeyboardType::Synth => self.kb_deck_synth(ui, target, deck_h, &mut strip),
+                        }
                     },
-                );
+                ).response.rect;
                 ui.add_space(4.0);
-                // Claim the whole remaining area so the panel's measured height
-                // (egui derives the outer rect from the content's min_rect) stays
-                // at the requested size instead of collapsing to the header row.
-                // Pitch bend and modulation wheels stand left of the keys, as
-                // tall as the keys (like GarageBand's); all strip signals go out
-                // as the Keys source, so the matrix routes them to the same rigs
-                // the played notes reach.
-                let (area, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), ui.available_height().max(48.0)),
-                    egui::Sense::hover(),
-                );
-                let wheel = |i: f32| Rect::from_min_max(
-                    Pos2::new(area.left() + i * (KB_WHEEL_W + 10.0), area.top() + 6.0),
-                    Pos2::new(area.left() + i * (KB_WHEEL_W + 10.0) + KB_WHEEL_W, area.bottom() - 19.0),
-                );
-                self.kb_wheel_ui(ui, wheel(0.0), "PITCH", true);
-                self.kb_wheel_ui(ui, wheel(1.0), "MOD", false);
-                strip[0] = wheel(0.0);
-                strip[1] = wheel(1.0);
-                let r = Rect::from_min_max(Pos2::new(area.left() + KB_WHEELS_W, area.top()), area.max);
-                let kb_resp = ui.interact(r, ui.id().with("dock_keys"), egui::Sense::click());
-                kb_rect = r;
-                let painter = ui.painter().clone();
-                let lit = |semi: usize| note_leds[(base + semi).min(127)] > 0.02;
-                for wi in 0..Self::dock_whites(kb_rect) {
-                    let kr = Self::dock_key_rect(kb_rect, wi);
-                    let fill = if lit(Self::dock_white_semi(wi)) { theme::ACCENT } else { WHITE };
-                    painter.rect_filled(kr, 3.0, fill);
-                    painter.rect_stroke(kr, 3.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
-                }
-                for oct in 0..Self::dock_octaves(kb_rect) {
-                    for bi in 0..5 {
-                        let kr = Self::dock_black_key_rect(kb_rect, oct, bi);
-                        let fill = if lit(12 * oct + BLACK_SEMI[bi]) { theme::ACCENT } else { BLACK };
-                        painter.rect_filled(kr, 2.0, fill);
-                        painter.rect_stroke(kr, 2.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
-                    }
-                }
-                // Split point: a line on the left edge of the split key (white keys).
-                if let Some(p) = split {
-                    let span = 12 * Self::dock_octaves(kb_rect);
-                    let semi = p as i64 - base as i64;
-                    if semi > 0 && semi <= span as i64 {
-                        let semi = semi as usize;
-                        let wi = (0..Self::dock_whites(kb_rect)).find(|&w| Self::dock_white_semi(w) >= semi).unwrap_or(0);
-                        let x = Self::dock_key_rect(kb_rect, wi).left() - 0.5;
-                        let top = Self::dock_key_rect(kb_rect, 0).top() - 4.0;
-                        let bot = Self::dock_key_rect(kb_rect, 0).bottom() + 4.0;
-                        painter.line_segment([Pos2::new(x, top), Pos2::new(x, bot)], Stroke::new(2.0, theme::CREAM));
-                    }
-                }
-                if kb_resp.clicked() {
-                    if let Some(pos) = kb_resp.interact_pointer_pos() {
-                        note = Self::dock_key_hit(kb_rect, pos);
-                    }
-                }
+                // --- cheekblock + keybed -------------------------------------
+                let bed_h = ui.available_height().max(48.0);
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(cheek_w, bed_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            match surface {
+                                KeyboardType::Piano => self.kb_cheek_piano(ui, bed_h),
+                                KeyboardType::JazzOrgan => self.kb_cheek_jazz(ui, bed_h),
+                                KeyboardType::PipeOrgan => self.kb_cheek_swell(ui, bed_h),
+                                KeyboardType::Synth => self.kb_cheek_synth(ui, bed_h, &mut strip),
+                            }
+                        },
+                    );
+                    let (area, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), bed_h), egui::Sense::hover());
+                    kb_rect = self.kb_keybed(ui, area, surface, 8.0);
+                });
             });
         self.dock_rect = resp.response.rect;
         self.dock_kb_rect = kb_rect;
+        self.kb_deck_rect = deck_rect;
         self.kb_strip = strip;
         self.assistant_rect = Rect::NOTHING;
         self.assistant_input_rect = Rect::NOTHING;
-        if let Some(semi) = note {
-            self.click_note((base + semi).min(127));
+    }
+
+    /// The keyboard's header row: surface chips (AUTO + the four), the
+    /// target badge, octave, chord readout, EXPAND/DOCK and close. The dock
+    /// and the expanded console share it.
+    fn kb_header(&mut self, ui: &mut egui::Ui, surface: crate::keyboard::KeyboardType, target: Option<usize>, expanded: bool) {
+        use crate::keyboard::{KeyboardMode, KeyboardType};
+        let octave = self.octave;
+        let chord = crate::keyboard::detect_chord(&self.held_note_list());
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 22.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                if expanded {
+                    // The console names what it plays.
+                    let title = target.map(|t| sentence_case(&self.units[t].name)).unwrap_or_else(|| surface.label().to_string());
+                    ui.label(egui::RichText::new(title).font(theme::medium_font(16.0)).color(theme::INK));
+                    ui.add_space(14.0);
+                } else {
+                    ui.label(egui::RichText::new("Keyboard").font(theme::medium_font(13.5)).color(theme::INK));
+                    ui.add_space(6.0);
+                }
+                if theme::chip_button(ui, "AUTO", self.kb_mode == KeyboardMode::Auto)
+                    .on_hover_text("follow the active rig's instrument")
+                    .clicked()
+                {
+                    self.kb_set_mode(KeyboardMode::Auto);
+                }
+                ui.add_space(2.0);
+                for (i, t) in KeyboardType::ALL.iter().enumerate() {
+                    let pinned = self.kb_mode.pinned() == Some(*t);
+                    let label = if ui.available_width() < if expanded { 900.0 } else { 560.0 } { t.short_label() } else { t.label() };
+                    let r = theme::chip_button(ui, label, surface == *t);
+                    self.kb_mode_rects[i] = r.rect;
+                    let tip = if pinned { "pinned — click to return to AUTO" } else { "pin this keyboard surface" };
+                    if r.on_hover_text(tip).clicked() {
+                        self.kb_set_mode(if pinned { KeyboardMode::Auto } else { KeyboardMode::Pinned(*t) });
+                    }
+                    ui.add_space(2.0);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::chip_button(ui, "×", false).on_hover_text("hide the keyboard (V)").clicked() {
+                        self.release_kb_drag_note();
+                        self.dock = DockView::None;
+                        self.kb_expanded = false;
+                    }
+                    ui.add_space(4.0);
+                    let exp = theme::chip_button(ui, if expanded { "DOCK" } else { "EXPAND" }, expanded);
+                    self.kb_expand_rect = exp.rect;
+                    if exp.on_hover_text("fullscreen performance view (Shift+V; Esc returns)").clicked() {
+                        self.kb_expanded = !self.kb_expanded;
+                    }
+                    ui.add_space(8.0);
+                    let chord_txt = chord.clone().unwrap_or_else(|| "—".into());
+                    ui.label(egui::RichText::new(chord_txt)
+                        .font(theme::medium_font(if expanded { 16.0 } else { 12.5 }))
+                        .color(if chord.is_some() { theme::LIVE_TEAL } else { theme::MUTED }));
+                    ui.add_space(8.0);
+                    if theme::chip_button(ui, "+", false).on_hover_text("octave up").clicked() {
+                        self.octave = (self.octave + 1).min(7);
+                    }
+                    ui.label(egui::RichText::new(format!("C{octave}")).size(11.5).color(theme::INK_2));
+                    if theme::chip_button(ui, "−", false).on_hover_text("octave down").clicked() {
+                        self.octave = self.octave.saturating_sub(1).max(1);
+                    }
+                    if ui.available_width() > 130.0 {
+                        ui.add_space(8.0);
+                        let badge = match (self.kb_mode, target) {
+                            (KeyboardMode::Auto, Some(t)) => format!("AUTO · {}", self.rig_name(self.units[t].rig as usize).to_uppercase()),
+                            (KeyboardMode::Auto, None) => "AUTO · NO INSTRUMENT".into(),
+                            _ => "PINNED".into(),
+                        };
+                        ui.label(egui::RichText::new(badge).size(10.5).color(theme::CREAM_DIM));
+                    }
+                });
+            },
+        );
+    }
+
+    /// One keybed (two stacked manuals for a dual Jazz Organ) painted into
+    /// `area` and played: press-and-hold, glissando, SLIDE bends. The dock
+    /// and the expanded console share it; returns the (upper) bed.
+    fn kb_keybed(&mut self, ui: &mut egui::Ui, area: Rect, surface: crate::keyboard::KeyboardType, gap: f32) -> Rect {
+        use crate::keyboard::{KeyboardType, SynthDragMode};
+        let note_leds = self.note_leds;
+        let sustained = self.kb_sustained;
+        let split = self.keys_unit.and_then(|k| self.shown_split(k));
+        let base = 12 * (self.octave as usize + 1); // the laptop keys' lowest note
+        let scale = self.keys_unit.and_then(|k| self.keys_scale(k));
+        let bed_resp = ui.interact(area, egui::Id::NULL.with("kb_bed"), egui::Sense::click_and_drag());
+        // Dual manual: two stacked waterfall keybeds, Upper on
+        // channel 0 and Lower on channel 1 (setBfree's manuals).
+        let dual = surface == KeyboardType::JazzOrgan && self.kb_dual_manual && area.height() >= 130.0;
+        let (bed, lower) = if dual {
+            let uh = ((area.height() - gap) * 0.5).round();
+            let up = Rect::from_min_size(area.min, egui::vec2(area.width(), uh));
+            let lo = Rect::from_min_max(Pos2::new(area.left(), area.top() + uh + gap), area.max);
+            (up, Some(lo))
+        } else {
+            (area, None)
+        };
+        let folded = surface == KeyboardType::Synth && self.kb_scale_fold && scale.is_some();
+        let fold_keys: Vec<crate::keyboard::FoldedKey> = if folded {
+            let count = (((bed.width() - 12.0) / 38.0).floor() as usize).clamp(7, 21);
+            crate::keyboard::folded_scale_keys(scale.unwrap(), base as u8, count)
+        } else {
+            Vec::new()
+        };
+        let fold_rect = |i: usize| -> Rect {
+            let kw = (bed.width() - 12.0) / fold_keys.len().max(1) as f32;
+            Rect::from_min_size(
+                Pos2::new(bed.left() + 6.0 + i as f32 * kw, bed.top() + 6.0),
+                egui::vec2(kw - 1.0, (bed.height() - 12.0).max(40.0)),
+            )
+        };
+        let painter = ui.painter().clone();
+        let key_fill = match surface {
+            KeyboardType::Piano => Self::KB_IVORY,
+            KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => Self::KB_WATERFALL,
+            KeyboardType::Synth => Self::KB_SYNTH_KEY,
+        };
+        let radius = match surface {
+            KeyboardType::Piano => 3.0,
+            KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => 1.0,
+            KeyboardType::Synth => 2.0,
+        };
+        // One keybed (the upper manual when dual): rails, keys,
+        // scale marks, split divider — pure paint, no state.
+        let paint_bed = |p: &egui::Painter, bed: Rect, ch_label: Option<&str>| {
+            let lit = |semi: usize| note_leds[(base + semi).min(127)] > 0.02;
+            let sus = |semi: usize| sustained[(base + semi).min(127)];
+            // The rail above the keys: crimson felt (piano),
+            // walnut-bronze (organs), a hairline (synth).
+            let rail = Rect::from_min_size(
+                Pos2::new(bed.left() + 6.0, bed.top() + 1.0),
+                egui::vec2(bed.width() - 12.0, 4.0),
+            );
+            let rail_col = match surface {
+                KeyboardType::Piano => Self::KB_FELT,
+                KeyboardType::JazzOrgan | KeyboardType::PipeOrgan => theme::DRAWBAR_BROWN,
+                KeyboardType::Synth => theme::HAIRLINE,
+            };
+            p.rect_filled(rail, 1.0, rail_col);
+            if let Some(label) = ch_label {
+                p.text(Pos2::new(bed.left() + 10.0, bed.top() + 8.0), egui::Align2::LEFT_TOP,
+                    label, FontId::proportional(8.5), theme::MUTED);
+            }
+            if folded {
+                for (i, k) in fold_keys.iter().enumerate() {
+                    let kr = fold_rect(i);
+                    let is_lit = note_leds[k.midi as usize] > 0.02;
+                    let fill = if is_lit { theme::ACCENT }
+                        else if k.is_root { mix(Self::KB_SYNTH_KEY, theme::LIVE_TEAL, 0.22) }
+                        else { Self::KB_SYNTH_KEY };
+                    p.rect_filled(kr, 2.0, fill);
+                    p.rect_stroke(kr, 2.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
+                    let ink = if is_lit { BLACK } else { theme::MUTED };
+                    if kr.width() >= 34.0 {
+                        p.text(Pos2::new(kr.center().x, kr.top() + 10.0), egui::Align2::CENTER_TOP,
+                            &k.note_label, FontId::proportional(8.5), ink);
+                    }
+                    p.text(Pos2::new(kr.center().x, kr.bottom() - 9.0), egui::Align2::CENTER_CENTER,
+                        k.degree, theme::medium_font(10.5), if is_lit { BLACK } else if k.is_root { theme::LIVE_TEAL_DEEP } else { theme::INK_2 });
+                }
+                return;
+            }
+            let dim = |semi: usize| -> bool {
+                surface == KeyboardType::Synth && scale.is_some_and(|c| !crate::keyboard::note_in_scale(c, (base + semi) as u8).0)
+            };
+            let root = |semi: usize| -> bool {
+                surface == KeyboardType::Synth && scale.is_some_and(|c| crate::keyboard::note_in_scale(c, (base + semi) as u8).1)
+            };
+            for wi in 0..Self::dock_whites(bed) {
+                let kr = Self::dock_key_rect(bed, wi);
+                let semi = Self::dock_white_semi(wi);
+                let fill = if lit(semi) { theme::ACCENT }
+                    else if sus(semi) { theme::LIVE_TEAL }
+                    else if dim(semi) { mix(key_fill, theme::PAPER, 0.62) }
+                    else { key_fill };
+                p.rect_filled(kr, radius, fill);
+                // A tall key is lit from the front: its far end lies in
+                // shade, its near end catches the light.
+                if kr.height() >= Self::KB_SHADED_KEY_H {
+                    let face = kr.shrink(1.0);
+                    let near = face.height() * 0.3;
+                    console::vgrad(p, Rect::from_min_max(face.min, Pos2::new(face.right(), face.top() + face.height() * 0.22)),
+                        theme::alpha(Color32::BLACK, 0.16), theme::alpha(Color32::BLACK, 0.0));
+                    console::vgrad(p, Rect::from_min_max(Pos2::new(face.left(), face.bottom() - near), face.max),
+                        theme::alpha(Color32::WHITE, 0.0), theme::alpha(Color32::WHITE, if lit(semi) || sus(semi) { 0.2 } else { 0.1 }));
+                }
+                p.rect_stroke(kr, radius, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
+                // The piano's key-front lip.
+                if surface == KeyboardType::Piano && kr.height() >= 50.0 {
+                    let lip = Rect::from_min_max(Pos2::new(kr.left() + 1.0, kr.bottom() - 6.0), kr.max - egui::vec2(1.0, 1.0));
+                    p.rect_filled(lip, 1.0, mix(fill, BLACK, 0.10));
+                }
+                if root(semi) && !lit(semi) && kr.width() >= 20.0 {
+                    p.circle_filled(Pos2::new(kr.center().x, kr.bottom() - 14.0), 2.5, theme::LIVE_TEAL);
+                }
+                // C labels orient the player (never on the dual
+                // manuals' channel tags, never on tiny keys).
+                if ch_label.is_none() && surface != KeyboardType::JazzOrgan && surface != KeyboardType::PipeOrgan
+                    && semi % 12 == 0 && kr.width() >= 28.0 && kr.height() >= 54.0
+                {
+                    let oct = (base + semi) as i32 / 12 - 1;
+                    p.text(Pos2::new(kr.center().x, kr.bottom() - 8.0), egui::Align2::CENTER_CENTER,
+                        format!("C{oct}"), FontId::proportional(9.0), if lit(semi) { BLACK } else { theme::MUTED });
+                }
+            }
+            for oct in 0..Self::dock_octaves(bed) {
+                for bi in 0..5 {
+                    let kr = Self::dock_black_key_rect(bed, oct, bi);
+                    let semi = 12 * oct + BLACK_SEMI[bi];
+                    let fill = if lit(semi) { theme::ACCENT }
+                        else if sus(semi) { theme::LIVE_TEAL }
+                        else if dim(semi) { mix(BLACK, theme::PAPER, 0.45) }
+                        else { BLACK };
+                    let shaded = kr.height() >= Self::KB_SHADED_KEY_H * 0.62;
+                    if shaded {
+                        // It stands over the whites and shades them.
+                        p.add(egui::epaint::RectShape::filled(kr.translate(egui::vec2(1.5, 3.0)), 2.0, theme::alpha(Color32::BLACK, 0.36)).with_blur_width(5.0));
+                    }
+                    p.rect_filled(kr, 1.5, fill);
+                    if shaded {
+                        // Its top face slopes down to the front edge.
+                        let front = (kr.height() * 0.1).clamp(5.0, 14.0);
+                        let top = Rect::from_min_max(Pos2::new(kr.left() + 2.0, kr.top()), Pos2::new(kr.right() - 2.0, kr.bottom() - front));
+                        console::vgrad(p, top, mix(fill, BLACK, 0.12), mix(fill, theme::CREAM, 0.13));
+                        p.line_segment([top.left_bottom(), top.right_bottom()], Stroke::new(1.0, theme::alpha(theme::CREAM, 0.3)));
+                        p.rect_filled(Rect::from_min_max(Pos2::new(kr.left() + 1.0, top.bottom() + 0.5), kr.max - egui::vec2(1.0, 1.0)), 1.0, mix(fill, Color32::BLACK, 0.45));
+                    }
+                    p.rect_stroke(kr, 1.5, Stroke::new(1.0, if shaded { Color32::from_rgb(0x08, 0x08, 0x08) } else { BORDER }), egui::StrokeKind::Inside);
+                    if root(semi) && !lit(semi) {
+                        p.circle_filled(Pos2::new(kr.center().x, kr.bottom() - 6.0), 2.0, theme::LIVE_TEAL);
+                    }
+                }
+            }
+            // Split point: a line on the left edge of the split key.
+            if let Some(sp) = split {
+                let span = 12 * Self::dock_octaves(bed);
+                let semi = sp as i64 - base as i64;
+                if semi > 0 && semi <= span as i64 {
+                    let semi = semi as usize;
+                    let wi = (0..Self::dock_whites(bed)).find(|&w| Self::dock_white_semi(w) >= semi).unwrap_or(0);
+                    let x = Self::dock_key_rect(bed, wi).left() - 0.5;
+                    let top = Self::dock_key_rect(bed, 0).top() - 4.0;
+                    let bot = Self::dock_key_rect(bed, 0).bottom() + 4.0;
+                    p.line_segment([Pos2::new(x, top), Pos2::new(x, bot)], Stroke::new(2.0, theme::CREAM));
+                }
+            }
+        };
+        if folded {
+            paint_bed(&painter, bed, None);
+        } else if let Some(lo) = lower {
+            paint_bed(&painter, bed, Some("UPPER · CH 1"));
+            paint_bed(&painter, lo, Some("LOWER · CH 2"));
+        } else {
+            paint_bed(&painter, bed, None);
         }
+        // --- press-and-hold interaction --------------------------
+        // Which key a point lands on: (semitone, channel, Y fraction).
+        let hit = |p: Pos2| -> Option<(usize, u8, f32)> {
+            if folded {
+                return fold_keys.iter().enumerate().find(|(i, _)| fold_rect(*i).contains(p))
+                    .map(|(i, k)| (k.midi as usize, 0u8, ((p.y - fold_rect(i).top()) / fold_rect(i).height()).clamp(0.0, 1.0)));
+            }
+            if let Some(lo) = lower {
+                if bed.contains(p) {
+                    return Self::dock_key_hit(bed, p).map(|s| (base + s, 0u8, ((p.y - bed.top()) / bed.height()).clamp(0.0, 1.0)));
+                }
+                if lo.contains(p) {
+                    return Self::dock_key_hit(lo, p).map(|s| (base + s, 1u8, ((p.y - lo.top()) / lo.height()).clamp(0.0, 1.0)));
+                }
+                return None;
+            }
+            Self::dock_key_hit(bed, p).map(|s| (base + s, 0u8, ((p.y - bed.top()) / bed.height()).clamp(0.0, 1.0)))
+        };
+        let y_touch = self.kb_y_touch;
+        let hit_vel = move |yf: f32| -> f32 {
+            if surface == KeyboardType::Piano && y_touch { crate::keyboard::piano_y_velocity(yf) } else { 0.95 }
+        };
+        let any_bed = |p: Pos2| bed.contains(p) || lower.is_some_and(|lo| lo.contains(p));
+        if bed_resp.is_pointer_button_down_on() {
+            if let Some(p) = bed_resp.interact_pointer_pos() {
+                if any_bed(p) {
+                    if let Some((semi, ch, yf)) = hit(p) {
+                        let sliding = surface == KeyboardType::Synth && self.kb_synth_drag == SynthDragMode::Slide;
+                        match self.kb_drag_note {
+                            None => {
+                                let vel = hit_vel(yf);
+                                self.kb_last_vel = vel;
+                                self.kb_press(semi, vel, ch);
+                                self.kb_drag_note = Some(semi);
+                                self.kb_drag_ch = ch;
+                                self.kb_drag_start_x = p.x;
+                                self.kb_drag_since = std::time::Instant::now();
+                            }
+                            Some(old) => {
+                                if sliding {
+                                    // SLIDE: horizontal drag bends the held note
+                                    // (±2 semitones across two key widths).
+                                    let kw = ((bed.width() - 12.0) / Self::dock_whites(bed) as f32).max(20.0);
+                                    let bend = ((p.x - self.kb_drag_start_x) / kw).clamp(-2.0, 2.0) / 2.0;
+                                    let v = (bend * 8191.0).round() as i16;
+                                    if v != (self.kb_bend * 8191.0).round() as i16 {
+                                        self.kb_bend = bend;
+                                        self.kb_bend_cmd(v);
+                                    }
+                                } else if old != semi || ch != self.kb_drag_ch {
+                                    // Glissando: the smear releases the old key
+                                    // and sounds the new one, legato.
+                                    self.kb_release(old, self.kb_drag_ch);
+                                    let vel = hit_vel(yf);
+                                    self.kb_last_vel = vel;
+                                    self.kb_press(semi, vel, ch);
+                                    self.kb_drag_note = Some(semi);
+                                    self.kb_drag_ch = ch;
+                                    self.kb_drag_start_x = p.x;
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(old) = self.kb_drag_note.take() {
+                    let ch = self.kb_drag_ch;
+                    self.kb_release(old, ch);
+                    self.kb_reset_bend();
+                }
+            }
+        } else if let Some(old) = self.kb_drag_note.take() {
+            // Pointer up: a hold releases at once; a short tap
+            // keeps sounding for the rest of a click note.
+            let ch = self.kb_drag_ch;
+            if self.kb_drag_since.elapsed().as_millis() < CLICK_NOTE_MS as u128 {
+                if self.kb_sustain && surface == KeyboardType::Piano {
+                    self.kb_sustained[old.min(127)] = true;
+                }
+                self.note_offs.push((self.kb_drag_since + std::time::Duration::from_millis(CLICK_NOTE_MS), old, ch));
+            } else {
+                self.kb_release(old, ch);
+            }
+            self.kb_reset_bend();
+        } else if bed_resp.clicked() {
+            // Press and release within one frame: a click note.
+            if let Some(p) = bed_resp.interact_pointer_pos() {
+                if let Some((semi, ch, yf)) = hit(p) {
+                    let vel = hit_vel(yf);
+                    self.kb_last_vel = vel;
+                    self.kb_press(semi, vel, ch);
+                    if self.kb_sustain && surface == KeyboardType::Piano {
+                        self.kb_sustained[semi.min(127)] = true;
+                    }
+                    self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), semi, ch));
+                }
+            }
+        }
+        bed
+    }
+
+    /// Piano ivory, organ waterfall cream, synth matte key, crimson felt.
+    const KB_IVORY: Color32 = Color32::from_rgb(0xEF, 0xEE, 0xE9);
+    const KB_WATERFALL: Color32 = Color32::from_rgb(0xE8, 0xE4, 0xD8);
+    const KB_SYNTH_KEY: Color32 = Color32::from_rgb(0xEA, 0xEA, 0xE6);
+    const KB_FELT: Color32 = Color32::from_rgb(0x6E, 0x24, 0x1C);
+    /// White keys at least this tall (the console's) are shaded as solid
+    /// keys; the dock's short keys stay flat.
+    const KB_SHADED_KEY_H: f32 = 84.0;
+
+    /// Currently sounding notes (every source), for the chord readout.
+    fn held_note_list(&self) -> Vec<u8> {
+        self.notes_down.iter().enumerate().filter(|(_, b)| **b != 0).map(|(i, _)| i as u8).collect()
+    }
+
+    /// The instrument unit the dock follows: the first playable instrument
+    /// of the active rig, else of any rig (an audio-only rig keeps the last
+    /// playable MIDI rig targeted rather than going dead).
+    fn kb_target_unit(&self) -> Option<usize> {
+        let inst = |u: &Unit| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst
+            || self.base_graph.node(u.node_id).is_some_and(|n| crate::organ::is_organ(&n.kind));
+        self.units.iter().position(|u| u.rig == self.active_rig as u8 && inst(u))
+            .or_else(|| self.units.iter().position(|u| inst(u)))
+    }
+
+    /// Auto classification of the target instrument (no pin): dedicated
+    /// plugins first, then the loaded patch / plugin name, then CLAP features.
+    fn kb_detected(&self) -> crate::keyboard::KeyboardType {
+        use crate::keyboard::KeyboardType;
+        let Some(ti) = self.kb_target_unit() else { return KeyboardType::Synth };
+        let u = &self.units[ti];
+        let Some(kind) = self.base_graph.node(u.node_id).map(|n| &n.kind) else { return KeyboardType::Synth };
+        let patch = self.voice_slot_of_node(u.node_id).and_then(|s| self.patch_names.get(s)).cloned().flatten();
+        let (plugin, features) = match kind {
+            NodeKind::Clap { plugin_id } => {
+                let pid = plugin_id.as_str();
+                let name = self.plugin_display_name(pid);
+                let feats = self.plugins_clap.iter().find(|p| p.id == pid).map(|p| p.features.clone()).unwrap_or_default();
+                (name, feats)
+            }
+            NodeKind::Lv2 { uri } => {
+                let name = self.plugins_lv2.iter().find(|p| p.uri == uri.as_str()).map(|p| p.name.clone())
+                    .or_else(|| Some(sentence_case(&u.name)));
+                (name, Vec::new())
+            }
+            _ => (None, Vec::new()),
+        };
+        crate::keyboard::classify_instrument(kind, patch.as_deref(), plugin.as_deref(), &features)
+    }
+
+    /// The surface the dock renders: the manual pin, else the detection.
+    fn kb_surface(&self) -> crate::keyboard::KeyboardType {
+        self.kb_mode.pinned().unwrap_or_else(|| self.kb_detected())
+    }
+
+    /// Pin / unpin a surface. A change releases what the pointer holds first
+    /// (rule 41): the new surface may route elsewhere.
+    fn kb_set_mode(&mut self, mode: crate::keyboard::KeyboardMode) {
+        if mode == self.kb_mode { return; }
+        self.release_kb_drag_note();
+        self.kb_mode = mode;
+    }
+
+    /// Note-on from the dock, on a 0-based channel. Channel 0 takes the
+    /// normal `fire_keys` path (sink or engine); the Lower Manual's channel 1
+    /// goes to the engine bus directly, with the same VEL scaling.
+    fn kb_press(&mut self, semi: usize, vel: f32, ch: u8) {
+        self.current_source = SourceId::Keys;
+        if ch == 0 {
+            self.fire_keys(semi, vel);
+            return;
+        }
+        self.fire_keys_with(semi, vel, false);
+        let kv = self.units.get(self.keys_idx()).and_then(|u| u.knobs.get(1)).map(|k| k.value).unwrap_or(0.8);
+        let amp = (vel * (0.35 + kv * 0.65)).clamp(0.0, 1.0);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().map(|mut b| b.send(Command::NoteOn {
+                note: semi.min(127) as u8, velocity: amp, source: SourceId::Keys, channel: ch,
+            }));
+        }
+    }
+
+    /// Note-off from the dock. With the damper down the piano key stays lit
+    /// teal (the plugin holds the sound on CC 64); the note-off still goes
+    /// out, so lifting the pedal releases everything.
+    fn kb_release(&mut self, semi: usize, ch: u8) {
+        if self.kb_sustain && self.kb_surface() == crate::keyboard::KeyboardType::Piano {
+            self.kb_sustained[semi.min(127)] = true;
+        }
+        self.current_source = SourceId::Keys;
+        if ch == 0 {
+            self.fire_keys(semi, 0.0);
+            return;
+        }
+        self.fire_keys_with(semi, 0.0, false);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().map(|mut b| b.send(Command::NoteOff { note: semi.min(127) as u8, source: SourceId::Keys, channel: ch }));
+        }
+    }
+
+    /// Release what the pointer holds (dock close, mode change, rig switch).
+    fn release_kb_drag_note(&mut self) {
+        if let Some(n) = self.kb_drag_note.take() {
+            let ch = self.kb_drag_ch;
+            self.kb_release(n, ch);
+        }
+        self.kb_reset_bend();
+    }
+
+    /// A SLIDE drag ends: the pitch wheel springs back to center.
+    fn kb_reset_bend(&mut self) {
+        if self.kb_bend != 0.0 {
+            self.kb_bend = 0.0;
+            self.kb_bend_cmd(0);
+        }
+    }
+
+    /// The damper pedal (CC 64): down holds released notes, up lets them go
+    /// and clears the teal sustain marks.
+    fn kb_toggle_sustain(&mut self) {
+        self.kb_sustain = !self.kb_sustain;
+        self.kb_cc(64, if self.kb_sustain { 127 } else { 0 });
+        self.kb_strip_pulse(0.85);
+        if !self.kb_sustain {
+            self.kb_sustained = [false; 128];
+        }
+    }
+
+    /// One organ parameter's current value: the hosted setBfree unit's knob
+    /// when there is one, else the dock's preview state.
+    fn kb_organ_value(&self, param: u32) -> f32 {
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_organ_unit(u)) {
+            if let Some(k) = self.units[u].knobs.iter().find(|k| k.param == Some(param)) {
+                return k.display_value;
+            }
+        }
+        match crate::organ::index(param) {
+            Some(i) if i < crate::organ::DRAWBARS => crate::organ::drawbar_value(self.kb_preview_drawbars[i]),
+            Some(9) => self.kb_preview_leslie as f32 / 2.0,
+            Some(10) => self.kb_preview_perc as f32 / 2.0,
+            _ => 0.0,
+        }
+    }
+
+    /// Set one organ parameter: the hosted unit's knob (publish_patch sends
+    /// the SetParam the engine turns into CCs), else preview state + the
+    /// standard B3 CCs out as the Keys source.
+    fn kb_set_organ_param(&mut self, param: u32, v: f32) {
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_organ_unit(u)) {
+            if let Some(k) = self.units[u].knobs.iter_mut().find(|k| k.param == Some(param)) {
+                k.set_immediate(v);
+                return;
+            }
+        }
+        match crate::organ::index(param) {
+            Some(i) if i < crate::organ::DRAWBARS => self.kb_preview_drawbars[i] = crate::organ::drawbar_position(v),
+            Some(9) => self.kb_preview_leslie = crate::organ::step(v, 3),
+            Some(10) => self.kb_preview_perc = crate::organ::step(v, 3),
+            _ => {}
+        }
+        if let Some((ccs, n)) = crate::organ::ccs(param, v) {
+            for &(cc, val) in &ccs[..n] {
+                self.kb_cc(cc, val);
+            }
+        }
+    }
+
+    /// The Pipe Organ console's state: the hosted Aeolus unit's face when
+    /// there is one, else the dock's preview (a console to explore before
+    /// the plugin is loaded).
+    fn kb_pipe_div(&self) -> usize {
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            return self.aeolus_faces.get(&node).copied().unwrap_or_default().division;
+        }
+        self.kb_preview_pipe_div
+    }
+
+    fn kb_pipe_drawn(&self) -> [u32; 4] {
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            return self.aeolus_faces.get(&node).and_then(|f| f.drawn).unwrap_or([0; 4]);
+        }
+        self.kb_preview_pipe_drawn
+    }
+
+    fn kb_pipe_trem(&self, div: usize) -> bool {
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            return self.aeolus_faces.get(&node).map(|f| f.tremulant[div]).unwrap_or(false);
+        }
+        self.kb_preview_pipe_trem[div]
+    }
+
+    fn kb_pipe_couplers(&self) -> [u8; 4] {
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            return self.aeolus_faces.get(&node).map(|f| f.couplers).unwrap_or([0; 4]);
+        }
+        self.kb_preview_pipe_couplers
+    }
+
+    fn kb_pipe_set_div(&mut self, div: usize) {
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            self.aeolus_faces.entry(node).or_default().division = div;
+        } else {
+            self.kb_preview_pipe_div = div;
+        }
+    }
+
+    /// Draw or push in stop `stop` of division `div` (which becomes the
+    /// shown division, on the rack face too).
+    fn kb_pipe_toggle_stop(&mut self, div: usize, stop: usize) {
+        self.kb_pipe_set_div(div);
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            if let Err(e) = self.toggle_aeolus_stop(node, stop) { self.plugin_msg = e; }
+        } else {
+            let div = self.kb_preview_pipe_div;
+            self.kb_preview_pipe_drawn[div] ^= 1 << stop;
+        }
+    }
+
+    fn kb_pipe_piston(&mut self, i: usize) {
+        let Some(reg) = crate::keyboard::pipe_piston_registration(i) else { return };
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            if let Err(e) = self.load_aeolus_registration(node, reg) { self.plugin_msg = e; }
+        } else if let Some(d) = crate::aeolus::drawn(&crate::aeolus::state(reg)) {
+            self.kb_preview_pipe_drawn = d;
+            self.kb_preview_pipe_trem = [reg.tremulant; 4];
+        }
+    }
+
+    fn kb_pipe_trem_toggle(&mut self, div: usize) {
+        self.kb_pipe_set_div(div);
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            if let Err(e) = self.toggle_aeolus_tremulant(node, div) { self.plugin_msg = e; }
+        } else {
+            self.kb_preview_pipe_trem[div] = !self.kb_preview_pipe_trem[div];
+        }
+    }
+
+    fn kb_pipe_coupler_toggle(&mut self, div: usize, link: usize) {
+        self.kb_pipe_set_div(div);
+        if let Some(u) = self.kb_target_unit().filter(|&u| self.is_aeolus_unit(u)) {
+            let node = self.units[u].node_id;
+            if let Err(e) = self.toggle_aeolus_coupler(node, div, link) { self.plugin_msg = e; }
+        } else {
+            self.kb_preview_pipe_couplers[div] ^= 1 << link;
+        }
+    }
+
+    /// The dock's VEL slider: one source of truth — the Keys unit's VEL knob
+    /// (found by label, rule 92), which laptop keys and clicks scale by too.
+    fn kb_vel(&self) -> f32 {
+        let ki = self.keys_idx();
+        self.units.get(ki).and_then(|u| u.knob_index("VEL").map(|i| u.knobs[i].value)).unwrap_or(0.8)
+    }
+
+    fn kb_set_vel(&mut self, v: f32) {
+        let ki = self.keys_idx();
+        if let Some(u) = self.units.get_mut(ki) {
+            if let Some(i) = u.knob_index("VEL") {
+                u.knobs[i].set_immediate(v.clamp(0.0, 1.0)); // rule 109: the drawn knob follows at once
+            }
+        }
+    }
+
+    fn kb_vel_slider(&mut self, ui: &mut egui::Ui, w: f32) -> Rect {
+        let vel = self.kb_vel();
+        let (track, resp) = ui.allocate_exact_size(egui::vec2(w, 16.0), egui::Sense::click_and_drag());
+        let resp = resp.on_hover_text("note velocity of the on-screen keys and laptop keys");
+        let mut vel_new = vel;
+        if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                vel_new = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            }
+        }
+        if (vel_new - vel).abs() > f32::EPSILON {
+            self.kb_set_vel(vel_new);
+        }
+        let painter = ui.painter();
+        painter.rect_filled(track, 2.0, theme::PAPER_SINK);
+        painter.rect_stroke(track, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+        let fx = track.left() + 2.0 + (track.width() - 4.0) * vel_new;
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(track.left() + 2.0, track.top() + 3.0), Pos2::new(fx, track.bottom() - 3.0)),
+            1.0,
+            theme::CREAM,
+        );
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(format!("VEL {:.2}", vel_new)).size(11.0).color(theme::INK_2));
+        track
+    }
+
+    /// One small arc knob (macros, DRIVE/REVERB): vertical drag moves the
+    /// value; returns the new value when the pointer moved it.
+    fn kb_mini_knob(&mut self, ui: &mut egui::Ui, w: f32, h: f32, label: &str, value: f32) -> Option<f32> {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
+        let resp = resp.on_hover_text(format!("{label} — drag up/down"));
+        let out = if resp.dragged() {
+            Some((value - resp.drag_delta().y / 120.0).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+        let p = ui.painter();
+        let c = Pos2::new(rect.center().x, rect.top() + (h - 14.0) * 0.5);
+        let r = (w.min(h - 14.0) * 0.5 - 2.0).max(6.0);
+        p.circle_filled(c, r, theme::PAPER_SINK);
+        p.circle_stroke(c, r, Stroke::new(1.0, if resp.hovered() { theme::CREAM_DIM } else { theme::HAIRLINE }));
+        // 270° sweep from the lower-left, like the rack's knobs.
+        let ang = std::f32::consts::PI * 0.75 + value.clamp(0.0, 1.0) * std::f32::consts::PI * 1.5;
+        let dir = egui::vec2(ang.cos(), ang.sin());
+        p.line_segment([c, c + dir * (r - 2.0)], Stroke::new(2.0, theme::CREAM));
+        p.circle_filled(c + dir * (r - 2.0), 1.5, if resp.dragged() { theme::ACCENT } else { theme::CREAM });
+        let short: String = label.chars().take(7).collect();
+        p.text(Pos2::new(rect.center().x, rect.bottom() - 6.0), egui::Align2::CENTER_CENTER,
+            short, FontId::proportional(8.5), theme::INK_2);
+        out
+    }
+
+    /// One dock drawbar: footage label above a track the bar is pulled down
+    /// in (0 = pushed in at the top, 8 = pulled out at the bottom).
+    fn kb_drawbar(&mut self, ui: &mut egui::Ui, w: f32, h: f32, footage: &str, pos: u8, bar: usize) -> Option<u8> {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
+        let track = Rect::from_min_max(rect.min + egui::vec2(0.0, 15.0), rect.max - egui::vec2(0.0, 2.0));
+        let mut out = None;
+        if resp.dragged() || resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                out = Some((((p.y - track.top()) / track.height()) * 8.0).round().clamp(0.0, 8.0) as u8);
+            }
+        }
+        let p = ui.painter();
+        p.text(Pos2::new(rect.center().x, rect.top() + 6.0), egui::Align2::CENTER_CENTER,
+            footage, FontId::proportional(8.5), theme::INK_2);
+        p.rect_filled(track, 2.0, theme::PAPER_SINK);
+        p.rect_stroke(track, 2.0, Stroke::new(1.0, if resp.hovered() { theme::CREAM_DIM } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+        let (cap, ink) = match bar {
+            0 | 1 => (theme::DRAWBAR_BROWN, theme::CREAM),
+            4 | 6 | 7 => (theme::MUTED, theme::CREAM),
+            _ => (theme::CREAM, theme::DARK_PANEL),
+        };
+        let len = (track.height() - 4.0) * pos as f32 / 8.0;
+        let bar_r = Rect::from_min_size(track.min + egui::vec2(2.0, 2.0), egui::vec2(track.width() - 4.0, len.max(3.0)));
+        p.rect_filled(bar_r, 1.5, if pos == 0 { alpha(cap, 0.35) } else { cap });
+        if pos > 0 && bar_r.height() >= 14.0 {
+            p.text(Pos2::new(bar_r.center().x, bar_r.bottom() - 7.0), egui::Align2::CENTER_CENTER,
+                pos.to_string(), theme::medium_font(10.0), ink);
+        }
+        out
+    }
+
+    /// A vertical fader at an explicit rect (SWELL): top = 1, bottom = 0.
+    fn kb_fader_at(&mut self, ui: &mut egui::Ui, rect: Rect, value: f32) -> Option<f32> {
+        let resp = ui.interact(rect, ui.id().with(("kb_fader", rect.min.x.to_bits(), rect.min.y.to_bits())), egui::Sense::click_and_drag());
+        let out = if resp.dragged() || resp.clicked() {
+            resp.interact_pointer_pos().map(|p| 1.0 - ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, theme::PAPER_SINK);
+        p.rect_stroke(rect, 2.0, Stroke::new(1.0, if resp.hovered() { theme::CREAM_DIM } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+        let v = out.unwrap_or(value).clamp(0.0, 1.0);
+        let fill = Rect::from_min_max(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0 - (rect.height() - 4.0) * v), rect.max - egui::vec2(2.0, 2.0));
+        if fill.height() > 0.0 { p.rect_filled(fill, 1.0, theme::CREAM); }
+        out
+    }
+
+    /// Piano cheekblock: the velocity rail — a live PP..FF meter of the last
+    /// hit (Y-TOUCH reads the same axis).
+    fn kb_cheek_piano(&mut self, ui: &mut egui::Ui, h: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, h), egui::Sense::hover());
+        let p = ui.painter();
+        let track = Rect::from_min_max(Pos2::new(rect.center().x - 8.0, rect.top() + 14.0), Pos2::new(rect.center().x + 8.0, rect.bottom() - 16.0));
+        p.rect_filled(track, 2.0, theme::PAPER_SINK);
+        p.rect_stroke(track, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+        let v = self.kb_last_vel.clamp(0.0, 1.0);
+        let fill = Rect::from_min_max(Pos2::new(track.left() + 2.0, track.bottom() - 2.0 - (track.height() - 4.0) * v), track.max - egui::vec2(2.0, 2.0));
+        if fill.height() > 0.0 { p.rect_filled(fill, 1.0, theme::ACCENT); }
+        p.text(Pos2::new(rect.center().x, rect.top() + 6.0), egui::Align2::CENTER_CENTER, "FF", FontId::proportional(8.5), theme::INK_2);
+        p.text(Pos2::new(rect.center().x, rect.bottom() - 8.0), egui::Align2::CENTER_CENTER, "PP", FontId::proportional(8.5), theme::INK_2);
+    }
+
+    /// Jazz Organ cheekblock: the Leslie 3-way rocker (STOP / SLOW / FAST)
+    /// and the SWELL fader (CC 11).
+    fn kb_cheek_jazz(&mut self, ui: &mut egui::Ui, h: f32) {
+        let leslie = crate::organ::step(self.kb_organ_value(crate::organ::P_LESLIE), 3);
+        // Three switches + the label fit the bed's height: a short dock
+        // (dual manual at the default window) shrinks the switches.
+        let btn_h = ((h - 24.0 - 9.0) / 3.0).clamp(14.0, 20.0).floor();
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.add_space(((h - 3.0 * btn_h - 9.0 - 14.0) * 0.5).max(0.0));
+            for (i, name) in ["STOP", "SLOW", "FAST"].iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(46.0, btn_h), egui::Sense::click());
+                let on = leslie == i;
+                let p = ui.painter();
+                let fill = if on { theme::CREAM } else if resp.hovered() { theme::DARK_PANEL_HI } else { theme::PAPER_SINK };
+                p.rect_filled(r, 2.0, fill);
+                p.rect_stroke(r, 2.0, Stroke::new(1.0, if on { theme::CREAM } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+                p.text(r.center(), egui::Align2::CENTER_CENTER, *name, theme::medium_font(9.0), if on { theme::DARK_PANEL } else { theme::INK_2 });
+                if resp.clicked() {
+                    self.kb_set_organ_param(crate::organ::P_LESLIE, i as f32 / 2.0);
+                    self.kb_strip_pulse(0.5);
+                }
+                ui.add_space(3.0);
+            }
+            ui.label(egui::RichText::new("LESLIE").size(8.5).color(theme::CREAM_DIM));
+        });
+        ui.add_space(6.0);
+        let (frect, _) = ui.allocate_exact_size(egui::vec2(24.0, h - 4.0), egui::Sense::hover());
+        let track = Rect::from_min_max(frect.min + egui::vec2(0.0, 6.0), frect.max - egui::vec2(0.0, 14.0));
+        if let Some(v) = self.kb_fader_at(ui, track, self.kb_swell) {
+            self.kb_swell = v;
+            self.kb_cc(11, (v * 127.0).round() as u8);
+            self.kb_strip_pulse(0.3 + v * 0.4);
+        }
+        let p = ui.painter();
+        p.text(Pos2::new(frect.center().x, frect.bottom() - 6.0), egui::Align2::CENTER_CENTER, "SWELL", FontId::proportional(8.0), theme::CREAM_DIM);
+    }
+
+    /// Pipe Organ cheekblock: SWELL (CC 11), the expression pedal.
+    fn kb_cheek_swell(&mut self, ui: &mut egui::Ui, h: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(36.0, h), egui::Sense::hover());
+        let track = Rect::from_min_max(Pos2::new(rect.center().x - 10.0, rect.top() + 6.0), Pos2::new(rect.center().x + 10.0, rect.bottom() - 16.0));
+        if let Some(v) = self.kb_fader_at(ui, track, self.kb_swell) {
+            self.kb_swell = v;
+            self.kb_cc(11, (v * 127.0).round() as u8);
+            self.kb_strip_pulse(0.3 + v * 0.4);
+        }
+        let p = ui.painter();
+        p.text(Pos2::new(rect.center().x, rect.bottom() - 8.0), egui::Align2::CENTER_CENTER, "SWELL", FontId::proportional(8.0), theme::CREAM_DIM);
+    }
+
+    /// Synth cheekblock: the spring-return PITCH wheel and the holding MOD
+    /// wheel (the strip's first two rects, GitHub #97).
+    fn kb_cheek_synth(&mut self, ui: &mut egui::Ui, h: f32, strip: &mut [Rect; 4]) {
+        ui.vertical(|ui| {
+            ui.add_space(((h - 56.0) * 0.5).max(0.0));
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                self.kb_wheel_ui(ui, "PITCH", true, &mut strip[0]);
+                ui.add_space(8.0);
+                self.kb_wheel_ui(ui, "MOD", false, &mut strip[1]);
+            });
+        });
+    }
+
+    /// Piano deck: DAMPER + SOFT pedals, Y-TOUCH, VEL, and the loaded patch's
+    /// own main controls as tone/space knobs (a Rhodes' tremolo, a Wurli's
+    /// drive — whatever the plugin names, rule 89).
+    fn kb_deck_piano(&mut self, ui: &mut egui::Ui, target: Option<usize>, deck_h: f32, strip: &mut [Rect; 4]) {
+        let damper = theme::chip_button(ui, "DAMPER", self.kb_sustain)
+            .on_hover_text("sustain pedal (CC 64): released keys keep sounding, lit teal, until the pedal lifts");
+        strip[2] = damper.rect;
+        if damper.clicked() { self.kb_toggle_sustain(); }
+        ui.add_space(8.0);
+        if theme::chip_button(ui, "SOFT", self.kb_soft).on_hover_text("una corda pedal (CC 67)").clicked() {
+            self.kb_soft = !self.kb_soft;
+            self.kb_cc(67, if self.kb_soft { 127 } else { 0 });
+            self.kb_strip_pulse(0.6);
+        }
+        ui.add_space(8.0);
+        if theme::chip_button(ui, "Y-TOUCH", self.kb_y_touch)
+            .on_hover_text("vertical hit position sets velocity: top of the key = pp, bottom = ff")
+            .clicked()
+        {
+            self.kb_y_touch = !self.kb_y_touch;
+        }
+        ui.add_space(10.0);
+        strip[3] = self.kb_vel_slider(ui, 110.0);
+        if let Some(t) = target {
+            let mains: Vec<(String, f32)> = self.units[t].knobs.iter()
+                .filter(|k| matches!(k.source, KnobSource::Main(_)))
+                .take(4)
+                .map(|k| (k.label.clone(), k.display_value))
+                .collect();
+            for (label, v) in mains {
+                ui.add_space(8.0);
+                if let Some(nv) = self.kb_mini_knob(ui, 34.0, deck_h - 4.0, &label, v) {
+                    if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && matches!(k.source, KnobSource::Main(_))) {
+                        k.set_immediate(nv);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One instant registration: all nine drawbars at once.
+    fn kb_jazz_preset(&mut self, preset: &crate::keyboard::OrganPreset) {
+        for (i, &pos) in preset.drawbars.iter().enumerate() {
+            self.kb_set_organ_param(crate::organ::drawbar_param(i), crate::organ::drawbar_value(pos));
+        }
+        self.kb_strip_pulse(0.7);
+    }
+
+    /// Jazz Organ deck: four instant registrations, PERC, DUAL MANUAL, the
+    /// nine drawbars (when the dock is tall enough) and DRIVE / REVERB.
+    fn kb_deck_jazz(&mut self, ui: &mut egui::Ui, organ_unit: Option<usize>, deck_h: f32) {
+        for preset in crate::keyboard::JAZZ_ORGAN_PRESETS {
+            if theme::chip_button(ui, preset.short, false).on_hover_text(preset.label).clicked() {
+                self.kb_jazz_preset(&preset);
+            }
+            ui.add_space(4.0);
+        }
+        ui.add_space(4.0);
+        let perc = crate::organ::step(self.kb_organ_value(crate::organ::P_PERC), 3);
+        if theme::chip_button(ui, &format!("PERC {}", ["OFF", "ON", "SOFT"][perc]), perc > 0)
+            .on_hover_text("percussion (CC 80): off / normal / soft")
+            .clicked()
+        {
+            self.kb_set_organ_param(crate::organ::P_PERC, ((perc + 1) % 3) as f32 / 2.0);
+        }
+        ui.add_space(4.0);
+        let dual_tip = if organ_unit.is_some() { "stack Upper (CH 1) and Lower (CH 2) manuals" } else { "stack two manuals (a hosted setBfree plays CH 1 / CH 2)" };
+        if theme::chip_button(ui, "DUAL", self.kb_dual_manual).on_hover_text(dual_tip).clicked() {
+            self.kb_dual_manual = !self.kb_dual_manual;
+        }
+        if deck_h >= 60.0 {
+            ui.add_space(10.0);
+            for i in 0..crate::organ::DRAWBARS {
+                let pos = crate::organ::drawbar_position(self.kb_organ_value(crate::organ::drawbar_param(i)));
+                let bar_w = (deck_h * 0.16).clamp(22.0, 36.0);
+                if let Some(np) = self.kb_drawbar(ui, bar_w, deck_h, crate::organ::FOOTAGES[i], pos, i) {
+                    self.kb_set_organ_param(crate::organ::drawbar_param(i), crate::organ::drawbar_value(np));
+                }
+                ui.add_space(3.0);
+            }
+            if ui.available_width() > 110.0 {
+                for (param, label) in [(crate::organ::P_DRIVE, "DRIVE"), (crate::organ::P_REVERB, "REVERB")] {
+                    let v = self.kb_organ_value(param);
+                    if let Some(nv) = self.kb_mini_knob(ui, (deck_h * 0.4).clamp(36.0, 72.0), (deck_h - 4.0).min(96.0), label, v) {
+                        self.kb_set_organ_param(param, nv);
+                    }
+                    ui.add_space(4.0);
+                }
+            }
+        }
+    }
+
+    /// Pipe Organ deck, like a console's stop jamb: division tabs, thumb
+    /// pistons (instant registrations), TREMULANT and couplers above the
+    /// shown division's stops. With a hosted Aeolus every toggle goes into
+    /// the plugin's own state; without one the console is a preview.
+    fn kb_deck_pipe(&mut self, ui: &mut egui::Ui, aeolus_unit: Option<usize>, deck_h: f32) {
+        let div = self.kb_pipe_div();
+        let drawn = self.kb_pipe_drawn();
+        let couplers = self.kb_pipe_couplers();
+        ui.vertical(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 26.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    for d in 0..4 {
+                        let on = d == div;
+                        let tip = crate::aeolus::DIVISIONS[d].name;
+                        if theme::chip_button(ui, crate::aeolus::division_tab(d), on).on_hover_text(tip).clicked() {
+                            self.kb_pipe_set_div(d);
+                        }
+                        ui.add_space(2.0);
+                    }
+                    ui.add_space(8.0);
+                    for (i, (short, name)) in crate::keyboard::PIPE_ORGAN_PISTONS.iter().enumerate() {
+                        let num: String = short.chars().take(1).collect();
+                        if theme::chip_button(ui, &num, false).on_hover_text(format!("piston {name}")).clicked() {
+                            self.kb_pipe_piston(i);
+                            self.kb_strip_pulse(0.7);
+                        }
+                        ui.add_space(2.0);
+                    }
+                    ui.add_space(8.0);
+                    if theme::chip_button(ui, "TREM", self.kb_pipe_trem(div))
+                        .on_hover_text(format!("tremulant of {}", crate::aeolus::DIVISIONS[div].name))
+                        .clicked()
+                    {
+                        self.kb_pipe_trem_toggle(div);
+                    }
+                    for (link, target_name) in crate::aeolus::DIVISIONS[div].links.iter().enumerate() {
+                        ui.add_space(4.0);
+                        let short = target_name.trim_start_matches("Manual ");
+                        let short = if short == "Pedal" { "P" } else { short };
+                        let on = (couplers[div] >> link) & 1 == 1;
+                        // Console convention: "II/I" couples Manual II to
+                        // Manual I (II's stops sound from the I keys).
+                        let tab = crate::aeolus::division_tab(div);
+                        if theme::chip_button(ui, &format!("{short}/{tab}"), on)
+                            .on_hover_text(format!("coupler {short}/{tab}: {target_name} sounds from {}", crate::aeolus::DIVISIONS[div].name))
+                            .clicked()
+                        {
+                            self.kb_pipe_coupler_toggle(div, link);
+                        }
+                    }
+                    if aeolus_unit.is_none() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("preview — load Aeolus to play it").size(10.0).color(theme::CREAM_DIM));
+                    }
+                },
+            );
+            ui.add_space(3.0);
+            // The stop jamb: LED + name per stop, wrapped into as many rows
+            // as the deck holds (the rest are a count away on the rack face
+            // or in the expanded view).
+            let stops = crate::aeolus::DIVISIONS[div].stops;
+            let area_h = (deck_h - 31.0).max(18.0);
+            let big = area_h >= 80.0;
+            let line_h = if big { 34.0 } else { 26.0 };
+            let rows = ((area_h / line_h).floor() as usize).max(1);
+            let cell_h = if rows == 1 { area_h } else { line_h - 4.0 };
+            let (area, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), area_h), egui::Sense::hover());
+            let p = ui.painter().clone();
+            let font = FontId::proportional(if big { 12.5 } else { 10.0 });
+            // Expanded: a jamb of equal stop tabs, rows filled evenly
+            // (at most 4 rows, at most 56 px tall), the whole deck used.
+            let grid = big.then(|| {
+                let n = stops.len().max(1);
+                let rows = rows.min(4).min(n);
+                let per_row = n.div_ceil(rows);
+                let w = (area.width() / per_row as f32).floor();
+                let h = (area_h / rows as f32 - 6.0).clamp(24.0, 56.0);
+                (per_row, w, h)
+            });
+            let (mut x, mut row) = (area.left(), 0usize);
+            let mut shown = 0usize;
+            for (i, name) in stops.iter().enumerate() {
+                let label = name.replace('\n', " ");
+                let cell = if let Some((per_row, w, h)) = grid {
+                    let (r, c) = (i / per_row, i % per_row);
+                    Rect::from_min_size(Pos2::new(area.left() + c as f32 * w, area.top() + r as f32 * (h + 6.0)), egui::vec2(w - 6.0, h))
+                } else {
+                    let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.clone(), font.clone(), theme::CREAM)).size().x;
+                    let cell_w = tw + 26.0;
+                    if x + cell_w > area.right() - 30.0 {
+                        if row + 1 >= rows { break; }
+                        row += 1;
+                        x = area.left();
+                    }
+                    let top = area.top() + row as f32 * line_h;
+                    let cell = Rect::from_min_size(Pos2::new(x, top), egui::vec2(cell_w - 3.0, cell_h));
+                    x += cell_w;
+                    cell
+                };
+                let on = (drawn[div] >> i) & 1 == 1;
+                let resp = ui.interact(cell, ui.id().with(("kb_stop", div, i)), egui::Sense::click());
+                if big {
+                    // Expanded: each stop is a stop-tab plate, lit when drawn.
+                    p.rect_filled(cell, 3.0, if on { alpha(theme::LIVE_TEAL, 0.12) } else { theme::PAPER_SINK });
+                    p.rect_stroke(cell, 3.0, Stroke::new(1.0, if on { alpha(theme::LIVE_TEAL, 0.6) } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+                }
+                if resp.hovered() {
+                    p.rect_filled(cell, 2.0, alpha(theme::CREAM, 0.06));
+                }
+                let pad = if big { 6.0 } else { 0.0 };
+                let led = Pos2::new(cell.left() + 8.0 + pad, cell.center().y);
+                if on {
+                    p.circle_filled(led, 5.5, alpha(theme::LIVE_TEAL, 0.18));
+                    p.circle_filled(led, 3.0, theme::LIVE_TEAL);
+                } else {
+                    p.circle_stroke(led, 3.0, Stroke::new(1.0, if resp.hovered() { theme::CREAM_DIM } else { theme::MUTED }));
+                }
+                p.text(Pos2::new(cell.left() + 16.0 + pad * 1.5, cell.center().y), egui::Align2::LEFT_CENTER,
+                    &label, font.clone(), if on { theme::CREAM } else { theme::CREAM_DIM });
+                if resp.clicked() {
+                    self.kb_pipe_toggle_stop(div, i);
+                }
+                shown += 1;
+            }
+            if shown < stops.len() {
+                let last = Rect::from_min_size(Pos2::new(area.left(), area.top() + row as f32 * line_h), egui::vec2(area.width(), cell_h));
+                p.text(Pos2::new(last.right() - 4.0, last.center().y), egui::Align2::RIGHT_CENTER,
+                    format!("+{}", stops.len() - shown), FontId::proportional(9.5), theme::CREAM_DIM);
+            }
+        });
+    }
+
+    /// Synth deck: the plugin's main controls as macros, the X/Y morph pad
+    /// (first two macros), SCALE / FOLD / ARP / DRAG, SUSTAIN and VEL.
+    fn kb_deck_synth(&mut self, ui: &mut egui::Ui, target: Option<usize>, deck_h: f32, strip: &mut [Rect; 4]) {
+        use crate::keyboard::SynthDragMode;
+        let mains: Vec<(String, f32)> = target.map(|t| {
+            self.units[t].knobs.iter()
+                .filter(|k| matches!(k.source, KnobSource::Main(_)))
+                .take(4)
+                .map(|k| (k.label.clone(), k.display_value))
+                .collect()
+        }).unwrap_or_default();
+        let n_macros = if deck_h < 50.0 { 2 } else { 4 };
+        for (label, v) in mains.iter().take(n_macros) {
+            if let Some(nv) = self.kb_mini_knob(ui, (deck_h * 0.4).clamp(32.0, 72.0), (deck_h - 4.0).min(96.0), label, *v) {
+                if let Some(t) = target {
+                    if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == *label && matches!(k.source, KnobSource::Main(_))) {
+                        k.set_immediate(nv);
+                    }
+                }
+            }
+            ui.add_space(4.0);
+        }
+        // X/Y pad: bidirectional over the first two macros.
+        if deck_h >= 56.0 && mains.len() >= 2 && ui.available_width() > 430.0 {
+            let size = (deck_h - 8.0).min(260.0);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(size * if deck_h > 120.0 { 1.6 } else { 1.0 }, size), egui::Sense::click_and_drag());
+            let resp = resp.on_hover_text(format!("X: {} · Y: {}", mains[0].0, mains[1].0));
+            let (mut nx, mut ny) = (mains[0].1, mains[1].1);
+            if resp.dragged() || resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    nx = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    ny = 1.0 - ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                }
+            }
+            if (nx - mains[0].1).abs() > 1e-4 || (ny - mains[1].1).abs() > 1e-4 {
+                if let Some(t) = target {
+                    for (label, nv) in [(&mains[0].0, nx), (&mains[1].0, ny)] {
+                        if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == *label && matches!(k.source, KnobSource::Main(_))) {
+                            k.set_immediate(nv);
+                        }
+                    }
+                }
+            }
+            let p = ui.painter();
+            p.rect_filled(rect, 3.0, theme::PAPER_SINK);
+            p.rect_stroke(rect, 3.0, Stroke::new(1.0, if resp.hovered() { theme::CREAM_DIM } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+            let cx = rect.left() + nx * rect.width();
+            let cy = rect.top() + (1.0 - ny) * rect.height();
+            p.line_segment([Pos2::new(cx, rect.top() + 2.0), Pos2::new(cx, rect.bottom() - 2.0)], Stroke::new(1.0, alpha(theme::CREAM, 0.15)));
+            p.line_segment([Pos2::new(rect.left() + 2.0, cy), Pos2::new(rect.right() - 2.0, cy)], Stroke::new(1.0, alpha(theme::CREAM, 0.15)));
+            p.circle_filled(Pos2::new(cx, cy), 4.0, theme::LIVE_TEAL);
+            ui.add_space(8.0);
+        }
+        // SCALE opens the Keys unit's scale picker (one picker everywhere).
+        let scale = self.keys_unit.and_then(|k| self.keys_scale(k));
+        let chip = theme::chip_button(ui, "SCALE", scale.is_some());
+        let chip_rect = chip.rect;
+        if chip.on_hover_text("scale snap + key of the Keys unit").clicked() {
+            self.scale_menu = Some(ScaleMenu { unit: self.keys_idx(), pos: Pos2::new(chip_rect.left(), chip_rect.bottom()) });
+        }
+        ui.add_space(4.0);
+        let readout = scale.map(|c| c.label()).unwrap_or_else(|| "off".into());
+        ui.label(egui::RichText::new(readout).size(11.0).color(if scale.is_some() { theme::LIVE_TEAL } else { theme::CREAM_DIM }));
+        ui.add_space(8.0);
+        if theme::chip_button(ui, "FOLD", self.kb_scale_fold)
+            .on_hover_text("fold the keybed to in-scale keys only (set a scale first)")
+            .clicked()
+        {
+            self.kb_scale_fold = !self.kb_scale_fold;
+        }
+        ui.add_space(4.0);
+        // ARP: with an Arp unit in the rig, on = a running pattern, off =
+        // CHORD mode (held keys sound together). Without one, a hint.
+        let arp = self.kb_arp_on();
+        let tip = if arp.is_some() {
+            "arpeggiator: on runs the pattern, off is chord mode (held keys sound together)"
+        } else {
+            "no Arp unit in this rig — add one (Plugins view, or ask the agent)"
+        };
+        if theme::chip_button(ui, "ARP", arp == Some(true)).on_hover_text(tip).clicked() {
+            self.kb_arp_toggle();
+        }
+        ui.add_space(4.0);
+        if theme::chip_button(ui, self.kb_synth_drag.label(), false)
+            .on_hover_text("horizontal drag: GLISS slides note-to-note, SLIDE bends the held note")
+            .clicked()
+        {
+            self.kb_synth_drag = match self.kb_synth_drag {
+                SynthDragMode::Gliss => SynthDragMode::Slide,
+                SynthDragMode::Slide => SynthDragMode::Gliss,
+            };
+        }
+        ui.add_space(8.0);
+        let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain)
+            .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts");
+        strip[2] = sus.rect;
+        if sus.clicked() { self.kb_toggle_sustain(); }
+        ui.add_space(8.0);
+        strip[3] = self.kb_vel_slider(ui, 90.0);
+    }
+
+    /// The dock state the agent reads (`get_keyboard_state`).
+    fn keyboard_state_json(&self) -> serde_json::Value {
+        let surface = self.kb_surface();
+        let target = self.kb_target_unit();
+        serde_json::json!({
+            "open": self.dock == DockView::Keyboard,
+            "expanded": self.kb_expanded,
+            "auto": self.kb_mode == crate::keyboard::KeyboardMode::Auto,
+            "mode": surface.as_str(),
+            "pinned": self.kb_mode.pinned().map(|t| t.as_str()),
+            "detected_mode": self.kb_detected().as_str(),
+            "target": target.map(|u| self.units[u].node_id),
+            "target_name": target.map(|u| sentence_case(&self.units[u].name)),
+            "rig": self.active_rig,
+            "octave": self.octave,
+            "damper": self.kb_sustain,
+            "soft": self.kb_soft,
+            "swell": self.kb_swell,
+            "leslie": crate::organ::step_name(crate::organ::P_LESLIE, self.kb_organ_value(crate::organ::P_LESLIE)),
+            "dual_manual": self.kb_dual_manual,
+            "scale_fold": self.kb_scale_fold,
+            "y_touch": self.kb_y_touch,
+            "synth_drag": self.kb_synth_drag.as_str(),
+            "chord": crate::keyboard::detect_chord(&self.held_note_list()),
+        })
+    }
+
+    /// The agent's `set_keyboard_mode`: every option the dock offers, with
+    /// the same validation the headless MCP uses.
+    fn apply_keyboard_mode_tool(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        if let Some(m) = args.get("mode").and_then(|v| v.as_str()) {
+            let mode = crate::keyboard::KeyboardMode::parse(m)
+                .ok_or_else(|| format!("unknown keyboard mode '{m}' (use auto, piano, jazz_organ, pipe_organ, or synth)"))?;
+            self.kb_set_mode(mode);
+        }
+        if let Some(d) = args.get("synth_drag").and_then(|v| v.as_str()) {
+            self.kb_synth_drag = crate::keyboard::SynthDragMode::parse(d)
+                .ok_or_else(|| format!("unknown synth_drag '{d}' (use gliss or slide)"))?;
+        }
+        if let Some(open) = args.get("open").and_then(|v| v.as_bool()) {
+            if open {
+                self.dock = DockView::Keyboard;
+            } else if self.dock == DockView::Keyboard {
+                self.release_kb_drag_note();
+                self.dock = DockView::None;
+                self.kb_expanded = false;
+            }
+        }
+        if let Some(exp) = args.get("expanded").and_then(|v| v.as_bool()) {
+            if exp { self.dock = DockView::Keyboard; }
+            self.kb_expanded = exp && self.dock == DockView::Keyboard;
+        }
+        if let Some(v) = args.get("dual_manual").and_then(|v| v.as_bool()) { self.kb_dual_manual = v; }
+        if let Some(v) = args.get("scale_fold").and_then(|v| v.as_bool()) { self.kb_scale_fold = v; }
+        if let Some(v) = args.get("y_touch").and_then(|v| v.as_bool()) { self.kb_y_touch = v; }
+        Ok(self.keyboard_state_json())
     }
 
     /// A mouse click on an on-screen key: a note of `CLICK_NOTE_MS`, released
@@ -15713,7 +16975,7 @@ impl DemoApp {
     fn click_note(&mut self, note: usize) {
         self.current_source = SourceId::Keys;
         self.fire_keys(note, 0.95);
-        self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), note));
+        self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), note, 0));
     }
 
     /// One keyboard-strip channel message, out as the Keys source: the same
@@ -15751,20 +17013,15 @@ impl DemoApp {
         }
     }
 
-    /// One strip wheel (GitHub #97): a small vertical track the pointer
-    /// drags — pitch (`spring`, value -1..=1, back to center on release,
-    /// like a real wheel) or modulation (value 0..=1, holds). Sends only
-    /// when the quantized MIDI value moves, so a frame that rounds to the
-    /// same bend/CC sends nothing.
-    fn kb_wheel_ui(&mut self, ui: &mut egui::Ui, t_rect: Rect, label: &str, spring: bool) {
-        // Keyed by what the wheel is, never by where it sits (rule 135).
-        let resp = ui.interact(t_rect, ui.id().with(("kb_wheel", label)), egui::Sense::click_and_drag());
-        // Pointer → value: the track bottom is the rest position (pitch:
-        // -1), the top is the extreme. Absolute, like a real wheel.
+    /// A wheel's pointer → MIDI: the track bottom is the rest position
+    /// (pitch: -1), the top the extreme, absolute like a real wheel. Pitch
+    /// springs back to center on release; mod holds. Sends only when the
+    /// quantized MIDI value moves. Returns the value to draw.
+    fn kb_wheel_drive(&mut self, resp: &egui::Response, track: Rect, spring: bool) -> f32 {
         let mut value = if spring { self.kb_bend } else { self.kb_mod };
         if resp.dragged() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let t = ((t_rect.bottom() - pos.y) / t_rect.height()).clamp(0.0, 1.0);
+                let t = ((track.bottom() - pos.y) / track.height()).clamp(0.0, 1.0);
                 value = if spring { t * 2.0 - 1.0 } else { t };
             }
         } else if spring && resp.drag_stopped() {
@@ -15785,72 +17042,44 @@ impl DemoApp {
                 self.kb_strip_pulse(0.3 + value * 0.5);
             }
         }
-        let painter = ui.painter().clone();
-        painter.rect_filled(t_rect, 2.0, theme::PAPER_SINK);
-        painter.rect_stroke(t_rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-        if spring {
-            // The center detent a pitch wheel returns to.
-            let cy = t_rect.center().y;
-            painter.line_segment(
-                [Pos2::new(t_rect.left() + 3.0, cy), Pos2::new(t_rect.right() - 3.0, cy)],
-                Stroke::new(1.0, theme::MUTED),
-            );
-        }
-        let t = if spring { (value + 1.0) * 0.5 } else { value };
-        let yc = t_rect.bottom() - t.clamp(0.0, 1.0) * t_rect.height();
-        let thumb = Rect::from_min_size(
-            Pos2::new(t_rect.left() + 3.0, yc - 2.0),
-            Vec2::new(t_rect.width() - 6.0, 4.0),
-        );
-        painter.rect_filled(thumb, 1.0, theme::CREAM);
-        painter.text(
-            Pos2::new(t_rect.center().x, t_rect.bottom() + 3.0),
-            egui::Align2::CENTER_TOP,
-            label,
-            egui::FontId::proportional(9.5),
-            theme::INK_2,
-        );
+        value
     }
 
-    /// The strip's velocity track and readout, laid out right to left in the
-    /// dock header. One source of truth: the Keys unit's VEL knob, which the
-    /// laptop keys and clicks already scale by (found by label, rule 92).
-    fn kb_vel_ui(&mut self, ui: &mut egui::Ui, rect_out: &mut Rect) {
-        let ki = self.keys_idx();
-        let vel_idx = self.units.get(ki).and_then(|u| u.knob_index("VEL"));
-        let vel = vel_idx
-            .and_then(|i| self.units.get(ki).map(|u| u.knobs[i].value))
-            .unwrap_or(0.8);
-        // The readout's room first (right to left), its text once the value is known.
-        let (readout, _) = ui.allocate_exact_size(egui::vec2(52.0, 16.0), egui::Sense::hover());
-        ui.add_space(6.0);
-        let (track, resp) = ui.allocate_exact_size(egui::vec2(120.0, 16.0), egui::Sense::click_and_drag());
-        let resp = resp.on_hover_text("note velocity of the on-screen keys and laptop keys");
+    /// One strip wheel (GitHub #97): a small vertical track the pointer
+    /// drags — pitch (`spring`, value -1..=1, back to center on release,
+    /// like a real wheel) or modulation (value 0..=1, holds). Sends only
+    /// when the quantized MIDI value moves, so a frame that rounds to the
+    /// same bend/CC sends nothing.
+    fn kb_wheel_ui(&mut self, ui: &mut egui::Ui, label: &str, spring: bool, rect_out: &mut Rect) {
+        const W: f32 = 26.0;
+        const H: f32 = 40.0;
+        let mut track = Rect::NOTHING;
+        ui.vertical(|ui| {
+            let (t_rect, resp) = ui.allocate_exact_size(egui::vec2(W, H), egui::Sense::click_and_drag());
+            track = t_rect;
+            let value = self.kb_wheel_drive(&resp, t_rect, spring);
+            let painter = ui.painter().clone();
+            painter.rect_filled(t_rect, 2.0, theme::PAPER_SINK);
+            painter.rect_stroke(t_rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            if spring {
+                // The center detent a pitch wheel returns to.
+                let cy = t_rect.center().y;
+                painter.line_segment(
+                    [Pos2::new(t_rect.left() + 3.0, cy), Pos2::new(t_rect.right() - 3.0, cy)],
+                    Stroke::new(1.0, theme::MUTED),
+                );
+            }
+            let t = if spring { (value + 1.0) * 0.5 } else { value };
+            let yc = t_rect.bottom() - t.clamp(0.0, 1.0) * t_rect.height();
+            let thumb = Rect::from_min_size(
+                Pos2::new(t_rect.left() + 3.0, yc - 2.0),
+                Vec2::new(t_rect.width() - 6.0, 4.0),
+            );
+            painter.rect_filled(thumb, 1.0, theme::CREAM);
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(label).size(9.5).color(theme::INK_2));
+        });
         *rect_out = track;
-        let mut vel_new = vel;
-        if resp.dragged() || resp.clicked() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                vel_new = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
-            }
-        }
-        if (vel_new - vel).abs() > f32::EPSILON {
-            if let Some(i) = vel_idx {
-                if let Some(u) = self.units.get_mut(ki) {
-                    // Rule 109: the drawn knob follows at once.
-                    u.knobs[i].set_immediate(vel_new);
-                }
-            }
-        }
-        let painter = ui.painter();
-        painter.rect_filled(track, 2.0, theme::PAPER_SINK);
-        painter.rect_stroke(track, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-        let fx = track.left() + 2.0 + (track.width() - 4.0) * vel_new;
-        painter.rect_filled(
-            Rect::from_min_max(Pos2::new(track.left() + 2.0, track.top() + 3.0), Pos2::new(fx, track.bottom() - 3.0)),
-            1.0,
-            theme::CREAM,
-        );
-        painter.text(readout.left_center(), egui::Align2::LEFT_CENTER, format!("VEL {vel_new:.2}"), egui::FontId::proportional(11.0), theme::INK_2);
     }
 
     /// Unit index of the Keys source (fallback 0 for a degenerate graph).
@@ -16454,8 +17683,61 @@ impl DemoApp {
         let next = crate::aeolus::with_stop(&state, face.division, stop, on)
             .ok_or("this Aeolus has its own organ: its stops are not on the face")?;
         main.load_state(&next).map_err(|e| format!("Aeolus stop: {e}"))?;
-        self.aeolus_faces.entry(node).or_default().drawn = crate::aeolus::drawn(&next);
+        self.update_aeolus_face_from_state(node, &next);
         Ok(())
+    }
+
+    fn toggle_aeolus_tremulant(&mut self, node: u32, division: usize) -> Result<(), String> {
+        let face = self.aeolus_faces.get(&node).copied().unwrap_or_default();
+        let on = !face.tremulant.get(division).copied().unwrap_or(false);
+        let main = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+            .ok_or("Aeolus is not running")?;
+        let state = main.save_state().map_err(|e| format!("Aeolus state: {e}"))?;
+        let next = crate::aeolus::with_tremulant(&state, division, on)
+            .ok_or("division has no tremulant")?;
+        main.load_state(&next).map_err(|e| format!("Aeolus tremulant: {e}"))?;
+        self.update_aeolus_face_from_state(node, &next);
+        Ok(())
+    }
+
+    fn toggle_aeolus_coupler(&mut self, node: u32, division: usize, link: usize) -> Result<(), String> {
+        let face = self.aeolus_faces.get(&node).copied().unwrap_or_default();
+        let on = (face.couplers.get(division).copied().unwrap_or(0) >> link) & 1 == 0;
+        let main = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+            .ok_or("Aeolus is not running")?;
+        let state = main.save_state().map_err(|e| format!("Aeolus state: {e}"))?;
+        let next = crate::aeolus::with_coupler(&state, division, link, on)
+            .ok_or("coupler not available")?;
+        main.load_state(&next).map_err(|e| format!("Aeolus coupler: {e}"))?;
+        self.update_aeolus_face_from_state(node, &next);
+        Ok(())
+    }
+
+    fn load_aeolus_registration(&mut self, node: u32, reg: &'static crate::aeolus::Registration) -> Result<(), String> {
+        let next = crate::aeolus::state(reg);
+        let main = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+            .ok_or("Aeolus is not running")?;
+        main.load_state(&next).map_err(|e| format!("Aeolus registration: {e}"))?;
+        if let Some(slot) = self.voice_slot_of_node(node) {
+            if let Some(p) = self.patch_names.get_mut(slot) {
+                *p = Some(reg.name.to_string());
+            }
+        }
+        self.update_aeolus_face_from_state(node, &next);
+        Ok(())
+    }
+
+    fn update_aeolus_face_from_state(&mut self, node: u32, state: &[u8]) {
+        let entry = self.aeolus_faces.entry(node).or_default();
+        entry.drawn = crate::aeolus::drawn(state);
+        for d in 0..4 {
+            if let Some(t) = crate::aeolus::tremulant(state, d) {
+                entry.tremulant[d] = t;
+            }
+        }
+        if let Some(c) = crate::aeolus::couplers(state) {
+            entry.couplers = c;
+        }
     }
 
     /// Keep each Aeolus face's stops in step with its plugin (a sound load,
@@ -16467,9 +17749,15 @@ impl DemoApp {
         if aeolus.is_empty() || self.ui_time - self.aeolus_poll_at < AEOLUS_POLL_SECS { return; }
         self.aeolus_poll_at = self.ui_time;
         for (_, node) in aeolus {
-            let Some(main) = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i)) else { continue };
-            let drawn = main.save_state().ok().and_then(|s| crate::aeolus::drawn(&s));
-            self.aeolus_faces.entry(node).or_default().drawn = drawn;
+            let state = self.voice_slot_of_node(node)
+                .and_then(|s| self.clap_pool_idx(s))
+                .and_then(|i| self._surge_main.get_mut(i))
+                .and_then(|main| main.save_state().ok());
+            if let Some(s) = state {
+                self.update_aeolus_face_from_state(node, &s);
+            } else {
+                self.aeolus_faces.entry(node).or_default().drawn = None;
+            }
         }
     }
 
@@ -21107,7 +22395,7 @@ impl DemoApp {
             self.scale_menu_rect = Rect::NOTHING;
             return;
         };
-        if self.stage_view != StageView::Rack || self.side != Side::Front {
+        if self.stage_view != StageView::Rack && self.dock != DockView::Keyboard || self.side != Side::Front {
             self.scale_menu = None;
             self.scale_menu_rect = Rect::NOTHING;
             return;
@@ -22231,8 +23519,22 @@ impl DemoApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
                 self.toggle_dock(DockView::Assistant);
             }
+            // Shift+V before plain V (rule 143): expand/fullscreen the keyboard dock.
+            if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::V)) {
+                if self.dock != DockView::Keyboard {
+                    self.dock = DockView::Keyboard;
+                    self.kb_expanded = true;
+                } else {
+                    self.kb_expanded = !self.kb_expanded;
+                }
+            }
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V)) {
                 self.toggle_dock(DockView::Keyboard);
+            }
+            if self.dock == DockView::Keyboard && self.kb_expanded
+                && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+            {
+                self.kb_expanded = false;
             }
             // Agent undo/redo (Ctrl+Shift+Z first: Ctrl+Z would match it too).
             let redo = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
@@ -22245,9 +23547,16 @@ impl DemoApp {
         self.take_dropped_files(&ctx);
 
         // Single adaptive top bar, then bottom dock, then unified Left Rail.
-        self.rig_inputs_panel(ui);
-        self.dock_panel_ui(ui);
-        self.navigator_panel_ui(ui);
+        // Expanded keyboard: the instrument's console is the whole window
+        // (no top bar, no rail, no rack).
+        if self.dock == DockView::Keyboard && self.kb_expanded {
+            self.rig_chip_rects.clear();
+            self.dock_panel_ui(ui);
+        } else {
+            self.rig_inputs_panel(ui);
+            self.dock_panel_ui(ui);
+            self.navigator_panel_ui(ui);
+        }
 
         // Native rig editor (task-26): handle open/close requests from unit
         // double-clicks. No X11 — the editor is a plain egui window drawn below.
@@ -22296,9 +23605,8 @@ impl DemoApp {
         let mut i = 0;
         while i < self.note_offs.len() {
             if self.note_offs[i].0 <= now {
-                let (_, semi) = self.note_offs.remove(i);
-                self.current_source = SourceId::Keys;
-                self.fire_keys(semi, 0.0);
+                let (_, semi, ch) = self.note_offs.remove(i);
+                self.kb_release(semi, ch);
             } else {
                 i += 1;
             }
@@ -22368,13 +23676,15 @@ impl DemoApp {
         self.publish_pins();
 
         self.tessellate();
-        match self.stage_view {
-            StageView::Rack => self.draw(ui),
-            StageView::Matrix => self.matrix_stage(ui),
-            StageView::Mixer => self.mixer_stage(ui),
-            StageView::Sessions => self.sessions_stage(ui),
-            StageView::Plugins => self.plugins_stage(ui),
-            StageView::Settings => self.settings_stage(ui),
+        if !(self.dock == DockView::Keyboard && self.kb_expanded) {
+            match self.stage_view {
+                StageView::Rack => self.draw(ui),
+                StageView::Matrix => self.matrix_stage(ui),
+                StageView::Mixer => self.mixer_stage(ui),
+                StageView::Sessions => self.sessions_stage(ui),
+                StageView::Plugins => self.plugins_stage(ui),
+                StageView::Settings => self.settings_stage(ui),
+            }
         }
         self.knob_menu_ui(&ctx);
         self.scale_menu_ui(&ctx);
@@ -23028,9 +24338,9 @@ impl EvalRig {
         let notes = bus.clone();
         app.note_sink = Some(Box::new(move |ev: NoteEvent| {
             let cmd = if ev.velocity > 0.0 {
-                Command::NoteOn { note: ev.note, velocity: ev.velocity, source: ev.source }
+                Command::NoteOn { note: ev.note, velocity: ev.velocity, source: ev.source, channel: 0 }
             } else {
-                Command::NoteOff { note: ev.note, source: ev.source }
+                Command::NoteOff { note: ev.note, source: ev.source, channel: 0 }
             };
             let _ = notes.lock().unwrap().send(cmd);
         }));
@@ -23749,9 +25059,9 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             // ev.note is an absolute MIDI note (0..127).
                             let note = ev.note;
                             let cmd = if ev.velocity > 0.0 {
-                                Command::NoteOn { note, velocity: ev.velocity, source: ev.source }
+                                Command::NoteOn { note, velocity: ev.velocity, source: ev.source, channel: 0 }
                             } else {
-                                Command::NoteOff { note, source: ev.source }
+                                Command::NoteOff { note, source: ev.source, channel: 0 }
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
@@ -24978,7 +26288,7 @@ mod rig_switch_tests {
         assert!(app.hw_direct.send(&off));
         let mut sent = Vec::new();
         drain.drain(|c| sent.push(c));
-        assert!(matches!(sent[0], Command::NoteOn { note: 60, source: SourceId::Hardware(2), velocity } if (velocity - 0.35).abs() < 1e-6),
+        assert!(matches!(sent[0], Command::NoteOn { note: 60, source: SourceId::Hardware(2), velocity , ..} if (velocity - 0.35).abs() < 1e-6),
             "VEL 0.0 scales to 0.35 like the UI path: {:?}", sent[0]);
         assert!(matches!(sent[1], Command::NoteOff { note: 60, .. }));
         // The UI frame then only animates it — no second NoteOn.
@@ -27072,7 +28382,7 @@ mod split_bpm_tests {
         assert_eq!(rx.recv().unwrap(), "ok");
         assert_eq!(app.undo_past.len(), 1, "the pre-edit rack is on the undo stack");
         assert!(Command::Connect { id: 1, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: CPortKind::Midi }.is_rack_edit());
-        assert!(!Command::NoteOn { note: 60, velocity: 1.0, source: SourceId::Keys }.is_rack_edit(), "playing is not an edit");
+        assert!(!Command::NoteOn { note: 60, velocity: 1.0, source: SourceId::Keys, channel: 0 }.is_rack_edit(), "playing is not an edit");
     }
 
     #[test]
@@ -29412,25 +30722,43 @@ mod ui_polish_agent_tests {
         assert!(h_tiny >= 111.0, "minimum dock height: {h_tiny}");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
+        // The MIDI strip fits beside the keys at every size (GitHub #97):
+        // the synth surface puts the wheels on the cheekblock left of the
+        // keybed and sustain + VEL on the deck above it (#163).
+        for _ in 0..3 { run_frame(&mut app, &ctx, Vec2::new(760.0, 520.0), vec![]); }
+        let sr = app.kb_strip;
+        assert!(sr.iter().all(|r| r.is_positive() && r.width() > 0.0), "strip laid out: {sr:?}");
+        let kb = app.dock_kb_rect;
+        assert!(sr.iter().all(|r| !r.shrink(0.5).intersects(kb)), "strip never covers the keys: {sr:?} vs {kb:?}");
+        assert!(sr.iter().all(|r| r.top() >= app.dock_rect.top()), "strip inside the dock");
     }
 
-    /// The MIDI strip (#97) costs the keys no height: only the header row
-    /// sits above them, the wheels stand beside them. The strip once took a
-    /// 56 pt row out of the dock, and the keys shrank from 146 to 86 pt at
-    /// 1600x1000.
+    /// The MIDI strip (#97) and the instrument's deck (#163) cost the keys
+    /// no height: only the header row and the deck sit above them, the
+    /// deck's height is added to the dock, and the wheels stand beside the
+    /// keys. The strip once took a 56 pt row out of the dock, and the keys
+    /// shrank from 146 to 86 pt at 1600x1000; the deck took them to 77.
     #[test]
     fn the_midi_strip_leaves_the_keys_the_dock_height() {
-        let mut app = DemoApp::new_with_sink(None);
-        app.dock = DockView::Keyboard;
-        let ctx = egui::Context::default();
-        for size in [Vec2::new(1600.0, 1000.0), Vec2::new(1280.0, 800.0), Vec2::new(760.0, 520.0), Vec2::new(781.0, 468.0)] {
-            for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
-            let (dock, kb, sr) = (app.dock_rect, app.dock_kb_rect, app.kb_strip);
-            let key_h = DemoApp::dock_key_rect(kb, 0).height();
-            assert!(kb.top() - dock.top() <= 48.0, "{size:?}: only the header sits above the keys: dock {dock:?}, keys {kb:?}");
-            assert!(key_h >= dock.height() - 64.0, "{size:?}: keys {key_h} pt of a {} pt dock", dock.height());
-            assert!(sr.iter().all(|r| r.is_positive() && dock.contains_rect(*r)), "{size:?}: strip inside the dock: {sr:?}");
-            assert!(sr.iter().all(|r| !r.intersects(kb.shrink(6.0))), "{size:?}: no strip control over the keys: {sr:?} vs {kb:?}");
+        use crate::keyboard::{KeyboardMode, KeyboardType};
+        for surface in KeyboardType::ALL {
+            let mut app = DemoApp::new_with_sink(None);
+            app.dock = DockView::Keyboard;
+            app.kb_mode = KeyboardMode::Pinned(surface);
+            let ctx = egui::Context::default();
+            for size in [Vec2::new(1600.0, 1000.0), Vec2::new(1280.0, 800.0), Vec2::new(760.0, 520.0), Vec2::new(781.0, 468.0)] {
+                for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+                let (dock, kb, deck, sr) = (app.dock_rect, app.dock_kb_rect, app.kb_deck_rect, app.kb_strip);
+                let key_h = DemoApp::dock_key_rect(kb, 0).height();
+                let deck_h = deck.height() + 4.0;
+                assert!(kb.top() - dock.top() <= 48.0 + deck_h, "{surface:?} {size:?}: only the header and deck sit above the keys: dock {dock:?}, deck {deck:?}, keys {kb:?}");
+                assert!(key_h >= dock.height() - deck_h - 70.0, "{surface:?} {size:?}: keys {key_h} pt of a {} pt dock with a {deck_h} pt deck", dock.height());
+                if size.x == 1600.0 {
+                    assert!(key_h >= 130.0, "{surface:?}: keys {key_h} pt at 1600x1000, the header-only dock gives 136");
+                }
+                assert!(sr.iter().all(|r| !r.is_positive() || dock.contains_rect(*r)), "{surface:?} {size:?}: strip inside the dock: {sr:?}");
+                assert!(sr.iter().all(|r| !r.intersects(kb.shrink(6.0))), "{surface:?} {size:?}: no strip control over the keys: {sr:?} vs {kb:?}");
+            }
         }
     }
 
@@ -34321,7 +35649,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 15] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 22] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("two rigs", &|a| a.load_multi_rig_demo()),
@@ -34342,6 +35670,13 @@ mod window_size_layout_tests {
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("settings", &|a| a.stage_view = StageView::Settings),
+            ("piano keyboard", &|a| a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::Piano)),
+            ("jazz organ keyboard", &|a| { a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::JazzOrgan); a.kb_dual_manual = true }),
+            ("pipe organ keyboard", &|a| a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::PipeOrgan)),
+            ("piano console", &|a| { a.kb_expanded = true; a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::Piano) }),
+            ("jazz organ console", &|a| { a.kb_expanded = true; a.kb_dual_manual = true; a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::JazzOrgan) }),
+            ("pipe organ console", &|a| { a.kb_expanded = true; a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::PipeOrgan) }),
+            ("synth console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::Synth) }),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
@@ -34352,6 +35687,209 @@ mod window_size_layout_tests {
 /// Offline screenshots of the real frame: egui's tessellated triangles
 /// rasterized on the CPU (no window, no compositor, no GPU). Run with
 /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`.
+#[cfg(test)]
+mod instrument_keyboard_tests {
+    //! #163: the dock's four instrument surfaces, driven through real frames.
+    use super::*;
+    use crate::control::PortKind as CPortKind;
+    use crate::keyboard::{KeyboardMode, KeyboardType};
+
+    const SIZE: Vec2 = Vec2 { x: 1600.0, y: 1000.0 };
+
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, SIZE));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    fn click(app: &mut DemoApp, ctx: &egui::Context, pos: Pos2) {
+        for ev in [egui::Event::PointerMoved(pos), button(pos, true), button(pos, false)] {
+            frame(app, ctx, vec![ev]);
+        }
+    }
+
+    /// Keys → `kind` → Master, with the dock open and a note log
+    /// (note, on?) of everything the dock sends.
+    fn rack_with(kind: Option<NodeKind>) -> (DemoApp, Arc<Mutex<Vec<(u8, bool)>>>) {
+        let mut app = DemoApp::new_with_sink(None);
+        if let Some(kind) = kind {
+            let mut g = crate::control::Graph::default();
+            let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            let inst = g.add_node(kind, name_bytes("INSTRUMENT"));
+            let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, CPortKind::Midi);
+            g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+            app.build_rack(&g, &[]);
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let l = log.clone();
+        app.note_sink = Some(Box::new(move |ev: NoteEvent| l.lock().unwrap().push((ev.note, ev.velocity > 0.0))));
+        app.dock = DockView::Keyboard;
+        (app, log)
+    }
+
+    fn organ() -> NodeKind { NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) } }
+    fn aeolus() -> NodeKind { NodeKind::Clap { plugin_id: crate::control::ClapId::new(crate::aeolus::AEOLUS_ID) } }
+
+    /// A point low on white key `wi`, clear of the black keys.
+    fn white_key(app: &DemoApp, wi: usize) -> Pos2 {
+        let r = DemoApp::dock_key_rect(app.dock_kb_rect, wi);
+        Pos2::new(r.center().x, r.bottom() - 8.0)
+    }
+
+    #[test]
+    fn the_dock_surface_follows_the_rigs_instrument() {
+        for (kind, want) in [
+            (None, KeyboardType::Synth), // the default rig plays Surge XT
+            (Some(organ()), KeyboardType::JazzOrgan),
+            (Some(aeolus()), KeyboardType::PipeOrgan),
+        ] {
+            let (app, _) = rack_with(kind.clone());
+            assert_eq!(app.kb_mode, KeyboardMode::Auto);
+            assert_eq!(app.kb_surface(), want, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_surface_chip_pins_it_and_a_second_click_returns_to_auto() {
+        let (mut app, _) = rack_with(None);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        let piano = app.kb_mode_rects[0];
+        assert!(piano.is_positive(), "chips laid out: {:?}", app.kb_mode_rects);
+        click(&mut app, &ctx, piano.center());
+        assert_eq!(app.kb_mode, KeyboardMode::Pinned(KeyboardType::Piano));
+        assert_eq!(app.kb_surface(), KeyboardType::Piano);
+        frame(&mut app, &ctx, vec![]);
+        let piano = app.kb_mode_rects[0];
+        click(&mut app, &ctx, piano.center());
+        assert_eq!(app.kb_mode, KeyboardMode::Auto);
+        assert_eq!(app.kb_surface(), KeyboardType::Synth, "back to what the rig plays");
+    }
+
+    /// Press-and-hold: the note sounds as long as the pointer is down,
+    /// however long that is, and stops when it lifts (not after a fixed
+    /// click length).
+    #[test]
+    fn a_held_dock_key_sounds_until_the_pointer_lifts() {
+        for kind in [None, Some(organ()), Some(aeolus())] {
+            let (mut app, log) = rack_with(kind.clone());
+            app.kb_mode = KeyboardMode::Pinned(KeyboardType::Piano);
+            let ctx = egui::Context::default();
+            for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+            let p = white_key(&app, 2);
+            frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+            frame(&mut app, &ctx, vec![button(p, true)]);
+            std::thread::sleep(std::time::Duration::from_millis(CLICK_NOTE_MS + 100));
+            for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+            let held = log.lock().unwrap().clone();
+            assert!(matches!(held.as_slice(), [(_, true)]), "one note-on and still held past a click's length ({kind:?}): {held:?}");
+            frame(&mut app, &ctx, vec![button(p, false)]);
+            let all = log.lock().unwrap().clone();
+            assert_eq!(all.len(), 2, "{all:?}");
+            assert_eq!(all[1], (all[0].0, false), "the lift releases that note");
+            assert!(app.notes_down.iter().all(|b| *b == 0), "no key stays lit");
+        }
+    }
+
+    /// A drag across the organ's waterfall keys plays each key it reaches
+    /// and releases each one it leaves: one note at a time, none left.
+    #[test]
+    fn an_organ_glissando_releases_every_key_it_leaves() {
+        let (mut app, log) = rack_with(Some(organ()));
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.kb_surface(), KeyboardType::JazzOrgan);
+        let from = white_key(&app, 0);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(from)]);
+        frame(&mut app, &ctx, vec![button(from, true)]);
+        for wi in 1..=4 {
+            let p = white_key(&app, wi);
+            frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+        }
+        let to = white_key(&app, 4);
+        std::thread::sleep(std::time::Duration::from_millis(CLICK_NOTE_MS + 50));
+        frame(&mut app, &ctx, vec![button(to, false)]);
+        let ev = log.lock().unwrap().clone();
+        let ons: Vec<u8> = ev.iter().filter(|e| e.1).map(|e| e.0).collect();
+        assert_eq!(ons.len(), 5, "every key reached sounds: {ev:?}");
+        let mut down = std::collections::HashSet::new();
+        for (n, on) in &ev {
+            if *on { assert!(down.is_empty(), "legato, one key at a time: {ev:?}"); down.insert(*n); } else { down.remove(n); }
+        }
+        assert!(down.is_empty(), "nothing left sounding: {ev:?}");
+    }
+
+    /// Rule 41: a change that can route the held note elsewhere (a surface
+    /// pin, a rig switch, closing the dock) releases it first.
+    #[test]
+    fn a_held_dock_key_is_released_before_the_surface_or_dock_changes() {
+        let changes: [(&str, &dyn Fn(&mut DemoApp)); 3] = [
+            ("pin", &|a| a.kb_set_mode(KeyboardMode::Pinned(KeyboardType::JazzOrgan))),
+            ("close", &|a| a.toggle_dock(DockView::Keyboard)),
+            ("tool", &|a| { a.exec_tool("set_keyboard_mode", &serde_json::json!({"open": false})); }),
+        ];
+        for (name, change) in changes {
+            let (mut app, log) = rack_with(None);
+            let ctx = egui::Context::default();
+            for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+            let p = white_key(&app, 1);
+            frame(&mut app, &ctx, vec![egui::Event::PointerMoved(p)]);
+            frame(&mut app, &ctx, vec![button(p, true)]);
+            assert!(app.kb_drag_note.is_some(), "{name}: key held");
+            change(&mut app);
+            let ev = log.lock().unwrap().clone();
+            assert!(matches!(ev.as_slice(), [(n, true), (m, false)] if n == m), "{name}: released at once: {ev:?}");
+            assert!(app.kb_drag_note.is_none(), "{name}");
+        }
+    }
+
+    /// Agent parity (rules 6, 23): the agent reads and sets what the
+    /// header chips and EXPAND set, and a bad mode is refused, not guessed.
+    #[test]
+    fn the_keyboard_tools_pin_expand_and_report() {
+        let (mut app, _) = rack_with(Some(organ()));
+        app.dock = DockView::None;
+        let ctx = egui::Context::default();
+        let out = app.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "pipe_organ", "expanded": true}));
+        assert!(!out.starts_with("error"), "{out}");
+        assert_eq!(app.kb_mode, KeyboardMode::Pinned(KeyboardType::PipeOrgan));
+        assert_eq!(app.dock, DockView::Keyboard, "expanding opens the dock");
+        assert!(app.kb_expanded);
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert!(app.dock_rect.height() > SIZE.y * 0.7, "expanded takes the stage: {:?}", app.dock_rect);
+        let state: serde_json::Value = serde_json::from_str(&app.exec_tool("get_keyboard_state", &serde_json::json!({}))).unwrap();
+        assert_eq!(state["mode"], "pipe_organ", "{state}");
+        assert_eq!(state["detected_mode"], "jazz_organ", "{state}");
+        assert_eq!(state["expanded"], true, "{state}");
+        let out = app.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "theremin"}));
+        assert!(out.starts_with("error"), "{out}");
+        assert_eq!(app.kb_mode, KeyboardMode::Pinned(KeyboardType::PipeOrgan), "a refused call changes nothing");
+        app.exec_tool("set_keyboard_mode", &serde_json::json!({"mode": "auto", "expanded": false}));
+        assert_eq!(app.kb_surface(), KeyboardType::JazzOrgan);
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert!(app.dock_rect.height() < SIZE.y * 0.5, "docked again: {:?}", app.dock_rect);
+    }
+
+    #[test]
+    fn the_pinned_surface_travels_with_the_session() {
+        let (mut app, _) = rack_with(None);
+        app.kb_set_mode(KeyboardMode::Pinned(KeyboardType::Piano));
+        let s = app.capture_session("kb").unwrap();
+        assert_eq!(s.keyboard_mode, Some(KeyboardMode::Pinned(KeyboardType::Piano)));
+        let (mut other, _) = rack_with(None);
+        other.apply_session(&s).unwrap();
+        assert_eq!(other.kb_mode, KeyboardMode::Pinned(KeyboardType::Piano));
+    }
+}
+
 #[cfg(test)]
 mod offline_shots {
     use super::*;
@@ -34487,6 +36025,69 @@ mod offline_shots {
             let mut app = DemoApp::new_with_sink(None);
             app.stage_view = StageView::Plugins;
             shot(&mut app, Vec2::new(w, h), &dir.join(format!("{w}x{h}-plugins.png")));
+        }
+    }
+
+    /// #163: each keyboard surface in AUTO on the rig it follows, with a
+    /// held C major chord, plus the dual manual and the expanded view.
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat keyboard_surface_shots -- --ignored"]
+    fn keyboard_surface_shots() {
+        use crate::keyboard::{KeyboardMode, KeyboardType};
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rig = |app: &mut DemoApp, kind: NodeKind, name: &str| {
+            let mut g = crate::control::Graph::default();
+            let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            let inst = g.add_node(kind, name_bytes(name));
+            let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, crate::control::PortKind::Midi);
+            g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, crate::control::PortKind::Audio);
+            app.build_rack(&g, &[]);
+        };
+        let organ = || NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) };
+        let aeolus = || NodeKind::Clap { plugin_id: crate::control::ClapId::new(crate::aeolus::AEOLUS_ID) };
+        let mains = |a: &mut DemoApp| super::main_control_tests::give_clap_units_main_knobs(a);
+        // A hosted Aeolus with piston 2 (Principal Chorus) drawn.
+        let chorus = |a: &mut DemoApp| {
+            if let Some(u) = a.kb_target_unit() {
+                let node = a.units[u].node_id;
+                let reg = crate::keyboard::pipe_piston_registration(1).unwrap();
+                a.aeolus_faces.entry(node).or_default().drawn = crate::aeolus::drawn(&crate::aeolus::state(reg));
+                a.aeolus_poll_at = a.ui_time + 1e6; // no live plugin to poll in a shot
+            }
+        };
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 11] = [
+            ("synth", &|a| mains(a)),
+            ("synth-expanded", &|a| { mains(a); a.kb_expanded = true }),
+            ("jazz-organ-expanded", &|a| { rig(a, organ(), "ORGAN"); a.kb_expanded = true }),
+            ("jazz-organ-dual-expanded", &|a| { rig(a, organ(), "ORGAN"); a.kb_dual_manual = true; a.kb_expanded = true }),
+            ("piano", &|a| a.kb_mode = KeyboardMode::Pinned(KeyboardType::Piano)),
+            ("piano-expanded", &|a| { a.kb_mode = KeyboardMode::Pinned(KeyboardType::Piano); a.kb_expanded = true; a.kb_sustain = true }),
+            ("jazz-organ", &|a| rig(a, organ(), "ORGAN")),
+            ("jazz-organ-dual", &|a| { rig(a, organ(), "ORGAN"); a.kb_dual_manual = true }),
+            ("pipe-organ", &|a| { rig(a, aeolus(), "AEOLUS"); chorus(a) }),
+            ("pipe-organ-expanded", &|a| { rig(a, aeolus(), "AEOLUS"); chorus(a); a.kb_expanded = true }),
+            ("pipe-organ-preview-expanded", &|a| { a.kb_mode = KeyboardMode::Pinned(KeyboardType::PipeOrgan); a.kb_expanded = true }),
+        ];
+        let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();
+        // KABELSALAT_SHOTS_SIZES=781x950,1576x468 renders other window sizes.
+        let sizes: Vec<(f32, f32)> = std::env::var("KABELSALAT_SHOTS_SIZES").ok()
+            .map(|s| s.split(',').filter_map(|wh| { let (w, h) = wh.split_once('x')?; Some((w.parse().ok()?, h.parse().ok()?)) }).collect())
+            .unwrap_or_else(|| vec![(1600.0, 1000.0), (1000.0, 700.0), (781.0, 468.0)]);
+        for (w, h) in sizes {
+            for (name, setup) in &views {
+                if only.as_deref().is_some_and(|o| !name.contains(o)) { continue; }
+                let mut app = DemoApp::new_with_sink(None); // rule 148: fresh per image
+                setup(&mut app);
+                app.dock = DockView::Keyboard;
+                let base = 12 * (app.octave as usize + 1);
+                for n in [base, base + 4, base + 7] {
+                    app.note_leds[n] = 1.0;
+                    app.notes_down[n] = 1;
+                }
+                shot(&mut app, Vec2::new(w, h), &dir.join(format!("{w}x{h}-kbd-{name}.png")));
+            }
         }
     }
 

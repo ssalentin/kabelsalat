@@ -980,8 +980,10 @@ pub enum Command {
     Connect { id: EdgeId, from: PortRef, to: PortRef, kind: PortKind },
     Disconnect(EdgeId),
     SetParam { node: NodeId, param: ParamId, value: f64 },
-    NoteOn { note: u8, velocity: f32, source: SourceId },
-    NoteOff { note: u8, source: SourceId },
+    /// `channel` is 0-based (0 = MIDI channel 1); the organ dock's Lower
+    /// Manual plays channel 1 (#163). Older JSON without it loads as 0.
+    NoteOn { note: u8, velocity: f32, source: SourceId, #[serde(default)] channel: u8 },
+    NoteOff { note: u8, source: SourceId, #[serde(default)] channel: u8 },
     /// Per-rig input selection (AUM operating model): which source classes
     /// feed this instrument node — the computer keyboard (on-screen clicks
     /// and laptop typing are one source) and hardware MIDI. The MIDI cable
@@ -1347,7 +1349,7 @@ mod tests {
     #[test]
     fn bus_roundtrip() {
         let (mut bus, mut drain) = command_bus();
-        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys }));
+        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 }));
         let mut got = Vec::new();
         drain.drain(|c| got.push(c));
         assert_eq!(got.len(), 1);
@@ -1368,8 +1370,8 @@ mod tests {
             Command::Connect { id: 12, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: PortKind::Midi },
             Command::Disconnect(12),
             Command::SetParam { node: 3, param: 3, value: 0.75 },
-            Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys },
-            Command::NoteOff { note: 60, source: SourceId::Hardware(20) },
+            Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 },
+            Command::NoteOff { note: 60, source: SourceId::Hardware(20), channel: 0 },
             Command::SetRigSource { node: 1, keyboard: true, hardware: true },
             Command::SetRigSource { node: 4, keyboard: false, hardware: true },
             Command::SetNodeSplit { node: 0, point: Some(60) },

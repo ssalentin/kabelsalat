@@ -180,14 +180,14 @@ fn surge(clips: &mut Vec<Clip>) -> anyhow::Result<()> {
     probe::wire(&mut g, 2, synth, master, 0);
     probe::wire(&mut g, 3, synth, master, 1);
     let mut engine = super::GraphEngine::new(g, drain, SR as f64, vec![(synth, voice)]);
-    bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 });
     let mut buf = vec![0.0f32; 256 * 2];
     let mut out = Vec::new();
     for _ in 0..(SR as usize * 6 / 5 / 256) {
         engine.render(&mut buf, 2);
         out.extend_from_slice(&buf);
     }
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
     let l: Vec<f32> = out.iter().step_by(2).copied().skip(SR as usize / 5).collect();
     let s = Spectrum::of(&l, SR);
     let want = probe::midi_hz(60) as f32;

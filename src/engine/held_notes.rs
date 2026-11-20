@@ -380,8 +380,8 @@ impl Run {
     /// key left sounding (empty = fine).
     fn step(&mut self, step: Step) -> Vec<(u32, u8)> {
         let (cmd, key) = match step {
-            Step::On(k) => (Some(Command::NoteOn { note: k, velocity: 0.8, source: SourceId::Keys }), Some(k)),
-            Step::Off(k) => (Some(Command::NoteOff { note: k, source: SourceId::Keys }), Some(k)),
+            Step::On(k) => (Some(Command::NoteOn { note: k, velocity: 0.8, source: SourceId::Keys, channel: 0 }), Some(k)),
+            Step::Off(k) => (Some(Command::NoteOff { note: k, source: SourceId::Keys, channel: 0 }), Some(k)),
             Step::Edit(e) => (Some(e.command(self.scn)), None),
             Step::Tick => (None, None),
         };

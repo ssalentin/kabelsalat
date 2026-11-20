@@ -2816,9 +2816,9 @@ impl GraphEngine {
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                     if s.plugin.is_instrument() {
                         if is_on {
-                            s.plugin.note_on(note, m.data[1]);
+                            s.plugin.note_on_ch(note, m.data[1], m.channel);
                         } else {
-                            s.plugin.note_off(note);
+                            s.plugin.note_off_ch(note, m.channel);
                         }
                     }
                 }
@@ -3623,8 +3623,8 @@ impl GraphEngine {
                 self.active_rig = active.min(rigs.len().saturating_sub(1));
                 self.publish_rig_snapshot();
             }
-            Command::NoteOn { note, velocity, source } => {
-                let msg = MidiMsg::note_on(0, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
+            Command::NoteOn { note, velocity, source, channel } => {
+                let msg = MidiMsg::note_on(channel & 0x0F, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
@@ -3658,13 +3658,13 @@ impl GraphEngine {
                     }
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                         if s.plugin.is_instrument() {
-                            s.plugin.note_on(out, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
+                            s.plugin.note_on_ch(out, (velocity.clamp(0.0, 1.0) * 127.0) as u8, channel & 0x0F);
                         }
                     }
                 }
             }
-            Command::NoteOff { note, source } => {
-                let msg = MidiMsg::note_off(0, note, 0);
+            Command::NoteOff { note, source, channel } => {
+                let msg = MidiMsg::note_off(channel & 0x0F, note, 0);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
@@ -3693,7 +3693,7 @@ impl GraphEngine {
                     }
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                         if s.plugin.is_instrument() {
-                            s.plugin.note_off(out);
+                            s.plugin.note_off_ch(out, channel & 0x0F);
                         }
                     }
                 }
@@ -5405,10 +5405,10 @@ mod tests {
     }
 
     fn on(note: u8) -> crate::control::Command {
-        crate::control::Command::NoteOn { note, velocity: 0.8, source: SourceId::Keys }
+        crate::control::Command::NoteOn { note, velocity: 0.8, source: SourceId::Keys, channel: 0 }
     }
     fn off(note: u8) -> crate::control::Command {
-        crate::control::Command::NoteOff { note, source: SourceId::Keys }
+        crate::control::Command::NoteOff { note, source: SourceId::Keys, channel: 0 }
     }
 
     #[test]
@@ -5431,7 +5431,7 @@ mod tests {
         assert_eq!(play(&mut e, &mut bus, off(59)), vec![(1, 59, false)]);
         assert_eq!(play(&mut e, &mut bus, off(60)), vec![(4, 60, false)]);
         // Laptop typing is the same Keyboard source: same Keys-node zones.
-        let lap = crate::control::Command::NoteOn { note: 48, velocity: 0.8, source: SourceId::Keys };
+        let lap = crate::control::Command::NoteOn { note: 48, velocity: 0.8, source: SourceId::Keys, channel: 0 };
         assert_eq!(play(&mut e, &mut bus, lap), vec![(1, 48, true)]);
     }
 
@@ -5594,13 +5594,13 @@ mod tests {
         let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![(1, voice)]);
         let mut buf = vec![0.0f32; 256 * 2];
         let mut peak_of_a_note = |engine: &mut super::GraphEngine, bus: &mut crate::control::CommandBus| {
-            bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+            bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
             let mut peak = 0.0f32;
             for _ in 0..40 {
                 engine.render(&mut buf, 2);
                 peak = peak.max(super::block_peak(&buf));
             }
-            bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+            bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
             for _ in 0..200 {
                 engine.render(&mut buf, 2);
             }
@@ -6459,8 +6459,8 @@ mod tests {
             return; // setBfree is not installed (CI)
         }
         engine.note_log.clear();
-        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: off });
-        bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: SourceId::Hardware(1) });
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: off, channel: 0 });
+        bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: SourceId::Hardware(1), channel: 0 });
         engine.render(&mut buf, 2);
         let heard: Vec<u8> = engine.note_log.iter().filter(|e| e.0 == organ && e.2).map(|e| e.1).collect();
         assert_eq!(heard, vec![62], "device 3 was turned off for the organ before its instance loaded; device 1 still plays it");
@@ -6603,14 +6603,14 @@ mod tests {
         engine.render(&mut buf, 2);
         engine.note_log.clear();
         engine.cc_log.clear();
-        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: dev });
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: dev, channel: 0 });
         bus.send(Command::Cc { source: dev, channel: 0, cc: 74, value: 127 });
         engine.render(&mut buf, 2);
         assert!(engine.note_log.is_empty(), "learn wired the device's notes: {:?}", engine.note_log);
         assert_eq!(engine.cc_log, vec![(1, 42, 1.0)], "the learned CC must still reach its param");
         // Shaping the route in the matrix makes it a normal (note) route.
         bus.send(Command::MatrixRule { source: dev, dest: 1, channel: None, transpose: 0, key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true });
-        bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: dev });
+        bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: dev, channel: 0 });
         engine.render(&mut buf, 2);
         assert!(engine.note_log.iter().any(|&(d, n, on)| d == 1 && n == 62 && on), "{:?}", engine.note_log);
     }
@@ -6821,13 +6821,13 @@ mod tests {
             }
             n as f32 * 48000.0 / (blocks as f32 * 256.0)
         };
-        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
         let straight = crossings(&mut engine, 100, 20);
         bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 8191 });
         let bent = crossings(&mut engine, 100, 20);
         bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
         let back = crossings(&mut engine, 100, 20);
-        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
         engine.render(&mut buf, 2);
         println!("pitch bend: {straight:.0} → {bent:.0} → {back:.0} crossings/s (full up = +2 st ≈ ×1.12)");
         assert!(straight > 50.0, "no signal at the master: {straight:.0} crossings/s");
@@ -6939,7 +6939,7 @@ pub fn lv2_engine_test() -> anyhow::Result<()> {
     g.connect_with_id(3, PortRef { node: lv2, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
 
     bus.send(Command::LoadGraph { graph: g });
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
 
     let mut buf = vec![0.0f32; 512 * 2];
     let mut peak = 0.0f32;
@@ -6977,7 +6977,7 @@ pub fn edge_level_test() -> anyhow::Result<()> {
     g.connect_with_id(4, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
     let mut engine = GraphEngine::new(g, drain, sr, vec![(synth, voice)]);
     let levels = engine.edge_levels_handle();
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let mut buf = vec![0.0f32; 512 * 2];
     let mut lit = [0.0f32; 5];
     for _ in 0..40 {
@@ -6990,7 +6990,7 @@ pub fn edge_level_test() -> anyhow::Result<()> {
     for e in 2..5 {
         anyhow::ensure!(lit[e] > 1e-3, "audio edge {e} stayed silent while playing ({})", lit[e]);
     }
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
     let mut secs = 0.0f32;
     let silent = |l: &EdgeLevels| (2..5u32).all(|e| l.load(e) < 1e-3);
     while !silent(&levels) && secs < 20.0 {
@@ -7077,9 +7077,9 @@ pub fn organ_test() -> anyhow::Result<()> {
     // Zero crossings per second of the left channel while `note` is held:
     // a registration's pitch content (16' alone ≈ the fundamental an octave
     // down, 1' alone ≈ three octaves up).
-    let measure = |engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, note: u8| -> (f32, f32) {
+    let measure_ch = |engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, note: u8, channel: u8| -> (f32, f32) {
         let mut buf = vec![0.0f32; 512 * 2];
-        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys, channel });
         for _ in 0..20 { engine.render(&mut buf, 2); }
         let (mut zc, mut prev, mut peak, mut n) = (0usize, 0.0f32, 0.0f32, 0usize);
         for _ in 0..47 {
@@ -7091,10 +7091,11 @@ pub fn organ_test() -> anyhow::Result<()> {
                 n += 1;
             }
         }
-        bus.send(Command::NoteOff { note, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note, source: SourceId::Keys, channel });
         for _ in 0..200 { engine.render(&mut buf, 2); }
         (zc as f32 / (n as f32 / sr as f32), peak)
     };
+    let measure = |engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, note: u8| measure_ch(engine, bus, note, 0);
     let registration = |bus: &mut crate::control::CommandBus, bars: [u8; DRAWBARS]| {
         for (i, b) in bars.iter().enumerate() {
             bus.send(Command::SetParam { node: organ, param: drawbar_param(i), value: crate::organ::drawbar_value(*b) as f64 });
@@ -7120,6 +7121,18 @@ pub fn organ_test() -> anyhow::Result<()> {
     // Leslie's movement and the percussion cannot fake it.
     anyhow::ensure!(high > 6.0 * low, "the drawbars did not change the registration ({high:.0} vs {low:.0} crossings/s): the CCs (or the ones sent while loading) did not arrive");
 
+    // The dock's Lower Manual (#163) plays MIDI channel 2 (0-based 1):
+    // setBfree's lower manual sounds with its own registration, and its
+    // note-off on that channel ends it.
+    let (_, lower_peak) = measure_ch(&mut engine, &mut bus, 60, 1);
+    let mut tail = 0.0f32;
+    for _ in 0..20 {
+        engine.render(&mut buf, 2);
+        tail = buf.iter().fold(tail, |m, x| m.max(x.abs()));
+    }
+    println!("organ-test: lower manual (channel 2) C4 peak {lower_peak:.3}, after its note-off {tail:.4}");
+    anyhow::ensure!(lower_peak > 1e-3, "the lower manual (channel 2) is silent");
+    anyhow::ensure!(tail < lower_peak * 0.5, "the lower manual kept sounding after its channel-2 note-off ({tail:.4})");
     // A Nord Electro 2 on a MIDI interface plays the same registrations with
     // its own drawbar CCs, through the profile's bindings.
     let nord = SourceId::Hardware(3);
@@ -7198,7 +7211,7 @@ pub fn midifx_test() -> anyhow::Result<()> {
         }
         p
     };
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let held = peak(&mut engine, 20);
     let ev = engine.lv2_last_note(inst);
     println!("midifx-test: C4 through MIDI Transpose (+7, set while loading) reached the instrument as {ev:?}; master peak {held:.4}");
@@ -7207,27 +7220,27 @@ pub fn midifx_test() -> anyhow::Result<()> {
     // Move the knob while the key is held, then release the key.
     bus.send(Command::SetParam { node: fx, param: semis_ctl.index as u32, value: norm(-5.0) });
     peak(&mut engine, 5);
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
     peak(&mut engine, 375);
     let after = peak(&mut engine, 94);
     println!("midifx-test: knob moved to -5 while C4 was held, key released: master peak afterwards {after:.5} (held {held:.4})");
     anyhow::ensure!(after < held * 0.01, "a note stayed on after release: the unit lost a note-off when its knob moved");
     // The new setting applies to the next note.
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     peak(&mut engine, 5);
     let ev = engine.lv2_last_note(inst);
     println!("midifx-test: next C4 at -5 reached the instrument as {ev:?}");
     anyhow::ensure!(matches!(ev, Some([0x90, 55, _])), "expected note-on 55 after the knob moved, got {ev:?}");
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
     peak(&mut engine, 375);
     let tail = peak(&mut engine, 94);
     anyhow::ensure!(tail < held * 0.01, "second note stayed on after release");
     // Removing the unit while a key is held must release it, not strand it.
-    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     peak(&mut engine, 5);
     bus.send(Command::RemoveNode(fx));
     peak(&mut engine, 5);
-    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys, channel: 0 });
     peak(&mut engine, 375);
     let removed = peak(&mut engine, 94);
     anyhow::ensure!(removed < held * 0.01, "removing the MIDI unit under a held key left the note sounding");
@@ -7272,11 +7285,11 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
         peak
     };
     let before = peak_over(&mut engine, 10);
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let held = peak_over(&mut engine, 47); // ~0.5 s
     let ev = engine.lv2_last_note(inst);
     anyhow::ensure!(matches!(ev, Some(e) if e[1] == 60), "LV2 instrument did not receive the note: {ev:?}");
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
     peak_over(&mut engine, 375); // ~4 s release tail
     let after = peak_over(&mut engine, 94); // the following ~1 s
     println!("lv2-instrument-engine-test: {uri}: master peak silent={before:.4} held={held:.4} 4-5 s after release={after:.4}");
@@ -7285,11 +7298,11 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     // A chord pressed and released within one block each: every note-off
     // must reach the plugin (one event per block left a note hanging).
     for n in [60u8, 64, 67] {
-        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     }
     let chord = peak_over(&mut engine, 47);
     for n in [60u8, 64, 67] {
-        bus.send(Command::NoteOff { note: n, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note: n, source: SourceId::Keys, channel: 0 });
     }
     peak_over(&mut engine, 375);
     let chord_after = peak_over(&mut engine, 94);
@@ -7299,12 +7312,12 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     // Legato: release 60 and press 62 in the same block, then release 62.
     // With one event per block the note-off for 60 was lost (a hanging
     // organ note, reported live with setBfree).
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     peak_over(&mut engine, 20);
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
-    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
+    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let legato = peak_over(&mut engine, 20);
-    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys, channel: 0 });
     peak_over(&mut engine, 375);
     let legato_after = peak_over(&mut engine, 94);
     println!("lv2-instrument-engine-test: legato held={legato:.4} 4-5 s after release={legato_after:.4}");
@@ -7358,9 +7371,9 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     bus.send(Command::Connect { id: 3, from: PortRef { node: inst, port: 0 }, to: PortRef { node: drive, port: 0 }, kind: PortKind::Audio });
     bus.send(Command::Connect { id: 4, from: PortRef { node: drive, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
     peak_over(&mut engine, 5);
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let through = peak_over(&mut engine, 47);
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
     peak_over(&mut engine, 100);
     println!("lv2-instrument-engine-test: through a Saturation unit: master peak held={through:.4}");
     anyhow::ensure!(through > 1e-3, "LV2 instrument {uri} → built-in effect → Master is silent");
@@ -7518,7 +7531,7 @@ pub fn lv2_async_test() -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_micros(5333)); // one 256-frame buffer
         }
         let attached_after = attached_after.ok_or_else(|| anyhow::anyhow!("{uri} never attached (with_loader={with_loader})"))?;
-        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
         let mut peak = 0.0f32;
         for _ in 0..94 {
             engine.render(&mut buf, 2);
@@ -7557,7 +7570,7 @@ fn timbre_of_note(engine: &mut GraphEngine, bus: &mut crate::control::CommandBus
     use crate::control::Command;
     use crate::matrix::SourceId;
     let mut buf = vec![0.0f32; 512 * 2];
-    bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let (mut zc, mut sq, mut dsq, mut n, mut prev) = (0usize, 0.0f64, 0.0f64, 0usize, 0.0f32);
     for _ in 0..(sr as usize / 2 / 512) {
         engine.render(&mut buf, 2);
@@ -7570,7 +7583,7 @@ fn timbre_of_note(engine: &mut GraphEngine, bus: &mut crate::control::CommandBus
             n += 1;
         }
     }
-    bus.send(Command::NoteOff { note, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note, source: SourceId::Keys, channel: 0 });
     for _ in 0..(sr as usize * 2 / 512) { engine.render(&mut buf, 2); }
     let rms = (sq / n as f64).sqrt() as f32;
     Timbre { rms, zero_cross_hz: zc as f32 / n as f32 * sr as f32 / 2.0, brightness: (dsq / n as f64).sqrt() as f32 / rms.max(1e-9) }
@@ -7823,14 +7836,14 @@ pub fn wind_test(query: Option<&str>) -> anyhow::Result<()> {
     let blocks = (2.0 * sr) as usize / block;
     let mut play = |engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, breath: &dyn Fn(f32) -> u8| -> f64 {
         let mut sum = 0.0f64;
-        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 });
         for b in 0..blocks {
             bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value: breath(b as f32 / blocks as f32) });
             engine.render(&mut buf, 2);
             sum += buf.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
         }
         bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value: 0 });
-        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
         for _ in 0..80 { engine.render(&mut buf, 2); }
         (sum / (blocks * block * 2) as f64).sqrt()
     };
@@ -7867,7 +7880,7 @@ pub fn add_node_test() -> anyhow::Result<()> {
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: surge, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });
     bus.send(Command::Connect { id: 4, from: PortRef { node: gain, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
 
     let mut buf = vec![0.0f32; 512 * 2];
     let mut peak = 0.0f32;
@@ -7897,7 +7910,7 @@ pub fn mono_master_test() -> anyhow::Result<()> {
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 2 }, PortKind::Audio);
     let mut engine = GraphEngine::new(g, drain, sr, vec![(surge, voice)]);
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let mut buf = vec![0.0f32; 512 * 2];
     let mut peak = 0.0f32;
     let mut centered = true;
@@ -7938,7 +7951,7 @@ pub fn multi_rig_test() -> anyhow::Result<()> {
     g.connect_with_id(3, PortRef { node: keys, port: 0 }, PortRef { node: sb, port: 0 }, PortKind::Midi);
     g.connect_with_id(4, PortRef { node: sb, port: 0 }, PortRef { node: mb, port: 0 }, PortKind::Audio);
     let mut engine = GraphEngine::new(g, drain, sr, vec![(sa, va), (sb, vb)]);
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
 
     let mut buf = vec![0.0f32; 512 * 2];
     let measure = |e: &mut GraphEngine, buf: &mut [f32]| -> f32 {
@@ -7984,7 +7997,7 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
         if n.id == sb || n.id == mb { n.rig = 1; }
     }
     let mut engine = GraphEngine::new(g, drain, sr, vec![(sa, va), (sb, vb)]);
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
 
     let mut buf = vec![0.0f32; 512 * 2];
     let measure = |e: &mut GraphEngine, buf: &mut [f32]| -> (f32, f32) {
@@ -8048,9 +8061,9 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
     // Every measurement retriggers the note: Surge's envelope decays, so a
     // measurement taken later would read lower for no mixing reason.
     let shot = |bus: &mut crate::control::CommandBus, e: &mut GraphEngine, buf: &mut [f32]| -> (f32, f32) {
-        bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note: 62, source: SourceId::Keys, channel: 0 });
         for _ in 0..40 { e.render(buf, 2); }
-        bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys, channel: 0 });
         let (mut pl, mut pr) = (0.0f32, 0.0f32);
         for _ in 0..12 {
             e.render(buf, 2);
@@ -8121,7 +8134,7 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
         g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
         bus.send(Command::LoadGraph { graph: g });
     }
-    bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     bus.send(Command::SetParam { node: gain, param: 0, value: 0.0 });
     let silent = settled(&mut engine, &mut buf).0;
     anyhow::ensure!(silent < 1e-3, "gain 0 did not silence the chain ({silent})");
@@ -8149,7 +8162,7 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
         let _ = (s0, keys);
         bus.send(Command::LoadGraph { graph: g });
     }
-    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     bus.send(Command::SetParam { node: mfx, param: 0, value: 1.0 });
     let with_insert = settled(&mut engine, &mut buf).0;
     bus.send(Command::SetParam { node: mfx, param: 0, value: 0.25 });
@@ -8217,7 +8230,7 @@ pub fn multi_rig_load_test() -> anyhow::Result<()> {
     );
 
     // 1. Keys play ONLY rig B (rig A is bound to device 2).
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     let b_only = measure(&mut engine, &mut buf);
     anyhow::ensure!(b_only > 1e-3, "rig B produced no output from keys (peak {b_only})");
 
@@ -8236,7 +8249,7 @@ pub fn multi_rig_load_test() -> anyhow::Result<()> {
         to: PortRef { node: 5, port: 0 },
         kind: PortKind::Audio,
     });
-    bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Hardware(2) });
+    bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Hardware(2), channel: 0 });
     let both = measure(&mut engine, &mut buf);
     anyhow::ensure!(both > b_only * 1.2, "rigs not summing (both {both} vs b_only {b_only})");
     println!(
@@ -8324,7 +8337,7 @@ pub fn many_voices_test() -> anyhow::Result<()> {
     // Every unit holds a chord at once: per-voice peak at its master cable
     // and the cost of a block with all of them sounding.
     for note in [48u8, 55, 60, 64] {
-        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     }
     let blocks = (SR as usize * 3) / BLOCK;
     let mut peaks = vec![0.0f32; units.len()];
@@ -8340,7 +8353,7 @@ pub fn many_voices_test() -> anyhow::Result<()> {
         master_peak = master_peak.max(block_peak(&buf));
     }
     for note in [48u8, 55, 60, 64] {
-        bus.send(Command::NoteOff { note, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note, source: SourceId::Keys, channel: 0 });
     }
     engine.render(&mut buf, 2);
     for (i, (name, _)) in plugins.iter().enumerate() {
@@ -8456,7 +8469,7 @@ pub fn arp_test() -> anyhow::Result<()> {
 
     // 1. Up pattern, two bars.
     for note in [60u8, 64, 67] {
-        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     }
     let blocks = (SR * 60.0 / BPM * 8.0 / BLOCK as f64).ceil() as usize; // 8 beats
     let mut onsets: Vec<(usize, u8)> = Vec::new();
@@ -8490,7 +8503,7 @@ pub fn arp_test() -> anyhow::Result<()> {
 
     // Releasing every key silences the arp at once.
     for note in [60u8, 64, 67] {
-        bus.send(Command::NoteOff { note, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note, source: SourceId::Keys, channel: 0 });
     }
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp).is_empty() && engine.arp_held(arp).is_empty(), "arp still holds notes after the release");
@@ -8500,20 +8513,20 @@ pub fn arp_test() -> anyhow::Result<()> {
         bus.send(Command::SetParam { node: arp, param, value: step_value(pos, n) as f64 });
     };
     knob(&mut bus, P_ARP_MODE, ArpMode::ALL.iter().position(|m| *m == ArpMode::Chord).unwrap(), ArpMode::ALL.len());
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 67], "one key must sound a triad, got {:?}", engine.arp_sounding(arp));
-    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 65, 67, 69, 72], "two keys, two triads, got {:?}", engine.arp_sounding(arp));
     let sevenths = ChordShape::ALL.iter().position(|c| *c == ChordShape::Dominant7).unwrap();
     knob(&mut bus, P_ARP_CHORD, sevenths, ChordShape::ALL.len());
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp).len() == 8, "dominant 7ths on two keys = 8 voices, got {:?}", engine.arp_sounding(arp));
-    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp) == vec![65, 69, 72, 75], "releasing C leaves F7, got {:?}", engine.arp_sounding(arp));
-    bus.send(Command::NoteOff { note: 65, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 65, source: SourceId::Keys, channel: 0 });
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp).is_empty(), "chords left sounding after both releases");
     println!("  chord mode: 1 key → 3 voices, 2 keys → 6, 7th shape → 4 per key, release clears them");
@@ -8521,10 +8534,10 @@ pub fn arp_test() -> anyhow::Result<()> {
     // 3. Scale snap on the Keys node: C# in C major sounds as C.
     bus.send(Command::SetKeysScale { node: keys, scale: Some(ScaleChoice { scale: Scale::Major, key: 0 }) });
     knob(&mut bus, P_ARP_CHORD, 0, ChordShape::ALL.len());
-    bus.send(Command::NoteOn { note: 61, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 61, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 67], "C# in C major must snap to C, got {:?}", engine.arp_sounding(arp));
-    bus.send(Command::NoteOff { note: 61, source: SourceId::Keys });
+    bus.send(Command::NoteOff { note: 61, source: SourceId::Keys, channel: 0 });
     engine.render(&mut buf, 2);
     anyhow::ensure!(engine.arp_sounding(arp).is_empty(), "the snapped note's release did not meet its pitch");
     println!("  scale snap: C# in C major → C (triad 60 64 67), released cleanly");
@@ -8606,13 +8619,13 @@ pub fn cc_map_test() -> anyhow::Result<()> {
     let mut render_note = |engine: &mut GraphEngine, cc: u8, val: u8| -> Vec<f32> {
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc, value: val });
         for _ in 0..4 { engine.render(&mut buf, 2); }
-        bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Hardware(0) });
+        bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Hardware(0), channel: 0 });
         let mut out = Vec::with_capacity(256 * 2 * 16);
         for _ in 0..16 {
             engine.render(&mut buf, 2);
             out.extend_from_slice(&buf);
         }
-        bus.send(Command::NoteOff { note: 48, source: SourceId::Hardware(0) });
+        bus.send(Command::NoteOff { note: 48, source: SourceId::Hardware(0), channel: 0 });
         for _ in 0..8 { engine.render(&mut buf, 2); }
         out
     };
@@ -8872,9 +8885,9 @@ pub fn target_test() -> anyhow::Result<()> {
         let blocks = |secs: f64| (secs * SR / BLOCK as f64) as usize;
         let per_chord = PHRASE_SECS / chords.len() as f64;
         for (notes, velocity) in chords {
-            for &note in notes { bus.send(Command::NoteOn { note, velocity, source: SourceId::Keys }); }
+            for &note in notes { bus.send(Command::NoteOn { note, velocity, source: SourceId::Keys, channel: 0 }); }
             for _ in 0..blocks(per_chord * 0.8) { engine.render(&mut buf, 2); }
-            for &note in notes { bus.send(Command::NoteOff { note, source: SourceId::Keys }); }
+            for &note in notes { bus.send(Command::NoteOff { note, source: SourceId::Keys, channel: 0 }); }
             for _ in 0..blocks(per_chord * 0.2) { engine.render(&mut buf, 2); }
         }
     };
@@ -8995,7 +9008,7 @@ pub fn meter_test() -> anyhow::Result<()> {
     // 1. Held chord for ~1.5 s: the meter (momentary, short-term) must read
     //    above the silent floor, and bands 2/3 (> 500 Hz) should carry energy.
     for &n in &[60u8, 64, 67] {
-        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys, channel: 0 });
     }
     for _ in 0..(1.5 * SR / BLOCK as f64) as usize {
         engine.render(&mut buf, 2);
@@ -9026,7 +9039,7 @@ pub fn meter_test() -> anyhow::Result<()> {
 
     // 4. Reset clears the integration (then silence leaves it NaN).
     for &n in &[60u8, 64, 67] {
-        bus.send(Command::NoteOff { note: n, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note: n, source: SourceId::Keys, channel: 0 });
     }
     for _ in 0..8 { engine.render(&mut buf, 2); }
     bus.send(Command::ResetMeter);
@@ -9219,8 +9232,8 @@ pub fn send_test() -> anyhow::Result<()> {
     bus.send(Command::Connect { id: 20, from: PortRef { node: aux, port: 0 }, to: PortRef { node: verb, port: 0 }, kind: PortKind::Audio });
     bus.send(Command::Connect { id: 21, from: PortRef { node: verb, port: 0 }, to: PortRef { node: ma, port: 0 }, kind: PortKind::Audio });
     bus.send(Command::SetParam { node: verb, param: 0, value: 1.0 }); // fully wet
-    bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Keys });
-    bus.send(Command::NoteOn { note: 55, velocity: 0.9, source: SourceId::Hardware(0) });
+    bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Keys, channel: 0 });
+    bus.send(Command::NoteOn { note: 55, velocity: 0.9, source: SourceId::Hardware(0), channel: 0 });
 
     // RMS over about one second of (master output, bus, reverb).
     let mut measure = |e: &mut GraphEngine| -> (f32, f32, f32) {

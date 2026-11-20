@@ -47,11 +47,27 @@ or the one you pin:
   notes as keys), arpeggiator switch, sustain and velocity.
 
 Keys sound for as long as you hold them, and the chord you hold is named in the
-header. **EXPAND** (**Shift+V**) gives the keyboard the whole stage, with the
-instrument's full console above the keys. The agent can read and switch all of
-this too (`get_keyboard_state`, `set_keyboard_mode`).
+header. The agent can read and switch all of this too (`get_keyboard_state`,
+`set_keyboard_mode`).
 
 <p align="center"><img src="docs/shots/keyboard.png" width="85%" alt="The software keyboard's four surfaces stacked: Piano with pedals, Jazz Organ with drawbars and Leslie, Pipe Organ with its stop jamb, Synth with wheels, macros and X/Y pad"/></p>
+
+**EXPAND** (**Shift+V**) turns the whole window into the instrument, without the
+rack (Esc or DOCK brings it back), and the instrument moves as you play:
+
+- **Piano:** the open case shows strings, dampers and hammers. A note's hammer
+  rises and its string swings, and the dampers lift with the sustain pedal.
+- **Jazz Organ:** a tone generator whose wheels light up for every pulled
+  drawbar of the notes you hold, full-length drawbars with the registration
+  written out ("88 8000 000"), preset keys, the rotary speaker spinning up and
+  down, one or two manuals and the swell shoe.
+- **Pipe Organ:** a pipe front where each sounding note's pipe speaks, every
+  division's drawknobs at once, couplers, tremulants, thumb pistons, and swell
+  shutters that open with the swell shoe.
+- **Synth:** a display with the patch and a scope, the patch's macro knobs, a
+  large X/Y pad, and full-height pitch and mod wheels.
+
+<p align="center"><img src="docs/shots/keyboard-consoles.png" width="85%" alt="The four full-window instrument consoles: Piano with strings and pedal lyre, Jazz Organ with tone generator and drawbars, Pipe Organ with pipe front and drawknobs, Synth with display, macro knobs and X/Y pad"/></p>
 
 ### Patch with real cables
 Press **Tab** to turn the rack around and patch on the back. Drag from jack to

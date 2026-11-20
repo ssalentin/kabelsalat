@@ -242,8 +242,14 @@ impl DemoApp {
         let mut keys_h = (kw * 4.4 + 12.0).min(b.height() * 0.44).max(90.0).round();
         let pedal_h = (b.height() * 0.15).clamp(54.0, 132.0).round();
         let mut nb_h = (b.height() * 0.15).clamp(64.0, 132.0).round();
-        let spare = b.height() - keys_h - pedal_h - nb_h - slip_h;
-        let action_h = if spare >= 72.0 { spare } else {
+        let mut spare = b.height() - keys_h - pedal_h - nb_h - slip_h;
+        // The strings are the piano's face: shorter keys before no strings.
+        if spare < 72.0 {
+            let give = (72.0 - spare).min(keys_h - (kw * 3.0 + 12.0).max(96.0)).max(0.0);
+            keys_h -= give;
+            spare += give;
+        }
+        let action_h = if spare >= 64.0 { spare } else {
             if spare > 0.0 { nb_h += spare; } else { keys_h = (keys_h + spare).max(70.0); }
             0.0
         };
@@ -688,15 +694,16 @@ impl DemoApp {
             }
         }
         let perc = crate::organ::step(self.kb_organ_value(crate::organ::P_PERC), 3);
-        // A tall panel has room for a third group: the manuals move here
-        // from under the knobs, and percussion sits between the two.
-        let three = c.height() - leg_h - pk_h - 2.0 * (leg_h + tab_h) >= 44.0;
-        let py = if three {
-            let (from, to) = (keys_r.bottom(), left.bottom() - leg_h - tab_h);
-            ((from + to) * 0.5 - (leg_h + tab_h) * 0.5 + leg_h).round()
-        } else {
-            left.bottom() - tab_h
-        };
+        // Percussion at the foot of the column; between it and the presets,
+        // when there is room, the registration as an organist writes it.
+        let py = left.bottom() - tab_h;
+        let reg_h = (tab_h + 6.0).min(40.0);
+        let room = py - leg_h - keys_r.bottom();
+        if room >= leg_h + reg_h + 18.0 {
+            let ry = (keys_r.bottom() + (room - leg_h - reg_h) * 0.5).round();
+            legend(ui, Pos2::new(left.left(), ry), Align::Min, "REGISTRATION", 9.0, theme::CREAM_DIM);
+            self.console_registration(&p, Rect::from_min_size(Pos2::new(left.left(), ry + leg_h), egui::vec2(left.width(), reg_h)));
+        }
         legend(ui, Pos2::new(left.left(), py - leg_h), Align::Min, "PERCUSSION", 9.0, theme::CREAM_DIM);
         let tw = (left.width() - 6.0) / 2.0;
         if tablet(ui, cid("con_perc"), Rect::from_min_size(Pos2::new(left.left(), py), egui::vec2(tw, tab_h)), "PERC", "", perc > 0, BRASS)
@@ -738,8 +745,7 @@ impl DemoApp {
         legend(ui, col_a.left_top(), Align::Min, "ROTARY", 9.0, theme::CREAM_DIM);
         let sw_h = tab_h;
         let sw_y = col_a.bottom() - sw_h;
-        // The speed tablets take the whole section once the manuals moved.
-        let sw_w = (if three { right.width() } else { col_a.width() } - 6.0) / 3.0;
+        let sw_w = (col_a.width() - 6.0) / 3.0;
         for (i, name) in ["STOP", "SLOW", "FAST"].iter().enumerate() {
             let r = Rect::from_min_size(Pos2::new(col_a.left() + i as f32 * (sw_w + 3.0), sw_y), egui::vec2(sw_w, sw_h));
             if tablet(ui, cid(("con_leslie", i)), r, name, "", rotary == i, theme::LIVE_TEAL).clicked() {
@@ -771,17 +777,40 @@ impl DemoApp {
                 self.kb_set_organ_param(param, nv);
             }
         }
-        let dual_r = if three {
-            legend(ui, Pos2::new(left.left(), left.bottom() - tab_h - leg_h), Align::Min, "MANUALS", 9.0, theme::CREAM_DIM);
-            Rect::from_min_size(Pos2::new(left.left(), left.bottom() - tab_h), egui::vec2(left.width(), tab_h))
-        } else {
-            Rect::from_min_size(Pos2::new(col_b.left(), col_b.bottom() - sw_h), egui::vec2(col_b.width(), sw_h))
-        };
+        // Under the knobs in every layout: the switch never moves away from
+        // the pointer that just turned the second manual on or off.
+        let dual_r = Rect::from_min_size(Pos2::new(col_b.left(), col_b.bottom() - sw_h), egui::vec2(col_b.width(), sw_h));
         if tablet(ui, cid("con_dual"), dual_r, "2 MANUALS", "", dual, theme::LIVE_TEAL)
             .on_hover_text("upper manual on MIDI channel 1, lower on channel 2 (setBfree)")
             .clicked()
         {
             self.kb_dual_manual = !self.kb_dual_manual;
+        }
+    }
+
+    /// The drawbar registration as organists write it ("88 8000 000"):
+    /// sub-octaves, then the four foundation bars, then the three upper
+    /// mixtures, each digit in its bar's tip colour.
+    fn console_registration(&self, p: &egui::Painter, r: Rect) {
+        well(p, r, 4.0, rgb(0x0C, 0x0B, 0x0A));
+        let group_gap = 0.9;
+        let cells = crate::organ::DRAWBARS as f32 + 2.0 * group_gap;
+        let inner = r.shrink2(egui::vec2(10.0, 3.0));
+        // Digits sit close, as written; the group gaps carry the structure.
+        let cw = (inner.width() / cells).min(r.height() * 0.55);
+        let size = ((r.height() * 0.58).min(cw * 1.25) * 2.0).floor() / 2.0;
+        let font = theme::medium_font(size.max(8.0));
+        let mut x = inner.center().x - cw * cells * 0.5 + cw * 0.5;
+        for i in 0..crate::organ::DRAWBARS {
+            if i == 2 || i == 6 { x += cw * group_gap; }
+            let pos = crate::organ::drawbar_position(self.kb_organ_value(crate::organ::drawbar_param(i)));
+            let col = match i {
+                0 | 1 => mix(theme::DRAWBAR_BROWN, IVORY, 0.35),
+                4 | 6 | 7 => theme::CREAM_DIM,
+                _ => IVORY,
+            };
+            p.text(Pos2::new(x, inner.center().y), egui::Align2::CENTER_CENTER, pos.to_string(), font.clone(), if pos == 0 { alpha(col, 0.35) } else { col });
+            x += cw;
         }
     }
 
@@ -917,7 +946,7 @@ impl DemoApp {
         let (name, font) = fit_text(ui, &name, name_plate.width() - 36.0, (plate_h * 0.36).clamp(12.0, 21.0), 9.0, true);
         p.text(name_plate.center() - egui::vec2(0.0, if two { 7.0 } else { 0.0 }), egui::Align2::CENTER_CENTER, name, font, IVORY_INK);
         if two {
-            let sub = if aeolus.is_some() { self.console_subtitle(target) } else { "preview: load Aeolus to play it".into() };
+            let sub = if aeolus.is_some() { self.console_subtitle(target) } else { "preview: load Aeolus".into() };
             legend_fit(ui, Pos2::new(name_plate.center().x, name_plate.bottom() - 17.0), Align::Center, &sub.to_uppercase(), name_plate.width() - 36.0, 8.0, IVORY_INK);
         }
         let couplers = self.kb_pipe_couplers();
@@ -1003,7 +1032,7 @@ impl DemoApp {
                 let cell = Rect::from_min_size(Pos2::new(area.left() + (i % cols) as f32 * cw, area.top() + (i / cols) as f32 * ch), egui::vec2(cw - 3.0, ch - 3.0));
                 let (name, foot) = stop_label(stop);
                 let on = (drawn >> i) & 1 == 1;
-                if tablet(ui, cid(("con_stop", d, i)), cell, &name, &foot, on, theme::LIVE_TEAL).on_hover_text(format!("{name} {foot}")).clicked() {
+                if stop_tablet(ui, cid(("con_stop", d, i)), cell, &name, &foot, on).on_hover_text(format!("{name} {foot}")).clicked() {
                     self.kb_pipe_toggle_stop(d, i);
                 }
             }
@@ -1228,7 +1257,8 @@ impl DemoApp {
             ("drag", self.kb_synth_drag.label().to_string(), self.kb_synth_drag == SynthDragMode::Slide),
             ("sustain", "SUSTAIN".into(), self.kb_sustain),
         ];
-        let tab_w = ((fr.width() - 4.0 * 6.0) / 6.0).clamp(54.0, 124.0);
+        // Five switches and VEL; VEL keeps at least 96 pt of the row.
+        let tab_w = ((fr.width() - 96.0 - 5.0 * 6.0) / 5.0).clamp(44.0, 124.0);
         let mut x = fr.left();
         for (id, label, on) in tabs.iter() {
             let r = Rect::from_min_size(Pos2::new(x, fr.top()), egui::vec2(tab_w, fr_h));
@@ -1256,7 +1286,7 @@ impl DemoApp {
             }
         }
         let vel_w = (fr.right() - x - 4.0).min(240.0);
-        laid.strip[3] = if vel_w >= 96.0 {
+        laid.strip[3] = if vel_w >= 72.0 {
             self.console_vel(ui, Rect::from_min_size(Pos2::new(x + 4.0, fr.center().y - 10.0), egui::vec2(vel_w, 20.0)))
         } else {
             Rect::NOTHING
@@ -1709,6 +1739,32 @@ fn tablet(ui: &mut egui::Ui, id: egui::Id, r: Rect, label: &str, tag: &str, on: 
     resp
 }
 
+/// A stop as a dark tablet, for jambs too small for drawknobs: drawn
+/// stops light up ivory with a teal lamp, so the registration stands out
+/// against the jamb at a glance.
+fn stop_tablet(ui: &mut egui::Ui, id: egui::Id, r: Rect, name: &str, foot: &str, on: bool) -> egui::Response {
+    let resp = ui.interact(r, id, egui::Sense::click());
+    let p = ui.painter().clone();
+    let (top, bottom) = if on {
+        (IVORY_HI, mix(IVORY, BRASS_DEEP, 0.18))
+    } else if resp.hovered() {
+        (rgb(0x2B, 0x24, 0x1D), rgb(0x1D, 0x17, 0x12))
+    } else {
+        (rgb(0x1F, 0x1A, 0x15), rgb(0x15, 0x11, 0x0D))
+    };
+    plate(&p, r, 3.0, top, bottom);
+    if on {
+        let lamp = Rect::from_min_size(r.left_top() + egui::vec2(2.0, 2.0), egui::vec2(3.0, (r.height() - 4.0).max(3.0)));
+        soft(&p, lamp.expand(1.5), 1.5, 4.0, alpha(theme::LIVE_TEAL, 0.5));
+        p.rect_filled(lamp, 1.0, theme::LIVE_TEAL);
+    }
+    p.rect_stroke(r, 3.0, Stroke::new(1.0, if on { alpha(theme::LIVE_TEAL, 0.8) } else if resp.hovered() { BRASS_DEEP } else { rgb(0x3A, 0x2C, 0x1F) }), egui::StrokeKind::Inside);
+    let label = if foot.is_empty() || r.width() < 70.0 { name.to_string() } else { format!("{name} {foot}") };
+    let (t, f) = fit_text(ui, &label, r.width() - 12.0, (r.height() * 0.5).clamp(7.5, 10.0), 6.5, on);
+    p.text(Pos2::new(r.center().x + if on { 2.0 } else { 0.0 }, r.center().y), egui::Align2::CENTER_CENTER, t, f, if on { IVORY_INK } else { theme::CREAM_DIM });
+    resp
+}
+
 /// A reverse-coloured preset key: black with its name in ivory.
 fn preset_key(ui: &mut egui::Ui, id: egui::Id, r: Rect, label: &str, bars: &[u8; crate::organ::DRAWBARS]) -> egui::Response {
     let resp = ui.interact(r, id, egui::Sense::click());
@@ -1975,8 +2031,9 @@ fn swell_shoe(ui: &mut egui::Ui, id: egui::Id, r: Rect, value: f32) -> Option<f3
 
 /// A horizontal value bar (VEL): label left, value right, drag to set.
 fn hbar(ui: &mut egui::Ui, id: egui::Id, r: Rect, label: &str, value: f32) -> Option<f32> {
-    let label_w = 34.0;
-    let value_w = 34.0;
+    // A narrow bar drops its read-out so the track stays draggable.
+    let label_w = 30.0;
+    let value_w = if r.width() >= 150.0 { 34.0 } else { 0.0 };
     let track = Rect::from_min_max(Pos2::new(r.left() + label_w, r.top()), Pos2::new(r.right() - value_w, r.bottom()));
     let resp = ui.interact(track, id, egui::Sense::click_and_drag()).on_hover_text("note velocity of the on-screen and laptop keys");
     let mut out = None;
@@ -2001,7 +2058,9 @@ fn hbar(ui: &mut egui::Ui, id: egui::Id, r: Rect, label: &str, value: f32) -> Op
     if resp.hovered() || resp.dragged() {
         p.rect_stroke(cap, 2.0, Stroke::new(1.0, theme::CREAM_DIM), egui::StrokeKind::Outside);
     }
-    p.text(Pos2::new(r.right(), r.center().y), egui::Align2::RIGHT_CENTER, format!("{v:.2}"), FontId::proportional(10.0), theme::CREAM_META);
+    if value_w > 0.0 {
+        p.text(Pos2::new(r.right(), r.center().y), egui::Align2::RIGHT_CENTER, format!("{v:.2}"), FontId::proportional(10.0), theme::CREAM_META);
+    }
     out
 }
 

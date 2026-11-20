@@ -1743,11 +1743,18 @@ fn clap_bundle_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// `dlopen` a CLAP bundle, after asking the file what it was built for:
+/// glibc reports an ELF of another CPU as "No such file or directory" (#135).
+fn open_bundle(path: &std::path::Path) -> Result<PluginEntry> {
+    crate::binarch::ensure_loadable(path)?;
+    // SAFETY: loading a CLAP bundle executes its init code. The app loads
+    // only the bundle the out-of-process scan found a plugin in; the scan
+    // itself runs this inside the isolated `scan-clap` child process.
+    unsafe { PluginEntry::load(path) }.with_context(|| format!("failed to load CLAP bundle {}", path.display()))
+}
+
 fn load_bundle(path: &std::path::Path, id: &str) -> Result<(PluginEntry, CString)> {
-    // SAFETY: loading a CLAP bundle executes its init code. Only the bundle
-    // the out-of-process scan found the plugin in is loaded here.
-    let entry = unsafe { PluginEntry::load(path) }
-        .with_context(|| format!("failed to load CLAP bundle {}", path.display()))?;
+    let entry = open_bundle(path)?;
     println!("bundle: {} (CLAP {})", path.display(), entry.version());
     Ok((entry, CString::new(id)?))
 }
@@ -1779,8 +1786,7 @@ pub fn clap_preset_providers(plugin_id: &str) -> Result<Vec<String>> {
     use clack_extensions::preset_discovery::factory::PresetDiscoveryFactory;
     let (path, _) = bundle_with(|p| p.id == plugin_id)
         .ok_or_else(|| anyhow!("CLAP plugin '{plugin_id}' not found in CLAP search paths"))?;
-    // SAFETY: as in `load_bundle`: the scan found the plugin in this bundle.
-    let entry = unsafe { PluginEntry::load(&path) }.with_context(|| format!("failed to load CLAP bundle {}", path.display()))?;
+    let entry = open_bundle(&path)?;
     let Some(factory) = entry.get_factory::<PresetDiscoveryFactory>() else { return Ok(Vec::new()) };
     Ok(factory.provider_descriptors()
         .map(|d| d.name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
@@ -2329,10 +2335,7 @@ fn save_scan_cache(path: &std::path::Path, cache: &ClapScanCache) -> Result<()> 
 
 /// Load one CLAP bundle and read its plugin descriptors.
 pub fn scan_clap_bundle(path: &std::path::Path) -> Result<Vec<ClapPluginInfo>> {
-    // SAFETY: loading a CLAP bundle executes its init code; production listing
-    // runs this inside the isolated `scan-clap` child process.
-    let entry = unsafe { PluginEntry::load(path) }
-        .with_context(|| format!("failed to load CLAP bundle {}", path.display()))?;
+    let entry = open_bundle(path)?;
     let factory = entry
         .get_plugin_factory()
         .ok_or_else(|| anyhow!("CLAP bundle {} has no plugin factory", path.display()))?;
@@ -2572,6 +2575,12 @@ fn scan_bundles_with(
     let mut uncached: Vec<(usize, &PathBuf, Option<BundleStamp>)> = Vec::new();
 
     for (idx, path) in paths.iter().enumerate() {
+        // Asked before the cache, so a failure cached with dlopen's "No such
+        // file" also reads as what it is (#135).
+        if let Some(reason) = crate::binarch::foreign(path) {
+            eprintln!("skip CLAP bundle {}: {reason}", path.display());
+            continue;
+        }
         let stamp = bundle_stamp(path);
         let key = path.to_string_lossy();
         if let (Some(st), Some(cached)) = (&stamp, cache.entries.get(key.as_ref())) {
@@ -2684,6 +2693,13 @@ fn scan_installed_bundles(retry_failed: bool) -> Vec<(PathBuf, Option<Vec<ClapPl
         retry_failed,
     );
     paths.into_iter().zip(per_bundle).collect()
+}
+
+/// Why each bundle on the CLAP search paths that was built for another CPU
+/// or system cannot load here, one sentence per bundle. Reads file headers
+/// only.
+pub fn unloadable_clap_bundles() -> Vec<String> {
+    clap_bundle_paths().iter().filter_map(|p| crate::binarch::foreign(p)).collect()
 }
 
 /// Every installed CLAP plugin, scanned out of process (cached).
@@ -3252,6 +3268,28 @@ mod clap_scan_tests {
             gone
         });
         assert!(dead, "grandchild {pid} survived the scanner timeout");
+    }
+
+    /// glibc calls an ELF of another CPU "No such file or directory" (#135).
+    #[test]
+    fn a_bundle_built_for_another_cpu_says_so_and_is_never_handed_to_the_scanner() {
+        let tmp = TempDir::new("foreign");
+        let bundle = tmp.0.join("Vital.clap");
+        let (machine, name) = crate::binarch::other_machine();
+        std::fs::write(&bundle, crate::binarch::fake_elf(machine)).unwrap();
+        let want = format!("Vital.clap is built for {name}; this machine is {}, so it cannot be loaded", std::env::consts::ARCH);
+
+        let err = scan_clap_bundle(&bundle).expect_err("a foreign bundle cannot be scanned");
+        assert_eq!(format!("{err:#}"), want);
+        let err = ClapVoice::new_from_bundle(48000.0, &bundle, "audio.vital.synth").err().expect("nor loaded");
+        assert_eq!(format!("{err:#}"), want);
+
+        let spawn_log = tmp.0.join("spawns.log");
+        let logging = sh_cmd(&r#"printf '%s\n' "$1" >> '__LOG__'; exit 1"#.replace("__LOG__", &spawn_log.display().to_string()));
+        let cache_file = tmp.0.join("cache").join("clap-scan.json");
+        let listed = list_clap_plugins_with(&[bundle.clone()], &logging, Some(&cache_file), Duration::from_secs(30), 1);
+        assert!(listed.is_empty());
+        assert!(!spawn_log.exists(), "the scanner was started for a bundle that can never load");
     }
 
     #[test]

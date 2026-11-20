@@ -16,6 +16,7 @@ mod arp;
 mod audio;
 mod audio_in;
 mod audio_out;
+mod binarch;
 mod bridge;
 mod capture;
 mod catalog;

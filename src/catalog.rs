@@ -729,9 +729,15 @@ pub fn scan_installed(entry: &CatalogEntry, scan: &ScanSet) -> bool {
 }
 
 /// "Installed" when any declared bundle dir exists under any root (the
-/// no-rescan fallback).
+/// no-rescan fallback). A bundle built for another CPU does not count: it
+/// can never load here (#135).
 pub fn bundle_installed(entry: &CatalogEntry, roots: &[&Path]) -> bool {
-    entry.bundles.iter().any(|b| roots.iter().any(|r| r.join(b).exists()))
+    entry.bundles.iter().any(|b| {
+        roots.iter().any(|r| {
+            let path = r.join(b);
+            path.exists() && crate::binarch::foreign(&path).is_none()
+        })
+    })
 }
 
 /// Combined detection: scan evidence OR a bundle path on disk.
@@ -1335,6 +1341,10 @@ mod tests {
         // A directory named after the LV2 bundle also counts.
         std::fs::create_dir_all(lv2.join("vitalium.lv2")).unwrap();
         assert!(bundle_installed(vitalium, &roots));
+        // A bundle built for another CPU is on disk and still not installed.
+        let (machine, _) = crate::binarch::other_machine();
+        std::fs::write(clap.join("YANES.clap"), crate::binarch::fake_elf(machine)).unwrap();
+        assert!(!bundle_installed(yanes, &roots), "a foreign YANES.clap cannot load here");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

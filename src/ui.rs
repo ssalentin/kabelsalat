@@ -1244,6 +1244,13 @@ impl CcLearnCapture {
     }
 }
 
+/// An on/off CC destination (mixer Mute/Solo, sustain and soft pedals):
+/// learn binds it on the first CC and it gets no range or curve.
+fn cc_dest_is_switch(target: crate::matrix::CcTarget, param: u32) -> bool {
+    (target == CcTarget::Mix && MixControl::from_param(param).is_some_and(|c| c.is_switch()))
+        || (target == CcTarget::MidiCc && crate::matrix::midi_cc_is_switch(param))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CcLearn {
     source: SourceId,
@@ -1269,7 +1276,7 @@ impl CcLearn {
     }
 
     fn is_switch(&self) -> bool {
-        self.target == CcTarget::Mix && MixControl::from_param(self.param).is_some_and(|c| c.is_switch())
+        cc_dest_is_switch(self.target, self.param)
     }
 
     fn capture_json(&self) -> Option<serde_json::Value> {
@@ -24499,8 +24506,7 @@ impl DemoApp {
         let mut cancel_learn = false;
         let mut clear = false;
         let mut reset_val = false;
-        let switch = (target == CcTarget::Mix && MixControl::from_param(param).is_some_and(|c| c.is_switch()))
-            || (target == CcTarget::MidiCc && crate::matrix::midi_cc_is_switch(param));
+        let switch = cc_dest_is_switch(target, param);
         let ranged = mapping.filter(|(_, m)| m.scale.is_continuous() && !learning && !switch);
         let (mut lo_pct, mut hi_pct) = ranged.map_or((0.0, 100.0), |(_, m)| {
             let (lo, hi) = m.scale.bounds();
@@ -37713,7 +37719,7 @@ mod mixer_parity_tests {
         let (param, target) = app.units[m].knobs[wi].cc_target().unwrap();
         app.set_cc_scaled(SourceId::Hardware(1), node, 1, Some(param), target, crate::matrix::CcScale::input_range(64, 104));
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 1, 84));
-        app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack });
+        app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack, from_dock: false });
         super::offline_shots::shot(&mut app, size, &dir.join("midi-learn-input-range-menu.png"));
     }
 
@@ -38727,6 +38733,15 @@ mod instrument_midi_learn_tests {
         (app, ctx, drain, organ)
     }
 
+    /// Continuous learns keep listening until the controller is still for
+    /// `LEARN_SETTLE_SECS` (range capture); let it settle.
+    fn settle_learn(app: &mut DemoApp, ctx: &egui::Context) {
+        assert!(app.cc_learn.as_ref().is_some_and(|l| l.capture.is_some()), "learn captured the CC and waits to settle");
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(app, ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "learn finished after settling");
+    }
+
     fn rect_for(app: &DemoApp, dest: CcDest) -> Rect {
         app.kb_learn_rects.iter().find(|(d, _)| *d == dest).map(|(_, r)| *r)
             .unwrap_or_else(|| panic!("no learnable control for {dest:?} in {:?}", app.kb_learn_rects.iter().map(|(d, _)| d).collect::<Vec<_>>()))
@@ -38746,7 +38761,7 @@ mod instrument_midi_learn_tests {
 
         // Hardware CC 74 completes learn, sends MatrixCcMap + catch-up CC, and moves kb_swell.
         cc(&mut app, &ctx, 1, 74, 32);
-        assert!(app.cc_learn.is_none(), "hardware CC completed SWELL learn");
+        settle_learn(&mut app, &ctx);
         assert!((app.kb_swell - 32.0 / 127.0).abs() < 1e-4, "kb_swell synced immediately: {}", app.kb_swell);
         let mut cmds = Vec::new();
         while let Some(c) = drain.pop() { cmds.push(c); }
@@ -38775,6 +38790,7 @@ mod instrument_midi_learn_tests {
         rclick(&mut app, &ctx, leslie_r.center());
         assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == leslie_dest));
         cc(&mut app, &ctx, 1, 82, 127);
+        settle_learn(&mut app, &ctx);
         assert_eq!(crate::organ::step_name(crate::organ::P_LESLIE, app.kb_organ_value(crate::organ::P_LESLIE)), Some("FAST"),
             "hardware CC synced Leslie buttons to FAST");
 
@@ -38784,8 +38800,21 @@ mod instrument_midi_learn_tests {
         rclick(&mut app, &ctx, bar_r.center());
         assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == bar_dest));
         cc(&mut app, &ctx, 1, 18, 64);
+        settle_learn(&mut app, &ctx);
         assert_eq!(crate::organ::drawbar_position(app.kb_organ_value(crate::organ::drawbar_param(2))), 4,
             "hardware CC synced 8' drawbar to position 4");
+    }
+
+    #[test]
+    fn a_learned_sustain_pedal_is_a_switch_and_binds_on_the_first_cc() {
+        let (mut app, ctx, _drain, organ) = organ_console_app();
+        app.cc_learn = Some(CcLearn::new(SourceId::Keys, organ, 64, CcTarget::MidiCc, true));
+        app.feed_cc_learn(SourceId::Hardware(1), 66, 127);
+        assert!(app.cc_learn.is_none(), "a pedal learn finishes on its first CC, no range capture");
+        let e = app.rule_edits.get(&(SourceId::Hardware(1), organ)).expect("binding stored");
+        assert!(e.cc_map.iter().any(|m| m.cc == 66 && m.param == 64 && m.target == CcTarget::MidiCc
+            && m.scale == crate::matrix::CcScale::IDENTITY), "{:?}", e.cc_map);
+        frame(&mut app, &ctx, vec![]);
     }
 
     #[test]
@@ -38842,6 +38871,7 @@ mod instrument_midi_learn_tests {
             param: crate::organ::drawbar_param(2),
             target: CcTarget::Knob,
             replace_existing: true,
+            capture: None,
         });
         super::offline_shots::shot(&mut app, SIZE, &dir.join("organ-console-midi-learn.png"));
 

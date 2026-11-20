@@ -1580,3 +1580,9 @@ Learned so far (2026-11-15, UI polish pass):
     (`mixer_with_inserts_and_quick_knobs_fits_narrow_windows`). Fold companion
     controls back into the vacated column and guard UI-toggled engine flags
     (`master_mute`) with a sync grace deadline.
+190. **What is a switch is answered in one place:** the knob menu knew that
+    sustain and soft (MidiCc 64/67) are on/off, but `CcLearn::is_switch`
+    only knew mixer Mute/Solo, so after #236's range capture met #241's
+    pedals a sustain learn sat 1.5 s in range capture instead of binding on
+    its first CC. Both ask `cc_dest_is_switch`; a new on/off destination is
+    added there (`a_learned_sustain_pedal_is_a_switch_and_binds_on_the_first_cc`).

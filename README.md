@@ -28,8 +28,11 @@ each played from its own keyboard or controller.
 ### Play right away
 Open the app and play with your laptop keyboard, the on-screen keyboard, or any
 USB MIDI keyboard — devices are found while the app runs, just plug them in.
-Starter setups (**F5–F8**) give you a lead with reverb, drums and bass, or an
-ambient pad with one key.
+Starter setups (**F5–F7**, **Shift+F5–F7**) give you a cathedral pipe organ,
+a jazz or rock tonewheel organ, an ambient pad, a synth lead or a guitar rig
+with one key. They use a handful of free plugins (Aeolus, setBfree, Surge XT,
+Guitarix); a setup whose plugins are missing is greyed out in Sessions with an
+Install button.
 
 The on-screen keyboard (**V**) turns into the instrument the active rig plays,
 or the one you pin:

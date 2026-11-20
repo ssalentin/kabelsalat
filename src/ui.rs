@@ -1012,6 +1012,42 @@ struct SavedRule {
 
 /// `s` moved onto `graph`, every node id mapped by `remap` (None drops it):
 /// knobs, plugin states, matrix routes and mixer strips follow their node.
+/// Mark every plugin a starter template needs as installed, for tests and
+/// shots: a bundle dir per catalog entry under a private plugin root.
+#[cfg(test)]
+fn template_plugins_installed(app: &mut DemoApp) {
+    let root = std::env::temp_dir().join(format!("ksalat-tpl-plugins-{}", std::process::id()));
+    for t in Template::ALL {
+        for id in t.plugins() {
+            let _ = std::fs::create_dir_all(root.join(crate::catalog::find(id).unwrap().bundles[0]));
+        }
+    }
+    app.catalog_roots = Some(vec![root]);
+}
+
+/// A starter template's hotkey: F5–F7, then the same keys with Shift.
+fn template_key(t: Template) -> (Key, bool) {
+    match t {
+        Template::CathedralOrgan => (Key::F5, false),
+        Template::JazzOrgan => (Key::F6, false),
+        Template::RockOrgan => (Key::F7, false),
+        Template::GuitarRig => (Key::F5, true),
+        Template::AmbientPad => (Key::F6, true),
+        Template::SynthLead => (Key::F7, true),
+    }
+}
+
+/// [`template_key`] as the list prints it ("F5", "Shift+F6").
+fn template_key_hint(t: Template) -> String {
+    let (key, shift) = template_key(t);
+    format!("{}{}", if shift { "Shift+" } else { "" }, key.name())
+}
+
+/// Every template id, for the agent tools' "use …" hints.
+fn template_names() -> String {
+    Template::ALL.iter().map(|t| t.id()).collect::<Vec<_>>().join(", ")
+}
+
 fn remap_session(
     s: &crate::session::Session,
     graph: Graph,
@@ -4453,7 +4489,8 @@ impl DemoApp {
                 (&["double-click"], "a synth to open its editor"),
                 (&["1–9", "←", "→"], "switch the rig in view"),
                 (&["F4"], "multi-rig demo"),
-                (&["F5–F8"], "starter templates"),
+                (&["F5–F7", "Shift"], "starter templates (Shift: the second three)"),
+                (&["F8"], "demo patch"),
             ]),
             col("Patch & views", &[
                 (&["drag"], "jack to jack to patch a cable"),
@@ -6774,6 +6811,36 @@ impl DemoApp {
         }
     }
 
+    /// Catalog entries a template needs that this machine has not installed.
+    fn template_missing(&self, t: Template) -> Vec<&'static crate::catalog::CatalogEntry> {
+        crate::catalog::missing(t.plugins(), |e| self.catalog_installed(e))
+    }
+
+    /// Load a template the user picked (button or hotkey) — unless it needs
+    /// plugins that are missing: then say which, and where to get them.
+    fn try_load_template(&mut self, t: Template) {
+        let missing = self.template_missing(t);
+        if missing.is_empty() {
+            self.load_template(t);
+        } else {
+            self.session_msg = format!("{}: {}", t.title(), crate::catalog::install_hint(&missing));
+        }
+    }
+
+    /// Start a template row's Install button and show the Plugins view, where
+    /// the install log runs; the template unlocks after the rescan.
+    fn install_from_template(&mut self, id: &str) {
+        match self.start_install(id) {
+            Ok(()) => {
+                self.session_msg = format!("Installing {id}…");
+                if self.stage_view != StageView::Plugins {
+                    self.toggle_stage(StageView::Plugins);
+                }
+            }
+            Err(e) => self.session_msg = e,
+        }
+    }
+
     /// Reload the default two-stack demo patch.
     fn load_demo_patch(&mut self) {
         let s = crate::session::Session::new("Demo patch", Graph::demo_patch());
@@ -8194,16 +8261,25 @@ impl DemoApp {
             "load_template" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("demo").to_lowercase();
                 let res = match name.as_str() {
-                    "lead_reverb" | "lead" => { self.load_template(Template::LeadReverb); Some("Loaded template 'Lead + Reverb'".to_string()) }
-                    "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); Some("Loaded template 'Drums + Bass'".to_string()) }
-                    "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); Some("Loaded template 'Ambient Pad'".to_string()) }
-                    "guitar_rig" | "guitar" => {
-                        self.load_template(Template::GuitarRig);
-                        Some("Loaded template 'Guitar Rig' — Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; pick the input device on the Audio In unit's face, the tuner is there too".to_string())
-                    }
                     "demo" => { self.load_demo_patch(); Some("Loaded the demo patch".to_string()) }
                     "multi_rig" | "rigs" => { self.load_multi_rig_demo(); Some("Loaded the multi-rig demo (2 rigs) — switch with set_active_rig or 1–9".to_string()) }
-                    _ => None,
+                    _ => Template::from_name(&name).map(|t| {
+                        self.load_template(t);
+                        let mut msg = format!("Loaded template '{}'", t.title());
+                        if t == Template::GuitarRig {
+                            msg.push_str(" — Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; pick the input device on the Audio In unit's face, the tuner is there too");
+                        }
+                        let missing = self.template_missing(t);
+                        if !missing.is_empty() {
+                            let ids: Vec<&str> = missing.iter().map(|e| e.id).collect();
+                            msg.push_str(&format!(
+                                ". Not installed here, so those units stay silent: {} Offer the user install_instrument for {}.",
+                                crate::catalog::install_hint(&missing),
+                                ids.join(", ")
+                            ));
+                        }
+                        msg
+                    }),
                 };
                 match res {
                     Some(msg) => {
@@ -8211,7 +8287,7 @@ impl DemoApp {
                         self.agent_activity.record(origin, format!("Template: {name}"), nodes, now);
                         msg
                     }
-                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, guitar_rig, demo, multi_rig)"),
+                    None => format!("unknown template '{name}' (use {}, demo, multi_rig)", template_names()),
                 }
             }
             "add_node" => {
@@ -10996,8 +11072,13 @@ impl DemoApp {
         let mut delete_rig_preset: Option<String> = None;
         let mut open_save_rig_preset = false;
         let mut load_tpl: Option<Template> = None;
+        let mut install_req: Option<&'static str> = None;
         let mut load_demo = false;
         let mut load_multi = false;
+
+        let tpl_missing: Vec<(Template, Vec<&'static crate::catalog::CatalogEntry>)> =
+            Template::ALL.iter().map(|&t| (t, self.template_missing(t))).collect();
+        let installing = self.install.as_ref().filter(|i| i.running).map(|i| i.id.clone());
 
         let rig_count = self.rig_count();
         let active_rig = self.active_rig;
@@ -11657,15 +11738,34 @@ impl DemoApp {
                                                     ui.add_space(5.0);
                                                     clicked
                                                 };
-                                                for (idx, t) in Template::ALL.iter().enumerate() {
+                                                for (idx, (t, missing)) in tpl_missing.iter().enumerate() {
                                                     if idx > 0 { Self::stage_hairline(ui); }
-                                                    let desc = match t {
-                                                        Template::LeadReverb => "Surge → Reverb · F5",
-                                                        Template::DrumsBass => "Dual Surge · F6",
-                                                        Template::AmbientPad => "Delay → Reverb · F7",
-                                                        Template::GuitarRig => "Live in → stomps · ⇧F5",
-                                                    };
-                                                    if tpl_row(ui, t.title(), desc) { load_tpl = Some(*t); }
+                                                    let desc = format!("{} · {}", t.blurb(), template_key_hint(*t));
+                                                    if missing.is_empty() {
+                                                        if tpl_row(ui, t.title(), &desc) { load_tpl = Some(*t); }
+                                                        continue;
+                                                    }
+                                                    let first = missing[0];
+                                                    let busy = installing.as_deref() == Some(first.id);
+                                                    ui.add_space(5.0);
+                                                    ui.vertical(|ui| {
+                                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                                        ui.add(egui::Label::new(egui::RichText::new(t.title()).font(theme::medium_font(12.0)).color(theme::INK_2)).truncate());
+                                                        ui.add(egui::Label::new(egui::RichText::new(&desc).size(10.0).color(theme::INK_2)).wrap());
+                                                        ui.add(egui::Label::new(egui::RichText::new(crate::catalog::install_hint(missing)).size(10.0).color(theme::AGENT_TEXT)).wrap());
+                                                        ui.add_space(2.0);
+                                                        let label = if busy { "Installing…".to_string() } else { format!("Install {}", first.name) };
+                                                        let how = crate::catalog::local_route(first)
+                                                            .map_or_else(|| format!("no Linux build for {}", std::env::consts::ARCH), |r| r.summary());
+                                                        if theme::primary_button(ui, &label)
+                                                            .on_hover_text(format!("install {} ({how}) — progress shows in Plugins", first.name))
+                                                            .clicked()
+                                                            && !busy
+                                                        {
+                                                            install_req = Some(first.id);
+                                                        }
+                                                    });
+                                                    ui.add_space(5.0);
                                                 }
                                                 Self::stage_hairline(ui);
                                                 if tpl_row(ui, "Demo patch", "2 Surge stacks · F8") { load_demo = true; }
@@ -11735,7 +11835,8 @@ impl DemoApp {
         if let Some(name) = delete_rig_preset {
             let _ = crate::session::delete_rig_preset(&presets_dir, &name);
         }
-        if let Some(t) = load_tpl { self.load_template(t); }
+        if let Some(t) = load_tpl { self.try_load_template(t); }
+        if let Some(id) = install_req { self.install_from_template(id); }
         if load_demo { self.load_demo_patch(); }
         if load_multi { self.load_multi_rig_demo(); }
     }
@@ -11851,8 +11952,13 @@ impl DemoApp {
         let mut overwrite_session: Option<String> = None;
         let mut delete_session: Option<String> = None;
         let mut load_tpl: Option<Template> = None;
+        let mut install_req: Option<&'static str> = None;
         let mut load_demo = false;
         let mut load_multi = false;
+
+        let tpl_missing: Vec<(Template, Vec<&'static crate::catalog::CatalogEntry>)> =
+            Template::ALL.iter().map(|&t| (t, self.template_missing(t))).collect();
+        let installing = self.install.as_ref().filter(|i| i.running).map(|i| i.id.clone());
         let mut open_in_rail = false;
 
         let area = egui::Area::new(egui::Id::unique("session_popover"))
@@ -11941,15 +12047,34 @@ impl DemoApp {
                                         ui.add_space(4.0);
                                         clicked
                                     };
-                                    for (idx, t) in Template::ALL.iter().enumerate() {
+                                    for (idx, (t, missing)) in tpl_missing.iter().enumerate() {
                                         if idx > 0 { Self::stage_hairline(ui); }
-                                        let desc = match t {
-                                            Template::LeadReverb => "Keys → Surge → Reverb · F5",
-                                            Template::DrumsBass => "Dual Surge layers · F6",
-                                            Template::AmbientPad => "Surge → Delay → Reverb · F7",
-                                            Template::GuitarRig => "Live input → stomps → amp · ⇧F5",
-                                        };
-                                        if tpl_row(ui, t.title(), desc) { load_tpl = Some(*t); }
+                                        let desc = format!("{} · {}", t.blurb(), template_key_hint(*t));
+                                        if missing.is_empty() {
+                                            if tpl_row(ui, t.title(), &desc) { load_tpl = Some(*t); }
+                                            continue;
+                                        }
+                                        let first = missing[0];
+                                        let busy = installing.as_deref() == Some(first.id);
+                                        ui.add_space(4.0);
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 2.0;
+                                            ui.label(egui::RichText::new(t.title()).font(theme::medium_font(12.5)).color(theme::INK_2));
+                                            ui.add(egui::Label::new(egui::RichText::new(&desc).size(10.5).color(theme::INK_2)).wrap());
+                                            ui.add(egui::Label::new(egui::RichText::new(crate::catalog::install_hint(missing)).size(10.5).color(theme::AGENT_TEXT)).wrap());
+                                            ui.add_space(2.0);
+                                            let label = if busy { "Installing…".to_string() } else { format!("Install {}", first.name) };
+                                            let how = crate::catalog::local_route(first)
+                                                .map_or_else(|| format!("no Linux build for {}", std::env::consts::ARCH), |r| r.summary());
+                                            if theme::primary_button(ui, &label)
+                                                .on_hover_text(format!("install {} ({how}) — progress shows in Plugins", first.name))
+                                                .clicked()
+                                                && !busy
+                                            {
+                                                install_req = Some(first.id);
+                                            }
+                                        });
+                                        ui.add_space(4.0);
                                     }
                                     Self::stage_hairline(ui);
                                     if tpl_row(ui, "Demo patch (2 stacks)", "2 Surge + Delay stacks · F8") { load_demo = true; }
@@ -12056,7 +12181,8 @@ impl DemoApp {
                 Err(e) => e,
             };
         }
-        if let Some(t) = load_tpl { self.load_template(t); self.session_popover_open = false; }
+        if let Some(t) = load_tpl { self.try_load_template(t); self.session_popover_open = false; }
+        if let Some(id) = install_req { self.install_from_template(id); self.session_popover_open = false; }
         if load_demo { self.load_demo_patch(); self.session_popover_open = false; }
         if load_multi { self.load_multi_rig_demo(); self.session_popover_open = false; }
         if open_in_rail {
@@ -13640,9 +13766,14 @@ impl DemoApp {
                 let mut load_demo = false;
                 let mut load_multi = false;
 
+                let tpl_missing: Vec<(Template, Vec<&'static crate::catalog::CatalogEntry>)> =
+                    Template::ALL.iter().map(|&t| (t, self.template_missing(t))).collect();
+                let installing = self.install.as_ref().filter(|i| i.running).map(|i| i.id.clone());
+                let mut install_req: Option<&'static str> = None;
                 let draw_left = |ui: &mut egui::Ui,
                                  session_name: &mut String,
                                  do_save: &mut bool,
+                                 install_req: &mut Option<&'static str>,
                                  load_tpl: &mut Option<Template>,
                                  load_demo: &mut bool,
                                  load_multi: &mut bool| {
@@ -13667,35 +13798,63 @@ impl DemoApp {
 
                     let template_row = |ui: &mut egui::Ui, title: &str, desc: &str, hover: &str| -> bool {
                         let mut clicked = false;
+                        // Button first, then the text in what is left of the
+                        // row (rule 100): a long line wraps instead of running
+                        // under Load in a narrow sheet.
                         ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(title).font(theme::medium_font(13.5)).color(theme::INK));
-                                ui.label(egui::RichText::new(desc).size(11.5).color(theme::INK_2));
-                            });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if theme::chip_button(ui, "Load", false).on_hover_text(hover).clicked() {
                                     clicked = true;
                                 }
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(title).font(theme::medium_font(13.5)).color(theme::INK));
+                                    ui.add(egui::Label::new(egui::RichText::new(desc).size(11.5).color(theme::INK_2)).wrap());
+                                });
                             });
                         });
                         clicked
                     };
 
-                    for (idx, t) in Template::ALL.iter().enumerate() {
+                    for (idx, (t, missing)) in tpl_missing.iter().enumerate() {
                         if idx > 0 {
                             ui.add_space(6.0);
                             Self::stage_hairline(ui);
                             ui.add_space(6.0);
                         }
-                        let (desc, key_hint) = match t {
-                            Template::LeadReverb => ("Keys → Surge → Reverb", "F5"),
-                            Template::DrumsBass => ("Dual Surge layers", "F6"),
-                            Template::AmbientPad => ("Surge → Delay → Reverb", "F7"),
-                            Template::GuitarRig => ("Live input → stomps → amp", "⇧F5"),
-                        };
-                        if template_row(ui, t.title(), &format!("{desc} · {key_hint}"), "load a playable pre-wired rack") {
-                            *load_tpl = Some(*t);
+                        let desc = format!("{} · {}", t.blurb(), template_key_hint(*t));
+                        if missing.is_empty() {
+                            if template_row(ui, t.title(), &desc, "load a playable pre-wired rack") {
+                                *load_tpl = Some(*t);
+                            }
+                            continue;
                         }
+                        // Greyed out: the rig needs plugins this machine lacks.
+                        // The row says which and installs the first one.
+                        let first = missing[0];
+                        let busy = installing.as_deref() == Some(first.id);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(t.title()).font(theme::medium_font(13.5)).color(theme::INK_2));
+                            ui.add(egui::Label::new(egui::RichText::new(&desc).size(11.5).color(theme::INK_2)).wrap());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(crate::catalog::install_hint(missing))
+                                        .size(11.5)
+                                        .color(theme::AGENT_TEXT),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(4.0);
+                            let label = if busy { "Installing…".to_string() } else { format!("Install {}", first.name) };
+                            let how = crate::catalog::local_route(first)
+                                .map_or_else(|| format!("no Linux build for {}", std::env::consts::ARCH), |r| r.summary());
+                            if theme::primary_button(ui, &label)
+                                .on_hover_text(format!("install {} ({how}) — progress shows in Plugins", first.name))
+                                .clicked()
+                                && !busy
+                            {
+                                *install_req = Some(first.id);
+                            }
+                        });
                     }
                     ui.add_space(6.0);
                     Self::stage_hairline(ui);
@@ -13850,6 +14009,7 @@ impl DemoApp {
                                             ui,
                                             &mut self.session_name,
                                             &mut do_save,
+                                            &mut install_req,
                                             &mut load_tpl,
                                             &mut load_demo,
                                             &mut load_multi,
@@ -13890,6 +14050,7 @@ impl DemoApp {
                                 ui,
                                 &mut self.session_name,
                                 &mut do_save,
+                                &mut install_req,
                                 &mut load_tpl,
                                 &mut load_demo,
                                 &mut load_multi,
@@ -13913,7 +14074,10 @@ impl DemoApp {
                     self.save_current_session(dir);
                 }
                 if let Some(t) = load_tpl {
-                    self.load_template(t);
+                    self.try_load_template(t);
+                }
+                if let Some(id) = install_req {
+                    self.install_from_template(id);
                 }
                 if load_demo {
                     self.load_demo_patch();
@@ -19673,15 +19837,18 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::ArrowRight) { rig_cycle = 1; }
             // Multi-rig demo (two independent rigs), F4.
             if i.consume_key(Modifiers::NONE, Key::F4) { load_multi = true; }
-            // Starter templates: F5/F6/F7, demo patch on F8 (task-17).
-            // The guitar rig replaces the keyboard patch (no Keys unit), so it
-            // sits on Shift+F5, next to its keyboard sibling. Asked BEFORE
-            // plain F5: egui matches `NONE` logically, so a Shift+F5 press
-            // would otherwise be consumed as F5 and load Lead + Reverb.
-            if i.consume_key(Modifiers::SHIFT, Key::F5) { load_tpl = Some(Template::GuitarRig); }
-            if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
-            if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
-            if i.consume_key(Modifiers::NONE, Key::F7) { load_tpl = Some(Template::AmbientPad); }
+            // Starter templates on F5–F7 and Shift+F5–F7 (template_key),
+            // demo patch on F8 (task-17). Shift is asked BEFORE plain: egui
+            // matches `NONE` logically, so a Shift+F5 press would otherwise
+            // be consumed as F5.
+            for shift in [true, false] {
+                for t in Template::ALL {
+                    let (key, s) = template_key(t);
+                    if s == shift && i.consume_key(if shift { Modifiers::SHIFT } else { Modifiers::NONE }, key) {
+                        load_tpl = Some(t);
+                    }
+                }
+            }
             if i.consume_key(Modifiers::NONE, Key::F8) { load_demo = true; }
             // Plugin browser (task-18).
             if i.consume_key(Modifiers::NONE, Key::F9) {
@@ -19764,7 +19931,7 @@ impl DemoApp {
             self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
         }
         if flip { self.on_tab(); }
-        if let Some(t) = load_tpl { self.load_template(t); }
+        if let Some(t) = load_tpl { self.try_load_template(t); }
         if load_demo { self.load_demo_patch(); }
         if load_multi { self.load_multi_rig_demo(); }
         if (rig_switch.is_some() || rig_cycle != 0) && self.rig_count() <= 1 {
@@ -24894,8 +25061,7 @@ pub fn run_session_test() -> anyhow::Result<()> {
     // --- Starter templates: each must rebuild a correct, playable rack ---
     // (units, cables, Keys/Master present, default params applied, layout grouped)
     let expect = [
-        (Template::LeadReverb, 4usize, 4usize, 1usize, 2usize),
-        (Template::DrumsBass, 6, 6, 2, 2),
+        (Template::SynthLead, 5usize, 5usize, 1usize, 3usize),
         (Template::AmbientPad, 5, 5, 1, 3),
     ];
     for (t, n_units, n_cables, n_cols, n_rows) in expect {
@@ -27551,20 +27717,34 @@ mod rig_switch_tests {
     }
 
     #[test]
-    fn shift_f5_loads_the_guitar_rig_and_plain_f5_the_lead() {
+    fn template_hotkeys_load_each_template_shift_first() {
         // egui matches `Modifiers::NONE` logically, so a Shift+F5 press that
-        // is asked for after F5 loads Lead + Reverb instead of the guitar rig.
+        // is asked for after F5 loads the F5 template instead.
         let ctx = egui::Context::default();
-        let names = |app: &DemoApp| -> Vec<String> { app.units.iter().map(|u| u.name.clone()).collect() };
         let mut app = DemoApp::new_with_sink(None);
+        template_plugins_installed(&mut app);
         for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
-        let shifted = |down: bool| egui::Event::Key {
-            key: Key::F5, physical_key: None, pressed: down, repeat: false, modifiers: Modifiers::SHIFT,
+        let press = |key: Key, shift: bool| {
+            let modifiers = if shift { Modifiers::SHIFT } else { Modifiers::NONE };
+            [true, false].map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }).to_vec()
         };
-        frame(&mut app, &ctx, vec![shifted(true), shifted(false)]);
-        assert!(names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "Shift+F5 → guitar rig: {:?}", names(&app));
-        frame(&mut app, &ctx, key(Key::F5));
-        assert!(!names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "plain F5 → lead: {:?}", names(&app));
+        for t in Template::ALL {
+            let (key, shift) = template_key(t);
+            frame(&mut app, &ctx, press(key, shift));
+            assert_eq!(app.session_msg, format!("Loaded template '{}'", t.title()), "{} on {}", t.title(), template_key_hint(t));
+        }
+    }
+
+    #[test]
+    fn a_template_hotkey_whose_plugins_are_missing_says_what_to_install() {
+        let ctx = egui::Context::default();
+        let mut app = DemoApp::new_with_sink(None);
+        app.catalog_roots = Some(vec![]); // nothing installed
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        let before: Vec<String> = app.units.iter().map(|u| u.name.clone()).collect();
+        frame(&mut app, &ctx, key(Key::F7)); // Rock Organ: setBfree + Guitarix
+        assert_eq!(app.session_msg, "Rock Organ: Needs setBfree and Guitarix — install them from Plugins (F9).");
+        assert_eq!(app.units.iter().map(|u| u.name.clone()).collect::<Vec<_>>(), before, "the rack is untouched");
     }
 
     #[test]
@@ -28333,7 +28513,7 @@ mod rig_switch_tests {
         let keys: Vec<String> = app.help_cols.iter()
             .flat_map(|c| c.rows.iter().flat_map(|r| r.keys.iter().map(|g| g.text().to_owned())))
             .collect();
-        for k in ["Tab", "Space", "Ctrl", "Del", "double-click", "F4", "F5–F8", "F9", "F10", "F11", "F12", "1–9", "R", "I", "SPLIT"] {
+        for k in ["Tab", "Space", "Ctrl", "Del", "double-click", "F4", "F5–F7", "F8", "F9", "F10", "F11", "F12", "1–9", "R", "I", "SPLIT"] {
             assert!(keys.iter().any(|x| x == k), "help lists {k}");
         }
         assert!(descs_has_mixer(&app), "F10 is the mixer now (the Transport window is gone)");
@@ -28916,7 +29096,7 @@ mod audio_viz_tests {
         assert_eq!(app.units.len(), before + 1, "remote AddNode adopted");
         assert_eq!(app.load_fade, 1.0, "sync adoption must not replay the load fade");
         // Explicit loads still fade in.
-        app.load_template(Template::LeadReverb);
+        app.load_template(Template::SynthLead);
         assert_eq!(app.load_fade, 0.0);
         app.update(1.0);
         app.load_multi_rig_demo();
@@ -29639,7 +29819,7 @@ mod split_bpm_tests {
         app.submit_chat("add a rig".into());
         app.exec_tool("add_rig", &serde_json::json!({"name": "Bass"}));
         frame(&mut app, &ctx, vec![]);
-        app.exec_tool("load_template", &serde_json::json!({"name": "drums_bass"}));
+        app.exec_tool("load_template", &serde_json::json!({"name": "synth_lead"}));
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.clock.saved(), saved, "a template load reset the clock");
         app.exec_tool("undo", &serde_json::json!({}));
@@ -30557,7 +30737,7 @@ mod stage_views_tests {
         app.toggle_stage(StageView::Sessions);
         let (bg, middle) = run_frame(&mut app, &ctx, size, vec![]);
         assert!(middle.is_empty(), "Sessions must not open a floating egui::Window: {middle:?}");
-        assert!(bg.iter().any(|t| t == "Lead + Reverb"), "Sessions renders templates in main stage: {bg:?}");
+        assert!(bg.iter().any(|t| t == "Cathedral Organ"), "Sessions renders templates in main stage: {bg:?}");
         assert!(bg.iter().any(|t| t == "Save current patch"), "Sessions save action painted");
         run_frame(&mut app, &ctx, size, key(Key::Escape));
         assert_eq!(app.stage_view, StageView::Rack, "Esc leaves the Sessions stage");
@@ -30968,7 +31148,7 @@ mod stage_views_tests {
         app.save_current_session(&dir);
         let jam = on_disk(&dir, "Jam");
 
-        app.load_template(Template::LeadReverb);
+        app.load_template(Template::SynthLead);
         assert_eq!(app.open_session, None);
         app.autosave_now(&dir);
         assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Jam".to_string()], "the first check after a load only records it");
@@ -31034,13 +31214,43 @@ mod stage_views_tests {
     }
 
     #[test]
+    fn the_sessions_stage_greys_out_templates_with_missing_plugins_and_installs_them() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("tpl-missing");
+        // Only Aeolus is installed: the Cathedral Organ loads, the tonewheel
+        // organs name their plugins and offer to install the first one.
+        let root = dir.join("plugins");
+        std::fs::create_dir_all(root.join("Aeolus.clap")).unwrap();
+        app.catalog_roots = Some(vec![root]);
+        app.stage_view = StageView::Sessions;
+        let ctx = egui::Context::default();
+        let texts: Vec<String> = stage_frame(&mut app, &ctx, &dir, vec![]).into_iter().map(|(t, _)| t).collect();
+        for t in [Template::CathedralOrgan, Template::JazzOrgan, Template::RockOrgan] {
+            assert!(texts.iter().any(|x| x == t.title()), "{} listed: {texts:?}", t.title());
+        }
+        assert!(!texts.iter().any(|t| t.contains("Aeolus")), "Aeolus is installed: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Load"), "the Cathedral Organ loads: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Needs setBfree — install it from Plugins (F9)."), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("Needs setBfree and Guitarix")), "{texts:?}");
+        assert_eq!(texts.iter().filter(|t| *t == "Install setBfree").count(), 2, "jazz + rock organ: {texts:?}");
+
+        click_text(&mut app, &ctx, &dir, "Load");
+        assert_eq!(app.session_msg, "Loaded template 'Cathedral Organ'");
+        app.stage_view = StageView::Sessions;
+        click_text(&mut app, &ctx, &dir, "Install setBfree");
+        assert_eq!(app.install.as_ref().map(|i| i.id.as_str()), Some("setbfree"), "the row starts the install");
+        assert_eq!(app.stage_view, StageView::Plugins, "and shows the install log");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm() {
         let mut app = DemoApp::new_with_sink(None);
         let dir = session_dir("overwrite");
         app.session_name = "Take one".into();
         app.save_current_session(&dir);
         let first = on_disk(&dir, "Take one");
-        app.load_template(Template::DrumsBass);
+        app.load_template(Template::SynthLead);
         turn_a_knob(&mut app);
         let ctx = egui::Context::default();
 
@@ -37890,7 +38100,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 23] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 24] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("two rigs", &|a| a.load_multi_rig_demo()),
@@ -37915,6 +38125,7 @@ mod window_size_layout_tests {
             }),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("sessions-installed", &|a| { a.stage_view = StageView::Sessions; template_plugins_installed(a) }),
             ("settings", &|a| a.stage_view = StageView::Settings),
             ("piano keyboard", &|a| a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::Piano)),
             ("jazz organ keyboard", &|a| { a.kb_mode = crate::keyboard::KeyboardMode::Pinned(crate::keyboard::KeyboardType::JazzOrgan); a.kb_dual_manual = true }),
@@ -38385,7 +38596,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 16] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 17] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
@@ -38416,6 +38627,7 @@ mod offline_shots {
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
             ("settings-keys", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Keys }),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("sessions-installed", &|a| { a.stage_view = StageView::Sessions; template_plugins_installed(a) }),
             ("agent", &|a| a.stage_demo_agent(false)),
         ];
         let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();

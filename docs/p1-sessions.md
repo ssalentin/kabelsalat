@@ -100,24 +100,33 @@ verbatim without understanding it, so the two workstreams stay decoupled.
 
 ## Starter templates (docs/ARCHITECTURE.md §2b)
 
-`Template::ALL` → `Lead + Reverb`, `Drums + Bass`, `Ambient Pad`. Each
-`Template::graph()` is a pre-wired `Graph` from existing node kinds
-(Keys / Clap / Dsp / MasterOut); `Template::session()` adds default knob
-values so it sounds good immediately. All use Surge XT
-(`org.surge-synth-team.surge-xt`), the ARM-native reference plugin.
+`Template::ALL` → six templates built from four hand-picked plugins plus the
+built-in DSP units. `Template::graph()` is the pre-wired `Graph`;
+`Template::session()` adds default knob values and plugin states so it sounds
+right at once. `Template::plugins()` names the catalog ids it needs.
 
-| Template | Patch | Character |
-|---|---|---|
-| Lead + Reverb | Keys → Surge → Reverb → Master, dry Surge → Master | singing lead, lush tail |
-| Drums + Bass | Keys → {Drums, Bass} Surge layers → Gain / Filter → Master | two layers, one keyboard |
-| Ambient Pad | Keys → Surge → Delay → Reverb → Master, dry → Master | instant atmosphere |
+| Template | Plugins | Patch | Character |
+|---|---|---|---|
+| Cathedral Organ | Aeolus | Keys → Aeolus (Full Organ registration) → Reverb → Master | pipe organ in a big room |
+| Jazz Organ | setBfree | Keys → setBfree (88 8000 000, percussion, slow Leslie) → Master | tonewheel jazz |
+| Rock Organ | setBfree, Guitarix | Keys → setBfree (all drawbars, fast Leslie, drive) → Amp → Cabinet → Master | organ through a cranked amp |
+| Ambient Pad | Surge XT | Keys → Surge → Delay → Reverb → Master, dry → Master | instant atmosphere |
+| Synth Lead | Surge XT | Keys → Surge → Delay → Reverb → Master, dry → Master | singing lead, slap echo |
+| Guitar Rig | Guitarix | Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master | live guitar |
+
+Hotkeys are F5–F7 (the organs) and Shift+F5–F7 (guitar, pad, lead). The
+Sessions view checks each template's plugins with the catalog's detection
+(`catalog::missing`): a template with missing plugins is greyed out, names
+them ("Needs setBfree and Guitarix — install them from Plugins (F9).") and
+offers an Install button for the first one, which starts the catalog install
+and opens Plugins to show its log. A hotkey for such a template only shows
+that message. The agent's `load_template` (app and MCP) still loads it and
+reports the missing plugins so the agent can offer `install_instrument`.
 
 Templates pick their own sequential edge ids (the `Graph` counter is private
 to the control plane). `templates_are_valid_and_playable` asserts every edge
-references real nodes, ids are unique, and there is a MIDI path Keys→synth and
-an audio path synth→Master. Drums+Bass is layered for now; key splits arrive
-with the MIDI matrix (task-9). Per-node DSP param tables land with task-7 —
-the session stores opaque `(node, param, value)` triples either way.
+references real nodes, ids are unique, and there is a MIDI path Keys→instrument
+and an audio path instrument→Master.
 
 ## Integration notes (task-10)
 

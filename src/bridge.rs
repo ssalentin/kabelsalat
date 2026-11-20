@@ -61,11 +61,24 @@ fn ui_call_within(tool: String, args: Value, wait: Duration) -> Result<String, S
     rx.recv_timeout(wait).map_err(|_| format!("the app did not answer in {} ms", wait.as_millis()))
 }
 
-/// Wall-clock ms of the last bridge request (an external agent is active).
-pub static LAST_REMOTE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The user paused external agents in the app: commands and UI tools that
-/// change anything are refused; queries still answer.
-pub static REMOTE_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What the bridge and the app share about external agents.
+#[derive(Default)]
+pub struct Remote {
+    /// Wall-clock ms of the last bridge request (an external agent is active).
+    pub last_ms: std::sync::atomic::AtomicU64,
+    /// The user paused external agents in the app: commands and UI tools that
+    /// change anything are refused; queries still answer.
+    pub paused: std::sync::atomic::AtomicBool,
+}
+
+/// The one `Remote` of the process: the bridge socket writes it and the
+/// real app shows it. An app that serves no bridge (every test's) keeps its
+/// own, so a request handled elsewhere in the process never shows in its
+/// top bar.
+pub fn remote() -> std::sync::Arc<Remote> {
+    static REMOTE: std::sync::OnceLock<std::sync::Arc<Remote>> = std::sync::OnceLock::new();
+    REMOTE.get_or_init(Default::default).clone()
+}
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -319,8 +332,9 @@ fn handle_line_with_pub(
         Ok(v) => v,
         Err(e) => return err_reply(format!("invalid JSON: {e}")),
     };
-    LAST_REMOTE_MS.store(now_ms(), Ordering::Relaxed);
-    if REMOTE_PAUSED.load(Ordering::Relaxed) && refused_while_paused(&req) {
+    let remote = remote();
+    remote.last_ms.store(now_ms(), Ordering::Relaxed);
+    if remote.paused.load(Ordering::Relaxed) && refused_while_paused(&req) {
         return err_reply(PAUSED_MSG);
     }
     match req.get("op").and_then(Value::as_str) {

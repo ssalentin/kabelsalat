@@ -123,9 +123,10 @@ pub struct Session {
     pub master_target: Option<crate::meter::MasterTarget>,
     /// Whether Kabelsalat's master mix to Master out is muted.
     pub master_mute: bool,
-    /// Virtual keyboard surface selection (#163): `None` = unspecified
-    /// (older sessions/templates leave current mode alone), `Some(Auto)` or `Some(Pinned(..))`.
-    pub keyboard_mode: Option<crate::keyboard::KeyboardMode>,
+    /// Each rig's instrument-type mark in rig order (#198); `None` = the
+    /// rig follows its instrument, and the list is empty while no rig is
+    /// marked. Travels by rig like `rig_names`.
+    pub rig_types: Vec<Option<crate::keyboard::KeyboardType>>,
     /// The time signature (#87). `None` = this session says nothing about
     /// it (older files, templates): a load then leaves the clock's as it is.
     pub time_sig: Option<crate::transport::TimeSig>,
@@ -214,7 +215,7 @@ impl Session {
             bus_outs: Vec::new(),
             master_target: None,
             master_mute: false,
-            keyboard_mode: None,
+            rig_types: Vec::new(),
             time_sig: None,
             midi_sources: Vec::new(),
             setlist: crate::setlist::Setlist::default(),
@@ -235,7 +236,7 @@ impl Session {
             && self.bus_outs == other.bus_outs
             && self.master_target == other.master_target
             && self.master_mute == other.master_mute
-            && self.keyboard_mode == other.keyboard_mode
+            && self.rig_types == other.rig_types
             && self.time_sig == other.time_sig
             && self.midi_sources == other.midi_sources
             && self.setlist == other.setlist
@@ -613,7 +614,8 @@ impl Session {
             bus_outs: self.bus_outs.clone(),
             master_target: self.master_target,
             master_mute: self.master_mute,
-            keyboard_mode: self.keyboard_mode,
+            rig_types: self.rig_types.clone(),
+            keyboard_mode: None,
             time_signature: self.time_sig,
             midi_sources: self.midi_sources.clone(),
             setlist: self.setlist.clone(),
@@ -645,6 +647,7 @@ impl Session {
             );
         }
         let states = read_state_files(package, &manifest.states, "session")?;
+        let rig_types = rig_types_of(&manifest);
         let mut setlist = manifest.setlist;
         setlist.normalize();
         let session = Session {
@@ -661,7 +664,7 @@ impl Session {
             bus_outs: manifest.bus_outs,
             master_target: manifest.master_target,
             master_mute: manifest.master_mute,
-            keyboard_mode: manifest.keyboard_mode,
+            rig_types,
             // A hand-edited file cannot give the clock a bar it cannot count.
             time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
             midi_sources: manifest.midi_sources,
@@ -788,8 +791,11 @@ struct SessionFile {
     /// Whether Kabelsalat's master mix is muted; older sessions default to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     master_mute: bool,
-    /// Virtual keyboard surface selection (#163); older sessions have none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Rig instrument-type marks (#198); absent while no rig is marked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rig_types: Vec<Option<crate::keyboard::KeyboardType>>,
+    /// The one keyboard pin of sessions before #198: read, never written.
+    #[serde(default, skip_serializing)]
     keyboard_mode: Option<crate::keyboard::KeyboardMode>,
     /// The time signature (#87); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -800,6 +806,18 @@ struct SessionFile {
     /// The setlist (#204); older/plain sessions omit it.
     #[serde(default, skip_serializing_if = "crate::setlist::Setlist::is_empty")]
     setlist: crate::setlist::Setlist,
+}
+
+/// A file's rig marks: its own, or an old session's single keyboard pin,
+/// which marked whatever the dock played (#163), so every rig of it.
+fn rig_types_of(manifest: &SessionFile) -> Vec<Option<crate::keyboard::KeyboardType>> {
+    match (manifest.rig_types.is_empty(), manifest.keyboard_mode.and_then(|m| m.pinned())) {
+        (true, Some(t)) => {
+            let rigs = manifest.graph.nodes.iter().map(|n| n.rig as usize + 1).max().unwrap_or(1);
+            vec![Some(t); rigs]
+        }
+        _ => manifest.rig_types.clone(),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1130,6 +1148,7 @@ impl RigPreset {
                 midi_device: self.midi_device,
                 clap_meta: self.clap_meta.clone(),
                 strip_knobs: self.session.strip_knobs().clone(),
+                rig_type: self.session.rig_types.first().copied().flatten(),
             };
             let json = serde_json::to_vec_pretty(&manifest)?;
             write_atomic(&staging.join(RIG_PRESET_FILE), &json)
@@ -1166,6 +1185,7 @@ impl RigPreset {
         for (node, knob) in manifest.strip_knobs {
             session.set_strip_knob(node, knob);
         }
+        session.rig_types = manifest.rig_type.map(|t| vec![Some(t)]).unwrap_or_default();
         let preset = RigPreset {
             name: manifest.name,
             rig_name: manifest.rig_name,
@@ -1200,6 +1220,9 @@ struct RigPresetFile {
     clap_meta: Vec<RigClapMeta>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     strip_knobs: BTreeMap<NodeId, String>,
+    /// The rig's instrument-type mark (#198); absent while it follows its instrument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rig_type: Option<crate::keyboard::KeyboardType>,
 }
 
 /// Default directory for saved rig presets (sibling to `~/kabelsalat-sessions`).
@@ -1895,24 +1918,50 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_mode_round_trips_and_old_sessions_have_none() {
-        use crate::keyboard::{KeyboardMode, KeyboardType};
-        let dir = std::env::temp_dir().join(format!("ksalat-kbmode-{}", std::process::id()));
+    fn rig_types_round_trip_and_are_absent_while_no_rig_is_marked() {
+        use crate::keyboard::KeyboardType;
+        let dir = std::env::temp_dir().join(format!("ksalat-rigtypes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let pkg = dir.join("kb.ksalat");
         let mut s = Session::new("kb", Graph::demo_patch());
-        s.keyboard_mode = Some(KeyboardMode::Pinned(KeyboardType::PipeOrgan));
+        s.rig_types = vec![Some(KeyboardType::PipeOrgan), None, Some(KeyboardType::Drums)];
         s.save(&pkg).unwrap();
-        assert_eq!(Session::load(&pkg).unwrap().keyboard_mode, Some(KeyboardMode::Pinned(KeyboardType::PipeOrgan)));
-        s.keyboard_mode = Some(KeyboardMode::Auto);
-        s.save(&pkg).unwrap();
-        assert_eq!(Session::load(&pkg).unwrap().keyboard_mode, Some(KeyboardMode::Auto));
-        s.keyboard_mode = None;
+        assert_eq!(Session::load(&pkg).unwrap().rig_types, s.rig_types);
+        let json = std::fs::read_to_string(pkg.join(SESSION_FILE)).unwrap();
+        assert!(json.contains("\"drums\""), "saved by machine name: {json}");
+        assert!(!json.contains("keyboard_mode"), "the old pin is never written");
+        s.rig_types.clear();
         let pkg2 = dir.join("plain.ksalat");
         s.save(&pkg2).unwrap();
         let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
-        assert!(!json.contains("keyboard_mode"), "absent when unset: old readers stay happy");
-        assert_eq!(Session::load(&pkg2).unwrap().keyboard_mode, None);
+        assert!(!json.contains("rig_types"), "absent when no rig is marked: old readers stay happy");
+        assert!(Session::load(&pkg2).unwrap().rig_types.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_sessions_keyboard_pin_marks_every_rig() {
+        use crate::control::{merge_rigs, standard_rig_graph, Rig};
+        use crate::keyboard::KeyboardType;
+        let dir = std::env::temp_dir().join(format!("ksalat-oldpin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let graph = merge_rigs(&[
+            Rig::new("A", standard_rig_graph(true), None),
+            Rig::new("B", standard_rig_graph(true), None),
+        ]);
+        let pkg = dir.join("old.ksalat");
+        Session::new("old", graph).save(&pkg).unwrap();
+        // What a session saved before #198 holds: one pin for the dock.
+        let file = pkg.join(SESSION_FILE);
+        let pinned = |mode: &str| {
+            let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            v["keyboard_mode"] = serde_json::json!(mode);
+            std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+            Session::load(&pkg).unwrap().rig_types
+        };
+        assert_eq!(pinned("jazz_organ"), vec![Some(KeyboardType::JazzOrgan); 2]);
+        assert_eq!(pinned("pipe_organ"), vec![Some(KeyboardType::PipeOrgan); 2]);
+        assert!(pinned("auto").is_empty(), "auto marks nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2331,6 +2380,15 @@ mod tests {
         assert_eq!(loaded.clap_meta, preset.clap_meta);
         assert_eq!(content(&loaded.session), content(&preset.session));
         assert_eq!(blobs(&loaded.session), blobs(&preset.session));
+        assert!(loaded.session.rig_types.is_empty(), "an unmarked rig loads unmarked");
+
+        // A marked rig's preset keeps the mark (#198).
+        let mut marked = preset.clone();
+        marked.session.rig_types = vec![Some(crate::keyboard::KeyboardType::Bass)];
+        let pkg_marked = RigPreset::package_path(&dir, "Marked").unwrap();
+        marked.save(&pkg_marked).unwrap();
+        assert_eq!(RigPreset::load(&pkg_marked).unwrap().session.rig_types, vec![Some(crate::keyboard::KeyboardType::Bass)]);
+        crate::session::delete_rig_preset(&dir, "Marked").unwrap();
 
         let mut bad = preset.clone();
         bad.session.graph.nodes[0].rig = 2;

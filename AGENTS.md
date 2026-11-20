@@ -1593,3 +1593,19 @@ Learned so far (2026-11-15, UI polish pass):
     back to the plugin's own parameter list, and refuses with "MIDI CC 11 …
     set_cc_map" (`set_param_never_sends_a_pedal_name_as_a_parameter_id`).
     A resolver that returns a target is matched on it at every call site.
+192. **What kind of instrument a rig is has one answer:** `DemoApp::rig_type`
+    (the rig's mark, else `keyboard::classify_instrument`), and for a plugin
+    in a list `plugins::clap_instrument_type` / `lv2_instrument_type`. The
+    keyboard, the Plugins browser and the demo phrase each kept their own
+    word list, so OneTrick CRYPTID was a DRUM card that opened the Synth
+    keyboard, and a rig marked Drums played a keys phrase. A new feature
+    that cares what an instrument is asks these; a new cue goes into
+    `keyboard::TEXT_CUES` or a catalog card's `instrument`, never a list of
+    its own (`the_browser_and_the_keyboard_agree`,
+    `real_sound_names_pick_their_phrase`).
+193. **A percussive control sounds on the press:** egui's `clicked()` fires
+    on the release, so the first drum pads hit only after the button came
+    up again. Pads, drums and anything struck use `DemoApp::struck` (the
+    primary press on the widget), and their test asserts the note after the
+    press frame alone (`a_drum_pad_sounds_when_it_is_pressed`).
+

@@ -94,8 +94,9 @@ struct State {
     record_sync: bool,
     /// Single-rig preset directory (isolated in unit tests).
     rig_presets_dir: std::path::PathBuf,
-    /// Virtual keyboard surface selection (#163, headless mirror).
-    keyboard_mode: crate::keyboard::KeyboardMode,
+    /// Each rig's instrument-type mark by rig index (#198, headless
+    /// mirror of the app's); `None` = the rig follows its instrument.
+    rig_types: Vec<Option<crate::keyboard::KeyboardType>>,
     /// Headless setlist mirror (#204); in Remote mode the GUI app owns it.
     setlist: crate::setlist::Setlist,
 }
@@ -744,8 +745,10 @@ struct SetMasterTargetArgs {
 /// Arguments for `set_keyboard_mode`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetKeyboardModeArgs {
-    /// Surface mode: "auto", "piano", "jazz_organ", "pipe_organ", or "synth".
+    /// The rig's type: "auto" (follow its instrument), "piano", "electric_piano", "jazz_organ", "pipe_organ", "synth", "bass", "wind" or "drums".
     mode: Option<String>,
+    /// 0-based rig index (rig 0 is the first rig, "Rig A"); default the active rig.
+    rig: Option<usize>,
     /// Show (true) or hide (false) the virtual keyboard dock.
     open: Option<bool>,
     /// Expand the keyboard dock to fullscreen performance mode (true) or return to bottom dock (false).
@@ -1160,6 +1163,64 @@ fn rig_meta(st: &State) -> Result<Vec<crate::control::RigMeta>, String> {
         return Ok(snap.rigs);
     }
     Ok(st.rigs.lock().map(|s| s.rigs.clone()).unwrap_or_default())
+}
+
+/// Rigs of the headless patch (a single-graph patch is one rig).
+fn headless_rig_count(st: &State) -> usize {
+    st.graph.nodes.iter().map(|n| n.rig as usize + 1).max().unwrap_or(1)
+}
+
+fn headless_active_rig(st: &State) -> usize {
+    st.rigs.lock().map(|s| s.active).unwrap_or(0).min(headless_rig_count(st) - 1)
+}
+
+/// One headless rig's type (#198): its mark, else what its first
+/// instrument node is, as the app classifies it.
+fn headless_rig_type(st: &State, rig: usize) -> Value {
+    let detected = st.graph.nodes.iter()
+        .find(|n| n.rig as usize == rig && matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }))
+        .map(|n| crate::keyboard::classify_instrument(&n.kind, None, Some(crate::control::name_str(&n.name)), &[]));
+    let mark = st.rig_types.get(rig).copied().flatten();
+    let name = st.rigs.lock().ok().and_then(|s| s.rigs.get(rig).map(|m| m.name.clone())).filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("Rig {}", (b'A' + rig.min(25) as u8) as char));
+    json!({
+        "rig": rig,
+        "name": name,
+        "type": mark.or(detected).map(|t| t.as_str()),
+        "detected": detected.map(|t| t.as_str()),
+        "marked": mark.is_some(),
+    })
+}
+
+/// Headless `get_keyboard_state`: no dock, the rigs' types.
+fn headless_keyboard_state(st: &State) -> Value {
+    let active = headless_active_rig(st);
+    let rigs: Vec<Value> = (0..headless_rig_count(st)).map(|r| headless_rig_type(st, r)).collect();
+    let a = &rigs[active];
+    json!({
+        "open": false,
+        "expanded": false,
+        "rig": active,
+        "auto": !a["marked"].as_bool().unwrap_or(false),
+        "marked": a["marked"],
+        "mode": a["type"].as_str().unwrap_or(crate::keyboard::KeyboardType::Synth.as_str()),
+        "detected_mode": a["detected"].as_str().unwrap_or(crate::keyboard::KeyboardType::Synth.as_str()),
+        "rigs": rigs,
+    })
+}
+
+/// A rig list (`{rigs: [...]}`) with each rig's `type` and `type_marked`
+/// from a `rigs` list as `get_keyboard_state` gives it.
+fn with_rig_types(mut data: Value, types: &[Value]) -> Value {
+    if let Some(list) = data.get_mut("rigs").and_then(Value::as_array_mut) {
+        for (i, r) in list.iter_mut().enumerate() {
+            if let (Some(obj), Some(t)) = (r.as_object_mut(), types.get(i)) {
+                obj.insert("type".into(), t["type"].clone());
+                obj.insert("type_marked".into(), t["marked"].clone());
+            }
+        }
+    }
+    data
 }
 
 fn sound_args(query: &str, rig: Option<usize>, node: Option<NodeId>) -> Value {
@@ -1577,6 +1638,8 @@ impl McpServer {
                 if rigs.len() <= 1 { return tool_err("the last rig cannot be deleted"); }
                 if r >= rigs.len() { return tool_err(format!("no rig {r}: there are {}", rigs.len())); }
                 rigs.remove(r);
+                // Marks follow their rig (#198).
+                if r < st.rig_types.len() { st.rig_types.remove(r); }
                 0
             }
             None => {
@@ -1811,32 +1874,21 @@ impl McpServer {
         }
     }
 
-    #[tool(name = "get_keyboard_state", description = "Read the virtual software keyboard dock state: open, expanded (fullscreen mode), auto vs pinned instrument mode (piano | jazz_organ | pipe_organ | synth), detected mode, target instrument, octave, sustain, swell, dual_manual, scale_fold, y_touch and synth_drag.")]
+    #[tool(name = "get_keyboard_state", description = "Read the virtual software keyboard dock state: open, expanded (fullscreen mode), the active rig's instrument type (mode: piano | electric_piano | jazz_organ | pipe_organ | synth | bass | wind | drums), whether it is marked or follows its instrument (auto, marked), the detected type, rigs (every rig's index, name, type, detected type and marked), target instrument, octave, sustain, swell, dual_manual, scale_fold, y_touch and synth_drag.")]
     fn get_keyboard_state(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
             return Self::ui_bridge_tool("get_keyboard_state", json!({}));
         }
-        let detected = st.graph.nodes.iter()
-            .find(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }))
-            .map(|n| crate::keyboard::classify_instrument(&n.kind, None, Some(crate::control::name_str(&n.name)), &[]))
-            .unwrap_or(crate::keyboard::KeyboardType::Synth);
-        let active = st.keyboard_mode.pinned().unwrap_or(detected);
-        ok_json(json!({
-            "open": false,
-            "expanded": false,
-            "auto": st.keyboard_mode == crate::keyboard::KeyboardMode::Auto,
-            "mode": active.as_str(),
-            "detected_mode": detected.as_str(),
-        }))
+        ok_json(headless_keyboard_state(&st))
     }
 
-    #[tool(name = "set_keyboard_mode", description = "Configure the virtual software keyboard dock: open/close it, toggle expanded/fullscreen performance view, switch between auto or a pinned instrument surface (piano | jazz_organ | pipe_organ | synth), or toggle surface options (dual_manual, scale_fold, y_touch, synth_drag: gliss|slide).")]
+    #[tool(name = "set_keyboard_mode", description = "Configure the virtual software keyboard dock: open/close it, toggle expanded/fullscreen performance view, mark a rig's instrument type (mode: piano | electric_piano | jazz_organ | pipe_organ | synth | bass | wind | drums) or return it to auto (follow its instrument), or toggle surface options (dual_manual, scale_fold, y_touch, synth_drag: gliss|slide). rig is 0-based (rig 0 = the first rig, Rig A) and defaults to the active rig; the keyboard plays the active rig's type.")]
     fn set_keyboard_mode(&self, Parameters(args): Parameters<SetKeyboardModeArgs>) -> Result<CallToolResult, McpError> {
         let parsed_mode = match args.mode.as_deref() {
             Some(s) => match crate::keyboard::KeyboardMode::parse(s) {
                 Some(m) => Some(m),
-                None => return tool_err(format!("unknown keyboard mode '{s}' (use auto, piano, jazz_organ, pipe_organ, or synth)")),
+                None => return tool_err(format!("unknown keyboard mode '{s}' (use {})", crate::keyboard::KeyboardMode::CHOICES)),
             },
             None => None,
         };
@@ -1849,6 +1901,7 @@ impl McpServer {
         if matches!(st.backend, Backend::Remote) {
             return Self::ui_bridge_tool("set_keyboard_mode", json!({
                 "mode": args.mode,
+                "rig": args.rig,
                 "open": args.open,
                 "expanded": args.expanded,
                 "dual_manual": args.dual_manual,
@@ -1857,13 +1910,18 @@ impl McpServer {
                 "synth_drag": args.synth_drag,
             }));
         }
+        let n = headless_rig_count(&st);
+        let rig = match args.rig {
+            Some(r) if r >= n => return tool_err(format!("no rig {r}: rig is 0-based and there are {n} (0..{})", n - 1)),
+            Some(r) => r,
+            None => headless_active_rig(&st),
+        };
         if let Some(m) = parsed_mode {
-            st.keyboard_mode = m;
+            if st.rig_types.len() <= rig { st.rig_types.resize(rig + 1, None); }
+            st.rig_types[rig] = m.pinned();
+            while st.rig_types.last() == Some(&None) { st.rig_types.pop(); }
         }
-        ok_json(json!({
-            "auto": st.keyboard_mode == crate::keyboard::KeyboardMode::Auto,
-            "mode": st.keyboard_mode.as_str(),
-        }))
+        ok_json(headless_keyboard_state(&st))
     }
 
     /// Add a node to the patch.
@@ -3058,6 +3116,11 @@ impl McpServer {
             });
         }
         st.graph = merge_rigs(&rigs);
+        // The clone keeps its source's mark (#198).
+        if let Some(mark) = st.rig_types.get(src).copied().flatten() {
+            st.rig_types.resize(target + 1, None);
+            st.rig_types[target] = Some(mark);
+        }
         let metas: Vec<crate::control::RigMeta> = rigs.iter()
             .map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
         if matches!(st.backend, Backend::Local(_)) {
@@ -3380,6 +3443,11 @@ impl McpServer {
         if !args.confirm {
             return tool_err("not deleted: pass confirm=true (ask the user first)");
         }
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            // The running app deletes the rig itself: every other rig keeps
+            // its knobs, synth state and type mark (#198).
+            return Self::ui_bridge_tool("delete_rig", json!({"rig": args.rig, "confirm": true}));
+        }
         self.edit_rigs(Some(args.rig), None)
     }
 
@@ -3574,7 +3642,7 @@ impl McpServer {
         }
     }
 
-    #[tool(name = "get_rigs", description = "Query the multi-rig state: {rigs:[{name, midi_device}], active}. Empty rigs means single-graph mode (a plain graph load clears it). midi_device null = any source; a number = only that hardware MIDI device.")]
+    #[tool(name = "get_rigs", description = "Query the multi-rig state: {rigs:[{name, midi_device, type, type_marked}], active}. type is the rig's instrument type (piano | electric_piano | jazz_organ | pipe_organ | synth | bass | wind | drums; null for a rig without an instrument), type_marked whether the player or set_keyboard_mode marked it. Empty rigs means single-graph mode (a plain graph load clears it). midi_device null = any source; a number = only that hardware MIDI device.")]
     fn get_rigs(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -3587,14 +3655,23 @@ impl McpServer {
                     reply.get("error").and_then(Value::as_str).unwrap_or("bridge query failed"),
                 );
             }
-            return ok_json(reply.get("data").cloned().unwrap_or(Value::Null));
+            let data = reply.get("data").cloned().unwrap_or(Value::Null);
+            // The rig types live in the app (#198): ask it, and answer
+            // without them only when it cannot say.
+            let types = bridge::request(&json!({"op": "ui", "tool": "get_keyboard_state", "args": {}})).ok()
+                .and_then(|r| r.get("data").cloned())
+                .and_then(|d| d.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).or(Some(d)))
+                .and_then(|d| d.get("rigs").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            return ok_json(with_rig_types(data, &types));
         }
-        let s = match st.rigs.lock() {
-            Ok(s) => s,
+        let snap = match st.rigs.lock() {
+            Ok(s) => serde_json::to_value(&*s),
             Err(_) => return tool_err("rig snapshot lock poisoned"),
         };
-        match serde_json::to_value(&*s) {
-            Ok(v) => ok_json(v),
+        let types: Vec<Value> = (0..headless_rig_count(&st)).map(|r| headless_rig_type(&st, r)).collect();
+        match snap {
+            Ok(v) => ok_json(with_rig_types(v, &types)),
             Err(e) => tool_err(format!("serializing rig snapshot: {e}")),
         }
     }
@@ -3825,8 +3902,10 @@ impl McpServer {
             },
             _ => {
                 let pname = name_str(&inst.name);
-                let class = crate::keyboard::classify_instrument(&inst.kind, None, Some(pname), &[]);
-                crate::demo::kind_for(class, None, Some(pname))
+                // The rig's type (#198): its mark, else its instrument's.
+                let ty = st.rig_types.get(rig).copied().flatten()
+                    .unwrap_or_else(|| crate::keyboard::classify_instrument(&inst.kind, None, Some(pname), &[]));
+                crate::demo::kind_for(ty, None, Some(pname))
             }
         };
         let bpm = st.graph_pub.as_ref().and_then(|p| p.lock().ok()).map_or(96.0, |g| g.transport.bpm);
@@ -4329,7 +4408,7 @@ pub fn run() -> anyhow::Result<()> {
         record: audio.record,
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
-        keyboard_mode: crate::keyboard::KeyboardMode::Auto,
+        rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
@@ -4368,7 +4447,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         record: Arc::new(crate::record::RecorderShared::new()),
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
-        keyboard_mode: crate::keyboard::KeyboardMode::Auto,
+        rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
@@ -4504,7 +4583,7 @@ mod tests {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir)
                 .join(format!("test-mcp-rig-presets-{}", std::process::id())),
-            keyboard_mode: crate::keyboard::KeyboardMode::Auto,
+            rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
         };
         let server = McpServer {

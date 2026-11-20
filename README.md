@@ -34,8 +34,14 @@ with one key. They use a handful of free plugins (Aeolus, setBfree, Surge XT,
 Guitarix); a setup whose plugins are missing is greyed out in Sessions with an
 Install button.
 
-The on-screen keyboard (**V**) turns into the instrument the active rig plays,
-or the one you pin:
+Every rig is a kind of instrument: piano, e-piano, jazz organ, pipe organ,
+synth, bass, wind or drums. kabelsalat knows it from the plugin (setBfree is an
+organ, AVL Drumkits are drums, Starbreath is a wind) or from the sound you load
+(a Surge XT "Winds/Flute" makes the rig a wind). You can also mark a rig as a
+type yourself; the mark is saved with the session. The left rail, the Plugins
+browser, the demo phrase and the agent all use the same type.
+
+The on-screen keyboard (**V**) turns into the instrument the active rig is:
 
 - **Piano:** damper and soft pedals, touch velocity from where you hit the key
   (soft at the top, loud at the bottom), sustained notes marked in teal.
@@ -48,6 +54,12 @@ or the one you pin:
 - **Synth:** pitch-bend and modulation wheels, the patch's own macro knobs and
   an X/Y pad over the first two, scale highlight and FOLD (only the scale's
   notes as keys), arpeggiator switch, sustain and velocity.
+- **E-Piano:** damper, touch velocity and a tremolo wheel.
+- **Bass:** a four-string neck beside the keys that shows where each held
+  note lies, and that you can play.
+- **Wind:** a breath control that sends CC 2, CC 11 or aftertouch, and
+  Y-BREATH: how far down the key you play sets the breath.
+- **Drums:** sixteen pads on the General MIDI drum notes in place of keys.
 
 Keys sound for as long as you hold them, and the chord you hold is named in the
 header. The agent can read and switch all of this too (`get_keyboard_state`,
@@ -71,6 +83,17 @@ rack (Esc or DOCK brings it back), and the instrument moves as you play:
   large X/Y pad, and full-height pitch and mod wheels.
 
 <p align="center"><img src="docs/shots/keyboard-consoles.png" width="85%" alt="The four full-window instrument consoles: Piano with strings and pedal lyre, Jazz Organ with tone generator and drawbars, Pipe Organ with pipe front and drawknobs, Synth with display, macro knobs and X/Y pad"/></p>
+
+- **E-Piano:** a tine per key that lights and swings while its note sounds,
+  the tremolo wheel and the sustain pedal.
+- **Bass:** a full neck to fifteen frets, with each held note on the string
+  and fret a bassist would use.
+- **Wind:** the breath column and an air column that shortens as the note
+  rises and fills with the breath you give it.
+- **Drums:** a kit seen from above, where you hit each drum and cymbal
+  (harder in the middle), next to a 4×4 pad bank.
+
+<p align="center"><img src="docs/shots/keyboard-consoles-2.png" width="85%" alt="Four more full-window consoles: E-Piano with a tine per key, Bass with a four-string neck showing the held notes, Wind with breath control and air column, Drums with an overhead kit and sixteen pads"/></p>
 
 ### Patch with real cables
 Press **Tab** to turn the rack around and patch on the back. Drag from jack to

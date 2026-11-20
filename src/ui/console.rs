@@ -23,7 +23,7 @@
 //! it, recesses are shaded under their upper rim, and shadows drop down.
 
 use super::*;
-use crate::keyboard::{KeyboardType, SynthDragMode};
+use crate::keyboard::{Surface, SynthDragMode};
 use egui::epaint::{Mesh, RectShape};
 use egui::Align;
 use std::f32::consts::{PI, TAU};
@@ -80,7 +80,7 @@ impl DemoApp {
     pub(super) fn keyboard_console_ui(&mut self, root: &mut egui::Ui) {
         self.kb_learn_rects.clear();
         let h = (root.available_height() - 2.0).max(164.0).round();
-        let surface = self.kb_surface();
+        let ty = self.kb_type();
         let target = self.kb_target_unit();
         let mut laid = Laid { bed: Rect::NOTHING, deck: Rect::NOTHING, strip: [Rect::NOTHING; 4] };
         let resp = egui::Panel::bottom("dock")
@@ -93,7 +93,7 @@ impl DemoApp {
                 let header = Rect::from_min_size(full.min + egui::vec2(pad, 0.0), egui::vec2(full.width() - 2.0 * pad, HEADER_H));
                 ui.scope_builder(
                     egui::UiBuilder::new().max_rect(header).layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    |ui| self.kb_header(ui, surface, target, true),
+                    |ui| self.kb_header(ui, ty, target, true),
                 );
                 ui.painter().line_segment(
                     [Pos2::new(full.left(), header.bottom()), Pos2::new(full.right(), header.bottom())],
@@ -106,14 +106,22 @@ impl DemoApp {
                 );
                 // The instrument stands on the stage: its shadow under it.
                 drop_shadow(ui.painter(), body.shrink(4.0), 12.0, 5.0, 16.0, 0.6);
-                match surface {
-                    KeyboardType::Piano => self.console_piano(ui, body, target, &mut laid),
-                    KeyboardType::JazzOrgan => self.console_jazz(ui, body, &mut laid),
-                    KeyboardType::PipeOrgan => self.console_pipe(ui, body, target, &mut laid),
-                    KeyboardType::Synth => self.console_synth(ui, body, target, &mut laid),
+                match ty.surface() {
+                    Surface::Piano => self.console_piano(ui, body, target, &mut laid),
+                    Surface::ElectricPiano => self.console_epiano(ui, body, target, &mut laid),
+                    Surface::JazzOrgan => self.console_jazz(ui, body, &mut laid),
+                    Surface::PipeOrgan => self.console_pipe(ui, body, target, &mut laid),
+                    Surface::Synth => self.console_synth(ui, body, target, &mut laid),
+                    Surface::Bass => self.console_bass(ui, body, target, &mut laid),
+                    Surface::Wind => self.console_wind(ui, body, target, &mut laid),
+                    Surface::Drums => self.console_drums(ui, body, target, &mut laid),
                 }
-                // Strings, wheels, pipes and the scope move while notes sound.
-                if self.note_leds.iter().any(|l| *l > 0.02) {
+                // Strings, tines, air column, kit ripples, wheels, pipes and the
+                // scope move while notes sound (or tremolo pulses).
+                if self.note_leds.iter().any(|l| *l > 0.02)
+                    || (ty.surface() == Surface::ElectricPiano && self.kb_mod > 0.05)
+                    || (ty.surface() == Surface::Wind && self.kb_breath > 0.05)
+                {
                     ui.ctx().request_repaint();
                 }
                 ui.allocate_rect(full, egui::Sense::hover());
@@ -277,7 +285,7 @@ impl DemoApp {
 
         // The keys in their well.
         p.rect_filled(bed_area, 0.0, rgb(0x05, 0x04, 0x04));
-        laid.bed = self.kb_keybed(ui, bed_area, KeyboardType::Piano, 0.0);
+        laid.bed = self.kb_keybed(ui, bed_area, Surface::Piano, 0.0);
         let bed = laid.bed;
         let keys = Rect::from_min_max(Self::dock_key_rect(bed, 0).left_top(), Self::dock_key_rect(bed, Self::dock_whites(bed) - 1).right_bottom());
         // The fallboard overhangs the back of the keys.
@@ -662,7 +670,7 @@ impl DemoApp {
             p.line_segment([r.left_top() + egui::vec2(2.0, 1.0), r.right_top() + egui::vec2(-2.0, 1.0)], Stroke::new(1.0, alpha(BRASS_HI, 0.3)));
         }
         let bed_area = Rect::from_min_max(Pos2::new(man.left() + cheek, man.top()), Pos2::new(man.right() - cheek, man.bottom()));
-        laid.bed = self.kb_keybed(ui, bed_area, KeyboardType::JazzOrgan, man_gap);
+        laid.bed = self.kb_keybed(ui, bed_area, Surface::JazzOrgan, man_gap);
         // Each manual lies in the shade of what overhangs it.
         let rows = if dual && bed_area.height() >= 130.0 { 2 } else { 1 };
         for k in 0..rows {
@@ -933,7 +941,7 @@ impl DemoApp {
         let bottom = Rect::from_min_max(Pos2::new(b.left() + side, y), Pos2::new(b.right() - side, b.bottom() - 4.0));
 
         p.rect_filled(bed_area, 2.0, rgb(0x0A, 0x07, 0x05));
-        laid.bed = self.kb_keybed(ui, bed_area, KeyboardType::PipeOrgan, 0.0);
+        laid.bed = self.kb_keybed(ui, bed_area, Surface::PipeOrgan, 0.0);
         vgrad(&p, Rect::from_min_size(laid.bed.min + egui::vec2(6.0, 6.0), egui::vec2(laid.bed.width() - 12.0, (laid.bed.height() * 0.1).clamp(7.0, 16.0))), alpha(SHADE, 0.4), alpha(SHADE, 0.0));
         let drawn = self.kb_pipe_drawn();
         if facade_h > 0.0 {
@@ -1252,7 +1260,7 @@ impl DemoApp {
         let wheels = Rect::from_min_size(keys_row.min, egui::vec2(well_w, keys_row.height()));
         let bed_area = Rect::from_min_max(Pos2::new(wheels.right() + 6.0, keys_row.top()), keys_row.max);
         p.rect_filled(bed_area, 3.0, rgb(0x08, 0x08, 0x07));
-        laid.bed = self.kb_keybed(ui, bed_area, KeyboardType::Synth, 0.0);
+        laid.bed = self.kb_keybed(ui, bed_area, Surface::Synth, 0.0);
         vgrad(&p, Rect::from_min_size(laid.bed.min + egui::vec2(6.0, 6.0), egui::vec2(laid.bed.width() - 12.0, (laid.bed.height() * 0.08).clamp(6.0, 16.0))), alpha(SHADE, 0.4), alpha(SHADE, 0.0));
 
         // The wheel well: PITCH (springs to center) and MOD (holds).
@@ -1435,6 +1443,684 @@ impl DemoApp {
                 p.circle_filled(c, 7.0, theme::LIVE_TEAL);
                 p.circle_filled(c, 3.0, rgb(0xC8, 0xF2, 0xEE));
                 p.circle_stroke(c, 11.0, Stroke::new(1.0, alpha(theme::LIVE_TEAL, 0.6)));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Electric Piano (Rhodes / Wurli): tines, tonebars, tremolo, sustain
+
+    fn console_epiano(&mut self, ui: &mut egui::Ui, b: Rect, target: Option<usize>, laid: &mut Laid) {
+        let p = ui.painter().clone();
+        let arm = (b.width() * 0.02).clamp(12.0, 28.0).round();
+        let wheel_w = (b.width() * 0.055).clamp(48.0, 82.0).round();
+        let inner_w = b.width() - 2.0 * arm;
+        let kw = Self::console_key_w(inner_w - wheel_w - 8.0);
+        let pedal_h = (b.height() * 0.13).clamp(46.0, 110.0).round();
+        let mut keys_h = (kw * 4.2 + 12.0).min(b.height() * 0.42).max(84.0).round();
+        let mut rail_h = (b.height() * 0.15).clamp(60.0, 116.0).round();
+        let mut spare = b.height() - keys_h - pedal_h - rail_h - 10.0;
+        if spare < 76.0 {
+            let give = (76.0 - spare).min(keys_h - 84.0).max(0.0);
+            keys_h -= give;
+            spare += give;
+        }
+        let harp_h = if spare >= 60.0 { spare } else {
+            if spare > 0.0 { rail_h += spare; }
+            0.0
+        };
+
+        // Tolex-wrapped case + chrome corner brackets.
+        let case = Rect::from_min_max(b.min, Pos2::new(b.right(), b.bottom() - pedal_h));
+        p.rect_filled(b, 10.0, rgb(0x0B, 0x0A, 0x09));
+        plate(&p, case, 10.0, rgb(0x22, 0x20, 0x1E), rgb(0x11, 0x10, 0x0F));
+        // Subtle tolex grain dots.
+        for k in 0..90u32 {
+            let x = case.left() + 8.0 + (case.width() - 16.0) * noise(k * 3 + 17);
+            let y = case.top() + 8.0 + (case.height() - 16.0) * noise(k * 7 + 41);
+            p.circle_filled(Pos2::new(x, y), 1.0, alpha(theme::CREAM, 0.035));
+        }
+        p.rect_stroke(case, 10.0, Stroke::new(1.5, rgb(0x3B, 0x39, 0x35)), egui::StrokeKind::Inside);
+
+        let mut y = b.top() + 8.0;
+        let harp = Rect::from_min_size(Pos2::new(b.left() + arm, y), egui::vec2(inner_w, (harp_h - 8.0).max(0.0)));
+        y += harp_h;
+        let rail = Rect::from_min_size(Pos2::new(b.left() + arm, y), egui::vec2(inner_w, rail_h));
+        y += rail_h + 4.0;
+        let keys_row = Rect::from_min_size(Pos2::new(b.left() + arm, y), egui::vec2(inner_w, keys_h));
+        let under = Rect::from_min_max(Pos2::new(b.left(), case.bottom()), b.max);
+
+        // Keybed + TREMOLO wheel cheekblock.
+        let cheek_r = Rect::from_min_size(keys_row.min, egui::vec2(wheel_w, keys_row.height()));
+        let bed_area = Rect::from_min_max(Pos2::new(cheek_r.right() + 8.0, keys_row.top()), keys_row.max);
+        p.rect_filled(bed_area, 3.0, rgb(0x07, 0x06, 0x06));
+        laid.bed = self.kb_keybed(ui, bed_area, Surface::ElectricPiano, 0.0);
+        let bed = laid.bed;
+
+        // TREMOLO (MOD CC 1) wheel well with pulsing vibrato pilot lamp.
+        well(&p, cheek_r, 6.0, rgb(0x0C, 0x0B, 0x0A));
+        let lamp_c = Pos2::new(cheek_r.center().x, cheek_r.top() + 12.0);
+        let trem_on = self.kb_mod > 0.05;
+        let pulse = if trem_on { 0.45 + 0.55 * (self.ui_time * (2.5 + self.kb_mod * 7.0) * TAU).sin().abs() } else { 0.0 };
+        if trem_on {
+            glow(&p, lamp_c, 9.0, alpha(theme::CABLE_AMBER, 0.45 * pulse));
+            p.circle_filled(lamp_c, 3.5, mix(theme::CABLE_AMBER, IVORY_HI, 0.4 * pulse));
+        } else {
+            p.circle_filled(lamp_c, 3.0, rgb(0x2A, 0x26, 0x22));
+        }
+        let wr = Rect::from_min_max(
+            Pos2::new(cheek_r.left() + 10.0, cheek_r.top() + 24.0),
+            Pos2::new(cheek_r.right() - 10.0, cheek_r.bottom() - 22.0),
+        );
+        let wresp = ui.interact(wr, cid("ep_trem_wheel"), egui::Sense::click_and_drag())
+            .on_hover_text("tremolo depth (Mod Wheel, CC 1)");
+        let mv = self.kb_wheel_drive(&wresp, wr, false);
+        wheel(&p, wr, mv, false, wresp.hovered() || wresp.dragged());
+        legend(ui, Pos2::new(cheek_r.center().x, cheek_r.bottom() - 15.0), Align::Center, "TREM", 8.0, theme::CREAM_DIM);
+        laid.strip[1] = wr;
+
+        // Open harp: tines, tonebars, pickup rail, felt dampers.
+        if harp.height() >= 52.0 {
+            self.console_epiano_harp(&p, harp, bed);
+        }
+
+        // Brushed aluminum/silver Rhodes nameplate & control rail.
+        plate(&p, rail, 4.0, rgb(0x2D, 0x2C, 0x2A), rgb(0x19, 0x18, 0x17));
+        p.line_segment([rail.left_top() + egui::vec2(4.0, 1.0), rail.right_top() + egui::vec2(-4.0, 1.0)], Stroke::new(1.0, alpha(ALU, 0.28)));
+        p.rect_stroke(rail, 4.0, Stroke::new(1.0, rgb(0x09, 0x08, 0x08)), egui::StrokeKind::Inside);
+
+        let zone_w = (rail.width() * 0.25).clamp(140.0, 290.0);
+        let content = rail.shrink2(egui::vec2(14.0, 6.0));
+        let mains = self.console_mains(target, 4);
+        let row_h = ((content.height() - 6.0) / 2.0).clamp(16.0, 26.0);
+        let yt_r = Rect::from_min_size(content.min, egui::vec2(88.0f32.min(zone_w * 0.55), row_h));
+        if tab(ui, cid("ep_ytouch"), yt_r, "Y-TOUCH", self.kb_y_touch, theme::LIVE_TEAL)
+            .on_hover_text("vertical hit position sets velocity: top = soft bell, bottom = bark")
+            .clicked()
+        {
+            self.kb_y_touch = !self.kb_y_touch;
+        }
+        let trem_r = Rect::from_min_size(Pos2::new(yt_r.right() + 6.0, content.top()), egui::vec2((zone_w - yt_r.width() - 6.0).max(56.0), row_h));
+        if tab(ui, cid("ep_trem_btn"), trem_r, "TREMOLO", trem_on, theme::CABLE_AMBER)
+            .on_hover_text("toggle tremolo via Mod Wheel (CC 1)")
+            .clicked()
+        {
+            self.kb_mod = if trem_on { 0.0 } else { 0.65 };
+            self.kb_cc(1, (self.kb_mod * 127.0).round() as u8);
+            self.kb_strip_pulse(0.6);
+        }
+        let vel_r = Rect::from_min_size(Pos2::new(content.left(), content.top() + row_h + 6.0), egui::vec2(zone_w, row_h.min(20.0)));
+        laid.strip[3] = self.console_vel(ui, vel_r);
+
+        if !mains.is_empty() {
+            let cell_w = (zone_w / mains.len() as f32).min(rail_h * 0.9).min(92.0);
+            let rw = cell_w * mains.len() as f32;
+            for (i, (label, v)) in mains.iter().enumerate() {
+                let cell = Rect::from_min_max(
+                    Pos2::new(content.right() - rw + i as f32 * cell_w, rail.top() + 4.0),
+                    Pos2::new(content.right() - rw + (i + 1) as f32 * cell_w, rail.bottom() - 3.0),
+                );
+                let (nv, mark, resp) = knob(ui, cid(("ep_main", i)), cell, label, *v, KnobLook::Bakelite, 58.0);
+                if let Some(nv) = nv {
+                    self.console_set_main(target, label, nv);
+                }
+                self.instrument_learn_ui(ui, &resp, mark, self.kb_main_dest(target, label));
+            }
+        }
+        let name_w = rail.width() - 2.0 * (zone_w + 20.0);
+        let name = self.console_patch(target, "Electric Piano");
+        let (name, font) = fit_text(ui, &name, name_w, (rail_h * 0.30).clamp(14.0, 30.0), 10.0, true);
+        let cx = rail.center().x;
+        let sub_room = content.height() >= font.size * 1.25 + 18.0;
+        let name_r = p.text(Pos2::new(cx, content.center().y - if sub_room { 7.0 } else { 0.0 }), egui::Align2::CENTER_CENTER, name, font, ALU);
+        if sub_room {
+            legend_fit(ui, Pos2::new(cx, name_r.bottom() + 4.0), Align::Center, &self.console_subtitle(target).to_uppercase(), name_w, 8.5, theme::CREAM_DIM);
+        }
+
+        // Under the case: chrome sustain rod and SUSTAIN pedal (CC 64).
+        let floor = under.bottom() - 4.0;
+        let pw = (kw * 1.4).clamp(48.0, 96.0);
+        let ph = (under.height() * 0.42).clamp(16.0, 38.0);
+        let py = floor - 13.0 - ph - 2.0;
+        let cx = under.center().x;
+        // Chrome rod down to the pedal.
+        p.line_segment([Pos2::new(cx, under.top()), Pos2::new(cx, py + 4.0)], Stroke::new(4.0, ALU_DEEP));
+        p.line_segment([Pos2::new(cx - 0.8, under.top()), Pos2::new(cx - 0.8, py + 4.0)], Stroke::new(1.2, IVORY_HI));
+        let sus_r = Rect::from_min_size(Pos2::new(cx - pw * 0.5, py), egui::vec2(pw, ph));
+        let sus = pedal(ui, cid("ep_sustain"), sus_r, "SUSTAIN", self.kb_sustain);
+        laid.strip[2] = sus.rect;
+        if sus.on_hover_text("sustain pedal (CC 64): tines ring until the pedal lifts").clicked() {
+            self.kb_toggle_sustain();
+        }
+        laid.deck = rail;
+    }
+
+    /// Electric piano open harp: staggered resonant tonebars, vibrating tines,
+    /// brass pickup coils, and felt dampers that lift per note or with sustain.
+    fn console_epiano_harp(&self, p: &egui::Painter, a: Rect, bed: Rect) {
+        well(p, a, 6.0, rgb(0x10, 0x0E, 0x0C));
+        let octaves = Self::dock_octaves(bed);
+        let span = 12 * octaves;
+        let kw = (bed.width() - 12.0) / Self::dock_whites(bed) as f32;
+        let pickup_y = a.bottom() - (a.height() * 0.22).clamp(14.0, 26.0);
+        let damper_y = a.bottom() - (a.height() * 0.10).clamp(6.0, 12.0);
+        let max_len = (pickup_y - a.top() - 14.0).max(16.0);
+
+        // Aluminum pickup rail across the harp.
+        let prail = Rect::from_min_max(Pos2::new(a.left() + 6.0, pickup_y - 3.0), Pos2::new(a.right() - 6.0, pickup_y + 4.0));
+        vgrad(p, prail, rgb(0x52, 0x4F, 0x49), rgb(0x24, 0x22, 0x20));
+
+        let wobble = self.ui_time * 52.0;
+        for semi in 0..=span {
+            let x = Self::console_semi_x(bed, semi);
+            if x < a.left() + 8.0 || x > a.right() - 8.0 { continue; }
+            let t = semi as f32 / span.max(1) as f32;
+            let len = max_len * (1.0 - 0.58 * t);
+            let top_y = pickup_y - len;
+            let led = self.console_led(semi).min(1.0);
+            let ringing = led > 0.02;
+
+            // Tonebar (upper resonator, brushed metal bar).
+            let bw = (kw * 0.34).clamp(3.0, 10.0);
+            let bar = Rect::from_min_max(Pos2::new(x - bw * 0.5, top_y), Pos2::new(x + bw * 0.5, pickup_y - 5.0));
+            let bar_top = if ringing { mix(ALU, theme::CABLE_AMBER, 0.45 * led) } else { rgb(0x74, 0x70, 0x68) };
+            let bar_bot = if ringing { mix(ALU_DEEP, BRASS, 0.35 * led) } else { rgb(0x36, 0x34, 0x30) };
+            vgrad(p, bar, bar_top, bar_bot);
+            // Tine (spring-steel wire alongside/under the tonebar; swings when struck).
+            let amp = if ringing { (kw * 0.18).clamp(1.5, 4.0) * led * (wobble + semi as f32 * 0.9).sin() } else { 0.0 };
+            if ringing {
+                glow(p, Pos2::new(x, pickup_y - 4.0), bw * 1.4, alpha(theme::CABLE_AMBER, 0.45 * led));
+                p.line_segment([Pos2::new(x, top_y + 3.0), Pos2::new(x + amp, pickup_y - 2.0)], Stroke::new(2.0, IVORY_HI));
+            } else {
+                p.line_segment([Pos2::new(x, top_y + 3.0), Pos2::new(x, pickup_y - 2.0)], Stroke::new(1.0, alpha(ALU, 0.65)));
+            }
+            // Pickup pole piece (copper/brass coil).
+            p.circle_filled(Pos2::new(x, pickup_y + 0.5), (bw * 0.36).clamp(1.8, 3.8), if ringing { BRASS_HI } else { BRASS_DEEP });
+            // Felt damper below the pickup rail.
+            let up = ringing || self.kb_sustain || self.kb_sustain_holds(semi);
+            let dr = Rect::from_center_size(Pos2::new(x, damper_y - if up { 3.5 } else { 0.0 }), egui::vec2((bw * 0.85).max(3.0), 4.5));
+            p.rect_filled(dr, 1.0, if up { theme::LIVE_TEAL } else { rgb(0x5A, 0x26, 0x1E) });
+        }
+        p.rect_stroke(a, 6.0, Stroke::new(1.5, rgb(0x07, 0x06, 0x05)), egui::StrokeKind::Inside);
+    }
+
+    // ------------------------------------------------------------------
+    // Bass: 4-string playable rosewood fretboard + keys below
+
+    fn console_bass(&mut self, ui: &mut egui::Ui, b: Rect, target: Option<usize>, laid: &mut Laid) {
+        let p = ui.painter().clone();
+        let cheek = (b.width() * 0.016).clamp(10.0, 22.0).round();
+        let inset = 12.0;
+        let well_w = (b.width() * 0.09).clamp(80.0, 144.0).round();
+        let panel = Rect::from_min_max(Pos2::new(b.left() + cheek, b.top()), Pos2::new(b.right() - cheek, b.bottom()));
+        let kw = Self::console_key_w(panel.width() - well_w - 2.0 * inset);
+        let keys_h = (kw * 3.8 + 12.0).min(b.height() * 0.36).max(76.0).round();
+        let ctrl_h = (b.height() * 0.16).clamp(62.0, 112.0).round();
+        let neck_h = (b.height() - keys_h - ctrl_h - 3.0 * inset - 16.0).max(80.0);
+
+        // Walnut / sunburst bass body cabinet.
+        wood(&p, b, 10.0, WALNUT_HI, WALNUT_DEEP, false, 47);
+        vgrad(&p, panel, rgb(0x21, 0x1B, 0x17), rgb(0x14, 0x11, 0x0F));
+        p.rect_stroke(b, 10.0, Stroke::new(1.0, mix(WALNUT, SHADE, 0.55)), egui::StrokeKind::Inside);
+
+        // Top: 4-string playable rosewood fretboard + split-coil pickup & bridge on the right.
+        let neck_row = Rect::from_min_size(panel.min + egui::vec2(inset, inset), egui::vec2(panel.width() - 2.0 * inset, neck_h));
+        let pickup_w = if neck_row.width() > 540.0 { (neck_row.width() * 0.13).clamp(72.0, 130.0) } else { 0.0 };
+        let neck_r = Rect::from_min_max(neck_row.min, Pos2::new(neck_row.right() - pickup_w - if pickup_w > 0.0 { 8.0 } else { 0.0 }, neck_row.bottom()));
+        self.kb_bass_fretboard(ui, neck_r, 15, true);
+        if pickup_w > 0.0 {
+            let body_r = Rect::from_min_max(Pos2::new(neck_r.right() + 8.0, neck_row.top()), neck_row.max);
+            well(&p, body_r, 6.0, rgb(0x1A, 0x13, 0x0F));
+            // Split-coil bass pickup + chrome bridge saddle.
+            let pu1 = Rect::from_min_size(Pos2::new(body_r.left() + 10.0, body_r.top() + body_r.height() * 0.14), egui::vec2(pickup_w * 0.34, body_r.height() * 0.34));
+            let pu2 = Rect::from_min_size(Pos2::new(body_r.left() + 18.0, body_r.top() + body_r.height() * 0.52), egui::vec2(pickup_w * 0.34, body_r.height() * 0.34));
+            for pu in [pu1, pu2] {
+                plate(&p, pu, 3.0, rgb(0x2A, 0x28, 0x26), rgb(0x11, 0x10, 0x10));
+                for k in 0..2 {
+                    let cy = pu.top() + pu.height() * (0.3 + 0.4 * k as f32);
+                    p.circle_filled(Pos2::new(pu.center().x, cy), 3.0, ALU);
+                }
+            }
+            let bridge = Rect::from_min_max(Pos2::new(body_r.right() - 22.0, body_r.top() + 10.0), Pos2::new(body_r.right() - 8.0, body_r.bottom() - 10.0));
+            plate(&p, bridge, 3.0, ALU, ALU_DEEP);
+        }
+
+        // Middle control strip: patch name, SCALE / FOLD / DRAG / SUSTAIN / VEL + tone knobs.
+        let ctrl = Rect::from_min_size(Pos2::new(panel.left() + inset, neck_row.bottom() + 8.0), egui::vec2(panel.width() - 2.0 * inset, ctrl_h));
+        laid.deck = ctrl;
+        well(&p, ctrl, 6.0, rgb(0x15, 0x13, 0x12));
+        let mains = self.console_mains(target, 4);
+        let knobs_w = if mains.is_empty() { 0.0 } else { (ctrl.width() * 0.32).clamp(160.0, 320.0) };
+        let left = Rect::from_min_max(ctrl.min + egui::vec2(10.0, 6.0), Pos2::new(ctrl.right() - knobs_w - 10.0, ctrl.bottom() - 6.0));
+        let name = self.console_patch(target, "Bass");
+        let (name_t, name_f) = fit_text(ui, &name, left.width() * 0.45, 18.0, 11.0, true);
+        let nr = p.text(Pos2::new(left.left(), left.top() + 2.0), egui::Align2::LEFT_TOP, name_t, name_f, GOLD_LEAF);
+        legend_fit(ui, Pos2::new(nr.right() + 10.0, left.top() + 7.0), Align::Min, &self.console_subtitle(target).to_uppercase(), (left.width() - nr.width() - 12.0).max(40.0), 8.5, theme::CREAM_DIM);
+
+        let row_y = left.bottom() - 24.0;
+        let scale = self.keys_unit.and_then(|k| self.keys_scale(k));
+        let scale_txt = scale.map(|c| c.label()).unwrap_or_else(|| "SCALE".into());
+        let mut x = left.left();
+        for (id, label, on) in [
+            ("scale", scale_txt, scale.is_some()),
+            ("fold", "FOLD".into(), self.kb_scale_fold),
+            ("drag", self.kb_synth_drag.label().to_string(), self.kb_synth_drag == SynthDragMode::Slide),
+            ("sustain", "SUSTAIN".into(), self.kb_sustain),
+        ] {
+            let r = Rect::from_min_size(Pos2::new(x, row_y), egui::vec2(76.0, 24.0));
+            x += 82.0;
+            let resp = tab(ui, cid(("bass_fn", id)), r, &label, on, theme::LIVE_TEAL);
+            if id == "sustain" { laid.strip[2] = r; }
+            if resp.clicked() {
+                match id {
+                    "scale" => self.scale_menu = Some(ScaleMenu { unit: self.keys_idx(), pos: Pos2::new(r.left(), r.bottom()) }),
+                    "fold" => self.kb_scale_fold = !self.kb_scale_fold,
+                    "drag" => self.kb_synth_drag = match self.kb_synth_drag {
+                        SynthDragMode::Gliss => SynthDragMode::Slide,
+                        SynthDragMode::Slide => SynthDragMode::Gliss,
+                    },
+                    _ => self.kb_toggle_sustain(),
+                }
+            }
+        }
+        let vel_w = (left.right() - x).min(200.0);
+        if vel_w >= 72.0 {
+            laid.strip[3] = self.console_vel(ui, Rect::from_min_size(Pos2::new(x, row_y + 2.0), egui::vec2(vel_w, 20.0)));
+        }
+        if !mains.is_empty() {
+            let cw = knobs_w / mains.len() as f32;
+            for (i, (label, v)) in mains.iter().enumerate() {
+                let cell = Rect::from_min_size(Pos2::new(ctrl.right() - knobs_w + i as f32 * cw, ctrl.top() + 4.0), egui::vec2(cw, ctrl.height() - 8.0));
+                let (nv, mark, resp) = knob(ui, cid(("bass_main", i)), cell, label, *v, KnobLook::Bakelite, 60.0);
+                if let Some(nv) = nv {
+                    self.console_set_main(target, label, nv);
+                }
+                self.instrument_learn_ui(ui, &resp, mark, self.kb_main_dest(target, label));
+            }
+        }
+
+        // Bottom: PITCH & MOD wheels + keybed.
+        let keys_row = Rect::from_min_max(Pos2::new(panel.left() + inset, b.bottom() - keys_h - inset), Pos2::new(panel.right() - inset, b.bottom() - inset));
+        let wheels = Rect::from_min_size(keys_row.min, egui::vec2(well_w, keys_row.height()));
+        let bed_area = Rect::from_min_max(Pos2::new(wheels.right() + 6.0, keys_row.top()), keys_row.max);
+        p.rect_filled(bed_area, 3.0, rgb(0x08, 0x08, 0x07));
+        laid.bed = self.kb_keybed(ui, bed_area, Surface::Bass, 0.0);
+        well(&p, wheels, 6.0, rgb(0x0C, 0x0B, 0x0A));
+        let wh = wheels.height() - 34.0;
+        let ww = ((wheels.width() - 34.0) / 2.0).max(16.0);
+        for (k, (label, spring)) in [("PITCH", true), ("MOD", false)].into_iter().enumerate() {
+            let r = Rect::from_min_size(Pos2::new(wheels.left() + 12.0 + k as f32 * (ww + 10.0), wheels.top() + 12.0), egui::vec2(ww, wh));
+            let resp = ui.interact(r, cid(("bass_wheel", k)), egui::Sense::click_and_drag());
+            let value = self.kb_wheel_drive(&resp, r, spring);
+            wheel(&p, r, if spring { (value + 1.0) * 0.5 } else { value }, spring, resp.hovered() || resp.dragged());
+            legend(ui, Pos2::new(r.center().x, wheels.bottom() - 16.0), Align::Center, label, 8.0, theme::CREAM_DIM);
+            laid.strip[k] = r;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Wind: Breath controller (CC2/CC11/AT), Y-Breath, living air column
+
+    fn console_wind(&mut self, ui: &mut egui::Ui, b: Rect, target: Option<usize>, laid: &mut Laid) {
+        use crate::keyboard::BreathTarget;
+        let p = ui.painter().clone();
+        let cheek = (b.width() * 0.016).clamp(10.0, 22.0).round();
+        let inset = 12.0;
+        let well_w = (b.width() * 0.09).clamp(80.0, 144.0).round();
+        let panel = Rect::from_min_max(Pos2::new(b.left() + cheek, b.top()), Pos2::new(b.right() - cheek, b.bottom()));
+        let kw = Self::console_key_w(panel.width() - well_w - 2.0 * inset);
+        let keys_h = (kw * 4.0 + 12.0).min(b.height() * 0.38).max(78.0).round();
+
+        // Dark ebony & brass wind console.
+        wood(&p, b, 10.0, rgb(0x2B, 0x24, 0x1B), rgb(0x14, 0x11, 0x0D), false, 73);
+        vgrad(&p, panel, rgb(0x1C, 0x1A, 0x17), rgb(0x11, 0x10, 0x0E));
+        p.rect_stroke(b, 10.0, Stroke::new(1.0, BRASS_DEEP), egui::StrokeKind::Inside);
+
+        let upper = Rect::from_min_max(panel.min + egui::vec2(inset, inset), Pos2::new(panel.right() - inset, b.bottom() - keys_h - inset - 10.0));
+        laid.deck = upper;
+
+        // Left: Large interactive BREATH ribbon/fader + target selector (CC2 / CC11 / AT).
+        let breath_w = (upper.width() * 0.23).clamp(150.0, 250.0);
+        let breath_box = Rect::from_min_size(upper.min, egui::vec2(breath_w, upper.height()));
+        well(&p, breath_box, 8.0, rgb(0x0D, 0x0F, 0x0F));
+        legend(ui, breath_box.left_top() + egui::vec2(12.0, 10.0), Align::Min, "BREATH", 9.5, GOLD_LEAF);
+        p.text(
+            Pos2::new(breath_box.right() - 12.0, breath_box.top() + 14.0),
+            egui::Align2::RIGHT_CENTER,
+            format!("{}%", (self.kb_breath * 100.0).round() as u32),
+            theme::medium_font(12.0),
+            theme::LIVE_TEAL,
+        );
+        // Breath ribbon track (vertical drag).
+        let track = Rect::from_min_max(
+            Pos2::new(breath_box.left() + 14.0, breath_box.top() + 30.0),
+            Pos2::new(breath_box.left() + 62.0, breath_box.bottom() - 14.0),
+        );
+        let bresp = ui.interact(track, cid("wind_breath"), egui::Sense::click_and_drag())
+            .on_hover_text("breath pressure: drag up/down to blow");
+        if bresp.dragged() || bresp.clicked() {
+            if let Some(pos) = bresp.interact_pointer_pos() {
+                let nv = 1.0 - ((pos.y - track.top()) / track.height().max(1.0)).clamp(0.0, 1.0);
+                self.kb_send_breath(nv);
+            }
+        }
+        well(&p, track, 6.0, rgb(0x07, 0x09, 0x09));
+        let fill_h = (track.height() - 6.0) * self.kb_breath.clamp(0.0, 1.0);
+        if fill_h > 1.0 {
+            let fr = Rect::from_min_max(Pos2::new(track.left() + 3.0, track.bottom() - 3.0 - fill_h), track.max - egui::vec2(3.0, 3.0));
+            soft(&p, fr.expand(2.0), 4.0, 8.0, alpha(theme::LIVE_TEAL, 0.35));
+            vgrad(&p, fr, rgb(0x8A, 0xF0, 0xE8), theme::LIVE_TEAL);
+        }
+        for k in 1..8 {
+            let ly = track.top() + track.height() * k as f32 / 8.0;
+            p.line_segment([Pos2::new(track.left() + 4.0, ly), Pos2::new(track.right() - 4.0, ly)], Stroke::new(1.0, alpha(theme::CREAM, 0.14)));
+        }
+        // Right side of breath box: CC2 / CC11 / AT + Y-BREATH tabs.
+        let side = Rect::from_min_max(Pos2::new(track.right() + 10.0, track.top()), Pos2::new(breath_box.right() - 10.0, track.bottom()));
+        let th = ((side.height() - 18.0) / 4.0).clamp(20.0, 34.0);
+        for (i, bt) in BreathTarget::ALL.iter().enumerate() {
+            let r = Rect::from_min_size(Pos2::new(side.left(), side.top() + i as f32 * (th + 6.0)), egui::vec2(side.width(), th));
+            if tab(ui, cid(("wind_bt", i)), r, bt.label(), self.kb_breath_target == *bt, theme::LIVE_TEAL).clicked() {
+                self.kb_breath_target = *bt;
+                self.kb_send_breath(self.kb_breath);
+            }
+        }
+        let yb_r = Rect::from_min_size(Pos2::new(side.left(), side.top() + 3.0 * (th + 6.0)), egui::vec2(side.width(), th));
+        if tab(ui, cid("wind_ybreath"), yb_r, "Y-BREATH", self.kb_y_breath, BRASS)
+            .on_hover_text("vertical position on a key drives breath live")
+            .clicked()
+        {
+            self.kb_y_breath = !self.kb_y_breath;
+        }
+
+        // Right side of upper stage: Air column above, patch + controls + knobs below.
+        let right = Rect::from_min_max(Pos2::new(breath_box.right() + 12.0, upper.top()), upper.max);
+        // The air column is the instrument's face: it takes what the
+        // compact control row leaves.
+        let ctrl_h = (right.height() * 0.3).clamp(92.0, 150.0);
+        let bore = Rect::from_min_max(right.min, Pos2::new(right.right(), (right.bottom() - ctrl_h - 10.0).max(right.top() + 72.0)));
+        self.console_wind_bore(&p, bore);
+
+        let ctrl = Rect::from_min_max(Pos2::new(right.left(), bore.bottom() + 10.0), right.max);
+        well(&p, ctrl, 6.0, rgb(0x14, 0x13, 0x11));
+        let mains = self.console_mains(target, 4);
+        let knobs_w = if mains.is_empty() { 0.0 } else { (ctrl.width() * 0.42).clamp(160.0, 340.0) };
+        let info = Rect::from_min_max(ctrl.min + egui::vec2(12.0, 8.0), Pos2::new(ctrl.right() - knobs_w - 10.0, ctrl.bottom() - 8.0));
+        let name = self.console_patch(target, "Wind");
+        let (nt, nf) = fit_text(ui, &name, info.width(), 20.0, 11.0, true);
+        let nr = p.text(info.left_top(), egui::Align2::LEFT_TOP, nt, nf, GOLD_LEAF);
+        legend_fit(ui, Pos2::new(info.left(), nr.bottom() + 4.0), Align::Min, &self.console_subtitle(target).to_uppercase(), info.width(), 8.5, theme::CREAM_DIM);
+        let row_y = (info.bottom() - 24.0).max(nr.bottom() + 20.0);
+        let scale = self.keys_unit.and_then(|k| self.keys_scale(k));
+        let scale_txt = scale.map(|c| c.label()).unwrap_or_else(|| "SCALE".into());
+        let mut x = info.left();
+        for (id, label, on) in [
+            ("scale", scale_txt, scale.is_some()),
+            ("drag", self.kb_synth_drag.label().to_string(), self.kb_synth_drag == SynthDragMode::Slide),
+        ] {
+            let r = Rect::from_min_size(Pos2::new(x, row_y), egui::vec2(82.0, 24.0));
+            x += 88.0;
+            if tab(ui, cid(("wind_fn", id)), r, &label, on, theme::LIVE_TEAL).clicked() {
+                match id {
+                    "scale" => self.scale_menu = Some(ScaleMenu { unit: self.keys_idx(), pos: Pos2::new(r.left(), r.bottom()) }),
+                    _ => self.kb_synth_drag = match self.kb_synth_drag {
+                        SynthDragMode::Gliss => SynthDragMode::Slide,
+                        SynthDragMode::Slide => SynthDragMode::Gliss,
+                    },
+                }
+            }
+        }
+        let vel_w = (info.right() - x).min(180.0);
+        if vel_w >= 68.0 {
+            laid.strip[3] = self.console_vel(ui, Rect::from_min_size(Pos2::new(x, row_y + 2.0), egui::vec2(vel_w, 20.0)));
+        }
+        if !mains.is_empty() {
+            let cw = knobs_w / mains.len() as f32;
+            for (i, (label, v)) in mains.iter().enumerate() {
+                let cell = Rect::from_min_size(Pos2::new(ctrl.right() - knobs_w + i as f32 * cw, ctrl.top() + 6.0), egui::vec2(cw, ctrl.height() - 12.0));
+                let (nv, mark, resp) = knob(ui, cid(("wind_main", i)), cell, label, *v, KnobLook::Brass, 68.0);
+                if let Some(nv) = nv {
+                    self.console_set_main(target, label, nv);
+                }
+                self.instrument_learn_ui(ui, &resp, mark, self.kb_main_dest(target, label));
+            }
+        }
+
+        // Bottom: PITCH & MOD wheels + keybed (with Y-BREATH).
+        let keys_row = Rect::from_min_max(Pos2::new(panel.left() + inset, b.bottom() - keys_h - inset), Pos2::new(panel.right() - inset, b.bottom() - inset));
+        let wheels = Rect::from_min_size(keys_row.min, egui::vec2(well_w, keys_row.height()));
+        let bed_area = Rect::from_min_max(Pos2::new(wheels.right() + 6.0, keys_row.top()), keys_row.max);
+        p.rect_filled(bed_area, 3.0, rgb(0x08, 0x08, 0x07));
+        laid.bed = self.kb_keybed(ui, bed_area, Surface::Wind, 0.0);
+        well(&p, wheels, 6.0, rgb(0x0C, 0x0B, 0x0A));
+        let wh = wheels.height() - 34.0;
+        let ww = ((wheels.width() - 34.0) / 2.0).max(16.0);
+        for (k, (label, spring)) in [("PITCH", true), ("MOD", false)].into_iter().enumerate() {
+            let r = Rect::from_min_size(Pos2::new(wheels.left() + 12.0 + k as f32 * (ww + 10.0), wheels.top() + 12.0), egui::vec2(ww, wh));
+            let resp = ui.interact(r, cid(("wind_wheel", k)), egui::Sense::click_and_drag());
+            let value = self.kb_wheel_drive(&resp, r, spring);
+            wheel(&p, r, if spring { (value + 1.0) * 0.5 } else { value }, spring, resp.hovered() || resp.dragged());
+            legend(ui, Pos2::new(r.center().x, wheels.bottom() - 16.0), Align::Center, label, 8.0, theme::CREAM_DIM);
+            laid.strip[k] = r;
+        }
+    }
+
+    /// Living air column (Luftsäule): a cutaway brass/woodwind bore whose
+    /// active standing-wave length follows pitch and whose airflow intensity
+    /// follows breath pressure.
+    fn console_wind_bore(&self, p: &egui::Painter, r: Rect) {
+        well(p, r, 8.0, rgb(0x0B, 0x0E, 0x0E));
+        let breath = self.kb_breath.clamp(0.0, 1.0);
+        // Active sounding note (highest sounding pitch sets the shortest open column).
+        let active_note = self.note_leds.iter().enumerate()
+            .filter(|(_, l)| **l > 0.02)
+            .max_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(n, l)| (n as f32, l.min(1.0)));
+        let pitch_t = active_note.map_or(0.35, |(n, _)| ((n - 48.0) / 36.0).clamp(0.0, 1.0));
+        let col_frac = 1.0 - 0.62 * pitch_t; // low note = long air column, high note = short column
+
+        // Below the "AIR COLUMN" legend (and its tone holes), never over it.
+        let label_h = 30.0;
+        let tube_h = (r.height() * 0.5).clamp(32.0, 210.0).min(r.height() - label_h - 10.0).max(24.0);
+        let tube_cy = (r.center().y - (r.height() * 0.08).min(30.0)).max(r.top() + label_h + tube_h * 0.5);
+        let tube = Rect::from_center_size(Pos2::new(r.center().x, tube_cy), egui::vec2(r.width() - 36.0, tube_h));
+        // Outer brass tube body + flared bell on the right.
+        vgrad(p, tube, BRASS_DEEP, mix(BRASS_DEEP, SHADE, 0.55));
+        p.rect_stroke(tube, 10.0, Stroke::new(1.5, BRASS), egui::StrokeKind::Inside);
+        let bore = tube.shrink2(egui::vec2(6.0, 6.0));
+        p.rect_filled(bore, 6.0, rgb(0x07, 0x09, 0x09));
+
+        // Glowing standing-wave air column inside the bore.
+        let col_w = bore.width() * col_frac;
+        let active_r = Rect::from_min_size(bore.min, egui::vec2(col_w, bore.height()));
+        let energy = if let Some((_, l)) = active_note { (0.25 + 0.75 * breath) * l } else { breath * 0.28 };
+        if energy > 0.02 {
+            hgrad(p, active_r, alpha(theme::LIVE_TEAL, 0.42 * energy), alpha(theme::LIVE_TEAL, 0.08 * energy));
+            let steps = ((col_w / 3.0) as usize).clamp(16, 120);
+            let freq = 2.0 + pitch_t * 5.0;
+            let amp = (bore.height() * 0.38) * energy;
+            let pts: Vec<Pos2> = (0..=steps).map(|k| {
+                let u = k as f32 / steps as f32;
+                let env = (u * PI).sin();
+                let y = bore.center().y + (u * freq * TAU - self.ui_time * 14.0).sin() * env * amp;
+                Pos2::new(bore.left() + col_w * u, y)
+            }).collect();
+            p.add(egui::Shape::line(pts.clone(), Stroke::new(4.0, alpha(theme::LIVE_TEAL, 0.22 * energy))));
+            p.add(egui::Shape::line(pts, Stroke::new(1.8, mix(theme::LIVE_TEAL, IVORY_HI, 0.4 * energy))));
+        }
+
+        // Tone holes along the top edge of the tube (closed inside the active column, open beyond).
+        let holes = 8usize;
+        for i in 0..holes {
+            let u = 0.14 + 0.76 * i as f32 / (holes - 1) as f32;
+            let hx = bore.left() + bore.width() * u;
+            let closed = u <= col_frac;
+            let hc = Pos2::new(hx, tube.top() + 3.0);
+            p.circle_filled(hc, 4.5, if closed { BRASS_HI } else { rgb(0x12, 0x10, 0x0E) });
+            p.circle_stroke(hc, 4.5, Stroke::new(1.0, BRASS_DEEP));
+        }
+
+        // Note & air column readout.
+        let pitch_lbl = active_note.and_then(|(n, _)| crate::keyboard::detect_chord(&[n as u8]))
+            .unwrap_or_else(|| "READY".into());
+        p.text(Pos2::new(r.left() + 14.0, r.top() + 10.0), egui::Align2::LEFT_TOP,
+            format!("AIR COLUMN · {pitch_lbl}"), theme::medium_font(10.0), theme::LIVE_TEAL);
+        // Under the bore, where there is room: the note and the breath it
+        // gets, large enough to read while playing.
+        let below = Rect::from_min_max(Pos2::new(r.left() + 18.0, tube.bottom() + 8.0), r.max - egui::vec2(18.0, 8.0));
+        if below.height() >= 34.0 {
+            let size = (below.height() * 0.42).clamp(18.0, 40.0);
+            let note = active_note.and_then(|(n, _)| crate::keyboard::detect_chord(&[n as u8])).unwrap_or_else(|| "—".into());
+            let nr = p.text(Pos2::new(below.left(), below.center().y), egui::Align2::LEFT_CENTER, note, theme::medium_font(size), GOLD_LEAF);
+            p.text(
+                Pos2::new(nr.right() + 16.0, below.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("BREATH {}% · {}", (breath * 100.0).round() as u32, self.kb_breath_target.label()),
+                theme::medium_font(11.0),
+                theme::CREAM_DIM,
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Drums: Overhead kit diagram + 4x4 GM velocity pad bank
+
+    fn console_drums(&mut self, ui: &mut egui::Ui, b: Rect, target: Option<usize>, laid: &mut Laid) {
+        let p = ui.painter().clone();
+        let cheek = (b.width() * 0.014).clamp(8.0, 20.0).round();
+        let inset = 12.0;
+        let panel = Rect::from_min_max(Pos2::new(b.left() + cheek, b.top()), Pos2::new(b.right() - cheek, b.bottom()));
+
+        wood(&p, b, 10.0, WALNUT_HI, WALNUT, false, 113);
+        vgrad(&p, panel, METAL_HI, METAL);
+        p.rect_stroke(b, 10.0, Stroke::new(1.0, mix(WALNUT, SHADE, 0.55)), egui::StrokeKind::Inside);
+
+        // Top control strip: patch name, HIT-VEL, VEL, plugin main knobs.
+        let top_h = (b.height() * 0.16).clamp(58.0, 108.0).round();
+        let top = Rect::from_min_size(panel.min + egui::vec2(inset, inset), egui::vec2(panel.width() - 2.0 * inset, top_h));
+        laid.deck = top;
+        well(&p, top, 6.0, rgb(0x13, 0x12, 0x11));
+
+        let mains = self.console_mains(target, 4);
+        let knobs_w = if mains.is_empty() { 0.0 } else { (top.width() * 0.34).clamp(160.0, 320.0) };
+        let left = Rect::from_min_max(top.min + egui::vec2(12.0, 6.0), Pos2::new(top.right() - knobs_w - 10.0, top.bottom() - 6.0));
+        let name = self.console_patch(target, "Drums");
+        let (nt, nf) = fit_text(ui, &name, left.width() * 0.55, 19.0, 11.0, true);
+        let nr = p.text(left.left_top(), egui::Align2::LEFT_TOP, nt, nf, theme::CREAM);
+        legend_fit(ui, Pos2::new(nr.right() + 10.0, left.top() + 5.0), Align::Min, &self.console_subtitle(target).to_uppercase(), (left.width() - nr.width() - 12.0).max(40.0), 8.5, theme::CREAM_DIM);
+
+        let row_y = left.bottom() - 24.0;
+        let hv_r = Rect::from_min_size(Pos2::new(left.left(), row_y), egui::vec2(92.0, 24.0));
+        if tab(ui, cid("drums_hitvel"), hv_r, "HIT-VEL", self.kb_pad_vel, theme::LIVE_TEAL)
+            .on_hover_text("hit position on a pad or drum head sets velocity: center = loud, rim = soft")
+            .clicked()
+        {
+            self.kb_pad_vel = !self.kb_pad_vel;
+        }
+        let vel_w = (left.right() - hv_r.right() - 14.0).min(220.0);
+        if vel_w >= 72.0 {
+            laid.strip[3] = self.console_vel(ui, Rect::from_min_size(Pos2::new(hv_r.right() + 10.0, row_y + 2.0), egui::vec2(vel_w, 20.0)));
+        }
+        if !mains.is_empty() {
+            let cw = knobs_w / mains.len() as f32;
+            for (i, (label, v)) in mains.iter().enumerate() {
+                let cell = Rect::from_min_size(Pos2::new(top.right() - knobs_w + i as f32 * cw, top.top() + 4.0), egui::vec2(cw, top.height() - 8.0));
+                let (nv, mark, resp) = knob(ui, cid(("drums_main", i)), cell, label, *v, KnobLook::Synth, 64.0);
+                if let Some(nv) = nv {
+                    self.console_set_main(target, label, nv);
+                }
+                self.instrument_learn_ui(ui, &resp, mark, self.kb_main_dest(target, label));
+            }
+        }
+
+        // Main stage: Overhead Kit on the left, 4x4 GM Pad Bank on the right.
+        let stage = Rect::from_min_max(Pos2::new(panel.left() + inset, top.bottom() + 10.0), Pos2::new(panel.right() - inset, b.bottom() - inset));
+        let show_kit = stage.width() >= 560.0;
+        if show_kit {
+            let kit_w = (stage.width() * 0.48).round();
+            let kit_r = Rect::from_min_size(stage.min, egui::vec2(kit_w, stage.height()));
+            let pads_r = Rect::from_min_max(Pos2::new(kit_r.right() + 12.0, stage.top()), stage.max);
+            self.console_drums_kit(ui, kit_r);
+            laid.bed = self.kb_drum_pads(ui, pads_r, 4, 4);
+        } else {
+            laid.bed = self.kb_drum_pads(ui, stage, 4, 4);
+        }
+    }
+
+    /// Overhead drum kit (Kit von oben): clickable & live-reactive shells and
+    /// lathed cymbals on GM notes.
+    fn console_drums_kit(&mut self, ui: &mut egui::Ui, area: Rect) {
+        let p = ui.painter().clone();
+        well(&p, area, 8.0, rgb(0x0D, 0x0C, 0x0B));
+        legend(ui, area.left_top() + egui::vec2(12.0, 10.0), Align::Min, "OVERHEAD KIT", 8.5, theme::CREAM_DIM);
+
+        let side = area.width().min(area.height() - 24.0).max(120.0);
+        let ox = area.center().x;
+        let oy = area.center().y + 8.0;
+        // (gm_note, label, rel_x, rel_y, rel_r, is_cymbal)
+        let pieces: [(u8, &str, f32, f32, f32, bool); 8] = [
+            (36, "KICK",   0.00,  0.24, 0.19, false),
+            (38, "SNARE", -0.22,  0.14, 0.14, false),
+            (42, "HI-HAT",-0.38,  0.02, 0.12, true),
+            (50, "HI TOM",-0.12, -0.10, 0.12, false),
+            (47, "MD TOM", 0.14, -0.10, 0.13, false),
+            (41, "FL TOM", 0.30,  0.12, 0.15, false),
+            (49, "CRASH", -0.28, -0.26, 0.14, true),
+            (51, "RIDE",   0.30, -0.24, 0.16, true),
+        ];
+
+        for (note, label, rx, ry, rr, cymbal) in pieces {
+            let c = Pos2::new(ox + rx * side, oy + ry * side);
+            let r = (rr * side).clamp(16.0, 76.0);
+            let hit_r = Rect::from_center_size(c, egui::Vec2::splat(r * 2.0));
+            let resp = ui.interact(hit_r, cid(("kit_piece", note)), egui::Sense::click())
+                .on_hover_text(format!("{label} (GM {note}): click to strike"));
+            if Self::struck(ui, &resp) {
+                let vel = if self.kb_pad_vel {
+                    ui.input(|i| i.pointer.interact_pos()).map_or(0.92, |pos| {
+                        let d = ((pos - c).length() / r.max(1.0)).clamp(0.0, 1.0);
+                        (1.0 - 0.72 * d).clamp(0.25, 1.0)
+                    })
+                } else {
+                    0.95
+                };
+                self.kb_hit_drum(note, vel);
+            }
+            let led = self.note_leds[note as usize].clamp(0.0, 1.0);
+            soft(&p, hit_r.translate(egui::vec2(0.0, 4.0)), r, 8.0, alpha(SHADE, 0.65));
+            if cymbal {
+                let hi = if led > 0.02 { mix(BRASS_HI, IVORY_HI, 0.5 * led) } else { BRASS_HI };
+                spun(&p, c, r, BRASS_DEEP, hi);
+                p.circle_stroke(c, r * 0.68, Stroke::new(0.8, alpha(SHADE, 0.25)));
+                p.circle_filled(c, r * 0.22, BRASS);
+                p.circle_filled(c, r * 0.07, rgb(0x16, 0x14, 0x12));
+            } else {
+                // Chrome rim + coated drum head.
+                disc(&p, c, r, ALU, ALU_DEEP);
+                let head_top = if led > 0.02 { mix(IVORY_HI, theme::ACCENT, 0.55 * led) } else { IVORY };
+                let head_bot = if led > 0.02 { mix(IVORY, theme::ACCENT, 0.35 * led) } else { rgb(0xC8, 0xC0, 0xB0) };
+                disc(&p, c, r * 0.88, head_top, head_bot);
+                if note == 36 {
+                    // Kick center patch.
+                    p.circle_stroke(c, r * 0.36, Stroke::new(1.2, alpha(SHADE, 0.35)));
+                }
+            }
+            if led > 0.02 {
+                p.circle_stroke(c, r * (1.0 + 0.16 * (1.0 - led)), Stroke::new(2.0, alpha(theme::ACCENT, 0.85 * led)));
+            }
+            if resp.hovered() {
+                p.circle_stroke(c, r + 1.5, Stroke::new(1.2, theme::CREAM_DIM));
+            }
+            let (t, f) = fit_text(ui, label, r * 1.6, 10.0, 7.0, true);
+            if cymbal {
+                // Under the bell, on a plate: the bell's nut sits at the centre.
+                let at = c + egui::vec2(0.0, r * 0.52);
+                let g = p.layout_no_wrap(t, f, theme::CREAM);
+                let plate = Rect::from_center_size(at, g.size() + egui::vec2(10.0, 4.0));
+                p.rect_filled(plate, 3.0, alpha(SHADE, 0.62));
+                p.galley(plate.center() - g.size() * 0.5, g, theme::CREAM);
+            } else {
+                p.text(c, egui::Align2::CENTER_CENTER, t, f, IVORY_INK);
             }
         }
     }

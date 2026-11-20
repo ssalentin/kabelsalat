@@ -7125,7 +7125,10 @@ impl DemoApp {
         let n_rigs = self.rig_count();
         let parse_sig = |v: &serde_json::Value| -> Result<crate::transport::TimeSig, String> {
             if let Some(s) = v.as_str() {
-                return crate::transport::TimeSig::parse(s);
+                let (ns, ds) = s.trim().split_once('/').ok_or("time_signature must be like '4/4' or '6/8'")?;
+                let num: u64 = ns.trim().parse().map_err(|_| "time_signature numerator must be a whole number")?;
+                let den: u64 = ds.trim().parse().map_err(|_| "time_signature denominator must be a whole number")?;
+                return crate::transport::TimeSig::checked(num, den);
             }
             let num = v.get("numerator").and_then(|x| x.as_u64()).ok_or("time_signature.numerator required")?;
             let den = v.get("denominator").and_then(|x| x.as_u64()).ok_or("time_signature.denominator required")?;

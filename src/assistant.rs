@@ -576,10 +576,10 @@ fn system_prompt() -> String {
      - Hear: listen records the next seconds of the master and a listening model scores \
      it 0-10 on the words you pass as attributes (take them from the user's request: \
      \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
-     It hears only what plays during the recording: call play_note for the notes first, \
-     in the same step. Use it to check a sound you made against what the user asked for, \
-     change one thing, then listen again to compare; stop after 3 rounds.\n\
-     - Play: play_note, set_octave.\n\
+     It hears only what plays during the recording: call play_note for a note or play_demo \
+     for a musical phrase first, in the same step. Use it to check a sound you made against \
+     what the user asked for, change one thing, then listen again to compare; stop after 3 rounds.\n\
+     - Play: play_note, play_demo, stop_demo, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_device_instrument (which hardware instrument is on a MIDI port, \
      so its drawbars and switches drive the rack: see list_instrument_profiles; prefer it over \
@@ -728,7 +728,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"listen",
-            "description":"Hear the master: records the next `seconds` of the master output (what the user hears) and asks a listening model to score it 0-10 on each attribute and describe what it heard; the answer includes the app's own loudness/peak/band measurements. Only sound that plays during the recording is heard, so call play_note first in the same step. Takes about seconds + 3 s.",
+            "description":"Hear the master: records the next `seconds` of the master output (what the user hears) and asks a listening model to score it 0-10 on each attribute and describe what it heard; the answer includes the app's own loudness/peak/band measurements. Only sound that plays during the recording is heard, so call play_note or play_demo first in the same step. Takes about seconds + 3 s.",
             "parameters":{"type":"object","properties":{
                 "attributes":{"type":"string","description":"Comma-separated words from the user's request the sound should match, e.g. \"8-bit, heroic\""},
                 "seconds":{"type":"number","description":"How long to record, 0.5-8 (default 4)"},
@@ -739,6 +739,19 @@ pub(crate) fn tools() -> Value {
             "name":"play_note",
             "description":"Play a note on the built-in synth (MIDI note number, duration in ms)",
             "parameters":{"type":"object","properties":{"note":{"type":"integer"},"ms":{"type":"integer"}},"required":["note"]}
+        }},
+        {"type":"function","function":{
+            "name":"play_demo",
+            "description":"Play a short live note phrase through one rig in a loop on the engine's clock at the current tempo (never recorded audio; stop with stop_demo). rig is the 0-based rig index (rig 0 = first rig / 'rig 1', rig 1 = 'rig 2'; omit for the rig in view). Optional phrase overrides the automatic choice: keys | bass | lead | pad | organ | drums | wind (the wind phrase also sends CC 2 and channel pressure breath). Gives listen a full phrase to judge.",
+            "parameters":{"type":"object","properties":{
+                "rig":{"type":"integer","description":"0-based rig index (0 = first rig, 1 = second rig); omit for the rig in view"},
+                "phrase":{"type":"string","enum":["keys","bass","lead","pad","organ","drums","wind"],"description":"Phrase kind (keys | bass | lead | pad | organ | drums | wind); omit to pick from the rig's loaded sound"}
+            }}
+        }},
+        {"type":"function","function":{
+            "name":"stop_demo",
+            "description":"Stop the running rig demo phrase and release any notes it holds.",
+            "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_octave",

@@ -1838,6 +1838,39 @@ fn nav_more_button(ui: &mut egui::Ui, rect: Rect, id: egui::Id, active: bool) ->
     resp
 }
 
+/// Per-rig demo phrase ▶ / ■ button in the Left Rail (#200), painted from the
+/// Hurricane palette. Disabled when the rig has no instrument.
+fn paint_nav_demo_button(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    hovered: bool,
+    playing: bool,
+    enabled: bool,
+) {
+    if ui.is_rect_visible(rect) {
+        let hov = enabled && hovered;
+        let (fill, stroke, fg) = if !enabled {
+            (theme::PAPER_SINK, theme::HAIRLINE, theme::MUTED)
+        } else if playing {
+            let f = if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON };
+            (f, f, theme::DARK_PANEL)
+        } else if hov {
+            (theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::MUTED, theme::CREAM)
+        } else {
+            (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID)
+        };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, fill);
+        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        let sym = if playing { "■" } else { "▶" };
+        let g = p.layout_no_wrap(sym.into(), theme::medium_font(9.5), fg);
+        p.galley(rect.center() - g.size() * 0.5, g, fg);
+    }
+    if enabled && hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+}
+
 /// The REC chip: tomato fill + a filled dot only while recording (Hurricane:
 /// tomato is reserved for the active record state); a calm dark chip with a
 /// dim open dot when idle. `secs` shows elapsed time while recording.
@@ -2853,6 +2886,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_keyboard_state", "set_keyboard_mode",
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
+    "play_demo", "stop_demo",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2870,7 +2904,17 @@ fn tool_is_read_only(name: &str) -> bool {
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks" | "set_buffer_size" | "set_midi_clock" | "set_device_instrument")
+    matches!(
+        name,
+        "install_instrument"
+            | "save_rig"
+            | "reset_engine_peaks"
+            | "set_buffer_size"
+            | "set_midi_clock"
+            | "set_device_instrument"
+            | "play_demo"
+            | "stop_demo"
+    )
 }
 
 /// File-player settings carried by play_file/set_player args (AUM
@@ -3453,6 +3497,10 @@ struct DemoApp {
     nav_row_rects: Vec<(NavRow, Rect)>,
     nav_chevron_rects: Vec<(u32, Rect)>,
     nav_rig_more_rects: Vec<(usize, Rect)>,
+    nav_rig_demo_rects: Vec<(usize, Rect)>,
+    /// Currently running rig demo phrase mirrored from `GraphPub::demo` (#200).
+    demo_playing: Option<crate::engine::DemoPub>,
+    last_demo_rev: u64,
     nav_filter_rects: [Rect; 3],
     rail_tab_rects: [Rect; 2],
     /// Open per-rig `⋯` menu in the Left Rail: `(rig_index, anchor_pos)`.
@@ -3957,6 +4005,9 @@ impl DemoApp {
             nav_row_rects: Vec::new(),
             nav_chevron_rects: Vec::new(),
             nav_rig_more_rects: Vec::new(),
+            nav_rig_demo_rects: Vec::new(),
+            demo_playing: None,
+            last_demo_rev: 0,
             nav_filter_rects: [Rect::NOTHING; 3],
             rail_tab_rects: [Rect::NOTHING; 2],
             nav_rig_menu: None,
@@ -5311,6 +5362,12 @@ impl DemoApp {
             self.last_player_rev = g.player_rev;
             self.player = g.player;
         }
+        // Per-rig demo phrase mirror (#200, rule 33): the button shows ■ only
+        // for what the engine published, and reverts to ▶ when an edit stops it.
+        if g.demo_rev != self.last_demo_rev {
+            self.last_demo_rev = g.demo_rev;
+            self.demo_playing = g.demo;
+        }
         let graph_rev_changed = g.rev != self.last_graph_rev;
         // The engine's voice binding. While it has not published the load
         // this app sent last, its table still describes the old graph.
@@ -5767,6 +5824,11 @@ impl DemoApp {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
                 format!("Play {}", note_name(note))
             }
+            "play_demo" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                format!("Play demo → {}", self.rig_name(rig))
+            }
+            "stop_demo" => "Stop demo".into(),
             "set_octave" => {
                 let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4);
                 format!("Octave → C{oct}")
@@ -7116,6 +7178,59 @@ impl DemoApp {
                     self.agent_activity.record(origin, format!("Play note {note}"), vec![k], now);
                 }
                 format!("played note {note} for {ms} ms")
+            }
+            "play_demo" => {
+                let rig = match args.get("rig") {
+                    Some(v) if !v.is_null() => match v.as_u64() {
+                        Some(r) => r as usize,
+                        None => return "error: play_demo: rig must be a 0-based integer".into(),
+                    },
+                    _ => self.active_rig,
+                };
+                let n_rigs = self.rig_count();
+                if rig >= n_rigs {
+                    return format!("error: play_demo: no rig {rig} ({n_rigs} rig(s), 0..{})", n_rigs.saturating_sub(1));
+                }
+                let Some(auto_kind) = self.rig_demo_phrase(rig) else {
+                    return format!("error: play_demo: rig {rig} '{}' has no instrument", self.rig_name(rig));
+                };
+                let kind = match args.get("phrase").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => match crate::demo::PhraseKind::parse(s) {
+                        Some(k) => k,
+                        None => return format!("error: play_demo: unknown phrase '{s}' (use keys, bass, lead, pad, organ, drums or wind)"),
+                    },
+                    _ => auto_kind,
+                };
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::DemoPlay { rig: rig as u8, phrase: kind });
+                }
+                let p = crate::demo::phrase(kind);
+                let secs = p.seconds(self.bpm);
+                let nodes: Vec<u32> = self.units.iter()
+                    .filter(|u| (n_rigs <= 1 || u.rig as usize == rig) && !matches!(u.node_kind, UnitKind::Master))
+                    .map(|u| u.node_id)
+                    .collect();
+                let label = self.human_tool_label(name, args);
+                self.agent_activity.touch_rig(rig, now);
+                self.agent_activity.record(origin, label, nodes, now);
+                serde_json::json!({
+                    "playing": true,
+                    "rig": rig,
+                    "rig_name": self.rig_name(rig),
+                    "phrase": kind.name(),
+                    "title": p.title,
+                    "beats": p.beats,
+                    "bpm": self.bpm,
+                    "seconds": (secs * 100.0).round() / 100.0,
+                })
+                .to_string()
+            }
+            "stop_demo" => {
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::DemoStop);
+                }
+                self.agent_activity.record(origin, "Stop demo", vec![], now);
+                serde_json::json!({"playing": false}).to_string()
             }
             "set_octave" => {
                 let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4).clamp(1, 7) as u8;
@@ -11594,6 +11709,38 @@ impl DemoApp {
         painter.layout_no_wrap(t, font, color)
     }
 
+    /// The first instrument unit of `rig`, and the demo phrase kind it calls
+    /// for (`None` when the rig has no instrument, e.g. the Guitar rig).
+    fn rig_demo_phrase(&self, rig: usize) -> Option<crate::demo::PhraseKind> {
+        let multi = self.rig_count() > 1;
+        let in_rig = |u: &Unit| if multi { u.rig as usize == rig } else { rig == 0 };
+        let is_inst = |u: &Unit| {
+            matches!(u.node_kind, UnitKind::Clap)
+                || u.lv2_inst
+                || self.base_graph.node(u.node_id).is_some_and(|n| crate::organ::is_organ(&n.kind))
+        };
+        let ti = self.units.iter().position(|u| in_rig(u) && is_inst(u))?;
+        let u = &self.units[ti];
+        let kind = &self.base_graph.node(u.node_id)?.kind;
+        let patch = self.voice_slot_of_node(u.node_id).and_then(|s| self.patch_names.get(s)).cloned().flatten();
+        let (plugin, features) = match kind {
+            NodeKind::Clap { plugin_id } => {
+                let pid = plugin_id.as_str();
+                let name = self.plugin_display_name(pid).or_else(|| Some(sentence_case(&u.name)));
+                let feats = self.plugins_clap.iter().find(|p| p.id == pid).map(|p| p.features.clone()).unwrap_or_default();
+                (name, feats)
+            }
+            NodeKind::Lv2 { uri } => {
+                let name = self.plugins_lv2.iter().find(|p| p.uri == uri.as_str()).map(|p| p.name.clone())
+                    .or_else(|| Some(sentence_case(&u.name)));
+                (name, Vec::new())
+            }
+            _ => (None, Vec::new()),
+        };
+        let class = crate::keyboard::classify_instrument(kind, patch.as_deref(), plugin.as_deref(), &features);
+        Some(crate::demo::kind_for(class, patch.as_deref(), plugin.as_deref()))
+    }
+
     /// Unified Left Rail (`Q`): owns the session's structural hierarchy (`Rigs`
     /// tab: rigs with live meters, MIDI/audio input badges, `+ Rig`, per-rig
     /// `⋯` menu, channels, plugins & Aux buses) and the unified `Library` tab
@@ -11604,6 +11751,7 @@ impl DemoApp {
             self.nav_row_rects.clear();
             self.nav_chevron_rects.clear();
             self.nav_rig_more_rects.clear();
+            self.nav_rig_demo_rects.clear();
             self.nav_filter_rects = [Rect::NOTHING; 3];
             self.rail_tab_rects = [Rect::NOTHING; 2];
             self.nav_rig_menu = None;
@@ -11614,6 +11762,7 @@ impl DemoApp {
         self.nav_row_rects.clear();
         self.nav_chevron_rects.clear();
         self.nav_rig_more_rects.clear();
+        self.nav_rig_demo_rects.clear();
         self.nav_filter_rects = [Rect::NOTHING; 3];
         self.rail_tab_rects = [Rect::NOTHING; 2];
         // When the Left Rail is open, it owns the rig list and "+ Rig" CTA.
@@ -11628,6 +11777,7 @@ impl DemoApp {
         let mut add_rig = false;
         let mut rename_rig: Option<(usize, String)> = None;
         let mut open_rig_menu: Option<(usize, Pos2)> = None;
+        let mut demo_cmd: Option<Command> = None;
         let mut do_save_session = false;
         let mut load_session: Option<String> = None;
         let mut overwrite_session: Option<String> = None;
@@ -11816,14 +11966,18 @@ impl DemoApp {
                                                     let level = self.rig_levels.get(r_idx).copied().unwrap_or(0.0);
                                                     let agent_t = self.agent_activity.rig_alpha(r_idx, self.ui_time);
                                                     let (src_lbl, is_audio) = self.rig_source_badge(r_idx);
+                                                    let phrase = self.rig_demo_phrase(r_idx);
+                                                    let demo_on = self.demo_playing.is_some_and(|d| d.rig as usize == r_idx);
                                                     let (rect, _) = ui.allocate_exact_size(egui::vec2(row_w, 28.0), egui::Sense::hover());
+                                                    let demo_rect = Rect::from_min_size(Pos2::new(rect.left() + 6.0, rect.top() + 4.0), egui::vec2(20.0, 20.0));
                                                     let more_rect = Rect::from_min_size(Pos2::new(rect.right() - 22.0, rect.top() + 4.0), egui::vec2(20.0, 20.0));
-                                                    let body_rect = Rect::from_min_max(rect.min, Pos2::new(more_rect.left() - 2.0, rect.bottom()));
+                                                    let body_rect = Rect::from_min_max(Pos2::new(demo_rect.right() + 2.0, rect.top()), Pos2::new(more_rect.left() - 2.0, rect.bottom()));
                                                     let body_resp = ui.interact(body_rect, egui::Id::unique(("nav_rig", r_idx)), egui::Sense::click());
                                                     let menu_open_here = self.nav_rig_menu.is_some_and(|(mr, _)| mr == r_idx);
+                                                    let demo_resp = ui.interact(demo_rect, egui::Id::unique(("nav_rig_demo", r_idx)), egui::Sense::click());
                                                     let more_resp = ui.interact(more_rect, egui::Id::unique(("nav_rig_more", r_idx)), egui::Sense::click());
                                                     if more_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                                                    let hov = body_resp.hovered() || more_resp.hovered();
+                                                    let hov = body_resp.hovered() || more_resp.hovered() || (phrase.is_some() && demo_resp.hovered());
                                                     if body_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
 
                                                     if active {
@@ -11860,11 +12014,12 @@ impl DemoApp {
                                                         text_limit = brect.left() - 6.0;
                                                     }
 
-                                                    // Paint ⋯ on top of any active fill without registering a second click target.
+                                                    // Paint ▶/■ and ⋯ on top of any active fill without registering a second click target.
+                                                    paint_nav_demo_button(ui, demo_rect, demo_resp.hovered(), demo_on, phrase.is_some());
                                                     paint_nav_more(ui, more_rect, menu_open_here, more_resp.hovered());
 
                                                     let col = if active { theme::INK } else { theme::INK_2 };
-                                                    let text_x = rect.left() + 9.0;
+                                                    let text_x = demo_rect.right() + 6.0;
                                                     let g = Self::ellipsized(
                                                         ui.painter(),
                                                         &format!("{} · {name}", rig + 1),
@@ -11876,9 +12031,21 @@ impl DemoApp {
 
                                                     self.nav_row_rects.push((row.clone(), rect));
                                                     self.nav_rig_more_rects.push((r_idx, more_rect));
+                                                    self.nav_rig_demo_rects.push((r_idx, demo_rect));
                                                     self.rig_chip_rects.push(rect);
 
-                                                    if more_resp.on_hover_text("Rig actions (rename, clone, save preset, replace, delete)").clicked() {
+                                                    let demo_tip = if phrase.is_some() {
+                                                        "Play a demo phrase through this rig"
+                                                    } else {
+                                                        "No instrument in this rig to play a demo phrase"
+                                                    };
+                                                    if demo_resp.on_hover_text(demo_tip).clicked() {
+                                                        if demo_on {
+                                                            demo_cmd = Some(Command::DemoStop);
+                                                        } else if let Some(kind) = phrase {
+                                                            demo_cmd = Some(Command::DemoPlay { rig: *rig, phrase: kind });
+                                                        }
+                                                    } else if more_resp.on_hover_text("Rig actions (rename, clone, save preset, replace, delete)").clicked() {
                                                         if menu_open_here {
                                                             self.nav_rig_menu = None;
                                                         } else {
@@ -12358,6 +12525,11 @@ impl DemoApp {
             self.mixer_flash = Some((bnode, self.ui_time + NAV_FLASH_S));
         }
         if add_rig { self.edit_rigs(None); }
+        if let Some(cmd) = demo_cmd {
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(cmd);
+            }
+        }
         if let Some((r, n)) = rename_rig { self.rename_rig_dialog = Some((r, n)); }
         if let Some(m) = open_rig_menu { self.nav_rig_menu = Some(m); }
         if do_save_session { self.save_current_session(&sessions_dir); }
@@ -30546,7 +30718,7 @@ mod split_bpm_tests {
     #[test]
     fn rack_knob_midi_learn_bind_follow_and_cancel() {
         let (mut app, ctx) = demo();
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         frame(&mut app, &ctx, vec![]);
         drain.drain(|_| {}); // clear initial SetParam/Connect burst
@@ -30637,7 +30809,7 @@ mod split_bpm_tests {
     #[test]
     fn a_learned_cc_moves_the_drawn_master_warm_knob() {
         let (mut app, ctx) = demo();
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         frame(&mut app, &ctx, vec![]);
         drain.drain(|_| {});
@@ -30666,7 +30838,7 @@ mod split_bpm_tests {
     #[test]
     fn a_knob_menu_range_caps_what_the_bound_pedal_reaches() {
         let (mut app, ctx) = demo();
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         frame(&mut app, &ctx, vec![]);
         let m = app.master_idx().unwrap();
@@ -30944,7 +31116,7 @@ mod split_bpm_tests {
     #[test]
     fn rack_knob_bound_menu_relearn_and_clear() {
         let (mut app, ctx) = demo();
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         frame(&mut app, &ctx, vec![]);
 
@@ -32107,7 +32279,7 @@ mod ui_polish_agent_tests {
             let mut app = DemoApp::new_with_sink(None);
             let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
             app.assistant = assistant;
-            let (bus, drain) = command_bus();
+            let (bus, drain) = crate::control::command_bus();
             let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
             let published = Arc::new(Mutex::new(crate::engine::GraphPub { graph: app.base_graph.clone(), ..Default::default() }));
             engine.set_graph_pub(published.clone());
@@ -32213,7 +32385,7 @@ mod ui_polish_agent_tests {
         app.sounds = crate::sounds::Libraries::blocking(vital_sounds);
         app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
         for u in app.units.iter_mut().filter(|u| u.name == "VITALIUM") { u.lv2_inst = true; }
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         let node = node_named(&app, 1, "VITALIUM");
 
@@ -32379,7 +32551,7 @@ mod ui_polish_agent_tests {
         app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
         // The test plugins are not installed, so the scan cannot class them.
         for u in app.units.iter_mut().filter(|u| u.name == "ORGAN" || u.name == "OSC") { u.lv2_inst = true; }
-        let (bus, drain) = command_bus();
+        let (bus, drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         (app, drain)
     }
@@ -32428,7 +32600,7 @@ mod ui_polish_agent_tests {
         let rigs = vec![instrument_rig("Organ", &[(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, "ORGAN")])];
         let mut app = DemoApp::new_with_sink(None);
         app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         let ctx = egui::Context::default();
         *app.hw_midi.devices.lock().unwrap() = vec![
@@ -32673,7 +32845,7 @@ mod ui_polish_agent_tests {
         ];
         let mut app = DemoApp::new_with_sink(None);
         app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         let ctx = egui::Context::default();
         let organ = node_named(&app, 1, "ORGAN");
@@ -34617,7 +34789,6 @@ mod face_layout_tests {
 mod main_control_tests {
     use super::*;
     use super::face_layout_tests::frame_at;
-    use crate::control::command_bus;
     use crate::main_controls::{MainControl, MainControls, MainSource};
 
     fn control(id: u32, name: &str, page: &str) -> MainControl {
@@ -34724,7 +34895,7 @@ mod main_control_tests {
         let (mut app, unit) = lv2_synth_rack(&[]);
         let node = app.units[unit].node_id;
         let ctx = egui::Context::default();
-        let (bus, mut drain) = command_bus();
+        let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
         assert_eq!(labels(&app, unit), ["CUTOFF", "RESO", "OSC 1 VOL", "BAL"], "no knob that drives nothing");
@@ -40107,6 +40278,183 @@ mod navigator_tests {
                 let name = if mixer { "mixer" } else { "rack" };
                 super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("{name}-nav-{w}x{h}.png")));
             }
+        }
+    }
+
+    #[test]
+    fn rail_rig_demo_button_plays_follows_engine_pub_survives_frames_and_stops() {
+        use crate::demo::PhraseKind;
+        use crate::engine::{DemoPub, GraphEngine, GraphPub};
+
+        fn collect_text(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => for c in v { collect_text(c, out); },
+                _ => {}
+            }
+        }
+
+        let (mut app, _) = two_rigs_with_inserts(false);
+        // Name Rig B's patch a bass sound so its button picks the Bass phrase.
+        if let Some(slot) = app.patch_names.get_mut(1) {
+            *slot = Some("Basses/Sub Bass 1".into());
+        }
+        let (bus, drain) = crate::control::command_bus();
+        let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(GraphPub {
+            graph: app.base_graph.clone(),
+            ..Default::default()
+        }));
+        engine.set_graph_pub(pub_.clone());
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        app.graph_pub = Some(pub_.clone());
+        app.nav_open = true;
+
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut buf = vec![0.0f32; 256 * 2];
+
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            shapes = run_frame_at(&mut app, &ctx, size, vec![]);
+            engine.render(&mut buf, 2);
+        }
+        assert_eq!(app.nav_rig_demo_rects.len(), 2, "each rig row has a demo button");
+        let demo_b = app.nav_rig_demo_rects[1].1;
+        let sym_in = |shapes: &[egui::epaint::ClippedShape], r: Rect| -> Vec<String> {
+            let mut texts = Vec::new();
+            for cs in shapes {
+                collect_text(&cs.shape, &mut texts);
+            }
+            texts.into_iter().filter(|(_, tr)| r.expand(1.0).contains(tr.center())).map(|(t, _)| t).collect()
+        };
+        assert_eq!(sym_in(&shapes, demo_b), vec!["▶"], "button starts as ▶");
+
+        // 1. Click Rig B's ▶ button: sends DemoPlay { rig: 1, phrase: Bass }.
+        // Before the engine renders, the UI still shows ▶ (rule 33: only the
+        // engine's publication flips it to ■).
+        click_at(&mut app, &ctx, size, demo_b.center());
+        assert_eq!(app.demo_playing, None, "UI waits for engine publication before showing ■");
+
+        // 2. Engine drains DemoPlay and publishes GraphPub::demo; across several
+        // real UI frames (each running publish_patch's duplicate Connect commands),
+        // the demo keeps running and the button shows ■.
+        for _ in 0..6 {
+            engine.render(&mut buf, 2);
+            shapes = run_frame_at(&mut app, &ctx, size, vec![]);
+        }
+        assert_eq!(
+            app.demo_playing,
+            Some(DemoPub { rig: 1, phrase: PhraseKind::Bass }),
+            "demo stayed live across real app frames and published to UI"
+        );
+        assert_eq!(sym_in(&shapes, demo_b), vec!["■"], "published demo flips button to ■");
+        assert_eq!(sym_in(&shapes, app.nav_rig_demo_rects[0].1), vec!["▶"], "Rig A stays ▶");
+
+        // 3. Second click on Rig B's ■ button sends DemoStop; once the engine
+        // publishes, the button flips back to ▶.
+        click_at(&mut app, &ctx, size, demo_b.center());
+        for _ in 0..3 {
+            engine.render(&mut buf, 2);
+            shapes = run_frame_at(&mut app, &ctx, size, vec![]);
+        }
+        assert_eq!(app.demo_playing, None);
+        assert_eq!(sym_in(&shapes, demo_b), vec!["▶"], "stopped demo flips back to ▶");
+
+        // 4. An audio-only rig (Guitar rig) has no instrument: its demo phrase is
+        // None and clicking the disabled button sends no command.
+        app.load_template(Template::GuitarRig);
+        assert_eq!(app.rig_demo_phrase(0), None, "audio-only Guitar rig has no demo phrase");
+        let (bus2, mut drain2) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus2)));
+        for _ in 0..2 {
+            run_frame_at(&mut app, &ctx, size, vec![]);
+        }
+        let mut sent = Vec::new();
+        drain2.drain(|c| sent.push(c));
+        sent.clear();
+        let demo_guitar = app.nav_rig_demo_rects[0].1;
+        click_at(&mut app, &ctx, size, demo_guitar.center());
+        drain2.drain(|c| sent.push(c));
+        assert!(
+            !sent.iter().any(|c| matches!(c, Command::DemoPlay { .. } | Command::DemoStop)),
+            "disabled button on an audio-only rig sends no demo command: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn play_demo_and_stop_demo_tools_are_in_all_tables_and_send_commands() {
+        use crate::demo::PhraseKind;
+        let names: Vec<String> = crate::assistant::tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        for tool in ["play_demo", "stop_demo"] {
+            assert!(names.iter().any(|n| n == tool), "assistant::tools missing {tool}");
+            assert!(UI_BRIDGE_TOOLS.contains(&tool), "UI_BRIDGE_TOOLS missing {tool}");
+            assert!(!tool_is_read_only(tool) && tool_changes_only_system(tool));
+        }
+
+        let (mut app, _) = two_rigs_with_inserts(false);
+        if let Some(slot) = app.patch_names.get_mut(1) {
+            *slot = Some("Winds/Flute".into());
+        }
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        app.bpm = 120.0;
+        let undo_before = app.undo_past.len();
+
+        let res: serde_json::Value = serde_json::from_str(
+            &app.exec_tool("play_demo", &serde_json::json!({"rig": 1})),
+        )
+        .unwrap();
+        assert_eq!(res["playing"], serde_json::json!(true));
+        assert_eq!(res["rig"], serde_json::json!(1));
+        assert_eq!(res["phrase"], serde_json::json!("wind"));
+        assert_eq!(res["seconds"], serde_json::json!(8.0));
+        assert_eq!(app.undo_past.len(), undo_before, "play_demo opens no undo snapshot");
+
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::DemoPlay { rig: 1, phrase: PhraseKind::Wind })),
+            "sent DemoPlay: {cmds:?}"
+        );
+
+        let bad_rig = app.exec_tool("play_demo", &serde_json::json!({"rig": 9}));
+        assert!(bad_rig.starts_with("error:"), "{bad_rig}");
+        let bad_phrase = app.exec_tool("play_demo", &serde_json::json!({"phrase": "bagpipes"}));
+        assert!(bad_phrase.starts_with("error:"), "{bad_phrase}");
+
+        cmds.clear();
+        let stop: serde_json::Value = serde_json::from_str(
+            &app.exec_tool("stop_demo", &serde_json::json!({})),
+        )
+        .unwrap();
+        assert_eq!(stop["playing"], serde_json::json!(false));
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::DemoStop)), "sent DemoStop: {cmds:?}");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat rig_demo_shots -- --ignored"]
+    fn rig_demo_shots() {
+        use crate::demo::PhraseKind;
+        use crate::engine::DemoPub;
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Rule 148: build a fresh app per image so the font atlas stays clean.
+        for (name, playing) in [
+            ("rail-demo-stopped", None),
+            ("rail-demo-playing", Some(DemoPub { rig: 0, phrase: PhraseKind::Organ })),
+        ] {
+            let (mut app, _) = two_rigs_with_inserts(true);
+            app.nav_open = true;
+            app.rail_tab = RailTab::Rigs;
+            app.demo_playing = playing;
+            super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join(format!("{name}.png")));
         }
     }
 }

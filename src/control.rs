@@ -1277,6 +1277,25 @@ pub enum Command {
     /// Put a saved loudness target back as it was (session load, undo): no
     /// measuring, and a no-op when the engine already holds it.
     RestoreMasterTarget { target: crate::meter::MasterTarget },
+    /// Play a demo phrase (#200) through rig `rig` as if it were played on
+    /// that rig's Keys, looping on the engine's clock until `DemoStop` or a
+    /// routing edit ends it (`Command::demo_effect`). One demo at a time: a
+    /// second `DemoPlay` releases the first one's notes, then starts.
+    DemoPlay { rig: u8, phrase: crate::demo::PhraseKind },
+    DemoStop,
+}
+
+/// What a command does to a running demo phrase. A demo note's note-off
+/// takes the routes its note-on took (rule 41), so every command that can
+/// move one ends the demo first, releasing its notes while those routes
+/// still exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DemoEffect {
+    Keeps,
+    Ends,
+    /// Ends it when this cable is a MIDI cable that exists: an audio cable,
+    /// or the UI's re-send of a cable already gone, moves no note.
+    EndsIfMidiCable(EdgeId),
 }
 
 /// Lock-free UI/frontend → engine command bus (rtrb SPSC ring).
@@ -1306,6 +1325,78 @@ impl Command {
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. }
             | Command::SetKeysScale { .. })
+    }
+}
+
+impl Command {
+    /// Rule 41 for the demo phrase, decided per command (no wildcard: a new
+    /// command must be classified). Connect only ever adds a route — a
+    /// demo note's off then also reaches a dest that never sounded, like a
+    /// key's (`held_notes`) — and so does an instrument added to a rig. The
+    /// source switches and the matrix gate the keys, not the demo, but they
+    /// end it as any routing edit does.
+    pub fn demo_effect(&self) -> DemoEffect {
+        use DemoEffect::{Ends, Keeps};
+        match self {
+            Command::AddNode { kind, .. } => match kind {
+                NodeKind::Arp | NodeKind::MidiFx { .. } => Ends,
+                NodeKind::Keys
+                | NodeKind::Clap { .. }
+                | NodeKind::Lv2 { .. }
+                | NodeKind::Dsp(_)
+                | NodeKind::MasterOut
+                | NodeKind::SystemAudio
+                | NodeKind::AudioIn { .. } => Keeps,
+            },
+            Command::Disconnect(id) => DemoEffect::EndsIfMidiCable(*id),
+            Command::RemoveNode(_)
+            | Command::LoadGraph { .. }
+            | Command::LoadRigs { .. }
+            | Command::SetRigSource { .. }
+            | Command::SetRigDevice { .. }
+            | Command::SetNodeSplit { .. }
+            | Command::SetKeysScale { .. }
+            | Command::SetZoneOctave { .. }
+            | Command::MatrixRule { .. } => Ends,
+            Command::Connect { .. }
+            | Command::SetParam { .. }
+            | Command::NoteOn { .. }
+            | Command::NoteOff { .. }
+            | Command::RenameRig { .. }
+            | Command::SetRigMix { .. }
+            | Command::SetStripMix { .. }
+            | Command::SetSend { .. }
+            | Command::SetBusOutput { .. }
+            | Command::SetStripBypass { .. }
+            | Command::RenameNode { .. }
+            | Command::Cc { .. }
+            | Command::PitchBend { .. }
+            | Command::Pressure { .. }
+            | Command::MatrixCcMap { .. }
+            | Command::SetSystemAudio { .. }
+            | Command::SetAudioIn { .. }
+            | Command::SetPlayer { .. }
+            | Command::SetPlayerCfg { .. }
+            | Command::SetPlayerEnable { .. }
+            | Command::TransportPlay
+            | Command::TransportStop
+            | Command::SetNodePlaying { .. }
+            | Command::SetBpm { .. }
+            | Command::SetCountIn { .. }
+            | Command::SetTimeSignature { .. }
+            | Command::LoadLv2Preset { .. }
+            | Command::LoadLv2State { .. }
+            | Command::ProgramChange { .. }
+            | Command::RecordStart
+            | Command::RecordStop
+            | Command::SetRecordSync { .. }
+            | Command::SetRecordArm { .. }
+            | Command::ResetMeter
+            | Command::SetMasterTarget { .. }
+            | Command::RestoreMasterTarget { .. }
+            | Command::DemoPlay { .. }
+            | Command::DemoStop => Keeps,
+        }
     }
 }
 
@@ -1472,6 +1563,8 @@ mod tests {
             Command::RestoreMasterTarget { target: crate::meter::MasterTarget::OFF },
             Command::SetAudioIn { node: 9, device: None, channels: Some(AudioInChannel::MonoR) },
             Command::SetAudioIn { node: 9, device: Some("USB Audio".into()), channels: None },
+            Command::DemoPlay { rig: 1, phrase: crate::demo::PhraseKind::Bass },
+            Command::DemoStop,
         ];
         for cmd in cmds {
             let s = serde_json::to_string(&cmd).unwrap();
@@ -1489,6 +1582,30 @@ mod tests {
         assert!(matches!(c, Command::SetNodeSplit { node: 0, point: None }));
         let c: Command = serde_json::from_str(r#"{"MatrixCcMap":{"source":{"Hardware":1},"dest":1,"cc":74,"param":42}}"#).unwrap();
         assert!(matches!(c, Command::MatrixCcMap { dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, .. }));
+    }
+
+    #[test]
+    fn demo_effect_classifies_routing_vs_non_routing_commands() {
+        use crate::demo::PhraseKind;
+        assert_eq!(Command::DemoPlay { rig: 0, phrase: PhraseKind::Keys }.demo_effect(), DemoEffect::Keeps);
+        assert_eq!(Command::DemoStop.demo_effect(), DemoEffect::Keeps);
+        assert_eq!(
+            Command::Connect { id: 1, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: PortKind::Midi }.demo_effect(),
+            DemoEffect::Keeps,
+            "the UI's per-frame Connect mirror must never stop a running demo"
+        );
+        assert_eq!(Command::SetParam { node: 1, param: 0, value: 0.5 }.demo_effect(), DemoEffect::Keeps);
+        assert_eq!(Command::SetBpm { bpm: 120.0 }.demo_effect(), DemoEffect::Keeps);
+        assert_eq!(Command::AddNode { kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY"), rig: 0, wire: false }.demo_effect(), DemoEffect::Keeps);
+        assert_eq!(Command::AddNode { kind: NodeKind::Arp, name: name_bytes("ARP"), rig: 0, wire: true }.demo_effect(), DemoEffect::Ends);
+        assert_eq!(Command::Disconnect(4).demo_effect(), DemoEffect::EndsIfMidiCable(4));
+        assert_eq!(Command::RemoveNode(1).demo_effect(), DemoEffect::Ends);
+        assert_eq!(Command::LoadGraph { graph: Graph::default() }.demo_effect(), DemoEffect::Ends);
+        assert_eq!(Command::SetNodeSplit { node: 0, point: Some(60) }.demo_effect(), DemoEffect::Ends);
+        assert_eq!(Command::SetKeysScale { node: 0, scale: None }.demo_effect(), DemoEffect::Ends);
+        assert_eq!(Command::SetZoneOctave { node: 0, zone: 0, octave: 1 }.demo_effect(), DemoEffect::Ends);
+        assert_eq!(Command::SetRigSource { node: 1, keyboard: false, hardware: true }.demo_effect(), DemoEffect::Ends);
+        assert_eq!(Command::SetRigDevice { node: 1, device: None }.demo_effect(), DemoEffect::Ends);
     }
 
     #[test]

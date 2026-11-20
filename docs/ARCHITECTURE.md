@@ -47,6 +47,13 @@ agents are in [AGENTS.md](../AGENTS.md).
   Knobs live in `engine::knob_specs`; `knob_values_from_args` is the one
   parser of the `set_arp` agent/MCP tool. `kabelsalat arp-test` renders two
   bars through a real Surge voice.
+- `demo.rs` — per-rig live demo phrase player (issue #200): seven static musical
+  note phrases (`PhraseKind`: keys, bass, lead, pad, organ, drums, wind with
+  40 ms CC 2 + channel pressure breath envelope), `kind_for` sound
+  classification, and the allocation-free `DemoPlayer` stepped on the engine's
+  tempo clock (`Command::DemoPlay` / `DemoStop`, published via `GraphPub::demo`
+  and released before any routing edit per `Command::demo_effect` and checked
+  by `engine/held_notes.rs` and `kabelsalat demo-test`).
 - `host.rs` — CLAP via clack-host: `ClapVoice` (audio side) + `ClapVoiceMain`
   (main thread), `VoiceController` (RT-safe notes/params), out-of-process
   plugin scan with a cache, Surge/Dexed patch files.

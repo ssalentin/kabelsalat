@@ -477,6 +477,15 @@ struct SetTimeSignatureArgs {
     denominator: u8,
 }
 
+/// Arguments for `play_demo`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PlayDemoArgs {
+    /// 0-based rig index (0 = first rig / "rig 1", 1 = second rig / "rig 2"; omit for the active rig).
+    rig: Option<u8>,
+    /// Optional phrase kind override: "keys", "bass", "lead", "pad", "organ", "drums", or "wind". Omit to choose from the rig's sound.
+    phrase: Option<String>,
+}
+
 /// Arguments for `set_count_in`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetCountInArgs {
@@ -3559,6 +3568,76 @@ impl McpServer {
         ok_json(sig.to_json())
     }
 
+    /// Play a live demo note phrase through a rig.
+    #[tool(name = "play_demo", description = "Play a short live note phrase through one rig in a loop on the engine's clock at the current tempo (Command::DemoPlay; never recorded audio; stop with stop_demo). rig is the 0-based rig index (0 = first rig / 'rig 1', 1 = 'rig 2'; omit for the active rig). Optional phrase overrides the automatic choice: keys | bass | lead | pad | organ | drums | wind (the wind phrase also sends CC 2 and channel pressure breath). Gives listen a full phrase to judge.")]
+    fn play_demo(&self, Parameters(args): Parameters<PlayDemoArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            let mut a = json!({});
+            if let Some(r) = args.rig { a["rig"] = json!(r); }
+            if let Some(p) = &args.phrase { a["phrase"] = json!(p); }
+            drop(st);
+            return Self::ui_bridge_tool("play_demo", a);
+        }
+        let (rigs, active) = st.rigs.lock().map(|s| (s.rigs.clone(), s.active)).unwrap_or_default();
+        let n_rigs = rigs.len().max(st.graph.nodes.iter().map(|n| n.rig as usize + 1).max().unwrap_or(1));
+        let rig = args.rig.map(|r| r as usize).unwrap_or_else(|| active.min(n_rigs.saturating_sub(1)));
+        if rig >= n_rigs {
+            return tool_err(format!("no rig {rig} ({n_rigs} rig(s), 0..{})", n_rigs.saturating_sub(1)));
+        }
+        let rig_name = rigs.get(rig).map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("Rig {}", (b'A' + (rig as u8).min(25)) as char));
+        let inst = st.graph.nodes.iter().find(|n| {
+            n.rig as usize == rig && (matches!(n.kind, NodeKind::Clap { .. })
+                || crate::organ::is_organ(&n.kind)
+                || matches!(&n.kind, NodeKind::Lv2 { uri } if crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument)))
+        });
+        let Some(inst) = inst else {
+            return tool_err(format!("rig {rig} '{rig_name}' has no instrument"));
+        };
+        let kind = match args.phrase.as_deref() {
+            Some(s) if !s.trim().is_empty() => match crate::demo::PhraseKind::parse(s) {
+                Some(k) => k,
+                None => return tool_err(format!("unknown phrase '{s}' (use keys, bass, lead, pad, organ, drums or wind)")),
+            },
+            _ => {
+                let pname = name_str(&inst.name);
+                let class = crate::keyboard::classify_instrument(&inst.kind, None, Some(pname), &[]);
+                crate::demo::kind_for(class, None, Some(pname))
+            }
+        };
+        let bpm = st.graph_pub.as_ref().and_then(|p| p.lock().ok()).map_or(96.0, |g| g.transport.bpm);
+        if let Err(e) = send_cmd(&mut st, Command::DemoPlay { rig: rig as u8, phrase: kind }) {
+            return tool_err(e);
+        }
+        let p = crate::demo::phrase(kind);
+        let secs = p.seconds(bpm);
+        ok_json(json!({
+            "playing": true,
+            "rig": rig,
+            "rig_name": rig_name,
+            "phrase": kind.name(),
+            "title": p.title,
+            "beats": p.beats,
+            "bpm": bpm,
+            "seconds": (secs * 100.0).round() / 100.0,
+        }))
+    }
+
+    /// Stop the running rig demo phrase.
+    #[tool(name = "stop_demo", description = "Stop the running rig demo phrase (Command::DemoStop) and release any notes it holds.")]
+    fn stop_demo(&self) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("stop_demo", json!({}));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::DemoStop) {
+            return tool_err(e);
+        }
+        ok_json(json!({"playing": false}))
+    }
+
     /// Configure master transport count-in.
     #[tool(name = "set_count_in", description = "Configure master transport count-in (Command::SetCountIn): plays N bars (1..=4, default 1) of metronome clicks before the song clock starts at beat 0. Pass enabled (bool) and/or bars (0 disables, 1..=4 enables).")]
     fn set_count_in(&self, Parameters(args): Parameters<SetCountInArgs>) -> Result<CallToolResult, McpError> {
@@ -4842,5 +4921,32 @@ mod tests {
         engine.render(&mut buf, 2);
         let listed = tool_json(&server.get_bus_outputs(Parameters(GetBusOutputsArgs {})));
         assert!(listed["buses"].as_array().unwrap().iter().any(|b| b["rig"] == json!(0) && b["output"].is_null()), "{listed}");
+    }
+
+    #[test]
+    fn play_demo_and_stop_demo_drive_engine_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 256 * 2];
+        let _ = server.set_bpm(Parameters(SetBpmArgs { bpm: 120.0 }));
+        engine.render(&mut buf, 2);
+
+        let started = tool_json(&server.play_demo(Parameters(PlayDemoArgs { rig: Some(0), phrase: Some("bass".into()) })));
+        assert_eq!(started["playing"], json!(true));
+        assert_eq!(started["rig"], json!(0));
+        assert_eq!(started["phrase"], json!("bass"));
+        assert_eq!(started["beats"], json!(16.0));
+        assert_eq!(started["seconds"], json!(8.0));
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.demo_pub(), Some(crate::engine::DemoPub { rig: 0, phrase: crate::demo::PhraseKind::Bass }));
+
+        let bad_rig = server.play_demo(Parameters(PlayDemoArgs { rig: Some(5), phrase: None }));
+        assert_eq!(bad_rig.unwrap().is_error, Some(true));
+        let bad_phrase = server.play_demo(Parameters(PlayDemoArgs { rig: Some(0), phrase: Some("kazoo".into()) }));
+        assert_eq!(bad_phrase.unwrap().is_error, Some(true));
+
+        let stopped = tool_json(&server.stop_demo());
+        assert_eq!(stopped["playing"], json!(false));
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.demo_pub(), None);
     }
 }

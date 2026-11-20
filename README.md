@@ -84,7 +84,11 @@ sag and swing, and light up when signal flows through them.
 bass on one keyboard and pads on another. All rigs play together; switch the one
 you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
-it has loaded.
+it has loaded. Every rig row in the Left Rail (**Q**) has a **▶** demo button
+that loops a live musical phrase suited to its sound (keys, bass, lead, pad,
+organ, drums, or wind with CC 2 and aftertouch breath) on the engine clock at
+the session tempo — turn knobs, swap sounds or add effects and hear them right
+away without a MIDI keyboard (`play_demo` / `stop_demo` for agents).
 
 ### Browse and install plugins by type
 Press **F9** (or **B**) to open **Plugins**, organized by what each unit does

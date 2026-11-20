@@ -1937,6 +1937,7 @@ dependencies = [
  "base64",
  "clack-extensions",
  "clack-host",
+ "clap-sys",
  "cpal",
  "eframe",
  "egui",

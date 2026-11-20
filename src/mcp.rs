@@ -3593,13 +3593,35 @@ fn reroute_stdout() -> anyhow::Result<std::fs::File> {
 
 /// Serve MCP over stdio on the private stdout duplicate (shared by both
 /// backends — the tool definitions are identical).
-fn serve_stdio(server: McpServer, rpc_stdout: std::fs::File) -> anyhow::Result<()> {
+///
+/// `mains` are the hosted plugins of the headless backend. This thread
+/// created them, so it is their main thread: between the server's wake-ups
+/// it serves what they ask the host for (callbacks, restarts, flushes), at
+/// the rate the app's frame does.
+fn serve_stdio(server: McpServer, rpc_stdout: std::fs::File, mains: &mut [ClapVoiceMain]) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    // `block_on` polls this future on the calling thread, so it may hold
+    // the plugins' main halves, which never leave it.
     rt.block_on(async move {
         let writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(rpc_stdout));
         let transport = (tokio::io::stdin(), writer);
         let service = server.serve(transport).await?;
-        service.waiting().await?;
+        let waiting = service.waiting();
+        tokio::pin!(waiting);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(33));
+        loop {
+            tokio::select! {
+                ended = &mut waiting => {
+                    ended?;
+                    break;
+                }
+                _ = tick.tick() => {
+                    for main in mains.iter_mut() {
+                        main.service();
+                    }
+                }
+            }
+        }
         Ok::<(), anyhow::Error>(())
     })
 }
@@ -3634,7 +3656,7 @@ pub fn run() -> anyhow::Result<()> {
         keyboard_mode: crate::keyboard::KeyboardMode::Auto,
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
-    let result = serve_stdio(server, rpc_stdout);
+    let result = serve_stdio(server, rpc_stdout, &mut audio.mains);
 
     // The stream and the CLAP main-thread handles stayed alive on this (the
     // creating) thread for the whole session; tear them down last. Stop + join
@@ -3687,7 +3709,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         state: Arc::new(Mutex::new(state)),
         tool_router: McpServer::tool_router(),
     };
-    serve_stdio(server, rpc_stdout)
+    serve_stdio(server, rpc_stdout, &mut [])
 }
 
 // ---------------------------------------------------------------------------

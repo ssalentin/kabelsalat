@@ -2722,7 +2722,7 @@ fn sentence_first(s: &str) -> String {
 /// bridge (they need the app's UI-thread state). Every MCP tool that calls
 /// `ui_bridge_tool("…")` must be listed — `ui_bridge_tools_cover_mcp` checks.
 const UI_BRIDGE_TOOLS: &[&str] = &[
-    "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
+    "load_sound", "list_sounds", "list_params", "set_param", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
     "save_rig", "load_rig", "list_rig_presets", "load_template",
@@ -5715,6 +5715,14 @@ impl DemoApp {
             }
             "set_matrix_rule" => "Set MIDI rule".into(),
             "list_params" => "List parameters".into(),
+            "set_param" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let who = args.get("name").or_else(|| args.get("knob")).and_then(|v| v.as_str());
+                match who {
+                    Some(n) if !n.trim().is_empty() => format!("{} · {}", self.unit_display_name(node), n.trim()),
+                    _ => format!("Set param · {}", self.unit_display_name(node)),
+                }
+            }
             "set_cc_map" => "Map MIDI CC".into(),
             "clear_cc_map" => "Clear MIDI CC".into(),
             "list_cc_maps" => "List MIDI CCs".into(),
@@ -7536,16 +7544,7 @@ impl DemoApp {
                 }
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
                 let words: Vec<&str> = q.split_whitespace().collect();
-                let choices = self.node_param_choices(node);
-                let total = choices.len();
-                let params: Vec<_> = choices.into_iter()
-                    .filter(|(_, name)| {
-                        let low = name.to_lowercase();
-                        words.iter().all(|w| low.contains(w))
-                    })
-                    .take(50)
-                    .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
-                    .collect();
+                let (total, params) = self.node_param_entries(node, &words, 50);
                 let knobs: Vec<_> = self.units.iter()
                     .find(|u| u.node_id == node)
                     .map(|u| {
@@ -7566,6 +7565,7 @@ impl DemoApp {
                     "knobs": knobs,
                 }).to_string()
             }
+            "set_param" => self.exec_set_param(args, origin, now),
             "learn_cc" => {
                 if args.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
                     self.cc_learn = None;
@@ -9480,6 +9480,422 @@ impl DemoApp {
             SourceId::Hardware(d) => format!("hw:{d}"),
             other => format!("{other:?}"),
         }
+    }
+
+    /// Rich parameter entries for `list_params`: `(total_count, filtered_entries)`
+    /// with current value, formatted text (when available), range, default, and
+    /// stepped flag so the agent can directly inspect and edit internal params.
+    fn node_param_entries(&mut self, node_id: u32, words: &[&str], limit: usize) -> (usize, Vec<serde_json::Value>) {
+        let Some(u_idx) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return (0, Vec::new());
+        };
+        let matches_words = |name: &str| {
+            let low = name.to_lowercase();
+            words.iter().all(|w| low.contains(w))
+        };
+        match &self.units[u_idx].node_kind {
+            UnitKind::Clap => {
+                if let Some(slot) = self.rig_of_unit(u_idx) {
+                    if let Some(idx) = self.clap_pool_idx(slot) {
+                        if let Some(main) = self._surge_main.get_mut(idx) {
+                            let all: Vec<_> = main
+                                .param_list()
+                                .into_iter()
+                                .filter(|p| p.automatable && !p.hidden && !p.readonly)
+                                .collect();
+                            let total = all.len();
+                            let entries = all
+                                .into_iter()
+                                .filter_map(|p| {
+                                    let label = if p.module.is_empty() {
+                                        p.name.clone()
+                                    } else {
+                                        format!("{} / {}", p.module, p.name)
+                                    };
+                                    if !matches_words(&label) {
+                                        return None;
+                                    }
+                                    Some((p, label))
+                                })
+                                .take(limit)
+                                .map(|(p, label)| {
+                                    let text = main.param_text(p.id, p.value);
+                                    serde_json::json!({
+                                        "id": p.id,
+                                        "name": label,
+                                        "value": p.value,
+                                        "text": text,
+                                        "min": p.min,
+                                        "max": p.max,
+                                        "default": p.default,
+                                        "stepped": p.stepped,
+                                        "target": "plugin",
+                                    })
+                                })
+                                .collect();
+                            return (total, entries);
+                        }
+                    }
+                }
+                (0, Vec::new())
+            }
+            UnitKind::Dsp(_) | UnitKind::MidiFx => {
+                let lv2_uri = match self.base_graph.node(node_id).map(|n| &n.kind) {
+                    Some(NodeKind::Lv2 { uri })
+                    | Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => Some(uri.as_str().to_string()),
+                    _ => None,
+                };
+                if let Some(uri) = lv2_uri {
+                    let descs = crate::lv2::control_descs_for_uri(&uri);
+                    let total = descs.len();
+                    let entries = descs
+                        .into_iter()
+                        .filter(|c| matches_words(&c.name))
+                        .take(limit)
+                        .map(|c| {
+                            let id = c.index as u32;
+                            let val = self.units[u_idx]
+                                .knobs
+                                .iter()
+                                .find(|k| k.param == Some(id))
+                                .map(|k| c.min as f64 + k.value as f64 * (c.max as f64 - c.min as f64))
+                                .unwrap_or(c.default as f64);
+                            serde_json::json!({
+                                "id": id,
+                                "name": c.name,
+                                "value": val,
+                                "min": c.min as f64,
+                                "max": c.max as f64,
+                                "default": c.default as f64,
+                                "target": "knob",
+                            })
+                        })
+                        .collect();
+                    return (total, entries);
+                }
+                let choices = self.node_param_choices(node_id);
+                let total = choices.len();
+                let entries = choices
+                    .into_iter()
+                    .filter(|(_, name)| matches_words(name))
+                    .take(limit)
+                    .map(|(id, name)| {
+                        let val = self.units[u_idx]
+                            .knobs
+                            .iter()
+                            .find(|k| k.param == Some(id))
+                            .map(|k| k.value as f64);
+                        let mut obj = serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "min": 0.0,
+                            "max": 1.0,
+                            "target": "knob",
+                        });
+                        if let Some(v) = val {
+                            obj["value"] = serde_json::json!(v);
+                        }
+                        obj
+                    })
+                    .collect();
+                (total, entries)
+            }
+            _ => {
+                let choices = self.node_param_choices(node_id);
+                let total = choices.len();
+                let entries = choices
+                    .into_iter()
+                    .filter(|(_, name)| matches_words(name))
+                    .take(limit)
+                    .map(|(id, name)| {
+                        let max = if id == P_AUDIO_IN_GAIN { 4.0 } else { 1.0 };
+                        let val = self.units[u_idx]
+                            .knobs
+                            .iter()
+                            .find(|k| k.param == Some(id))
+                            .map(|k| k.value as f64 * max);
+                        let mut obj = serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "min": 0.0,
+                            "max": max,
+                            "target": "knob",
+                        });
+                        if let Some(v) = val {
+                            obj["value"] = serde_json::json!(v);
+                        }
+                        obj
+                    })
+                    .collect();
+                (total, entries)
+            }
+        }
+    }
+
+    /// Directly edit an internal parameter or rack knob on any node (CLAP
+    /// synths/FX like Starbreath or Surge XT, LV2 plugins, DSP, Master, Arp,
+    /// Audio In, System Audio, MIDI FX).
+    fn exec_set_param(&mut self, args: &serde_json::Value, origin: AgentOrigin, now: f32) -> String {
+        let Some(node) = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32) else {
+            return "error: set_param needs 'node'".into();
+        };
+        let Some(u_idx) = self.units.iter().position(|u| u.node_id == node) else {
+            return format!("error: no unit with node id {node}");
+        };
+        let raw_value = args.get("value").and_then(|v| v.as_f64());
+        let raw_norm = args.get("normalized").and_then(|v| v.as_f64());
+        if raw_value.is_none() && raw_norm.is_none() {
+            return "error: set_param needs 'value' (plain units) or 'normalized' (0..1)".into();
+        }
+        if let Some(v) = raw_value {
+            if !v.is_finite() {
+                return "error: 'value' must be a finite number".into();
+            }
+        }
+        if let Some(n) = raw_norm {
+            if !n.is_finite() {
+                return "error: 'normalized' must be a finite number".into();
+            }
+        }
+        let target_arg = args.get("target").and_then(|v| v.as_str());
+        let explicit_target = match target_arg {
+            None => None,
+            Some(t) => match Self::parse_cc_target(Some(t)) {
+                Ok(CcTarget::Mix) => {
+                    return "error: set_param does not edit mixer strips — use set_rig_mix or set_strip_mix".into();
+                }
+                Ok(parsed) => Some(parsed),
+                Err(e) => return format!("error: {e}"),
+            },
+        };
+
+        let is_clap = matches!(self.units[u_idx].node_kind, UnitKind::Clap);
+        let name_arg = args
+            .get("name")
+            .or_else(|| args.get("knob"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let param_arg = args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32);
+        let unit_display = self.unit_display_name(node);
+
+        // Resolve (param_id, effective_target).
+        let (param_id, effective_target) = if let Some(name) = name_arg {
+            let knob_hit = self.resolve_unit_knob(node, name).ok().filter(|&(_, tgt)| {
+                // If caller explicitly asked for target="plugin" on a CLAP node,
+                // don't match the rack's built-in LEVEL knob (CcTarget::Knob).
+                !(is_clap && explicit_target == Some(CcTarget::PluginParam) && tgt == CcTarget::Knob)
+            });
+            if let Some((id, tgt)) = knob_hit {
+                (id, tgt)
+            } else {
+                // Fall back to searching the full internal parameter list.
+                let choices = self.node_param_choices(node);
+                let low = name.to_lowercase();
+                let exact: Vec<(u32, String)> = choices
+                    .iter()
+                    .filter(|(_, label)| {
+                        let l = label.to_lowercase();
+                        l == low || l.rsplit(" / ").next().is_some_and(|bare| bare == low)
+                    })
+                    .cloned()
+                    .collect();
+                let found = if exact.len() == 1 {
+                    Some(exact[0].0)
+                } else if exact.len() > 1 {
+                    let list: Vec<String> = exact.iter().take(6).map(|(id, l)| format!("{l} (id {id})")).collect();
+                    return format!("error: ambiguous parameter '{name}' on {unit_display}: {} — pass the full name or param id", list.join(", "));
+                } else {
+                    let words: Vec<&str> = low.split_whitespace().collect();
+                    let sub: Vec<(u32, String)> = choices
+                        .iter()
+                        .filter(|(_, label)| {
+                            let l = label.to_lowercase();
+                            words.iter().all(|w| l.contains(w))
+                        })
+                        .cloned()
+                        .collect();
+                    if sub.len() == 1 {
+                        Some(sub[0].0)
+                    } else if sub.len() > 1 {
+                        let list: Vec<String> = sub.iter().take(6).map(|(id, l)| format!("{l} (id {id})")).collect();
+                        return format!("error: ambiguous parameter '{name}' on {unit_display}: {} — pass the exact name or param id", list.join(", "));
+                    } else {
+                        None
+                    }
+                };
+                match found {
+                    Some(id) => (id, if is_clap { CcTarget::PluginParam } else { CcTarget::Knob }),
+                    None => return format!("error: no parameter '{name}' on {unit_display} (call list_params(node={node}) to inspect)"),
+                }
+            }
+        } else if let Some(id) = param_arg {
+            let tgt = if is_clap {
+                explicit_target.unwrap_or(CcTarget::PluginParam)
+            } else {
+                CcTarget::Knob
+            };
+            (id, tgt)
+        } else {
+            return "error: set_param needs 'param' (id) or 'name'".into();
+        };
+
+        // Branch 1: CLAP internal plugin parameter.
+        if is_clap && effective_target == CcTarget::PluginParam {
+            let Some(slot) = self.rig_of_unit(u_idx) else {
+                return format!("error: {unit_display} has no hosted CLAP voice");
+            };
+            let Some(pool_idx) = self.clap_pool_idx(slot) else {
+                return format!("error: {unit_display} is not loaded");
+            };
+            let desc = {
+                let Some(main) = self._surge_main.get_mut(pool_idx) else {
+                    return format!("error: {unit_display} is not loaded");
+                };
+                main.param_list().into_iter().find(|p| p.id == param_id)
+            };
+            let Some(p) = desc else {
+                return format!("error: no parameter id {param_id} on {unit_display} (call list_params(node={node}) to see valid ids)");
+            };
+            if p.readonly {
+                return format!("error: parameter '{}' (id {param_id}) on {unit_display} is read-only", p.name);
+            }
+            let span = p.max - p.min;
+            let mut plain = if let Some(n) = raw_norm {
+                p.min + n.clamp(0.0, 1.0) * span
+            } else {
+                raw_value.unwrap().clamp(p.min, p.max)
+            };
+            if p.stepped {
+                plain = plain.round().clamp(p.min, p.max);
+            }
+            let norm = if span.abs() > 1e-12 {
+                ((plain - p.min) / span).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let Some(ctl) = self.surge_controllers.get(pool_idx) else {
+                return format!("error: {unit_display} controller unavailable");
+            };
+            ctl.set_param(ClapId::new(param_id), plain);
+            let text = self._surge_main[pool_idx].param_text(param_id, plain);
+            let label = if p.module.is_empty() {
+                p.name.clone()
+            } else {
+                format!("{} / {}", p.module, p.name)
+            };
+            // Keep any matching face knob and open parameter editor in sync.
+            let hold_until = self.ui_time + READBACK_HOLD_SECS;
+            for k in &mut self.units[u_idx].knobs {
+                if k.clap.is_some_and(|pin| pin.id == param_id) {
+                    k.set_immediate(norm);
+                    if let Some(pin) = k.clap.as_mut() {
+                        pin.sent = norm;
+                        pin.hold_until = hold_until;
+                    }
+                }
+            }
+            if self.editor_open && self.editor_rig == slot {
+                if let Some(ep) = self.editor_params.iter_mut().find(|ep| ep.id == param_id) {
+                    ep.value = plain;
+                }
+            }
+            let rig = self.units[u_idx].rig as usize;
+            self.agent_activity.touch_rig(rig, now);
+            self.agent_activity.record(origin, format!("{unit_display} · {} → {text}", p.name), vec![node], now);
+            return serde_json::json!({
+                "node": node,
+                "param": param_id,
+                "name": label,
+                "value": plain,
+                "text": text,
+                "min": p.min,
+                "max": p.max,
+                "target": "plugin",
+            })
+            .to_string();
+        }
+
+        // Branch 2: Engine / LV2 / DSP / Master / Arp / AudioIn / SystemAudio / MidiFx / CLAP rack LEVEL knob.
+        let lv2_uri = match self.base_graph.node(node).map(|n| &n.kind) {
+            Some(NodeKind::Lv2 { uri })
+            | Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => Some(uri.as_str().to_string()),
+            _ => None,
+        };
+        let (label, min, max, engine_val, knob_val, plain_val) = if let Some(uri) = lv2_uri.filter(|_| crate::organ::index(param_id).is_none()) {
+            let desc = crate::lv2::control_descs_for_uri(&uri)
+                .into_iter()
+                .find(|c| c.index as u32 == param_id)
+                .map(|c| (c.name, c.min as f64, c.max as f64))
+                .or_else(|| {
+                    self.unit_main_controls(u_idx)
+                        .and_then(|m| m.controls.into_iter().find(|c| c.id == param_id))
+                        .map(|c| (c.name, c.min, c.max))
+                });
+            let Some((name, min, max)) = desc else {
+                return format!("error: no parameter id {param_id} on {unit_display} (call list_params(node={node}) to see valid ids)");
+            };
+            let span = max - min;
+            let (plain, norm) = if let Some(n) = raw_norm {
+                let n = n.clamp(0.0, 1.0);
+                (min + n * span, n)
+            } else {
+                let plain = raw_value.unwrap().clamp(min, max);
+                let n = if span.abs() > 1e-12 { ((plain - min) / span).clamp(0.0, 1.0) } else { 0.0 };
+                (plain, n)
+            };
+            (name, min, max, norm, norm as f32, plain)
+        } else if matches!(self.units[u_idx].node_kind, UnitKind::AudioIn) && param_id == P_AUDIO_IN_GAIN {
+            let (plain, norm) = if let Some(n) = raw_norm {
+                let n = n.clamp(0.0, 1.0);
+                (n * 4.0, n)
+            } else {
+                let p = raw_value.unwrap().clamp(0.0, 4.0);
+                (p, p / 4.0)
+            };
+            ("Gain".to_string(), 0.0, 4.0, plain, norm as f32, plain)
+        } else {
+            let choices = self.node_param_choices(node);
+            let known_name = self.units[u_idx]
+                .knobs
+                .iter()
+                .find(|k| k.param == Some(param_id))
+                .map(|k| k.label.clone())
+                .or_else(|| choices.into_iter().find(|(id, _)| *id == param_id).map(|(_, n)| n));
+            let Some(name) = known_name else {
+                return format!("error: no parameter id {param_id} on {unit_display} (call list_params(node={node}) to see valid ids)");
+            };
+            let v = raw_norm.or(raw_value).unwrap().clamp(0.0, 1.0);
+            (name, 0.0, 1.0, v, v as f32, v)
+        };
+
+        for k in &mut self.units[u_idx].knobs {
+            if k.param == Some(param_id) {
+                k.set_immediate(knob_val);
+            }
+        }
+        if let Some(bus) = &self.bus {
+            if bus.lock().unwrap().send(Command::SetParam { node, param: param_id, value: engine_val }) {
+                for k in &mut self.units[u_idx].knobs {
+                    if k.param == Some(param_id) {
+                        k.sent = Some(knob_val);
+                    }
+                }
+            }
+        }
+        let rig = self.units[u_idx].rig as usize;
+        self.agent_activity.touch_rig(rig, now);
+        self.agent_activity.record(origin, format!("{unit_display} · {label} → {plain_val:.3}"), vec![node], now);
+        serde_json::json!({
+            "node": node,
+            "param": param_id,
+            "name": label,
+            "value": plain_val,
+            "min": min,
+            "max": max,
+            "target": "knob",
+        })
+        .to_string()
     }
 
     fn node_param_choices(&mut self, node_id: u32) -> Vec<(u32, String)> {
@@ -33146,6 +33562,156 @@ mod main_control_tests {
         assert_eq!(labels(&rig.app, surge), ["CUTOFF", "SKEW H", "SHAPE", "SPEED", "LEVEL"], "the patch's named macros");
         assert_eq!(rig.app.resolve_unit_knob(node, "M5: Vibrato Rate").map(|(_, t)| t), Ok(crate::matrix::CcTarget::PluginParam),
             "a macro past the face binds by name");
+    }
+
+    #[test]
+    fn set_param_tool_parity_dsp_lv2_and_errors() {
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(names.contains(&"set_param"), "assistant schema exposes set_param");
+        assert!(UI_BRIDGE_TOOLS.contains(&"set_param"), "UI bridge serves set_param");
+        assert!(!tool_is_read_only("set_param"), "set_param opens an undo step");
+
+        // DSP Delay: edit by name and by id, syncs face knob + sends Command::SetParam.
+        let mut app = DemoApp::new_with_sink(None);
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let res: serde_json::Value = serde_json::from_str(&app.exec_tool("set_param", &serde_json::json!({
+            "node": 2, "name": "MIX", "value": 0.65
+        }))).unwrap();
+        assert_eq!(res["node"], 2);
+        assert_eq!(res["param"], crate::engine::P_MIX);
+        assert!((res["value"].as_f64().unwrap() - 0.65).abs() < 1e-6, "{res}");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetParam { node: 2, param, value }
+            if *param == crate::engine::P_MIX && (*value - 0.65).abs() < 1e-6)), "{cmds:?}");
+        let mix_knob = app.units.iter().find(|u| u.node_id == 2).unwrap()
+            .knobs.iter().find(|k| k.param == Some(crate::engine::P_MIX)).unwrap();
+        assert!((mix_knob.value - 0.65).abs() < 1e-5, "face knob synced");
+
+        // LV2 synth: plain value in 0..2 maps to normalized 0..1 on Command::SetParam + face knob.
+        let (mut lv2_app, unit) = lv2_synth_rack(&[]);
+        let lv2_node = lv2_app.units[unit].node_id;
+        let ctx = egui::Context::default();
+        frame_at(&mut lv2_app, &ctx, Vec2::new(1600.0, 1000.0));
+        let (bus, mut drain) = crate::control::command_bus();
+        lv2_app.bus = Some(Arc::new(Mutex::new(bus)));
+        let out: serde_json::Value = serde_json::from_str(&lv2_app.exec_tool("set_param", &serde_json::json!({
+            "node": lv2_node, "name": "M1: Cutoff", "value": 1.5
+        }))).unwrap();
+        assert_eq!(out["param"], 101);
+        assert!((out["value"].as_f64().unwrap() - 1.5).abs() < 1e-6, "{out}");
+        assert!((lv2_app.units[unit].knobs[0].value - 0.75).abs() < 1e-5, "0.75 of 0..2");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetParam { node, param: 101, value }
+            if *node == lv2_node && (*value - 0.75).abs() < 1e-6)), "{cmds:?}");
+
+        // Validation / error paths.
+        assert!(app.exec_tool("set_param", &serde_json::json!({"node": 999, "param": 0, "value": 0.5})).starts_with("error:"));
+        assert!(app.exec_tool("set_param", &serde_json::json!({"node": 2, "param": 0})).starts_with("error:"));
+        assert!(app.exec_tool("set_param", &serde_json::json!({"node": 2, "value": 0.5})).starts_with("error:"));
+        assert!(app.exec_tool("set_param", &serde_json::json!({"node": 2, "param": 999, "value": 0.5})).starts_with("error:"));
+        assert!(app.exec_tool("set_param", &serde_json::json!({"node": 2, "name": "NONEXISTENT", "value": 0.5})).starts_with("error:"));
+        assert!(app.exec_tool("set_param", &serde_json::json!({"node": 2, "param": 0, "value": 0.5, "target": "mix"})).starts_with("error:"));
+    }
+
+    #[test]
+    fn set_param_edits_real_clap_internal_params_including_starbreath() {
+        // Test on Starbreath when installed, plus Surge XT (always installed locally).
+        let Ok(mut rig) = EvalRig::new(Assistant::new(), &(Vec::new(), Vec::new())) else { return };
+        rig.settle();
+
+        // 1. Surge XT: edit a face knob AND a deep internal parameter (not on the face) by id and name.
+        let surge_idx = rig.app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let surge_node = rig.app.units[surge_idx].node_id;
+        let listed: serde_json::Value = serde_json::from_str(&rig.app.exec_tool("list_params", &serde_json::json!({
+            "node": surge_node, "query": "filter 1 cutoff"
+        }))).unwrap();
+        let params = listed["params"].as_array().unwrap();
+        assert!(!params.is_empty(), "Surge has filter 1 cutoff params: {listed}");
+        let p0 = &params[0];
+        assert!(p0["min"].is_number() && p0["max"].is_number() && p0["value"].is_number() && p0["text"].is_string(),
+            "list_params exposes range, value, and text: {p0}");
+        let cutoff_id = p0["id"].as_u64().unwrap() as u32;
+        let min = p0["min"].as_f64().unwrap();
+        let max = p0["max"].as_f64().unwrap();
+        let orig = p0["value"].as_f64().unwrap();
+        let target_val = if (orig - (min + (max - min) * 0.25)).abs() > 0.05 {
+            min + (max - min) * 0.25
+        } else {
+            min + (max - min) * 0.75
+        };
+
+        let set_res: serde_json::Value = serde_json::from_str(&rig.app.exec_tool("set_param", &serde_json::json!({
+            "node": surge_node, "param": cutoff_id, "value": target_val
+        }))).unwrap();
+        assert_eq!(set_res["target"], "plugin");
+        assert!((set_res["value"].as_f64().unwrap() - target_val).abs() < 1e-4, "{set_res}");
+        rig.settle();
+        let read_back = rig.app._surge_main[0].param_value(cutoff_id).unwrap();
+        assert!((read_back - target_val).abs() < 1e-2, "Surge applied internal param {cutoff_id}: expected {target_val}, got {read_back}");
+
+        // Editing a CLAP rack LEVEL knob still works via name="LEVEL".
+        let lvl_res: serde_json::Value = serde_json::from_str(&rig.app.exec_tool("set_param", &serde_json::json!({
+            "node": surge_node, "name": "LEVEL", "value": 0.42
+        }))).unwrap();
+        assert_eq!(lvl_res["target"], "knob");
+        assert_eq!(lvl_res["param"], P_LEVEL);
+
+        // 2. Starbreath (if installed): add a Starbreath rig, inspect its internal params, edit one live, and verify readback + undo.
+        let sb_path = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".clap/Starbreath.clap"));
+        if sb_path.as_ref().is_some_and(|p| p.exists()) {
+            rig.app.edit_rigs_with(None, Some("Breath"), Some(("org.starbreath.starbreath", "Starbreath")));
+            rig.settle();
+            let sb_unit = rig.app.units.iter().position(|u| {
+                matches!(
+                    rig.app.base_graph.node(u.node_id).map(|n| &n.kind),
+                    Some(NodeKind::Clap { plugin_id }) if plugin_id.as_str() == "org.starbreath.starbreath"
+                )
+            }).expect("Starbreath unit added");
+            let sb_node = rig.app.units[sb_unit].node_id;
+            let sb_slot = rig.app.rig_of_unit(sb_unit).expect("Starbreath slot");
+            let sb_pool = rig.app.clap_pool_idx(sb_slot).expect("Starbreath pool idx");
+
+            let sb_listed: serde_json::Value = serde_json::from_str(&rig.app.exec_tool("list_params", &serde_json::json!({
+                "node": sb_node
+            }))).unwrap();
+            let sb_params = sb_listed["params"].as_array().unwrap();
+            assert!(!sb_params.is_empty(), "Starbreath exposes internal params: {sb_listed}");
+            // Pick a continuous (non-stepped) parameter with a non-zero range so we can assert an exact move.
+            let chosen = sb_params.iter().find(|p| {
+                !p["stepped"].as_bool().unwrap_or(false)
+                    && (p["max"].as_f64().unwrap_or(0.0) - p["min"].as_f64().unwrap_or(0.0)).abs() > 1e-4
+            }).unwrap_or(&sb_params[0]);
+            let sb_pid = chosen["id"].as_u64().unwrap() as u32;
+            let sb_name = chosen["name"].as_str().unwrap().to_string();
+            let sb_min = chosen["min"].as_f64().unwrap();
+            let sb_max = chosen["max"].as_f64().unwrap();
+            let sb_orig = chosen["value"].as_f64().unwrap();
+            let sb_norm = if ((sb_orig - sb_min) / (sb_max - sb_min)).abs() < 0.4 { 0.8 } else { 0.2 };
+            let sb_expected = sb_min + sb_norm * (sb_max - sb_min);
+            // Start a fresh agent turn so undo reverts only this parameter edit, not the rig setup.
+            rig.app.undo_job = None;
+
+            let sb_set: serde_json::Value = serde_json::from_str(&rig.app.exec_tool("set_param", &serde_json::json!({
+                "node": sb_node, "name": sb_name, "normalized": sb_norm
+            }))).unwrap();
+            assert_eq!(sb_set["param"], sb_pid, "{sb_set}");
+            assert_eq!(sb_set["target"], "plugin", "{sb_set}");
+            rig.settle();
+            let sb_read = rig.app._surge_main[sb_pool].param_value(sb_pid).unwrap();
+            assert!((sb_read - sb_expected).abs() < (sb_max - sb_min) * 0.02 + 1e-3,
+                "Starbreath applied '{sb_name}' (id {sb_pid}): expected {sb_expected}, got {sb_read}");
+
+            // Undo restores Starbreath's previous parameter value.
+            let _ = rig.app.exec_tool("undo", &serde_json::json!({}));
+            rig.settle();
+            let sb_after_undo = rig.app._surge_main[sb_pool].param_value(sb_pid).unwrap();
+            assert!((sb_after_undo - sb_orig).abs() < (sb_max - sb_min) * 0.02 + 1e-3,
+                "Undo restored Starbreath '{sb_name}': expected {sb_orig}, got {sb_after_undo}");
+        }
     }
 
     #[test]

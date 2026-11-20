@@ -593,6 +593,12 @@ fn system_prompt() -> String {
      (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome and by the \
      tempo-synced features of hosted CLAP plugins (synced LFOs, sequencers, arps); \
      the user drags it on any metronome's face).\n\
+     - Synth & effect parameters: list_params(node, query) inspects a unit's main_controls and \
+     full internal parameter list (id, name, current value, formatted text, min..max, default, \
+     stepped) for any synth or effect (Starbreath, Surge XT, Dexed, Vitalium, LV2, built-in \
+     DSP, Master). set_param(node, param or name, value or normalized) directly edits any \
+     internal parameter or rack knob live — call several set_param calls in one step to shape \
+     a patch (undo reverts them).\n\
      - Transport: start/stop is a property of each rack instrument that supports it \
      (metronome today; get_graph marks them transport=true with their playing state). \
      set_node_playing(node, playing) starts/stops ONE instrument; transport_play/\
@@ -847,8 +853,20 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_params",
-            "description":"List a node's parameters. main_controls comes first: the few parameters the instrument's designer marked as most important (page, name, id, current value and text, and the face knob that shows it). Prefer them when the user asks to shape or map a sound, and pass a main control's name as knob=<name> to set_cc_map or learn_cc. params is the full list (id, name), filtered by query words: use it only when no main control fits. knobs are the rack face knobs.",
+            "description":"List a node's parameters (for set_param, set_cc_map, or learn_cc). main_controls comes first: the few parameters the instrument's designer marked as most important (page, name, id, current value and text, min..max, and the face knob that shows it). Prefer them when shaping or mapping a sound. params is the full internal parameter list (id, name, current value, text, min, max, default, stepped), filtered by query words: use it to inspect and edit any internal synth or effect parameter (e.g. Starbreath, Surge XT, Vitalium, LV2, DSP). knobs are the rack face knobs.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"query":{"type":"string"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_param",
+            "description":"Directly edit a node's internal parameter or rack knob live (for any CLAP synth/FX like Starbreath or Surge XT, LV2 plugin, built-in DSP, Master, Arp, Audio In, or MIDI FX). Call list_params(node, query) first to discover parameter ids, names, and min..max ranges. Identify the parameter by param (numeric id) or name (parameter name, main control name, or face knob label from list_params). Pass value in the parameter's plain units (min..max from list_params), OR normalized (0..1 across min..max). On CLAP nodes, target defaults to 'plugin' (internal synth/FX parameters); pass target='knob' or name='LEVEL' for the rack LEVEL knob. Call several set_param calls in one step to shape a patch; undo reverts them.",
+            "parameters":{"type":"object","properties":{
+                "node":{"type":"integer","description":"Target node id (get_graph or context)"},
+                "param":{"type":"integer","description":"Parameter id from list_params"},
+                "name":{"type":"string","description":"Parameter name, main control name, or face knob label from list_params"},
+                "value":{"type":"number","description":"New value in plain units (min..max from list_params)"},
+                "normalized":{"type":"number","description":"New value normalized 0..1 across min..max (alternative to value)"},
+                "target":{"type":"string","enum":["plugin","knob"],"description":"On CLAP nodes: 'plugin' (default, internal plugin parameter) or 'knob' (rack LEVEL knob)"}
+            },"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"list_cc_maps",

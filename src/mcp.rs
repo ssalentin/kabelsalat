@@ -243,11 +243,23 @@ struct DisconnectArgs {
 struct SetParamArgs {
     /// Target node id.
     node: NodeId,
-    /// Engine param id: 0=level (instrument), 1=delay time, 2=delay mix,
-    /// 3=master volume, 4=master warmth/saturation.
-    param: u32,
-    /// New value (plain units, e.g. 0.0..=1.0 for levels/mix).
-    value: f64,
+    /// Parameter id from `list_params` (optional if `name` is given).
+    #[serde(default)]
+    param: Option<u32>,
+    /// Parameter name, main control name, or face knob label from `list_params`
+    /// (optional if `param` is given).
+    #[serde(default, alias = "knob")]
+    name: Option<String>,
+    /// New value in plain units (`min..max` from `list_params`).
+    #[serde(default)]
+    value: Option<f64>,
+    /// New value normalized `0..1` across `min..max` (alternative to `value`).
+    #[serde(default)]
+    normalized: Option<f64>,
+    /// On CLAP nodes: `"plugin"` (default, internal synth/FX parameter) or
+    /// `"knob"` (rack LEVEL knob).
+    #[serde(default)]
+    target: Option<String>,
 }
 
 /// Arguments for `set_rig_source`.
@@ -1770,20 +1782,79 @@ impl McpServer {
         ok_json(json!({"disconnected": args.edge}))
     }
 
-    /// Set an engine parameter.
-    #[tool(name = "set_param", description = "Set a parameter (Command::SetParam). Param ids: 0=instrument level, 1=delay time, 2=delay mix, 3=master volume, 4=master warmth. Values are plain units (levels/mix 0..1).")]
+    /// Directly edit an internal synth/FX parameter or rack knob.
+    #[tool(name = "set_param", description = "Directly edit a node's internal parameter or rack knob live (for CLAP synths/FX like Starbreath or Surge XT, LV2 plugins, built-in DSP, Master, Arp, Audio In, or MIDI FX). Call list_params(node, query) first to discover parameter ids, names, and min..max ranges. Pass param (id) or name (parameter name, main control name, or face knob label), and value (plain units in min..max) or normalized (0..1). On CLAP nodes, target defaults to 'plugin' (internal parameters, requires --attach); pass target='knob' or name='LEVEL' for the rack LEVEL knob.")]
     fn set_param(&self, Parameters(args): Parameters<SetParamArgs>) -> Result<CallToolResult, McpError> {
+        let remote = {
+            let st = self.state.lock().unwrap();
+            matches!(st.backend, Backend::Remote)
+        };
+        if remote {
+            let mut payload = json!({ "node": args.node });
+            if let Some(p) = args.param { payload["param"] = json!(p); }
+            if let Some(n) = args.name { payload["name"] = json!(n); }
+            if let Some(v) = args.value { payload["value"] = json!(v); }
+            if let Some(n) = args.normalized { payload["normalized"] = json!(n); }
+            if let Some(t) = args.target { payload["target"] = json!(t); }
+            return Self::ui_bridge_tool("set_param", payload);
+        }
         let mut st = self.state.lock().unwrap();
-        if let Err(e) = refresh_remote(&mut st) {
-            return tool_err(e);
-        }
-        if st.graph.node(args.node).is_none() {
+        let Some(node_kind) = st.graph.node(args.node).map(|n| n.kind.clone()) else {
             return tool_err(format!("node {} does not exist", args.node));
+        };
+        if args.value.is_none() && args.normalized.is_none() {
+            return tool_err("set_param needs 'value' or 'normalized'");
         }
-        if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: args.param, value: args.value }) {
+        if let Some(v) = args.value {
+            if !v.is_finite() { return tool_err("'value' must be finite"); }
+        }
+        if let Some(n) = args.normalized {
+            if !n.is_finite() { return tool_err("'normalized' must be finite"); }
+        }
+        let is_clap = matches!(node_kind, NodeKind::Clap { .. });
+        let target_is_knob = args.target.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("knob"));
+        let param = if let Some(ref name) = args.name {
+            match Self::resolve_headless_knob(&node_kind, name) {
+                Ok(p) => p,
+                Err(_) if is_clap => {
+                    return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+                }
+                Err(e) => return tool_err(e),
+            }
+        } else if let Some(p) = args.param {
+            if is_clap && !target_is_knob && p != crate::engine::P_LEVEL {
+                return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+            }
+            p
+        } else {
+            return tool_err("set_param needs 'param' or 'name'");
+        };
+        let value = match &node_kind {
+            NodeKind::Lv2 { uri }
+            | NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }
+                if crate::organ::index(param).is_none() =>
+            {
+                if let Some(n) = args.normalized {
+                    n.clamp(0.0, 1.0)
+                } else {
+                    let v = args.value.unwrap();
+                    if let Some(c) = crate::lv2::control_descs_for_uri(uri.as_str())
+                        .into_iter()
+                        .find(|c| c.index as u32 == param)
+                    {
+                        let span = (c.max - c.min) as f64;
+                        if span.abs() > 1e-12 { ((v - c.min as f64) / span).clamp(0.0, 1.0) } else { 0.0 }
+                    } else {
+                        v.clamp(0.0, 1.0)
+                    }
+                }
+            }
+            _ => args.normalized.or(args.value).unwrap(),
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param, value }) {
             return tool_err(e);
         }
-        ok_json(json!({"node": args.node, "param": args.param, "value": args.value}))
+        ok_json(json!({"node": args.node, "param": param, "value": value}))
     }
 
     /// Per-rig input selection.
@@ -2489,7 +2560,7 @@ impl McpServer {
     }
 
     /// List bindable parameter ids and names for a node.
-    #[tool(name = "list_params", description = "List a node's parameters for set_cc_map / learn_cc. main_controls comes first: the few parameters the plugin's designer marked as most important (page, name, id, value, text, and the face knob showing it). Prefer them, and pass a main control's name as knob=<name>. params is the full list (id, name), filtered by query. CLAP plugin params require --attach to the running GUI app.")]
+    #[tool(name = "list_params", description = "List a node's parameters for set_param / set_cc_map / learn_cc. main_controls comes first: the few parameters the plugin's designer marked as most important (page, name, id, value, text, min, max, and the face knob showing it). Prefer them, and pass a main control's name as name=<name> to set_param or knob=<name> to set_cc_map. params is the full internal parameter list (id, name, value, text, min, max, default, stepped), filtered by query. CLAP plugin params require --attach to the running GUI app.")]
     fn list_params(&self, Parameters(args): Parameters<ListParamsArgs>) -> Result<CallToolResult, McpError> {
         let remote = {
             let st = self.state.lock().unwrap();
@@ -4041,6 +4112,28 @@ mod tests {
         let delay = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None })));
         assert_eq!(delay["main_controls"], json!([]));
         assert_eq!(delay["main_controls_source"], Value::Null);
+    }
+
+    #[test]
+    fn headless_set_param_supports_name_id_and_rejects_clap_internal() {
+        let (server, _engine) = local_server();
+        // Set Delay MIX by name.
+        let by_name: SetParamArgs = serde_json::from_value(json!({"node": 2, "name": "MIX", "value": 0.4})).unwrap();
+        let out = tool_json(&server.set_param(Parameters(by_name)));
+        assert_eq!(out["param"], json!(crate::engine::P_MIX), "{out}");
+        assert!((out["value"].as_f64().unwrap() - 0.4).abs() < 1e-6, "{out}");
+        // Set Delay TIME by id with normalized.
+        let by_id: SetParamArgs = serde_json::from_value(json!({"node": 2, "param": crate::engine::P_TIME, "normalized": 0.7})).unwrap();
+        let out = tool_json(&server.set_param(Parameters(by_id)));
+        assert_eq!(out["param"], json!(crate::engine::P_TIME), "{out}");
+        // CLAP internal param headless tells caller to use --attach.
+        let clap_internal: SetParamArgs = serde_json::from_value(json!({"node": 1, "param": 42, "value": 0.5})).unwrap();
+        let err = server.set_param(Parameters(clap_internal)).unwrap();
+        assert_eq!(err.is_error, Some(true), "CLAP internal param rejected headless: {err:?}");
+        // CLAP rack LEVEL knob (param 0 / name LEVEL) still works headless.
+        let clap_level: SetParamArgs = serde_json::from_value(json!({"node": 1, "name": "LEVEL", "value": 0.8})).unwrap();
+        let out = tool_json(&server.set_param(Parameters(clap_level)));
+        assert_eq!(out["param"], json!(crate::engine::P_LEVEL), "{out}");
     }
 
     /// #22: play_file needs the app (the path cannot cross the command bus);

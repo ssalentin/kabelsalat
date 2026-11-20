@@ -581,7 +581,9 @@ fn system_prompt() -> String {
      change one thing, then listen again to compare; stop after 3 rounds.\n\
      - Play: play_note, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
-     hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
+     hardware keyboard), set_device_instrument (which hardware instrument is on a MIDI port, \
+     so its drawbars and switches drive the rack: see list_instrument_profiles; prefer it over \
+     one set_cc_map per control when a profile fits), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
      LOW below the point, port 1 = HIGH at/above; wire each to a rig with connect \
      from_port 0/1 — there is no automatic rig split; low_octave/high_octave shift a zone by \
      octaves. The keys below a split are low already and many bass sounds are pitched down: \
@@ -817,6 +819,16 @@ pub(crate) fn tools() -> Value {
             "name":"set_rig_device",
             "description":"Select which hardware MIDI device feeds a rig (AUM: a different keyboard per rig). node 1=Surge A, 4=Surge B. device is a device index (see get_status / hw list); omit device (null) for any device.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"device":{"type":"integer"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_instrument_profiles",
+            "description":"List the instrument profiles (what every controller of a hardware instrument means, e.g. the Nord Electro 2: drawbars, rotary, percussion, drive) with the rack nodes each would drive and which CC lands on which parameter, and the hardware MIDI devices with the profile each has now (chosen_by: pick = set by hand or by you, port name = recognised from the port's name).",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_device_instrument",
+            "description":"Say which hardware instrument is on a MIDI port: device is the hardware device index (list_instrument_profiles, same index as hw:<index>), profile a profile id or name from list_instrument_profiles, or \"none\" for no profile. The profile's controllers then drive the rack (all drawbars, rotary, percussion and drive of an organ the device plays) without a MIDI learn per knob, and follow the rack as units come and go; \"none\" takes back exactly what the profile bound. The choice is remembered for that device across sessions.",
+            "parameters":{"type":"object","properties":{"device":{"type":"integer"},"profile":{"type":"string"}},"required":["device","profile"]}
         }},
         {"type":"function","function":{
             "name":"get_matrix",

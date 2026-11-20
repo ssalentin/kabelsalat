@@ -1324,6 +1324,15 @@ Learned so far (2026-11-15, UI polish pass):
     `hw_device_index`, which enters an unplugged device as offline, never
     falls back to "every device"
     (`a_saved_session_restores_each_clap_synths_keyboard_hardware_and_device`).
+182. **A check through the master compares channels for silence, never the
+    level of two voices with the level of one:** `rig-mix-test` asked whether
+    two free-running Surge voices peak 10 % above one, after the limiter. One
+    voice alone already sits at the limiter's ceiling (0.222 in every run), so
+    the difference was only the limiter's onset overshoot, which follows the
+    voices' phases: 12 of 40 runs failed (#110), and two saws half a period
+    apart sum to the level of one even before the limiter. Pan the sources
+    apart (A hard left, B hard right) and ask whether a channel is silent:
+    0.000000 against 0.31 in 40 of 40 runs, whatever the phases.
 
 ## Working on kabelsalat
 

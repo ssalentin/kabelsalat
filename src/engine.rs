@@ -1282,7 +1282,7 @@ pub struct GraphEngine {
     #[cfg(test)]
     note_log: Vec<(NodeId, u8, bool)>,
     #[cfg(test)]
-    cc_log: Vec<(NodeId, ParamId, f64)>,
+    pub(crate) cc_log: Vec<(NodeId, ParamId, f64)>,
     #[cfg(test)]
     cc_passthrough_log: Vec<(NodeId, u8, u8)>,
     // Multi-rig state (LoadRigs): rig names/devices + the UI-selected rig.
@@ -8676,25 +8676,42 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
         }
         (pl, pr)
     };
-    let (src_both_l, src_both_r) = shot(&mut bus, &mut engine, &mut buf);
-    anyhow::ensure!(src_both_l > 1e-3 && src_both_r > 1e-3, "two sources produced no output ({src_both_l}, {src_both_r})");
-    // Mute source A → only source B sounds.
+    // Source A hard left, source B hard right: each channel carries one
+    // source, so every check below asks whether a channel is silent. The
+    // answer is the same for any phase the two free-running Surge voices
+    // take against each other, and it is the same before and after the
+    // master limiter. Comparing the level of both sources with the level of
+    // one could not tell them apart: one source alone already sits at the
+    // limiter's ceiling, and two saws half a period apart sum to the level
+    // of one.
+    let silent = |quiet: f32, loud: f32| quiet < loud * 0.01;
+    bus.send(Command::SetStripMix { node: sa, pan: Some(-1.0), mute: None, solo: None });
+    bus.send(Command::SetStripMix { node: sb, pan: Some(1.0), mute: None, solo: None });
+    let (apart_l, apart_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(apart_l > 1e-3 && apart_r > 1e-3, "two sources produced no output ({apart_l}, {apart_r})");
+    // Mute source A → its channel falls silent, source B's stays.
     bus.send(Command::SetStripMix { node: sa, pan: None, mute: Some(true), solo: None });
-    let (b_only_l, _b_only_r) = shot(&mut bus, &mut engine, &mut buf);
-    anyhow::ensure!(b_only_l > 1e-3, "muted source A killed source B too ({b_only_l})");
-    anyhow::ensure!(src_both_l > b_only_l * 1.1, "muting one source changed nothing (both {src_both_l} vs b-only {b_only_l})");
-    // Unmute, then solo source B ≈ the same "B only" picture.
+    let (mute_a_l, mute_a_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(mute_a_r > 1e-3, "muted source A killed source B too (B's channel {mute_a_r})");
+    anyhow::ensure!(silent(mute_a_l, mute_a_r), "muting source A left it sounding (A's channel {mute_a_l}, B's {mute_a_r})");
+    // Unmute, then solo source B: the same "B only" picture.
     bus.send(Command::SetStripMix { node: sa, pan: None, mute: Some(false), solo: None });
     bus.send(Command::SetStripMix { node: sb, pan: None, mute: None, solo: Some(true) });
-    let (solo_b_l, _solo_b_r) = shot(&mut bus, &mut engine, &mut buf);
-    anyhow::ensure!((solo_b_l - b_only_l).abs() < b_only_l * 0.25, "source solo != source mute-other (solo {solo_b_l} vs b-only {b_only_l})");
+    let (solo_b_l, solo_b_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(solo_b_r > 1e-3 && silent(solo_b_l, solo_b_r), "source solo != source mute-other (A's channel {solo_b_l}, B's {solo_b_r})");
     bus.send(Command::SetStripMix { node: sb, pan: None, mute: None, solo: Some(false) });
-    // Pan source A hard left: source B stays on both channels.
+    // Pan, heard on source A alone: centred it is on both channels, hard
+    // left it leaves the right one.
+    bus.send(Command::SetStripMix { node: sb, pan: Some(0.0), mute: Some(true), solo: None });
+    bus.send(Command::SetStripMix { node: sa, pan: Some(0.0), mute: None, solo: None });
+    let (centre_l, centre_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(centre_l > 1e-3 && centre_r > 1e-3, "a centred source is on both channels (L {centre_l}, R {centre_r})");
     bus.send(Command::SetStripMix { node: sa, pan: Some(-1.0), mute: None, solo: None });
     let (pan_src_l, pan_src_r) = shot(&mut bus, &mut engine, &mut buf);
-    anyhow::ensure!(pan_src_r < src_both_r * 0.8, "hard-left pan did not reduce right (both {src_both_r} vs {pan_src_r})");
-    anyhow::ensure!(pan_src_l > 1e-3 && pan_src_r > 1e-3, "source pan killed a channel (L {pan_src_l}, R {pan_src_r})");
+    anyhow::ensure!(pan_src_l > 1e-3 && silent(pan_src_r, pan_src_l), "hard-left pan did not leave the right channel (L {pan_src_l}, R {pan_src_r})");
     bus.send(Command::SetStripMix { node: sa, pan: Some(0.0), mute: None, solo: None });
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: Some(false), solo: None });
+    println!("rig-mix-test: OK — strip mute/solo/pan act on one source (apart L {apart_l:.4} R {apart_r:.4}; A muted L {mute_a_l:.6} R {mute_a_r:.4}; B solo L {solo_b_l:.6} R {solo_b_r:.4}; A hard left L {pan_src_l:.4} R {pan_src_r:.6})");
     // Strip state is published back (rule 33): attach a publication, change
     // one strip, and read the entry the UI mirror adopts.
     let pub_: std::sync::Arc<std::sync::Mutex<GraphPub>> = Default::default();
@@ -8776,7 +8793,7 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
     let insert_bypassed = settled(&mut engine, &mut buf).0;
     anyhow::ensure!(insert_bypassed > insert_quiet * 1.8, "bypassing the master insert did not pass the mix ({insert_bypassed} vs {insert_quiet})");
     println!("strip-mix: OK — source mute/solo/pan only touch their source, bypass passes through, master inserts shape the sum");
-    println!("  source both {src_both_l:.4} → B-only {b_only_l:.4}, solo B {solo_b_l:.4}; gain-0 {silent:.4} → bypass {bypassed:.4}; insert 1.0 {with_insert:.4} → 0.25 {insert_quiet:.4} → bypass {insert_bypassed:.4}");
+    println!("  gain-0 {silent:.4} → bypass {bypassed:.4}; insert 1.0 {with_insert:.4} → 0.25 {insert_quiet:.4} → bypass {insert_bypassed:.4}");
     Ok(())
 }
 

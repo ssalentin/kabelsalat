@@ -116,7 +116,11 @@ agents are in [AGENTS.md](../AGENTS.md).
   `target` is the one table of which rack parameter a role drives. The app
   gives each hardware port a profile (picked in the matrix, or matched by the
   port name) and keeps the matrix CC bindings in line with it
-  (`DemoApp::sync_instrument_maps`).
+  (`DemoApp::sync_instrument_maps`). Agents pick it too
+  (`list_instrument_profiles`, `set_device_instrument`, #56); the app and
+  headless MCP share `instruments::wanted` / `changes` / `listing`, so both
+  bind and report the same. Headless MCP opens no MIDI ports: there a profile
+  is set per device index and lasts for the server.
 - `transport.rs` — song clock, tempo, time signature, count-in, tap tempo.
   The song position stays in quarter notes; `TimeSig` (#87) only decides the
   bar length (`bar_beats`) and the beat the metronome clicks (`beat_len`).

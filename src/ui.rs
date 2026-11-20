@@ -2737,6 +2737,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_master_target", "set_master_target",
     "get_keyboard_state", "set_keyboard_mode",
     "set_time_signature",
+    "list_instrument_profiles", "set_device_instrument",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2754,7 +2755,7 @@ fn tool_is_read_only(name: &str) -> bool {
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks" | "set_buffer_size" | "set_midi_clock")
+    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks" | "set_buffer_size" | "set_midi_clock" | "set_device_instrument")
 }
 
 /// File-player settings carried by play_file/set_player args (AUM
@@ -5702,6 +5703,8 @@ impl DemoApp {
                 None => "Set MIDI input".into(),
             },
             "get_matrix" => "Read MIDI matrix".into(),
+            "list_instrument_profiles" => "List instrument profiles".into(),
+            "set_device_instrument" => "Set instrument profile".into(),
             "set_matrix_cell" => {
                 if args.get("on").and_then(|v| v.as_bool()).unwrap_or(true) {
                     "Enable MIDI route".into()
@@ -7263,6 +7266,8 @@ impl DemoApp {
                     None => format!("rig {node} listens to any hardware device"),
                 }
             }
+            "list_instrument_profiles" => self.instrument_profiles_report().to_string(),
+            "set_device_instrument" => self.set_device_instrument_tool(args, origin, now),
             "get_matrix" => {
                 let sinks: Vec<serde_json::Value> = self.matrix_sinks().iter().map(|&s| {
                     let u = &self.units[s];
@@ -9913,23 +9918,13 @@ impl DemoApp {
 
     /// Every CC binding the devices' profiles ask for: one per device, node
     /// the device plays, and controller.
-    fn wanted_instrument_bindings(&self) -> Vec<(SourceId, u32, crate::instruments::Binding)> {
-        let mut wanted = Vec::new();
+    fn wanted_instrument_bindings(&self) -> Vec<crate::instruments::Bound> {
         let published = self.graph_pub.as_ref().and_then(|p| p.lock().ok());
-        let plays = |src: SourceId, dest: u32| {
-            published.as_ref().map_or(true, |g| g.rules.iter().any(|r| r.source == src && r.dest == dest && !r.cc_only))
-        };
-        for d in 0..self.hw_devices.len() as u32 {
-            let Some(profile) = self.device_profile(d) else { continue };
-            let src = SourceId::Hardware(d);
-            for u in &self.units {
-                let Some(node) = self.base_graph.node(u.node_id) else { continue };
-                let bindings = profile.bindings(&node.kind);
-                if bindings.is_empty() || !plays(src, u.node_id) { continue; }
-                wanted.extend(bindings.into_iter().map(|b| (src, u.node_id, b)));
-            }
-        }
-        wanted
+        let devices = (0..self.hw_devices.len() as u32).filter_map(|d| Some((d, self.device_profile(d)?)));
+        crate::instruments::wanted(devices, &self.base_graph, |src, dest| {
+            self.units.iter().any(|u| u.node_id == dest)
+                && published.as_ref().map_or(true, |g| g.rules.iter().any(|r| r.source == src && r.dest == dest && !r.cc_only))
+        })
     }
 
     /// Bring the matrix in line with the devices' profiles: bind what is
@@ -9941,23 +9936,62 @@ impl DemoApp {
     fn sync_instrument_maps(&mut self) {
         if self.instrument_bound.is_empty() && self.hw_devices.is_empty() { return; }
         let wanted = self.wanted_instrument_bindings();
-        let bound = |app: &Self, src: SourceId, dest: u32, b: &crate::instruments::Binding| {
-            app.rule_edits.get(&(src, dest)).and_then(|e| e.cc_map.iter().find(|m| m.cc == b.cc)).is_some_and(|m| {
+        let changes = crate::instruments::changes(&self.instrument_bound, &wanted, |(src, dest, b)| {
+            self.rule_edits.get(&(*src, *dest)).and_then(|e| e.cc_map.iter().find(|m| m.cc == b.cc)).is_some_and(|m| {
                 (m.param, m.target, m.scale) == (b.param, b.target, b.scale)
             })
-        };
-        let stale: Vec<_> = self.instrument_bound.iter().filter(|x| !wanted.contains(x)).copied().collect();
-        for (src, dest, b) in stale {
-            if bound(self, src, dest, &b) {
-                self.set_cc_scaled(src, dest, b.cc, None, b.target, b.scale);
-            }
-        }
-        for &(src, dest, b) in &wanted {
-            if !bound(self, src, dest, &b) {
-                self.set_cc_scaled(src, dest, b.cc, Some(b.param), b.target, b.scale);
-            }
+        });
+        for ((src, dest, b), on) in changes {
+            self.set_cc_scaled(src, dest, b.cc, on.then_some(b.param), b.target, b.scale);
         }
         self.instrument_bound = wanted;
+    }
+
+    /// `list_instrument_profiles`: the profiles with what each would drive
+    /// on this rack, and the hardware devices with the profile each has.
+    fn instrument_profiles_report(&self) -> serde_json::Value {
+        let devices: Vec<serde_json::Value> = (0..self.hw_devices.len() as u32).map(|d| {
+            let raw = &self.hw_devices[d as usize];
+            let profile = self.device_profile(d);
+            let mut v = crate::instruments::device_report(d, midi_port_key(raw), profile, &self.instrument_bound, &self.base_graph);
+            v["live"] = serde_json::json!(self.hw_live.get(d as usize).copied().unwrap_or(true));
+            v["chosen_by"] = match (profile.is_some(), self.device_instruments.contains_key(midi_port_key(raw))) {
+                (_, true) => "pick".into(),
+                (true, false) => "port name".into(),
+                (false, false) => serde_json::Value::Null,
+            };
+            v
+        }).collect();
+        serde_json::json!({
+            "profiles": crate::instruments::listing(&self.instrument_profiles, &self.base_graph),
+            "devices": devices,
+            "more_profiles": "MIDI Guide CSV files in ~/.config/kabelsalat/instruments/ (read at start)",
+        })
+    }
+
+    /// `set_device_instrument`: what the matrix's profile picker does.
+    fn set_device_instrument_tool(&mut self, args: &serde_json::Value, origin: AgentOrigin, now: f32) -> String {
+        let Some(d) = args.get("device").and_then(|v| v.as_u64()).map(|d| d as u32) else {
+            return "set_device_instrument: device (a hardware device index from list_instrument_profiles) is required".into();
+        };
+        let Some(raw) = self.hw_devices.get(d as usize).cloned() else {
+            return format!("set_device_instrument: no hardware MIDI device {d} ({} known) — see list_instrument_profiles", self.hw_devices.len());
+        };
+        let query = args.get("profile").and_then(|v| v.as_str()).unwrap_or("");
+        let id = match crate::instruments::find(&self.instrument_profiles, query) {
+            Ok(p) => p.map(|p| p.id.clone()).unwrap_or_default(),
+            Err(e) => return format!("set_device_instrument: {e}"),
+        };
+        self.pick_device_profile(d, &id);
+        self.sync_instrument_maps();
+        let mut touched: Vec<u32> = self.instrument_bound.iter().filter(|(s, _, _)| *s == SourceId::Hardware(d)).map(|(_, n, _)| *n).collect();
+        touched.dedup();
+        for &node in &touched {
+            self.agent_activity.touch_cell(SourceId::Hardware(d), node, now);
+        }
+        let title = self.device_profile(d).map_or("No profile".to_string(), |p| p.title());
+        self.agent_activity.record(origin, format!("{title} → {}", midi_port_name(&raw).device), touched, now);
+        crate::instruments::device_report(d, midi_port_key(&raw), self.device_profile(d), &self.instrument_bound, &self.base_graph).to_string()
     }
 
     fn set_cc_binding(&mut self, source: SourceId, dest: u32, cc: u8, param: Option<u32>, target: crate::matrix::CcTarget) {
@@ -30761,6 +30795,113 @@ mod ui_polish_agent_tests {
         super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
         let cc_map: Vec<(u8, u32)> = app.rule_edits.get(&(nord, organ)).map_or(vec![], |e| e.cc_map.iter().map(|m| (m.cc, m.param)).collect());
         assert_eq!(cc_map, vec![(111, crate::organ::P_REVERB)], "the profile's bindings are gone, the hand-made one stays");
+    }
+
+    /// #56: an agent lists the profiles and picks one per port, and that is
+    /// the matrix picker's own state: the same profile shows there, the same
+    /// bindings go to the engine and into the saved session, the instrument's
+    /// raw controllers move the organ face, and "none" takes them back.
+    #[test]
+    fn an_agent_picks_a_devices_instrument_profile_like_the_matrix_picker() {
+        for t in ["list_instrument_profiles", "set_device_instrument"] {
+            assert!(crate::assistant::tools().as_array().unwrap().iter().any(|x| x["function"]["name"] == t), "{t} missing in assistant::tools()");
+            assert!(UI_BRIDGE_TOOLS.contains(&t), "{t} is not served to attached agents");
+        }
+        assert!(tool_is_read_only("list_instrument_profiles"));
+        assert!(!tool_is_read_only("set_device_instrument") && tool_changes_only_system("set_device_instrument"),
+            "a port's instrument is the machine's setup (config.json), not an undo step of the patch");
+
+        let rigs = vec![instrument_rig("Organ", &[(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, "ORGAN")])];
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        *app.hw_midi.devices.lock().unwrap() = vec![
+            ("U6MIDI Pro:U6MIDI Pro MIDI 1 32:0".into(), true),
+            ("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0".into(), true),
+        ];
+        app.hw_midi.rev.fetch_add(1, Ordering::Release);
+        let organ = node_named(&app, 0, "ORGAN");
+        let nord = SourceId::Hardware(1);
+        let size = Vec2::new(1600.0, 1000.0);
+        super::face_layout_tests::frame_at(&mut app, &ctx, size);
+        while drain.pop().is_some() {}
+        let json = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap_or_else(|e| panic!("{e}: {s}"));
+
+        // The list: the profile, what it would drive here, and the ports.
+        let list = json(app.exec_tool("list_instrument_profiles", &serde_json::json!({})));
+        let electro = list["profiles"].as_array().unwrap().iter().find(|p| p["id"] == "nord-electro-2").expect("the built-in profile");
+        assert_eq!((&electro["name"], &electro["controllers"]), (&serde_json::json!("Nord Electro 2"), &serde_json::json!(59)));
+        let drives = electro["drives"].as_array().unwrap();
+        assert_eq!((drives.len(), &drives[0]["node"], &drives[0]["name"]), (1, &serde_json::json!(organ), &serde_json::json!("ORGAN")), "{electro}");
+        let controls = drives[0]["controls"].as_array().unwrap();
+        assert_eq!(controls.len(), 12);
+        assert!(controls.iter().any(|c| c["cc"] == 18 && c["control"] == "8' upper drawbar" && c["param"] == crate::organ::drawbar_param(2)), "{controls:?}");
+        let devices = list["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!((&devices[1]["device"], &devices[1]["source"], &devices[1]["profile"]), (&serde_json::json!(1), &serde_json::json!("hw:1"), &serde_json::Value::Null), "{devices:?}");
+        assert!(devices[1]["name"].as_str().unwrap().contains("ESI MIDIMATE eX"), "{devices:?}");
+
+        // Refusals change nothing and say what would work.
+        let bad = app.exec_tool("set_device_instrument", &serde_json::json!({"device": 1, "profile": "nord-stage"}));
+        assert!(bad.contains("no instrument profile 'nord-stage'") && bad.contains("nord-electro-2"), "{bad}");
+        let bad = app.exec_tool("set_device_instrument", &serde_json::json!({"device": 7, "profile": "nord-electro-2"}));
+        assert!(bad.contains("no hardware MIDI device 7"), "{bad}");
+        assert!(app.device_profile(1).is_none() && app.rule_edits.is_empty());
+
+        // Picked by its name, as a user would say it.
+        let set = json(app.exec_tool("set_device_instrument", &serde_json::json!({"device": 1, "profile": "Nord Electro 2"})));
+        assert_eq!(set["profile"], "nord-electro-2", "{set}");
+        assert_eq!(set["drives"], serde_json::json!([{"node": organ, "name": "ORGAN", "controls": 12}]), "{set}");
+        assert_eq!(app.device_profile(1).map(|p| p.title()).as_deref(), Some("Nord Electro 2"), "the matrix picker shows the agent's pick");
+        assert!(app.device_profile(0).is_none(), "the other port has none");
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        let mut bound: Vec<u8> = sent.iter().filter_map(|c| match c {
+            Command::MatrixCcMap { source, dest, cc, param: Some(_), target: crate::matrix::CcTarget::Knob, .. }
+                if *source == nord && *dest == organ => Some(*cc),
+            _ => None,
+        }).collect();
+        bound.sort();
+        assert_eq!(bound, [16, 17, 18, 19, 20, 21, 22, 23, 24, 82, 87, 111], "the engine got the bindings in the tool call itself");
+        super::face_layout_tests::frame_at(&mut app, &ctx, size);
+        let mut resent = 0;
+        drain.drain(|c| if matches!(c, Command::MatrixCcMap { .. }) { resent += 1; });
+        assert_eq!(resent, 0, "the next frame has nothing left to bind");
+
+        // What the UI and the other tools show.
+        let list = json(app.exec_tool("list_instrument_profiles", &serde_json::json!({})));
+        assert_eq!((&list["devices"][1]["profile"], &list["devices"][1]["chosen_by"]), (&serde_json::json!("nord-electro-2"), &serde_json::json!("pick")), "{list}");
+        assert_eq!(list["devices"][1]["drives"][0]["controls"], 12);
+        let maps = app.exec_tool("list_cc_maps", &serde_json::json!({"node": organ, "source": "hw:1"}));
+        assert!(maps.contains("\"cc\":18"), "list_cc_maps shows the profile's bindings: {maps}");
+
+        // The session saves them.
+        let saved = app.capture_session("nord").unwrap();
+        let rules = saved.matrix().expect("the session holds the matrix").as_array().unwrap().clone();
+        let rule = rules.iter().find(|r| r["dest"] == organ && r["source"] == serde_json::json!({"Hardware": 1})).unwrap_or_else(|| panic!("{rules:?}"));
+        assert_eq!(rule["cc_map"].as_array().unwrap().len(), 12, "{rule}");
+
+        // Raw controllers from that port: 8' drawbar to 6, rotary fast.
+        let u = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        let knob = |app: &DemoApp, param| app.units[u].knobs.iter().find(|k| k.param == Some(param)).unwrap().display_value;
+        for (cc, v) in [(18u8, 86u8), (82, 127)] {
+            app.hw_cc_queue.lock().unwrap().push_back((nord, 0, cc, v));
+        }
+        super::face_layout_tests::frame_at(&mut app, &ctx, size);
+        assert_eq!(crate::organ::drawbar_position(knob(&app, crate::organ::drawbar_param(2))), 6);
+        assert_eq!(crate::organ::step_name(crate::organ::P_LESLIE, knob(&app, crate::organ::P_LESLIE)), Some("FAST"));
+
+        // "none" takes back what the profile bound, at once and for good.
+        while drain.pop().is_some() {}
+        let off = json(app.exec_tool("set_device_instrument", &serde_json::json!({"device": 1, "profile": "none"})));
+        assert_eq!((&off["profile"], &off["drives"]), (&serde_json::Value::Null, &serde_json::json!([])), "{off}");
+        let mut unbound = 0;
+        drain.drain(|c| if matches!(c, Command::MatrixCcMap { param: None, .. }) { unbound += 1; });
+        assert_eq!(unbound, 12);
+        super::face_layout_tests::frame_at(&mut app, &ctx, size);
+        assert!(app.device_profile(1).is_none() && app.rule_edits.is_empty(), "{:?}", app.rule_edits.keys());
     }
 
     /// setBfree's face: drawbars and four CC knobs, all ordinary knob

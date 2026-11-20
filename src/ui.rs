@@ -3290,6 +3290,10 @@ struct DemoApp {
     sessions_dir_override: Option<std::path::PathBuf>,
     /// Last adopted `GraphPub::mix_rev` (engine mixer publication).
     last_mix_rev: u64,
+    /// How late each strip sounds, in frames, as the engine published it
+    /// (`GraphPub::latency`, #76); strips on time have no entry.
+    strip_latency: Vec<(u32, u32)>,
+    last_latency_rev: u64,
     /// Last adopted `GraphPub::meter_rev` (engine master-meter publication,
     /// Bravo 1) — updated every block by `sync_from_engine`.
     last_meter_rev: u64,
@@ -3778,6 +3782,8 @@ impl DemoApp {
             settings_btn_rect: Rect::NOTHING,
             sessions_dir_override: None,
             last_mix_rev: 0,
+            strip_latency: Vec::new(),
+            last_latency_rev: 0,
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
             master_target: crate::meter::MasterTarget::OFF,
@@ -4974,6 +4980,10 @@ impl DemoApp {
         let now = self.ui_time;
         // Mixer mirror: adopt remote (MCP/CLI/agent) SetRigMix changes —
         // the Mixer showed stale vol/pan after a bridge edit (rule 25 class).
+        if g.latency_rev != self.last_latency_rev {
+            self.last_latency_rev = g.latency_rev;
+            self.strip_latency.clone_from(&g.latency);
+        }
         let mut mix_diff_rigs: Vec<usize> = Vec::new();
         if g.mix_rev != self.last_mix_rev {
             self.last_mix_rev = g.mix_rev;
@@ -9471,6 +9481,21 @@ impl DemoApp {
 
     /// A fader's dB readout with its MIDI tag behind it (one label of two
     /// colours, rule 100).
+    /// How late a strip sounds (#76): what its plugins report plus what
+    /// delay compensation adds. The row is there for every strip as soon as
+    /// one strip is late, so the controls below stay on one line across the
+    /// mixer; with every strip on time it takes no room at all.
+    fn strip_latency_ui(&self, ui: &mut egui::Ui, node: Option<u32>) {
+        if self.strip_latency.is_empty() {
+            return;
+        }
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), STRIP_LATENCY_H), egui::Sense::hover());
+        let Some(frames) = node.and_then(|n| self.strip_latency.iter().find(|l| l.0 == n)).map(|l| l.1) else { return };
+        let sr = if self.sample_rate > 0.0 { self.sample_rate } else { 48000.0 };
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, latency_text(frames, sr), egui::FontId::monospace(9.5), theme::CREAM_DIM);
+        resp.on_hover_text(format!("this strip sounds {frames} frames late: the latency its plugins report, and what keeps parallel paths in phase"));
+    }
+
     fn fader_readout_ui(&self, ui: &mut egui::Ui, gain: f32, size: f32, dest: Option<CcDest>) -> egui::Response {
         let font = egui::FontId::monospace(size);
         let mut job = egui::text::LayoutJob::default();
@@ -17286,6 +17311,9 @@ impl DemoApp {
                     let Some(idx) = slots.iter().find(|(_, n)| *n == node).and_then(|(slot, _)| self.clap_pool_idx(*slot)) else { continue };
                     let voice = self.clap_voice_ids.get(idx).copied();
                     let Some(main) = self._surge_main.get_mut(idx) else { continue };
+                    if poll {
+                        main.poll_latency();
+                    }
                     let renamed = poll && main.poll_main_controls();
                     let u = &mut self.units[ui];
                     if renamed || u.main_from != voice {
@@ -19542,7 +19570,9 @@ impl DemoApp {
                     .max(buses.iter().map(|&u| self.strip_chain(u).map_or(0, |c| c.len())).max().unwrap_or(0));
                 // Send rows (issue #5): a heading and one row per bus.
                 let sends_h = if buses.is_empty() { 0.0 } else { 18.0 + (SLOT_H + 3.0) * buses.len() as f32 };
-                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32 + sends_h;
+                // The latency row (#76) brings its own height (rule 167).
+                let latency_h = if self.strip_latency.is_empty() { 0.0 } else { STRIP_LATENCY_H + 3.0 };
+                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32 + sends_h + latency_h;
                 let fader_h = (view_h - overhead).clamp(64.0, 480.0);
                 let h = view_h.max(fader_h + overhead);
                 ui.horizontal_top(|ui| {
@@ -19959,6 +19989,7 @@ impl DemoApp {
                 // Readout + pan + M/S (#73).
                 self.fader_readout_ui(ui, readout, 10.5, fader_dest)
                     .on_hover_text("this source's level · double-click the fader: 0 dB");
+                self.strip_latency_ui(ui, Some(node));
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.add_space(((w - 92.0) * 0.5).max(4.0));
@@ -20041,6 +20072,7 @@ impl DemoApp {
             self.mixer_fader_rects.push(fr);
             self.fader_readout_ui(ui, vol, 10.5, vol_dest)
                 .on_hover_text("this rig's level · double-click the fader: 0 dB");
+            self.strip_latency_ui(ui, self.rig_bus_node(rig));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(((STRIP_W - 92.0) * 0.5).max(4.0));
@@ -23068,6 +23100,15 @@ fn paint_knob_dial(
 /// Grid rects of one mixer slot row: (quick-knob box at the right edge,
 /// plate left of it), inside `SLOT_PAD_L` from the spine and `SLOT_PAD_R`
 /// from the strip's right edge.
+/// Height of a mixer strip's latency row.
+const STRIP_LATENCY_H: f32 = 13.0;
+
+/// A latency as a strip shows it: "5.0 ms", "170 ms".
+fn latency_text(frames: u32, sample_rate: f64) -> String {
+    let ms = frames as f64 * 1000.0 / sample_rate;
+    if ms < 99.95 { format!("{ms:.1} ms") } else { format!("{ms:.0} ms") }
+}
+
 fn strip_slot_rects(sr: Rect) -> (Rect, Rect) {
     let left = sr.left() + STRIP_SPINE_W + SLOT_PAD_L;
     let right = sr.right() - SLOT_PAD_R;
@@ -29693,6 +29734,33 @@ mod ui_polish_agent_tests {
         ToolCall { name: name.into(), args }
     }
 
+    /// The engine says how late a strip sounds and the mixer shows it (#76,
+    /// rule 33): a Limiter in a source's chain makes that strip 5 ms late.
+    #[test]
+    fn a_strip_with_a_latent_insert_shows_its_latency_in_the_mixer() {
+        let mut live = Live::new();
+        live.app.apply_session(&crate::session::Session::new("One rig", crate::control::standard_rig_graph(true))).unwrap();
+        live.app.stage_view = StageView::Mixer;
+        for _ in 0..8 { live.frame(); }
+        let late = |texts: &[(String, Rect)]| texts.iter().filter(|(t, _)| t == "5.0 ms").map(|(_, r)| *r).collect::<Vec<_>>();
+        let texts = run_frame(&mut live.app, &live.ctx, WINDOW, vec![]);
+        assert!(late(&texts).is_empty() && live.app.strip_latency.is_empty(), "every strip is on time: no latency row");
+        let fader_before = live.app.mixer_fader_rects[0].height();
+        let unit = live.app.rig_strip_sources(0)[0];
+        let (node, name) = (live.app.units[unit].node_id, live.app.units[unit].name.clone());
+        live.app.strip_insert_edit(node, StripInsertEdit::Add { kind: NodeKind::Dsp(DspKind::Limiter), name: "LIMITER".into() }).unwrap();
+        for _ in 0..20 { live.frame(); }
+        let node = live.app.units.iter().find(|u| u.name == name).expect("the source is still there").node_id;
+        assert_eq!(live.app.strip_latency.iter().find(|l| l.0 == node).map(|l| l.1), Some(240), "the engine's latency for the strip: {:?}", live.app.strip_latency);
+        let texts = run_frame(&mut live.app, &live.ctx, WINDOW, vec![]);
+        let strip = live.app.mixer_strip_rects.iter().find(|(_, n, _)| *n == node).expect("its strip").2;
+        let shown = late(&texts);
+        assert!(shown.iter().any(|r| strip.contains_rect(*r)), "the strip shows 5.0 ms inside itself: {shown:?} in {strip:?}");
+        assert_eq!(shown.len(), 2, "the source's strip and its rig bus, nobody else: {shown:?}");
+        // The row brought its own height (rule 167): the fader gave it up.
+        assert!(live.app.mixer_fader_rects[0].height() <= fader_before);
+    }
+
     /// An app whose assistant worker is the test, on a real (voiceless)
     /// engine: each frame renders one engine block.
     struct Live {
@@ -33817,6 +33885,34 @@ mod mixer_parity_tests {
         }
     }
 
+    /// The mixer with late strips (#76) as PNGs, before (every strip on
+    /// time) and after:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat mixer_latency_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn mixer_latency_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, late) in [("before", false), ("after", true)] {
+            for (w, h) in [(1600.0, 1000.0), (781.0, 950.0)] {
+                // A fresh app per image (rule 148).
+                let mut app = DemoApp::new_with_sink(None);
+                app.load_multi_rig_demo();
+                app.stage_view = StageView::Mixer;
+                if late {
+                    let sources = app.rig_strip_sources(0);
+                    let master = app.rig_bus_node(0).unwrap();
+                    app.strip_latency = vec![(app.units[sources[0]].node_id, 240), (master, 240)];
+                    if let Some(&second) = app.rig_strip_sources(1).first() {
+                        app.strip_latency.push((app.units[second].node_id, 8192));
+                        app.strip_latency.push((app.rig_bus_node(1).unwrap(), 8192));
+                    }
+                }
+                super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("mixer-latency-{name}-{w}x{h}.png")));
+            }
+        }
+    }
+
     /// A pedal (CC 11) on Master WARM with its knob menu open, at the full
     /// range and held to 10..60 %, as PNGs:
     /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat knob_range_shots -- --ignored`
@@ -35649,7 +35745,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 22] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 23] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("two rigs", &|a| a.load_multi_rig_demo()),
@@ -35660,6 +35756,11 @@ mod window_size_layout_tests {
                 a.master_target = crate::meter::MasterTarget { lufs: Some(-14.0), gain_db: 7.4, before_lufs: Some(-21.4), guard_db: -0.6, last_point: None, limited: false };
                 a.master_meter.integrated_lufs = -14.2;
                 a.master_meter.true_peak_max_db = -1.1;
+            }),
+            ("two-rig mixer with late strips", &|a| {
+                a.load_multi_rig_demo();
+                a.stage_view = StageView::Mixer;
+                a.strip_latency = a.units.iter().enumerate().map(|(i, u)| (u.node_id, [240, 16384, 37][i % 3])).collect();
             }),
             ("matrix", &|a| a.stage_view = StageView::Matrix),
             ("matrix with clock ports", &|a| {

@@ -1022,7 +1022,7 @@ impl Processor for Reverb {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const SR: f64 = 48000.0;
@@ -1551,7 +1551,7 @@ mod tests {
     // other threads cannot pollute the count; const-initialized so the counter
     // itself never allocates.
 
-    mod rt_alloc {
+    pub(crate) mod rt_alloc {
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
 

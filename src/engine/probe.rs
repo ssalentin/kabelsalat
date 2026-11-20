@@ -75,6 +75,25 @@ impl Probe {
         Self { engine, bus, side, feeds: Vec::new(), block: crate::bridge::BUFFER_FRAMES as usize }
     }
 
+    /// An engine that hosts `graph`'s LV2 units the way the app does (rule
+    /// 144): an empty engine with the loader thread, the graph as a load,
+    /// and blocks until every instance is attached.
+    pub fn hosting(graph: Graph) -> Self {
+        let want = graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Lv2 { .. })).count();
+        let mut probe = Self::new(Graph::default());
+        probe.engine.spawn_lv2_loader();
+        probe.send(Command::LoadGraph { graph });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            probe.settle(1);
+            if probe.engine.lv2.len() == want {
+                return probe;
+            }
+            assert!(std::time::Instant::now() < deadline, "probe: {} of {want} LV2 units attached", probe.engine.lv2.len());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     /// Feed `signal` (mono, to both channels) into the Audio In `node`.
     pub fn feed(&mut self, name: &'static str, node: NodeId, signal: impl Iterator<Item = f32> + 'static) {
         let (ring, rx) = rtrb::RingBuffer::new(self.block * 2 * 4);
@@ -122,6 +141,19 @@ impl Probe {
     }
 
     /// Render and discard (feeds keep running).
+    /// Feed and render one block into `out` and keep nothing: what the
+    /// audio thread does, so a test can count its allocations.
+    pub fn block(&mut self, out: &mut [f32]) {
+        for f in &mut self.feeds {
+            for _ in 0..out.len() / 2 {
+                let s = f.signal.next().unwrap_or(0.0);
+                let _ = f.ring.push(s);
+                let _ = f.ring.push(s);
+            }
+        }
+        self.engine.render(out, 2);
+    }
+
     pub fn settle(&mut self, blocks: usize) {
         self.run(blocks, &[]);
     }
@@ -312,12 +344,18 @@ impl TwoRigs {
 /// → Pan hard right → Master: the master's L is the dry path, its R the
 /// latent one. Returns the probe and the chain's units.
 pub fn split_paths(chain: &[DspKind]) -> (Probe, Vec<NodeId>) {
+    let kinds: Vec<NodeKind> = chain.iter().map(|k| NodeKind::Dsp(k.clone())).collect();
+    split_paths_of(&kinds)
+}
+
+/// `split_paths` with any units; LV2 ones are hosted as the app hosts them.
+pub fn split_paths_of(chain: &[NodeKind]) -> (Probe, Vec<NodeId>) {
     let mut g = Graph::default();
     let ain = audio_in(&mut g, "IN");
     let left = g.add_node(NodeKind::Dsp(DspKind::Pan), name_bytes("PAN L"));
     let right = g.add_node(NodeKind::Dsp(DspKind::Pan), name_bytes("PAN R"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
-    let units: Vec<NodeId> = chain.iter().map(|k| g.add_node(NodeKind::Dsp(k.clone()), name_bytes("UNIT"))).collect();
+    let units: Vec<NodeId> = chain.iter().map(|k| g.add_node(k.clone(), name_bytes("UNIT"))).collect();
     wire(&mut g, 1, ain, left, 0);
     wire(&mut g, 2, left, master, 0);
     wire(&mut g, 3, left, master, 1);
@@ -329,7 +367,8 @@ pub fn split_paths(chain: &[DspKind]) -> (Probe, Vec<NodeId>) {
     wire(&mut g, 4, prev, right, 0);
     wire(&mut g, 5, right, master, 0);
     wire(&mut g, 6, right, master, 1);
-    let mut probe = Probe::new(g);
+    let hosted = chain.iter().any(|k| matches!(k, NodeKind::Lv2 { .. }));
+    let mut probe = if hosted { Probe::hosting(g) } else { Probe::new(g) };
     probe.send(Command::SetParam { node: left, param: 0, value: 0.0 });
     probe.send(Command::SetParam { node: right, param: 0, value: 1.0 });
     probe.feed("noise", ain, analysis::white(5).map(|x| x * 0.2));

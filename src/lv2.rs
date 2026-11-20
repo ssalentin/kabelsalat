@@ -330,6 +330,10 @@ extern "C" {
         max: *mut *mut LilvNode,
     );
     fn lilv_instance_free(instance: *mut LilvInstance);
+    fn lilv_plugin_has_latency(plugin: *const LilvPlugin) -> bool;
+    fn lilv_plugin_get_latency_port_index(plugin: *const LilvPlugin) -> u32;
+    fn lilv_new_file_uri(world: *mut LilvWorld, host: *const c_char, path: *const c_char) -> *mut LilvNode;
+    fn lilv_world_load_bundle(world: *mut LilvWorld, bundle_uri: *const LilvNode);
 }
 
 /// One MIDI event a MIDI-FX plugin wrote to its output port.
@@ -1232,6 +1236,27 @@ pub struct Lv2Plugin {
     block: usize,
     uri: String,
     sample_rate: f64,
+    /// The control output the plugin writes its latency to
+    /// (`lv2:reportsLatency`), when it has one.
+    latency_port: Option<usize>,
+}
+
+/// Bundles `Lv2Plugin::load` reads beside the LV2 search path.
+static EXTRA_BUNDLES: std::sync::Mutex<Vec<std::ffi::CString>> = std::sync::Mutex::new(Vec::new());
+
+/// Let `Lv2Plugin::load` find the plugins of the bundle folder `dir`,
+/// wherever it lies (rule 116: a test loads its own bundle by path, and
+/// `LV2_PATH` is the whole process's).
+pub fn add_bundle(dir: &std::path::Path) {
+    let mut path = dir.to_string_lossy().into_owned();
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    let Ok(path) = std::ffi::CString::new(path) else { return };
+    let mut extra = EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
+    if !extra.contains(&path) {
+        extra.push(path);
+    }
 }
 
 /// Plugins whose instances must never be freed (#14): Vitalium's own
@@ -1284,9 +1309,16 @@ impl Lv2Plugin {
             let world = lilv_world_new();
             anyhow::ensure!(!world.is_null(), "lilv_world_new failed");
             lilv_world_load_all(world);
+            for dir in EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                let bundle = lilv_new_file_uri(world, std::ptr::null(), dir.as_ptr());
+                lilv_world_load_bundle(world, bundle);
+                lilv_node_free(bundle);
+            }
             let plugin = find_plugin(world, needle);
             anyhow::ensure!(!plugin.is_null(), "LV2 plugin not found: {needle}");
             let uri = node_borrowed(lilv_plugin_get_uri(plugin));
+            // A control output like any other: it is connected below.
+            let latency_port = lilv_plugin_has_latency(plugin).then(|| lilv_plugin_get_latency_port_index(plugin) as usize);
 
             let mut urid = Box::new(UridMap { map: std::collections::HashMap::new(), next: 1 });
             let handle = &mut *urid as *mut UridMap as *mut c_void;
@@ -1426,7 +1458,7 @@ impl Lv2Plugin {
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), is_midi_fx, _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), is_midi_fx, _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate, latency_port })
         }
     }
 
@@ -1467,6 +1499,19 @@ impl Lv2Plugin {
 
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Whether the plugin reports a latency (`lv2:reportsLatency`), which
+    /// may then change with any block.
+    pub fn reports_latency(&self) -> bool {
+        self.latency_port.is_some()
+    }
+
+    /// The latency the plugin wrote in its last `run`, in frames; 0 before
+    /// the first one and for a plugin that reports none. Allocation-free.
+    pub fn latency_frames(&self) -> u32 {
+        let reported = self.latency_port.and_then(|i| self.buffers.get(i)).map_or(0.0, |b| b[0]);
+        if reported.is_finite() && reported > 0.0 { reported.round() as u32 } else { 0 }
     }
 
     /// Number of control-input ports (knobs).

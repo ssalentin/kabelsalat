@@ -334,7 +334,7 @@ agents are in [AGENTS.md](../AGENTS.md).
   allocated in the constructor. A send level is a learnable mixer control
   (`MixControl::Send(slot)`, the slot being the bus's place among the
   patch's buses), bound on the strip it leaves from. Not in it: a bus output other than the master
-  (#31) and delay compensation for latent plugins on a bus (#76). Check with
+  (#31). Check with
   `kabelsalat send-test` (two Surge rigs into one reverb bus).
 - **2026-11-15** — **No squished racks** (user): the assistant panel only takes
   the height the rack can spare; big patches keep readable units and pan
@@ -577,34 +577,69 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 
 ### Delay compensation and the analysis harness
 
-**Delay compensation** (`engine/pdc.rs`). A unit with a lookahead (the
-Limiter: 240 frames at 48 kHz) delays its path; where that path meets a
-parallel one, the two would be 5 ms apart (a hollow, comb-filtered sum).
-`compensation(graph, latency_of)` is a pure plan: a node's output latency is
-its own plus the largest of its audio inputs', and at every summing point
-(an effect's input, `sum_audio_into`; a rig's master, render step 3) each
-input waits the difference to the largest, as a `(source, destination,
-frames)` delay. The plan follows the engine's effect order (`next_effect`),
-so the cable that closes a feedback loop (it carries the previous block)
-neither counts nor gets a delay, and the plan ends. Sends are not cables, so
-the plan takes them beside the graph. A return has to line up with the dry
-sound of whoever sent into the bus, not with the master its cable ends at: a
-whole-rig send taps the rig's aligned sum and needs nothing; a send of one
-source waits on its way into the bus for the latent units of its rig
-(`(source, bus, frames)`, applied in `BusTaps::tap`); a latent unit in a
-bus's own chain makes the senders' rigs wait after their sends are tapped
-(`(master, master, frames)`, `Pdc::rig_out`). Without a latent unit in a
-bus's chain, rig sends change nothing and rigs never wait for each other. A
-send that starts or stops sounding replans. Master
-inserts, the file player, system audio and the Audio In monitor are serial
-or outside the graph and are not part of it. `Pdc` owns one ring per planned delay; it
-replans in `publish_graph` (every structural edit ends there), keeps the
-rings whose delay is unchanged and allocates only for new ones, never per
-block. With no latent unit the plan is empty and every sum is the plain sum
-(`engine-bench` hashes the same). A bypassed latent unit keeps its delay (its
-input runs through a ring of its latency), so a bypass toggle moves nothing
-in time. `latency_of` reads the built-in processors only: LV2
-`lv2:reportsLatency` and the CLAP latency extension slot in there.
+**Delay compensation** (`engine/pdc.rs`, issues #13 and #76). A latent unit
+(the Limiter's lookahead: 240 frames at 48 kHz; a hosted plugin's reported
+latency) delays its path; where that path meets a parallel one, the two
+would be that far apart (a hollow, comb-filtered sum).
+
+*Where latency comes from* (`GraphEngine::replan_delays`): a built-in
+processor's `latency_frames`; an LV2 plugin's `lv2:reportsLatency` port,
+which it writes in every `run` (`Lv2Plugin::latency_frames`, read after each
+block into `Lv2Slot::latency`); a CLAP voice's `latency` extension, read on
+the main thread when the voice is activated and refreshed whenever the plugin
+calls `host_latency.changed()` (`ClapVoice::latency` via a shared atomic). One
+unit counts for at most `pdc::MAX_FRAMES` (16384).
+
+*The plan* (`Planner::plan`, a pure function of graph, sends and latencies):
+every node knows how late each source's sound is at its output (`arr`, a
+table of node × source; a source is a node nothing is cabled into, a bus for
+its return). At every summing point (an effect's input, `sum_audio_into`; a
+rig's master, render step 3) the inputs that share a source form a set, and
+each set is shifted until its sources line up, as `(source, destination,
+frames)` delays. Inputs that share no source are left alone: a latent effect
+on one instrument never delays another (the played note path gains nothing
+it does not need), an instrument's own latency moves nothing, and a latent
+unit nothing is cabled into delays nobody. One number per node cannot say
+this (two sources through one shared unit, one of them latent before it).
+The plan follows the engine's effect order (`next_effect`), so the cable
+that closes a feedback loop (it carries the previous block) neither counts
+nor gets a delay, and the plan ends. Sends are not cables, so the plan takes
+them beside the graph. A return has to line up with the dry sound of whoever
+sent into the bus, not with the master its cable ends at: a whole-rig send
+taps the rig's aligned sum and needs nothing; a send of one source waits on
+its way into the bus as long as its dry sound takes from the tap to the
+rig's sum (`(source, bus, frames)`, applied in `BusTaps::tap`); a latent
+unit in a bus's own chain makes the senders' rigs wait after their sends are
+tapped (`(master, master, frames)`, `Pdc::rig_out`). Without a latent unit
+in a bus's chain, rig sends change nothing and rigs never wait for each
+other. Master inserts, the file player, system audio and the Audio In
+monitor are serial or outside the graph and are not part of it.
+
+*When it replans.* On every structural edit (`publish_graph`), which may
+allocate like the edit itself. When a hosted plugin reports another latency
+(a knob on the plugin) or a send starts or stops sounding, the engine replans
+without allocating: the planner keeps its tables between plans, and while the
+graph holds a unit whose latency can change (or a bus beside any latent unit),
+`Pdc` keeps every candidate line (`Planner::cand`) preallocated (`MAX_FRAMES`
+when varying, or the sum of fixed latencies for bus sends); a line the plan
+does not use is parked at 0 frames and costs nothing per block. A graph with built-in units only keeps
+exactly the plan's lines, and with no latent unit there is no line at all
+and every sum is the plain sum (`engine-bench` hashes the same). A line
+whose delay is unchanged keeps what it holds; another delay starts from
+silence. A bypassed latent unit keeps its delay (its input runs through a
+ring of its latency), so a bypass toggle moves nothing in time.
+
+*What the UI shows* (rule 33): `GraphPub::latency` lists how late each
+strip sounds (sources, rigs by their master, buses), published with the
+graph and, for a run-time change, under `try_lock` within reserved room.
+The mixer draws it under the fader.
+
+*Proof.* The tests and `analysis-test` host `engine/fixture/latent.c`, an
+LV2 plugin that delays by its Delay control and reports that as its latency
+(built with `cc`, loaded by path through `lv2::add_bundle`), on the app's
+load path (`Probe::hosting`): cross-correlation puts the latent path at lag
+0 after every change, and a counting allocator sees no allocation while the
+engine follows one.
 
 **Analysis harness** (issue #13). `analysis.rs` holds pure measures with no
 dependency: a radix-2 FFT and `Spectrum` (Hann window) with

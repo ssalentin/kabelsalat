@@ -1006,8 +1006,17 @@ impl Default for GraphPub {
             master_target: MasterTarget::OFF,
             latency: Vec::new(),
             latency_rev: 0,
+            demo: None,
+            demo_rev: 0,
         }
     }
+}
+
+/// Which rig's demo phrase is currently looping in the engine (#200).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DemoPub {
+    pub rig: u8,
+    pub phrase: crate::demo::PhraseKind,
 }
 
 /// Published engine transport + count-in state (copied under `try_lock`, zero allocation).
@@ -1140,6 +1149,9 @@ pub struct GraphPub {
     /// by `latency_rev`.
     pub latency: Vec<(NodeId, u32)>,
     pub latency_rev: u64,
+    /// Which rig's demo phrase is currently playing (#200), bumped by `demo_rev`.
+    pub demo: Option<DemoPub>,
+    pub demo_rev: u64,
 }
 
 fn write_latency(g: &mut GraphPub, late: &[(NodeId, u32)]) {
@@ -1409,6 +1421,9 @@ pub struct GraphEngine {
     /// Delay lines that keep parallel paths in phase (`pdc`), replanned on
     /// graph edits.
     pdc: pdc::Pdc,
+    /// Per-rig live demo phrase player (#200); at most one runs at a time.
+    demo: Option<crate::demo::DemoPlayer>,
+    demo_dirty: bool,
 }
 
 impl GraphEngine {
@@ -1559,6 +1574,8 @@ impl GraphEngine {
             record_sync_pending: false,
             meter: MasterMeter::new(sample_rate),
             pdc: pdc::Pdc::default(),
+            demo: None,
+            demo_dirty: false,
         };
         engine.replan_delays(true);
         engine
@@ -2264,6 +2281,10 @@ impl GraphEngine {
         }
     }
 
+    pub fn demo_pub(&self) -> Option<DemoPub> {
+        self.demo.as_ref().map(|d| DemoPub { rig: d.rig, phrase: d.kind() })
+    }
+
     /// Rig list from the last `LoadRigs` (empty for single-graph loads).
     #[allow(dead_code)] // public query API for the UI (task-22 integration)
     pub fn rig_meta(&self) -> &[RigMeta] {
@@ -2352,6 +2373,7 @@ impl GraphEngine {
     fn publish_graph(&mut self) {
         self.replan_delays(true);
         let tp = self.transport_pub();
+        let dp = self.demo_pub();
         if let Some(p) = &self.graph_pub {
             if let Ok(mut g) = p.lock() {
                 g.rev = g.rev.wrapping_add(1);
@@ -2368,6 +2390,11 @@ impl GraphEngine {
                 g.mix_rev = g.mix_rev.wrapping_add(1);
                 g.transport = tp;
                 g.transport_rev = g.transport_rev.wrapping_add(1);
+                if g.demo != dp {
+                    g.demo = dp;
+                    g.demo_rev = g.demo_rev.wrapping_add(1);
+                }
+                self.demo_dirty = false;
                 write_voices(&mut g, &self.voices);
                 self.voices_dirty = false;
             }
@@ -2767,6 +2794,12 @@ impl GraphEngine {
     /// Tick — it drives the real note delivery the same way `render` does.
     #[cfg(test)]
     pub(crate) fn arp_test_step(&mut self) {
+        if let Some(mut player) = self.demo.take() {
+            let rig = player.rig;
+            let beats = player.beats_to_next_event() + 0.25;
+            player.tick(beats, 0.05, &mut |ev| self.demo_event(rig, ev));
+            self.demo = Some(player);
+        }
         let mut arps = std::mem::take(&mut self.arp);
         for a in &mut arps {
             let (node, vel) = (a.node, a.velocity());
@@ -3418,7 +3451,7 @@ impl GraphEngine {
     /// their note-on because the zone is a pure function of the note.
     /// Allocation-free linear scans, like the rest of the render path.
     fn keys_gate(&self, dest: NodeId, played: u8) -> bool {
-        self.keys_route(dest, played).is_some()
+        self.keys_route_in_rig(None, dest, played).is_some()
     }
 
     /// What a played note picks up on its way from a Keys node to `dest`:
@@ -3426,9 +3459,11 @@ impl GraphEngine {
     /// Note-on and note-off take the same answer — the snap is a pure
     /// function of the note — so a release always meets the pitch its
     /// note-on started (rule 41). Allocation-free.
-    fn keys_route(&self, dest: NodeId, played: u8) -> Option<KeysRoute> {
+    fn keys_route_in_rig(&self, rig: Option<u8>, dest: NodeId, played: u8) -> Option<KeysRoute> {
         self.graph.nodes.iter().find_map(|n| {
-            if !matches!(n.kind, NodeKind::Keys) { return None; }
+            if !matches!(n.kind, NodeKind::Keys) || rig.is_some_and(|r| n.rig != r) {
+                return None;
+            }
             let port = split_port(n.split, played);
             self.graph.edges.iter().any(|e| {
                 e.kind == PortKind::Midi
@@ -3440,6 +3475,164 @@ impl GraphEngine {
                 scale: n.scale,
             })
         })
+    }
+
+    /// Deliver one note-on (`m.status == 0x90`) or note-off (`m.status == 0x80`)
+    /// to `dest` along the Keys cable that carries `played`. For a live input
+    /// (`source = Some(src)`, `rig = None`), matrix rules and `source_accepted`
+    /// already gated or gate it; for the rig demo (`source = None`,
+    /// `rig = Some(r)`), only `r`'s Keys node and destinations in `r` are fed,
+    /// regardless of `source_accepted`.
+    fn deliver_keys_note(
+        &mut self,
+        dest: NodeId,
+        played: u8,
+        m: MidiMsg,
+        vel: f64,
+        source: Option<SourceId>,
+        rig: Option<u8>,
+    ) {
+        if let Some(r) = rig {
+            if !self.graph.node(dest).is_some_and(|n| n.rig == r) {
+                return;
+            }
+        }
+        let Some(route) = self.keys_route_in_rig(rig, dest, played) else { return };
+        let Some(out) = Self::routed_note(&m, &route) else { return };
+        let on = m.status == 0x90;
+        if self.arp.iter().any(|a| a.node == dest) {
+            if on {
+                let now = self.arp_clock(dest);
+                let v = vel as f32;
+                self.with_arp_slot(dest, |a, eng| {
+                    let (node, av) = (a.node, a.velocity());
+                    let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, av);
+                    a.note_in(out, v, now, &mut emit);
+                });
+            } else {
+                self.with_arp_slot(dest, |a, eng| {
+                    let (node, av) = (a.node, a.velocity());
+                    let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, av);
+                    a.note_out(out, &mut emit);
+                });
+            }
+            return;
+        }
+        #[cfg(test)]
+        self.note_log.push((dest, out, on));
+        if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+            if !on || source.is_none_or(|src| self.fx_accepts(dest, src)) {
+                self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
+            }
+            return;
+        }
+        if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+            if source.is_none_or(|src| source_accepted(s, src)) {
+                if on {
+                    s.voice.note_on(out as u16, vel);
+                } else {
+                    s.voice.note_off(out as u16);
+                }
+            }
+        }
+        if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+            if s.plugin.is_instrument() {
+                if on {
+                    s.plugin.note_on_ch(out, m.data[1], m.channel);
+                } else {
+                    s.plugin.note_off_ch(out, m.channel);
+                }
+            }
+        }
+    }
+
+    /// Deliver one demo event (#200) to rig `rig` as if played on that rig's
+    /// Keys node: note-ons/offs follow the Keys MIDI cables (split, zone
+    /// octave, scale snap) into arp, MIDI-FX, CLAP voice or LV2 instrument;
+    /// breath sends both CC 2 and channel pressure to the rig's instruments.
+    fn demo_event(&mut self, rig: u8, ev: crate::demo::DemoEvent) {
+        use crate::demo::DemoEvent;
+        match ev {
+            DemoEvent::On { note, vel } => {
+                let m = MidiMsg::note_on(0, note, vel);
+                let v = vel as f64 / 127.0;
+                for i in 0..self.graph.nodes.len() {
+                    if self.graph.nodes[i].rig == rig {
+                        let dest = self.graph.nodes[i].id;
+                        self.deliver_keys_note(dest, note, m, v, None, Some(rig));
+                    }
+                }
+            }
+            DemoEvent::Off { note } => {
+                let m = MidiMsg::note_off(0, note, 0);
+                for i in 0..self.graph.nodes.len() {
+                    if self.graph.nodes[i].rig == rig {
+                        let dest = self.graph.nodes[i].id;
+                        self.deliver_keys_note(dest, note, m, 0.0, None, Some(rig));
+                    }
+                }
+            }
+            DemoEvent::Breath(val) => {
+                let (at_wire, at_len) = MidiMsg::channel_aftertouch(0, val).wire();
+                for i in 0..self.graph.nodes.len() {
+                    if self.graph.nodes[i].rig != rig {
+                        continue;
+                    }
+                    let dest = self.graph.nodes[i].id;
+                    if !self.has_midi_cable(dest) {
+                        continue;
+                    }
+                    let is_clap = matches!(self.graph.nodes[i].kind, NodeKind::Clap { .. });
+                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                        s.voice.send_cc_rt(0, 2, val);
+                        s.voice.send_midi_rt(at_wire);
+                        #[cfg(test)]
+                        {
+                            self.cc_passthrough_log.push((dest, 2, val));
+                            self.cc_passthrough_log.push((dest, val, 0));
+                        }
+                    } else if is_clap {
+                        #[cfg(test)]
+                        {
+                            self.cc_passthrough_log.push((dest, 2, val));
+                            self.cc_passthrough_log.push((dest, val, 0));
+                        }
+                    } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                        if s.plugin.is_instrument() {
+                            s.plugin.control_change(2, val);
+                            let mut wire = at_wire;
+                            wire[0] &= 0xF0;
+                            s.plugin.midi(&wire[..at_len]);
+                            #[cfg(test)]
+                            {
+                                self.cc_passthrough_log.push((dest, 2, val));
+                                self.cc_passthrough_log.push((dest, val, 0));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop the running demo phrase, releasing every note it holds through
+    /// the routes that still exist (rule 41).
+    fn stop_demo(&mut self) {
+        let Some(mut player) = self.demo.take() else { return };
+        let rig = player.rig;
+        player.stop(&mut |ev| self.demo_event(rig, ev));
+        self.demo_dirty = true;
+    }
+
+    /// Step the running demo phrase through one audio block (`frames`) on the
+    /// engine's tempo clock (rule 43).
+    fn tick_demo(&mut self, frames: usize) {
+        let Some(mut player) = self.demo.take() else { return };
+        let rig = player.rig;
+        let beats = frames as f64 * Transport::beats_per_frame(self.transport.bpm, self.sample_rate);
+        let secs = frames as f64 / self.sample_rate.max(1.0);
+        player.tick(beats, secs, &mut |ev| self.demo_event(rig, ev));
+        self.demo = Some(player);
     }
 
     /// The note that reaches `dest`: the matrix-transformed note, the zone's
@@ -3595,6 +3788,15 @@ impl GraphEngine {
     fn apply(&mut self, cmd: Command) {
         if matches!(cmd, Command::AddNode { .. } | Command::LoadGraph { .. } | Command::LoadRigs { .. }) {
             self.drain_voice_msgs();
+        }
+        match cmd.demo_effect() {
+            crate::control::DemoEffect::Keeps => {}
+            crate::control::DemoEffect::Ends => self.stop_demo(),
+            crate::control::DemoEffect::EndsIfMidiCable(id) => {
+                if self.graph.edges.iter().any(|e| e.id == id && e.kind == PortKind::Midi) {
+                    self.stop_demo();
+                }
+            }
         }
         match cmd {
             Command::AddNode { kind, name, rig, wire } => {
@@ -3974,39 +4176,7 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let Some(route) = self.keys_route(dest, note) else { continue };
-                    let Some(out) = Self::routed_note(&m, &route) else { continue };
-                    // An arp destination: the note joins its hold (or, chord
-                    // mode, sounds its chord at once); the arp generates its
-                    // own notes downstream from here.
-                    if self.arp.iter().any(|a| a.node == dest) {
-                        let now = self.arp_clock(dest);
-                        let vel = velocity as f32;
-                        self.with_arp_slot(dest, |a, eng| {
-                            let (node, v) = (a.node, a.velocity());
-                            let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, v);
-                            a.note_in(out, vel, now, &mut emit);
-                        });
-                        continue;
-                    }
-                    #[cfg(test)]
-                    self.note_log.push((dest, out, true));
-                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
-                        if self.fx_accepts(dest, source) {
-                            self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
-                        }
-                        continue;
-                    }
-                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
-                        if source_accepted(s, source) {
-                            s.voice.note_on(out as u16, velocity as f64);
-                        }
-                    }
-                    if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
-                        if s.plugin.is_instrument() {
-                            s.plugin.note_on_ch(out, (velocity.clamp(0.0, 1.0) * 127.0) as u8, channel & 0x0F);
-                        }
-                    }
+                    self.deliver_keys_note(dest, note, m, velocity as f64, Some(source), None);
                 }
             }
             Command::NoteOff { note, source, channel } => {
@@ -4014,34 +4184,7 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let Some(route) = self.keys_route(dest, note) else { continue };
-                    let Some(out) = Self::routed_note(&m, &route) else { continue };
-                    // The release meets the arp at the same snapped pitch its
-                    // note-on did; the arp stops what it had going.
-                    if self.arp.iter().any(|a| a.node == dest) {
-                        self.with_arp_slot(dest, |a, eng| {
-                            let (node, v) = (a.node, a.velocity());
-                            let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, v);
-                            a.note_out(out, &mut emit);
-                        });
-                        continue;
-                    }
-                    #[cfg(test)]
-                    self.note_log.push((dest, out, false));
-                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
-                        self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
-                        continue;
-                    }
-                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
-                        if source_accepted(s, source) {
-                            s.voice.note_off(out as u16);
-                        }
-                    }
-                    if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
-                        if s.plugin.is_instrument() {
-                            s.plugin.note_off_ch(out, channel & 0x0F);
-                        }
-                    }
+                    self.deliver_keys_note(dest, note, m, 0.0, Some(source), None);
                 }
             }
             Command::SetRigSource { node, keyboard, hardware } => {
@@ -4556,6 +4699,14 @@ impl GraphEngine {
                     self.apply_master_target(target);
                 }
             }
+            Command::DemoPlay { rig, phrase } => {
+                self.stop_demo();
+                self.demo = Some(crate::demo::DemoPlayer::new(rig, phrase));
+                self.demo_dirty = true;
+            }
+            Command::DemoStop => {
+                self.stop_demo();
+            }
         }
     }
 
@@ -4751,8 +4902,11 @@ impl GraphEngine {
             self.publish_latency();
         }
         // MIDI-FX units run before the instruments render, so the notes they
-        // emit sound in the same block the events arrived in.
+        // emit sound in the same block the events arrived in. The rig demo
+        // ticks right before them so its notes and breath sound on the block
+        // it starts in, including through a MIDI-FX strip or arp.
         let fx_frames = data.len() / ch;
+        self.tick_demo(fx_frames);
         self.pump_midi_fx(fx_frames);
         // Attach freshly-opened input captures (UI opened a device for a node):
         // a (node, ring consumer) pair, swapped in place of any stale consumer.
@@ -4942,9 +5096,10 @@ impl GraphEngine {
                 }
             }
         }
-        if self.transport_dirty || self.player_dirty {
+        if self.transport_dirty || self.player_dirty || self.demo_dirty {
             let tp = self.transport_pub();
             let pp = self.player_pub();
+            let dp = self.demo_pub();
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     if self.transport_dirty {
@@ -4957,10 +5112,16 @@ impl GraphEngine {
                         g.player_rev = g.player_rev.wrapping_add(1);
                         self.player_dirty = false;
                     }
+                    if self.demo_dirty {
+                        g.demo = dp;
+                        g.demo_rev = g.demo_rev.wrapping_add(1);
+                        self.demo_dirty = false;
+                    }
                 },
                 None => {
                     self.transport_dirty = false;
                     self.player_dirty = false;
+                    self.demo_dirty = false;
                 }
             }
         }
@@ -9265,6 +9426,249 @@ pub fn arp_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `kabelsalat demo-test` (issue #200): offline engine, two rigs with real
+/// Surge XT voices. Verifies:
+/// (a) `DemoPlay` on rig 0 makes rig 0's bus audible and rig 1's bus silent,
+///     and the reverse on rig 1;
+/// (b) note onsets land where the phrase says at the transport BPM, within one
+///     block, over two loop passes, and after `SetBpm` mid-phrase the spacing
+///     follows;
+/// (c) after `DemoStop`, and after a `LoadGraph` mid-note, the master is
+///     silent once the tails are flushed (rule 133);
+/// (d) every `PhraseKind` plays and stops without a stuck note.
+pub fn demo_test() -> anyhow::Result<()> {
+    use crate::control::{
+        command_bus, merge_rigs, standard_rig_graph, Command, Graph, NodeKind,
+        PortKind, Rig, SURGE_PLUGIN_ID,
+    };
+    use crate::demo::{phrase, PhraseKind};
+    use crate::host::ClapVoice;
+    const SR: f64 = 48000.0;
+    const BLOCK: usize = 256;
+
+    let rigs = vec![
+        Rig::new("Rig A", standard_rig_graph(true), None),
+        Rig::new("Rig B", standard_rig_graph(true), None),
+    ];
+    let merged = merge_rigs(&rigs);
+    let edge_of_rig = |g: &Graph, rig: u8| -> u32 {
+        g.edges
+            .iter()
+            .find(|e| {
+                e.kind == PortKind::Audio
+                    && g.node(e.from.node).is_some_and(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. }))
+            })
+            .expect("rig audio edge")
+            .id
+    };
+    let edge_a = edge_of_rig(&merged, 0);
+    let edge_b = edge_of_rig(&merged, 1);
+
+    let (va, _ma) = ClapVoice::new_plugin(SR, SURGE_PLUGIN_ID)?;
+    let (vb, _mb) = ClapVoice::new_plugin(SR, SURGE_PLUGIN_ID)?;
+    let claps: Vec<NodeId> = merged
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
+        .map(|n| n.id)
+        .collect();
+    anyhow::ensure!(claps.len() == 2, "expected 2 Clap nodes, got {claps:?}");
+
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(merged.clone(), drain, SR, vec![(claps[0], va), (claps[1], vb)]);
+    let graph_pub = Arc::new(Mutex::new(GraphPub { graph: merged.clone(), ..Default::default() }));
+    engine.set_graph_pub(graph_pub.clone());
+    let levels = engine.edge_levels_handle();
+    let mut buf = vec![0.0f32; BLOCK * 2];
+
+    // (a) Rig isolation: demo on rig 0 sounds only on rig 0; demo on rig 1 only on rig 1.
+    bus.send(Command::SetBpm { bpm: 120.0 });
+    bus.send(Command::DemoPlay { rig: 0, phrase: PhraseKind::Bass });
+    let (mut peak_a0, mut peak_b0) = (0.0f32, 0.0f32);
+    for _ in 0..40 {
+        engine.render(&mut buf, 2);
+        peak_a0 = peak_a0.max(levels.load(edge_a));
+        peak_b0 = peak_b0.max(levels.load(edge_b));
+    }
+    anyhow::ensure!(
+        peak_a0 > 1e-3 && peak_b0 < 1e-6,
+        "demo on rig 0 must sound only on rig 0: rig 0 bus peak {peak_a0:.4}, rig 1 bus peak {peak_b0:.6}"
+    );
+    anyhow::ensure!(
+        graph_pub.lock().unwrap().demo == Some(DemoPub { rig: 0, phrase: PhraseKind::Bass }),
+        "GraphPub did not publish rig 0's demo"
+    );
+
+    // Switching straight to rig 1 stops rig 0's notes and plays rig 1.
+    bus.send(Command::DemoPlay { rig: 1, phrase: PhraseKind::Lead });
+    // Flush rig 0's release tail before measuring rig 0 silence.
+    for _ in 0..50 {
+        engine.render(&mut buf, 2);
+    }
+    let (mut peak_a1, mut peak_b1) = (0.0f32, 0.0f32);
+    for _ in 0..40 {
+        engine.render(&mut buf, 2);
+        peak_a1 = peak_a1.max(levels.load(edge_a));
+        peak_b1 = peak_b1.max(levels.load(edge_b));
+    }
+    anyhow::ensure!(
+        peak_b1 > 1e-3 && peak_a1 < 1e-5,
+        "demo on rig 1 must sound only on rig 1: rig 0 bus peak {peak_a1:.6}, rig 1 bus peak {peak_b1:.4}"
+    );
+    println!(
+        "  (a) rig isolation: rig 0 demo → bus A {peak_a0:.4}, bus B {peak_b0:.6}; rig 1 demo → bus A {peak_a1:.6}, bus B {peak_b1:.4}"
+    );
+
+    // (b) Timing over 2 loop passes at 120 BPM, then SetBpm mid-phrase to 240 BPM.
+    bus.send(Command::DemoStop);
+    for _ in 0..50 {
+        engine.render(&mut buf, 2);
+    }
+    let bpm1 = 120.0f64;
+    let p = phrase(PhraseKind::Lead);
+    let block_beats_1 = BLOCK as f64 * Transport::beats_per_frame(bpm1, SR);
+    let two_pass_blocks = (2.0 * p.beats as f64 / block_beats_1).ceil() as usize;
+    bus.send(Command::SetBpm { bpm: bpm1 as f32 });
+    bus.send(Command::DemoPlay { rig: 0, phrase: PhraseKind::Lead });
+    let mut onsets: Vec<(usize, u8, i64)> = Vec::new();
+    let mut prev: Vec<(u8, i64)> = Vec::new();
+    for b in 0..two_pass_blocks {
+        engine.render(&mut buf, 2);
+        let cur: Vec<(u8, i64)> = engine
+            .demo
+            .as_ref()
+            .map(|d| d.sounding().iter().map(|&(n, off)| (n, (off * 1000.0).round() as i64)).collect())
+            .unwrap_or_default();
+        for &item in &cur {
+            if !prev.contains(&item) {
+                onsets.push((b, item.0, item.1));
+            }
+        }
+        prev = cur;
+    }
+    let want: Vec<(f64, u8)> = (0..3)
+        .flat_map(|k| p.notes.iter().map(move |n| (k as f64 * p.beats as f64 + n.beat as f64, n.note)))
+        .collect();
+    anyhow::ensure!(
+        onsets.len() >= 2 * p.notes.len(),
+        "expected at least {} onsets over 2 passes, got {}",
+        2 * p.notes.len(),
+        onsets.len()
+    );
+    for (i, &(b, got_note, _)) in onsets.iter().take(2 * p.notes.len()).enumerate() {
+        let (want_beat, want_note) = want[i];
+        let got_beat = b as f64 * block_beats_1;
+        anyhow::ensure!(
+            got_note == want_note && (got_beat - want_beat).abs() <= block_beats_1 + 1e-9,
+            "onset {i}: got note {got_note} at beat {got_beat:.4}, wanted {want_note} at {want_beat:.4}"
+        );
+    }
+
+    // Mid-phrase tempo change: double BPM to 240 and verify next onsets follow 240 BPM spacing.
+    let bpm2 = 240.0f64;
+    let block_beats_2 = BLOCK as f64 * Transport::beats_per_frame(bpm2, SR);
+    bus.send(Command::SetBpm { bpm: bpm2 as f32 });
+    let pass_blocks_2 = (p.beats as f64 / block_beats_2).ceil() as usize;
+    let mut onsets_fast: Vec<usize> = Vec::new();
+    for b in 0..pass_blocks_2 {
+        engine.render(&mut buf, 2);
+        let cur: Vec<(u8, i64)> = engine
+            .demo
+            .as_ref()
+            .map(|d| d.sounding().iter().map(|&(n, off)| (n, (off * 1000.0).round() as i64)).collect())
+            .unwrap_or_default();
+        for &item in &cur {
+            if !prev.contains(&item) {
+                onsets_fast.push(b);
+            }
+        }
+        prev = cur;
+    }
+    anyhow::ensure!(
+        onsets_fast.len() >= p.notes.len(),
+        "at 240 BPM one pass must fire {} onsets, got {}",
+        p.notes.len(),
+        onsets_fast.len()
+    );
+    println!(
+        "  (b) timing: {} onsets over 2 passes @ 120 BPM (within 1 block = {:.2} ms), then {} onsets in 1 pass after SetBpm → 240 BPM",
+        2 * p.notes.len(),
+        BLOCK as f64 / SR * 1000.0,
+        onsets_fast.len()
+    );
+
+    // (c) Silence after DemoStop and after LoadGraph mid-note (rule 133).
+    bus.send(Command::DemoStop);
+    for _ in 0..60 {
+        engine.render(&mut buf, 2);
+    }
+    let mut after_stop_peak = 0.0f32;
+    for _ in 0..10 {
+        engine.render(&mut buf, 2);
+        after_stop_peak = after_stop_peak.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+    }
+    anyhow::ensure!(
+        after_stop_peak < 1e-4,
+        "master not silent after DemoStop + tail flush: peak {after_stop_peak:.6}"
+    );
+
+    bus.send(Command::DemoPlay { rig: 0, phrase: PhraseKind::Pad });
+    let mut mid_note_peak = 0.0f32;
+    for _ in 0..20 {
+        engine.render(&mut buf, 2);
+        mid_note_peak = mid_note_peak.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+    }
+    anyhow::ensure!(mid_note_peak > 1e-3, "Pad demo did not sound before LoadGraph");
+    bus.send(Command::LoadGraph { graph: merged.clone() });
+    for _ in 0..60 {
+        engine.render(&mut buf, 2);
+    }
+    let mut after_load_peak = 0.0f32;
+    for _ in 0..10 {
+        engine.render(&mut buf, 2);
+        after_load_peak = after_load_peak.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+    }
+    anyhow::ensure!(
+        after_load_peak < 1e-4 && engine.demo_pub().is_none(),
+        "master not silent after LoadGraph mid-note: peak {after_load_peak:.6}, demo {:?}",
+        engine.demo_pub()
+    );
+    println!(
+        "  (c) release & flush: after DemoStop peak {after_stop_peak:.6}, after LoadGraph mid-note peak {after_load_peak:.6}"
+    );
+
+    // (d) Every PhraseKind plays audibly and stops without a stuck note.
+    bus.send(Command::SetBpm { bpm: 240.0 });
+    for kind in PhraseKind::ALL {
+        let ph = phrase(kind);
+        let blocks = (ph.beats as f64 / block_beats_2).ceil() as usize + 4;
+        bus.send(Command::DemoPlay { rig: 0, phrase: kind });
+        let mut play_peak = 0.0f32;
+        for _ in 0..blocks {
+            engine.render(&mut buf, 2);
+            play_peak = play_peak.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+        }
+        anyhow::ensure!(play_peak > 1e-3, "{kind:?} demo phrase was silent (peak {play_peak})");
+        bus.send(Command::DemoStop);
+        for _ in 0..60 {
+            engine.render(&mut buf, 2);
+        }
+        let mut tail_peak = 0.0f32;
+        for _ in 0..8 {
+            engine.render(&mut buf, 2);
+            tail_peak = tail_peak.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+        }
+        anyhow::ensure!(
+            tail_peak < 1e-4,
+            "{kind:?} left a stuck note after DemoStop: peak {tail_peak:.6}"
+        );
+    }
+    let names: Vec<&str> = PhraseKind::ALL.iter().map(|k| k.name()).collect();
+    println!("  (d) all 7 phrases ({}) played and released cleanly", names.join(", "));
+    println!("demo-test: OK");
+    Ok(())
+}
+
 /// Real-plugin CC-mapping self-test: maps CC 74 on Hardware(0) to Surge XT's
 /// Filter 1 Cutoff, sends CC 0 and CC 127, and verifies both parameter readback
 /// and rendered audio difference.
@@ -10412,5 +10816,121 @@ mod send_tests {
         fx_rig_m.retire(v0.into_voice());
         fx_bus_m.retire(v1.into_voice());
         fx_mst_m.retire(v2.into_voice());
+    }
+
+    #[test]
+    fn demo_phrase_plays_only_its_rig_ignores_source_switch_and_publishes() {
+        use crate::control::{
+            command_bus, merge_rigs, standard_rig_graph, Command, DspKind, NodeKind, PortKind,
+            Rig,
+        };
+        use crate::demo::PhraseKind;
+
+        let rigs = vec![
+            Rig::new("Rig A", standard_rig_graph(true), None),
+            Rig::new("Rig B", standard_rig_graph(true), Some(2)),
+        ];
+        let merged = merge_rigs(&rigs);
+        let claps: Vec<u32> = merged
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
+            .map(|n| n.id)
+            .collect();
+        let (sa, sb) = (claps[0], claps[1]);
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(merged.clone(), drain, 48000.0, vec![]);
+        let pubd = std::sync::Arc::new(std::sync::Mutex::new(GraphPub::default()));
+        engine.set_graph_pub(pubd.clone());
+        bus.send(Command::LoadRigs { rigs, active: 0 });
+        // Turn keyboard source off on Surge A: the demo still plays through Rig A.
+        bus.send(Command::SetRigSource { node: sa, keyboard: false, hardware: false });
+        let mut buf = vec![0.0f32; 256 * 2];
+        engine.render(&mut buf, 2);
+        engine.note_log.clear();
+
+        bus.send(Command::DemoPlay { rig: 0, phrase: PhraseKind::Bass });
+        engine.render(&mut buf, 2);
+        assert_eq!(
+            pubd.lock().unwrap().demo,
+            Some(super::DemoPub { rig: 0, phrase: PhraseKind::Bass }),
+            "running demo is published in GraphPub"
+        );
+        assert!(
+            engine.note_log.iter().any(|&(d, n, on)| d == sa && n == 40 && on),
+            "demo note 40 reached rig 0's synth even with keyboard source off: {:?}",
+            engine.note_log
+        );
+        assert!(
+            engine.note_log.iter().all(|&(d, _, _)| d != sb),
+            "rig 1 never hears rig 0's demo: {:?}",
+            engine.note_log
+        );
+
+        // Duplicate Connects (the UI's per-frame publish_patch) and adding an
+        // audio effect keep the demo running.
+        for e in &merged.edges {
+            bus.send(Command::Connect { id: e.id, from: e.from, to: e.to, kind: e.kind });
+        }
+        bus.send(Command::AddNode {
+            kind: NodeKind::Dsp(DspKind::Delay),
+            name: crate::control::name_bytes("DELAY"),
+            rig: 0,
+            wire: false,
+        });
+        engine.render(&mut buf, 2);
+        assert_eq!(
+            pubd.lock().unwrap().demo,
+            Some(super::DemoPub { rig: 0, phrase: PhraseKind::Bass }),
+            "duplicate Connect and audio effect AddNode keep the demo running"
+        );
+
+        // Unplugging a MIDI cable stops the demo and releases its held note first.
+        let midi_edge = merged.edges.iter().find(|e| e.kind == PortKind::Midi && e.to.node == sa).unwrap().id;
+        engine.note_log.clear();
+        bus.send(Command::Disconnect(midi_edge));
+        engine.render(&mut buf, 2);
+        assert_eq!(pubd.lock().unwrap().demo, None, "MIDI Disconnect stops the demo");
+        assert!(
+            engine.note_log.iter().any(|&(d, n, on)| d == sa && (n == 40 || n == 255) && !on),
+            "held demo note was released before the MIDI cable vanished: {:?}",
+            engine.note_log
+        );
+    }
+
+    #[test]
+    fn wind_demo_phrase_sends_cc2_and_channel_pressure_breath_and_zeros_on_stop() {
+        use crate::control::{command_bus, standard_rig_graph, Command, NodeKind};
+        use crate::demo::PhraseKind;
+
+        let g = standard_rig_graph(true);
+        let surge = g.nodes.iter().find(|n| matches!(n.kind, NodeKind::Clap { .. })).unwrap().id;
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(g, drain, 48000.0, vec![]);
+        let mut buf = vec![0.0f32; 256 * 2];
+        bus.send(Command::DemoPlay { rig: 0, phrase: PhraseKind::Wind });
+        for _ in 0..12 {
+            engine.render(&mut buf, 2);
+        }
+        // Breath emits both CC 2 `(dest, 2, val)` and channel aftertouch `(dest, val, 0)`.
+        assert!(
+            engine.cc_passthrough_log.iter().any(|&(d, a, b)| d == surge && a == 2 && b > 0),
+            "wind demo sent CC 2 > 0: {:?}",
+            engine.cc_passthrough_log
+        );
+        assert!(
+            engine.cc_passthrough_log.iter().any(|&(d, a, b)| d == surge && a > 0 && b == 0),
+            "wind demo sent channel pressure > 0: {:?}",
+            engine.cc_passthrough_log
+        );
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::DemoStop);
+        engine.render(&mut buf, 2);
+        assert!(
+            engine.cc_passthrough_log.contains(&(surge, 2, 0))
+                && engine.cc_passthrough_log.contains(&(surge, 0, 0)),
+            "DemoStop resets both CC 2 and channel pressure to 0: {:?}",
+            engine.cc_passthrough_log
+        );
     }
 }

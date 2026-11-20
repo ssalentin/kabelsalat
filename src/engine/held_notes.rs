@@ -62,6 +62,8 @@ pub(super) enum Kind {
     Fx,
     /// A rig source switch (keyboard / hardware) of an instrument.
     Source,
+    /// Starting or stopping a rig demo phrase (#200).
+    Demo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,16 +112,21 @@ enum Edit {
     RemoveFx,
     /// SetRigSource on Surge A: keyboard on/off.
     Source { keyboard: bool },
+    /// Start a demo phrase on rig 0 (#200).
+    DemoPlay(crate::demo::PhraseKind),
+    /// Stop the running demo phrase (#200).
+    DemoStop,
 }
 
-/// Which scenario a search runs: the plain rack, the arp (#90), or the rack
-/// with a MIDI strip (#86): its own edits, or the plain routing edits.
+/// Which scenario a search runs: the plain rack, the arp (#90), the rack
+/// with a MIDI strip (#86), or the rig demo phrase player (#200).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scenario {
     Routing,
     Arp,
     RoutingWithStrip,
     Fx,
+    Demo,
 }
 
 /// C# major pentatonic: B (59) snaps down to A#, C (60) up to C#. Two keys
@@ -182,6 +189,23 @@ const ARP_EDITS: [Edit; 7] = [
     Edit::Wire { id: 1, from: KEYS, to: SURGE_A },
 ];
 
+/// Edits of the rig demo scenario (#200): demo start/stop, time, and one
+/// edit of each routing kind (split, zone octave, scale, matrix rule, cable,
+/// node removal, arp take-over, source switch, template load).
+const DEMO_EDITS: [Edit; 11] = [
+    Edit::DemoPlay(crate::demo::PhraseKind::Lead),
+    Edit::DemoStop,
+    Edit::Split(Some(72)),
+    Edit::ZoneOctave { zone: 0, octave: 1 },
+    Edit::Scale(Some(PENTATONIC)),
+    Edit::Rule { dest: SURGE_A, transpose: 12, enabled: true },
+    Edit::Unplug(1),
+    Edit::Plug { id: 1, port: 0, dest: SURGE_A },
+    Edit::Remove(SURGE_B),
+    Edit::AddArp,
+    Edit::Source { keyboard: false },
+];
+
 impl Edit {
     fn kind(self) -> Kind {
         match self {
@@ -195,6 +219,7 @@ impl Edit {
             Edit::Wire { .. } => Kind::Cable,
             Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
             Edit::Source { .. } => Kind::Source,
+            Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
         }
     }
 
@@ -272,6 +297,8 @@ impl Edit {
             },
             Edit::RemoveFx => Command::RemoveNode(FX),
             Edit::Source { keyboard } => Command::SetRigSource { node: SURGE_A, keyboard, hardware: true },
+            Edit::DemoPlay(phrase) => Command::DemoPlay { rig: 0, phrase },
+            Edit::DemoStop => Command::DemoStop,
         }
     }
 }
@@ -320,7 +347,7 @@ fn start_graph_with_strip() -> Graph {
 fn start_graph_for(scn: Scenario) -> Graph {
     match scn {
         Scenario::RoutingWithStrip | Scenario::Fx => start_graph_with_strip(),
-        Scenario::Routing | Scenario::Arp => start_graph(),
+        Scenario::Routing | Scenario::Arp | Scenario::Demo => start_graph(),
     }
 }
 
@@ -412,10 +439,16 @@ impl Run {
             Step::Off(k) => {
                 self.held.remove(&k);
                 // The released key's own notes must be gone; when it was the
-                // last key held, so must everything the arp generated.
-                let last = self.held.is_empty();
+                // last key held and no demo is playing, so must everything
+                // the arp or demo generated.
                 let left: Vec<(u32, u8)> = self.sounding.iter()
-                    .filter(|s| if self.arp_scenario { last } else { s.2 == k })
+                    .filter(|s| if self.arp_scenario {
+                        self.held.is_empty()
+                    } else if self.scn == Scenario::Demo {
+                        (self.held.is_empty() && self.engine.demo.is_none()) || s.2 == k
+                    } else {
+                        s.2 == k
+                    })
                     .map(|s| (s.0, s.1)).collect();
                 left
             }
@@ -425,16 +458,31 @@ impl Run {
                     Edit::LoadStart => self.arp_added = false,
                     _ => {}
                 }
-                // The MIDI-FX search records every edit as one kind: which kinds
-                // a key saw is part of the state, and six multiplied it past
-                // what a test can exhaust.
-                let kind = if self.scn == Scenario::Fx { Kind::Fx } else { e.kind() };
+                // The MIDI-FX and demo searches record every edit as one kind:
+                // which kinds a key saw is part of the state, and nine kinds
+                // would multiply it past what a test can exhaust.
+                let kind = match self.scn {
+                    Scenario::Fx => Kind::Fx,
+                    Scenario::Demo => Kind::Demo,
+                    _ => e.kind(),
+                };
                 for kinds in self.held.values_mut() {
                     kinds.insert(kind);
                 }
+                // Invariant for the demo phrase player: once the demo is
+                // stopped (by DemoStop or by any routing edit) and all keys
+                // are released, nothing sounds at all.
+                if self.scn == Scenario::Demo && self.held.is_empty() && self.engine.demo.is_none() {
+                    return self.sounding.iter().map(|s| (s.0, s.1)).collect();
+                }
                 Vec::new()
             }
-            Step::Tick => Vec::new(),
+            Step::Tick => {
+                if self.scn == Scenario::Demo && self.held.is_empty() && self.engine.demo.is_none() {
+                    return self.sounding.iter().map(|s| (s.0, s.1)).collect();
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -448,10 +496,11 @@ impl Run {
         .expect("serialize state");
         let arps: Vec<String> = self.engine.arp.iter().map(|a| a.fingerprint()).collect();
         let fx: Vec<i8> = self.engine.midi_fx.iter().map(|s| s.semis).collect();
+        let demo = self.engine.demo.as_ref().map(|d| d.fingerprint());
         // Hashed: 100k states of a kilobyte of JSON each is memory the check
         // does not need to keep.
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{routing}|{fx:?}|{:?}|{:?}|{arps:?}|{}", self.held, self.sounding, self.arp_added).hash(&mut h);
+        format!("{routing}|{fx:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}", self.held, self.sounding, self.arp_added).hash(&mut h);
         h.finish()
     }
 }
@@ -492,6 +541,8 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::PlugFx(_)) => "Connect cable 9 MIDI-FX → Surge A".to_string(),
         Step::Edit(Edit::RemoveFx) => "RemoveNode MIDI-FX".to_string(),
         Step::Edit(Edit::Source { keyboard }) => format!("SetRigSource Surge A keyboard {keyboard}"),
+        Step::Edit(Edit::DemoPlay(kind)) => format!("DemoPlay rig 0 {kind:?}"),
+        Step::Edit(Edit::DemoStop) => "DemoStop".to_string(),
         Step::Tick => "Tick (time passes)".to_string(),
     }
 }
@@ -538,6 +589,16 @@ pub(super) fn explore_fx(max_states: usize) -> Report {
     alphabet.extend(FX_EDITS.iter().map(|&e| Step::Edit(e)));
     alphabet.push(Step::Edit(Edit::LoadStart));
     explore_with(&alphabet, max_states, Scenario::Fx)
+}
+
+/// The rig demo phrase player (issue #200): demo start/stop, time, held key,
+/// and routing edits of every kind. Invariant: whenever the demo is stopped
+/// and all keys are released, nothing sounds.
+pub(super) fn explore_demo(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = vec![Step::On(60), Step::Off(60), Step::Tick];
+    alphabet.extend(DEMO_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::Demo)
 }
 
 fn explore_with(alphabet: &[Step], max_states: usize, scn: Scenario) -> Report {
@@ -647,4 +708,19 @@ fn held_notes_are_released_under_every_routing_edit() {
     assert!(report.complete, "state bound hit before fixpoint: the alphabet's state space grew");
     let fixed: Vec<_> = known.iter().filter(|k| !found.contains(k)).collect();
     assert!(fixed.is_empty(), "known finding(s) {fixed:?} no longer reproduce: remove from KNOWN");
+}
+
+#[test]
+fn held_notes_and_demo_phrases_are_released_under_routing_edits() {
+    let report = explore_demo(100_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (demo): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes with the demo phrase player (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the demo alphabet's state space grew");
 }

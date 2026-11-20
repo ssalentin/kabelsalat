@@ -54,7 +54,16 @@ agents are in [AGENTS.md](../AGENTS.md).
   host (`DemoApp::sync_clap_slots`, on the UI thread = the plugins' main
   thread): it instantiates a voice for every CLAP unit the engine has none
   for and retires voices no unit plays. Headless `kabelsalat mcp` hosts
-  only its two startup voices.
+  only its two startup voices. What a plugin asks of the host is a flag it
+  may raise from any thread; `ClapVoiceMain::service` serves the flags on
+  the main thread (every UI frame through `pump`, every 33 ms in headless
+  `mcp`): `request_callback` gets one `on_main_thread()`, `request_flush`
+  is served by the next `process()` or, for an inactive plugin, by
+  `params.flush()`, and `request_restart` moves the voice's `Live` set
+  (processor, buffers, parameter ranges) to the main thread, which
+  deactivates, activates and sends a new set. `start_processing` and
+  `stop_processing` run on the thread that renders. The test plugin in
+  `src/host/probe.rs` records the thread of every call.
 - `lv2.rs` — hand-written lilv FFI; LV2 effects and instruments, presets,
   MIDNAM programme names, loader thread, `LILV_LOCK`.
 - `plugins.rs` — what kind of plugin each one is. Every built-in unit, CLAP

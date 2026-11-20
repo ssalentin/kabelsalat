@@ -640,6 +640,9 @@ impl eframe::App for PreviewApp {
         // Keep the MIDI monitor fresh without burning CPU at full frame rate.
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if let Some(main) = self._surge_main.as_mut() {
+            main.service();
+        }
         // Laptop-keyboard playing.
         let events = ctx.input(|i| i.events.clone());
         for ev in events {

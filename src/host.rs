@@ -18,9 +18,10 @@
 //! save/restore state.
 //!
 //! Architecture (matches docs/ARCHITECTURE.md §7):
-//! - main thread: plugin instance lifecycle, params/state (CLAP [main-thread])
-//! - audio thread: owns `ClapVoice` (the `StartedPluginAudioProcessor`), renders
-//!   blocks (CLAP [audio-thread])
+//! - main thread: plugin instance lifecycle, params/state, and what the plugin
+//!   asks of the host (`ClapVoiceMain::service`) (CLAP [main-thread])
+//! - audio thread: owns `ClapVoice` (the audio processor), starts and stops
+//!   processing, renders blocks (CLAP [audio-thread])
 //! - cpal callback: drains a lock-free `rtrb` ring into the device buffer
 
 use std::cell::{Cell, RefCell};
@@ -78,10 +79,11 @@ struct HostShared {
     gui: OnceLock<Option<PluginGui>>,
     timer: OnceLock<Option<PluginTimer>>,
     posix_fd: OnceLock<Option<PluginPosixFd>>,
-    // Plugin -> host requests (lock-free flags).
+    // Plugin -> host requests. The plugin may raise them from any thread,
+    // its audio thread included, so they are flags and nothing else;
+    // `ClapVoiceMain::service` reads them on the main thread.
     callback_requested: AtomicBool,
     restart_requested: AtomicBool,
-    process_requested: AtomicBool,
     flush_requested: AtomicBool,
     // Editor requests. clack dispatches every HostGuiImpl callback to the
     // shared handler (they may come from any thread).
@@ -103,9 +105,9 @@ impl<'a> SharedHandler<'a> for HostShared {
     fn request_restart(&self) {
         self.restart_requested.store(true, Ordering::SeqCst);
     }
-    fn request_process(&self) {
-        self.process_requested.store(true, Ordering::SeqCst);
-    }
+    /// Nothing to do: a voice a unit plays is processed in every block, and
+    /// a voice no unit plays is retired, never put to sleep.
+    fn request_process(&self) {}
     fn request_callback(&self) {
         self.callback_requested.store(true, Ordering::SeqCst);
     }
@@ -384,6 +386,111 @@ impl StateGate {
     }
 }
 
+/// What a voice has only while its plugin is active: the processor, and
+/// the tables and buffers sized to what the plugin declared for this
+/// activation. A restart (`request_restart`) moves the whole set to the main
+/// thread and a new one back, so the audio thread neither allocates nor
+/// frees for it.
+struct Live {
+    processor: PluginAudioProcessor<TestHost>,
+    /// Sorted `(id, min, max)`, read once per activation for lock-free CC scaling.
+    param_ranges: Vec<(u32, f64, f64)>,
+    in_count: usize,
+    main_out: usize,
+    in_bufs: Vec<Vec<f32>>,
+    /// One buffer set per output port; only `main_out` is heard. Drum
+    /// machines (OneTrick CRYPTID: 12 ports) put each drum on its own port
+    /// and the mix on the main one.
+    out_bufs: Vec<Vec<Vec<f32>>>,
+    in_ports: AudioPorts,
+    out_ports: AudioPorts,
+}
+
+impl Live {
+    /// Activate the inactive `plugin` for `sample_rate` and size everything
+    /// to the ports and parameters it declares now. Main thread.
+    fn activate(plugin: &mut PluginInstance<TestHost>, exts: Exts, sample_rate: f64) -> Result<Box<Live>> {
+        let (in_count, in_ch, out_chs, main_out) = inspect_audio_ports(plugin, exts.audio_ports)?;
+        let audio_config = PluginAudioConfiguration {
+            sample_rate,
+            min_frames_count: 1,
+            max_frames_count: BLOCK as u32,
+        };
+        let stopped = plugin.activate(|_, _| (), audio_config).context("activating the plugin")?;
+        let mut param_ranges = Vec::new();
+        if let Some(params) = exts.params {
+            let handle = plugin.plugin_handle();
+            let count = params.count(&handle);
+            let mut info_buf = ParamInfoBuffer::new();
+            param_ranges.reserve(count as usize);
+            for i in 0..count {
+                if let Some(info) = params.get_info(&handle, i, &mut info_buf) {
+                    param_ranges.push((info.id.get(), info.min_value, info.max_value));
+                }
+            }
+            param_ranges.sort_unstable_by_key(|&(id, _, _)| id);
+        }
+        Ok(Box::new(Live {
+            processor: stopped.into(),
+            param_ranges,
+            in_count,
+            main_out,
+            in_bufs: (0..in_ch.max(1)).map(|_| vec![0.0; BLOCK]).collect(),
+            out_bufs: out_chs.iter().map(|&chs| (0..chs).map(|_| vec![0.0; BLOCK]).collect()).collect(),
+            in_ports: AudioPorts::with_capacity(in_ch.max(1), 1),
+            out_ports: AudioPorts::with_capacity(out_chs.iter().sum(), out_chs.len()),
+        }))
+    }
+}
+
+/// The audio side's end of the restart hand-off (see [`MainLink`]).
+struct AudioLink {
+    /// The main thread wants the [`Live`] set back, processing stopped.
+    stop: Arc<AtomicBool>,
+    to_main: rtrb::Producer<Box<Live>>,
+    from_main: rtrb::Consumer<Box<Live>>,
+}
+
+/// The main thread's end of the restart hand-off: it raises `stop`, the
+/// audio side stops processing and sends its [`Live`] set, the main thread
+/// deactivates and reactivates the plugin and sends a new set.
+struct MainLink {
+    stop: Arc<AtomicBool>,
+    from_audio: rtrb::Consumer<Box<Live>>,
+    to_audio: rtrb::Producer<Box<Live>>,
+}
+
+fn restart_link() -> (AudioLink, MainLink) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (to_main, from_audio) = rtrb::RingBuffer::new(1);
+    let (to_audio, from_main) = rtrb::RingBuffer::new(1);
+    (AudioLink { stop: stop.clone(), to_main, from_main }, MainLink { stop, from_audio, to_audio })
+}
+
+/// Where a restart the plugin asked for stands, on the main thread.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Restart {
+    /// Active, nothing asked.
+    Idle,
+    /// The audio side was asked for the processor.
+    Stopping,
+    /// The plugin refused to activate again; it stays inactive until it
+    /// asks for another restart.
+    Inactive,
+}
+
+/// How often the host did what a plugin asked for (`ClapVoiceMain::served`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Served {
+    /// `on_main_thread()` calls after `request_callback()`.
+    pub callbacks: u64,
+    /// Deactivations followed by an activation after `request_restart()`.
+    pub restarts: u64,
+    /// `params.flush()` calls on the main thread after `request_flush()`
+    /// from an inactive plugin. An active one is flushed by `process()`.
+    pub flushes: u64,
+}
+
 /// A live Surge XT voice: the CLAP audio processor plus preallocated buffers.
 ///
 /// `Send` but `!Sync`: create it on the main thread, then move it to the audio
@@ -394,28 +501,19 @@ impl StateGate {
 pub struct ClapVoice {
     voice_id: u64,
     plugin_id: String,
-    processor: StartedPluginAudioProcessor<TestHost>,
+    /// None while a restart has the set on the main thread: silence.
+    live: Option<Box<Live>>,
+    link: AudioLink,
     cmds_tx: Arc<Mutex<rtrb::Producer<VoiceCmd>>>,
     cmds_rx: rtrb::Consumer<VoiceCmd>,
     /// Preallocated audio-thread command queue (avoids Mutex lock in `GraphEngine`).
     rt_cmds: Vec<VoiceCmd>,
-    /// Sorted `(id, min, max)` table populated once at instantiation for lock-free CC scaling.
-    param_ranges: Vec<(u32, f64, f64)>,
     /// Optional sample-accurate sequence (frame offset, command), e.g. the
     /// host-test arpeggio. Preallocated; consumed with a cursor.
     schedule: Vec<(u64, VoiceCmd)>,
     sched_idx: usize,
     frame: u64,
     sample_rate: f64,
-    in_count: usize,
-    main_out: usize,
-    in_bufs: Vec<Vec<f32>>,
-    /// One buffer set per output port; only `main_out` is heard. Drum
-    /// machines (OneTrick CRYPTID: 12 ports) put each drum on its own port
-    /// and the mix on the main one.
-    out_bufs: Vec<Vec<Vec<f32>>>,
-    in_ports: AudioPorts,
-    out_ports: AudioPorts,
     ev_in: EventBuffer,
     ev_out: EventBuffer,
     process_errors: u64,
@@ -523,59 +621,31 @@ impl ClapVoice {
         sample_rate: f64,
     ) -> Result<(ClapVoice, ClapVoiceMain)> {
         static NEXT_VOICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let (in_count, in_ch, out_chs, main_out) =
-            inspect_audio_ports(&mut plugin, exts.audio_ports)?;
-        let audio_config = PluginAudioConfiguration {
-            sample_rate,
-            min_frames_count: 1,
-            max_frames_count: BLOCK as u32,
-        };
-        let stopped = plugin
-            .activate(|_, _| (), audio_config)
-            .context("activating Surge XT")?;
+        // Processing starts with the first rendered block, on the thread
+        // that renders (`start_processing` is an [audio-thread] call).
+        let live = Live::activate(&mut plugin, exts, sample_rate).with_context(|| format!("activating {id_str}"))?;
         // Surge only reports meaningful latency once active.
         // CLAP lets a plugin change it only while it is being activated,
         // so this value holds for as long as the voice runs.
         let latency = exts.latency.map(|l| l.get(&plugin.plugin_handle())).unwrap_or(0);
         println!("plugin-reported latency (active): {latency} samples");
         let shared_latency = Arc::new(std::sync::atomic::AtomicU32::new(latency));
-        let mut param_ranges = Vec::new();
-        if let Some(params) = exts.params {
-            let handle = plugin.plugin_handle();
-            let count = params.count(&handle);
-            let mut info_buf = ParamInfoBuffer::new();
-            param_ranges.reserve(count as usize);
-            for i in 0..count {
-                if let Some(info) = params.get_info(&handle, i, &mut info_buf) {
-                    param_ranges.push((info.id.get(), info.min_value, info.max_value));
-                }
-            }
-            param_ranges.sort_unstable_by_key(|&(id, _, _)| id);
-        }
-        let processor = stopped
-            .start_processing()
-            .map_err(|_| anyhow!("start_processing failed"))?;
+        let (audio_link, main_link) = restart_link();
 
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
         let gate = Arc::new(StateGate::default());
         let voice = ClapVoice {
             voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             plugin_id: id_str.clone(),
-            processor,
+            live: Some(live),
+            link: audio_link,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
             cmds_rx,
             rt_cmds: Vec::with_capacity(EVENT_CAP as usize),
-            param_ranges,
             schedule: Vec::new(),
             sched_idx: 0,
             frame: 0,
             sample_rate,
-            in_count,
-            main_out,
-            in_bufs: (0..in_ch.max(1)).map(|_| vec![0.0; BLOCK]).collect(),
-            out_bufs: out_chs.iter().map(|&chs| (0..chs).map(|_| vec![0.0; BLOCK]).collect()).collect(),
-            in_ports: AudioPorts::with_capacity(in_ch.max(1), 1),
-            out_ports: AudioPorts::with_capacity(out_chs.iter().sum(), out_chs.len()),
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
@@ -592,6 +662,10 @@ impl ClapVoice {
             gate,
             shared_latency,
             load_mark: None,
+            link: main_link,
+            restart: Restart::Idle,
+            served: Served::default(),
+            sample_rate,
             _entry: entry,
         };
         main.refresh_main_controls();
@@ -635,10 +709,8 @@ impl ClapVoice {
 
     /// Native `(min, max)` range for `id`, if reported by the plugin.
     pub fn param_range(&self, id: u32) -> Option<(f64, f64)> {
-        self.param_ranges
-            .binary_search_by_key(&id, |&(pid, _, _)| pid)
-            .ok()
-            .map(|idx| (self.param_ranges[idx].1, self.param_ranges[idx].2))
+        let ranges = &self.live.as_ref()?.param_ranges;
+        ranges.binary_search_by_key(&id, |&(pid, _, _)| pid).ok().map(|idx| (ranges[idx].1, ranges[idx].2))
     }
 
     /// Scale a normalized `0..=1` value into the parameter's range and queue it
@@ -698,6 +770,19 @@ impl ClapVoice {
     }
 
     fn render_block(&mut self, n: usize, out: &mut [f32], transport: &Transport) {
+        self.hand_over();
+        // No set (a restart has it) or a plugin that will not start: silence.
+        // The commands wait in their queues for the block that renders.
+        let Some(live) = self.live.as_deref_mut() else {
+            out[..n * 2].fill(0.0);
+            return;
+        };
+        let Live { processor, param_ranges, in_count, main_out, in_bufs, out_bufs, in_ports, out_ports } = live;
+        let Ok(processor) = processor.ensure_processing_started() else {
+            self.process_errors += 1;
+            out[..n * 2].fill(0.0);
+            return;
+        };
         if !self.gate.enter() {
             out[..n * 2].fill(0.0);
             return;
@@ -710,14 +795,14 @@ impl ClapVoice {
             if self.ev_in.len() >= EVENT_CAP {
                 break;
             }
-            push_cmd(&mut self.ev_in, &self.param_ranges, 0, self.rt_cmds[i]);
+            push_cmd(&mut self.ev_in, param_ranges, 0, self.rt_cmds[i]);
         }
         self.rt_cmds.clear();
         while let Ok(cmd) = self.cmds_rx.pop() {
             if self.ev_in.len() >= EVENT_CAP {
                 break;
             }
-            push_cmd(&mut self.ev_in, &self.param_ranges, 0, cmd);
+            push_cmd(&mut self.ev_in, param_ranges, 0, cmd);
         }
         while self.sched_idx < self.schedule.len()
             && self.schedule[self.sched_idx].0 < self.frame + n as u64
@@ -726,30 +811,30 @@ impl ClapVoice {
                 break;
             }
             let (t, cmd) = self.schedule[self.sched_idx];
-            push_cmd(&mut self.ev_in, &self.param_ranges, (t - self.frame) as u32, cmd);
+            push_cmd(&mut self.ev_in, param_ranges, (t - self.frame) as u32, cmd);
             self.sched_idx += 1;
         }
 
         let in_port = AudioPortBuffer {
             latency: 0,
             channels: AudioPortBufferType::f32_input_only(
-                self.in_bufs.iter_mut().map(|b| InputChannel::constant(b.as_mut_slice())),
+                in_bufs.iter_mut().map(|b| InputChannel::constant(b.as_mut_slice())),
             ),
         };
-        let mut input = if self.in_count == 1 {
-            self.in_ports.with_input_buffers([in_port])
+        let mut input = if *in_count == 1 {
+            in_ports.with_input_buffers([in_port])
         } else {
             // Zero input ports: same concrete type, empty iterator.
-            self.in_ports.with_input_buffers([in_port].into_iter().take(0))
+            in_ports.with_input_buffers([in_port].into_iter().take(0))
         };
         // Port configs from an iterator (no heap alloc: `out_ports` holds
         // room for every port and channel).
-        let mut output = self.out_ports.with_output_buffers(self.out_bufs.iter_mut().map(|p| out_port!(p)));
+        let mut output = out_ports.with_output_buffers(out_bufs.iter_mut().map(|p| out_port!(p)));
         // Buffers are BLOCK-sized; process exactly n frames.
         input.truncate(n as u32);
         output.truncate(n as u32);
 
-        let status = self.processor.process(
+        let status = processor.process(
             &input,
             &mut output,
             &self.ev_in.as_input(),
@@ -766,16 +851,39 @@ impl ClapVoice {
         // but unused. On process failure output silence.
         let failed = status.is_err();
         for i in 0..n {
-            out[i * 2] = if failed { 0.0 } else { self.out_bufs[self.main_out][0][i] };
-            out[i * 2 + 1] = if failed { 0.0 } else { self.out_bufs[self.main_out][1][i] };
+            out[i * 2] = if failed { 0.0 } else { out_bufs[*main_out][0][i] };
+            out[i * 2 + 1] = if failed { 0.0 } else { out_bufs[*main_out][1][i] };
         }
         self.frame += n as u64;
     }
 
-    /// Stop processing and hand the processor back for main-thread
-    /// deactivation (`ClapVoiceMain::deactivate`). Call on the audio thread.
-    pub fn stop(self) -> StoppedPluginAudioProcessor<TestHost> {
-        self.processor.stop_processing()
+    /// The audio side of a restart: give the set to the main thread when it
+    /// asks, with processing stopped, and adopt the one it sends back.
+    /// Moves two boxes; allocates and frees nothing.
+    fn hand_over(&mut self) {
+        if self.live.is_none() {
+            self.live = self.link.from_main.pop().ok();
+        }
+        // The request stays up until there is a set to give: the main
+        // thread may ask again before the last one it sent was adopted.
+        if self.live.is_some() && self.link.stop.swap(false, Ordering::SeqCst) {
+            let mut live = self.live.take().unwrap();
+            live.processor.ensure_processing_stopped();
+            if let Err(rtrb::PushError::Full(live)) = self.link.to_main.push(live) {
+                // Cannot happen (the main thread asks once and takes the
+                // set before it asks again); keep playing if it does.
+                self.live = Some(live);
+            }
+        }
+    }
+
+    /// Stop processing and give the processor up for deactivation
+    /// (`ClapVoiceMain::retire`). Runs on the main thread once nothing
+    /// renders the voice any more, which makes it the plugin's audio thread
+    /// for this call. None while a restart has the processor on the main side.
+    fn stop(mut self) -> Option<StoppedPluginAudioProcessor<TestHost>> {
+        let live = self.live.take().or_else(|| self.link.from_main.pop().ok())?;
+        Some(live.processor.into_stopped())
     }
 }
 
@@ -834,6 +942,184 @@ fn push_cmd(ev_in: &mut EventBuffer, params: &[(u32, f64, f64)], time: u32, cmd:
             v,
         )),
         VoiceCmd::Midi(data) => ev_in.push(&MidiEvent::new(time, 0, data)),
+    }
+}
+
+#[cfg(test)]
+mod probe;
+
+#[cfg(test)]
+mod host_request_tests {
+    use super::probe::host_probe;
+    use super::*;
+
+    fn render(voice: &mut ClapVoice) -> [f32; BLOCK * 2] {
+        let mut buf = [1.0f32; BLOCK * 2];
+        voice.render(&mut buf, Transport::default());
+        buf
+    }
+
+    #[test]
+    fn a_requested_callback_runs_once_on_the_main_thread_without_an_editor() {
+        let (voice, mut main, probe) = host_probe();
+        main.service();
+        assert!(probe.calls("on_main_thread").is_empty(), "no callback without a request");
+        // The plugin may ask from any thread.
+        std::thread::scope(|s| {
+            s.spawn(|| probe.request_callback());
+        });
+        assert!(!main.editor_open());
+        main.pump();
+        main.pump();
+        let calls = probe.calls("on_main_thread");
+        assert_eq!(calls.len(), 1, "one request, one call");
+        assert_eq!(calls[0].thread, std::thread::current().id());
+        assert_eq!(main.served(), Served { callbacks: 1, ..Served::default() });
+        main.retire(voice);
+    }
+
+    #[test]
+    fn a_restart_request_reactivates_off_the_audio_thread_and_the_voice_plays_on() {
+        let (mut voice, mut main, probe) = host_probe();
+        let main_thread = std::thread::current().id();
+        assert_eq!(voice.param_range(1), None);
+
+        // The voice renders on its own thread, as in the engine; the test
+        // steps it block by block.
+        let (step_tx, step_rx) = mpsc::channel::<()>();
+        let (out_tx, out_rx) = mpsc::channel::<f32>();
+        let audio = std::thread::spawn(move || {
+            while step_rx.recv().is_ok() {
+                let _ = out_tx.send(render(&mut voice)[0]);
+            }
+            voice
+        });
+        let audio_thread = audio.thread().id();
+        let mut block = || {
+            step_tx.send(()).unwrap();
+            out_rx.recv().unwrap()
+        };
+
+        assert_eq!(block(), 0.25);
+        // After the restart the plugin has a second parameter.
+        probe.params.store(2, Ordering::SeqCst);
+        probe.request_restart();
+        main.service();
+        assert_eq!(probe.calls("deactivate").len(), 0, "the processor is still with the audio side");
+        assert_eq!(block(), 0.0, "the block that hands the processor over is silent");
+        main.service();
+        assert_eq!(main.served().restarts, 1);
+        assert_eq!(block(), 0.25, "the next block plays again");
+        main.service();
+        assert_eq!(main.served().restarts, 1, "one request, one restart");
+
+        assert_eq!(
+            probe.sequence(),
+            ["activate", "start_processing", "first process", "stop_processing", "deactivate", "activate", "start_processing"]
+        );
+        for what in ["activate", "deactivate"] {
+            assert!(probe.calls(what).iter().all(|c| c.thread == main_thread), "{what} belongs to the main thread");
+        }
+        for what in ["start_processing", "stop_processing"] {
+            assert!(probe.calls(what).iter().all(|c| c.thread == audio_thread), "{what} belongs to the audio thread");
+        }
+
+        drop(step_tx);
+        let voice = audio.join().unwrap();
+        assert_eq!(voice.param_range(1), Some((0.0, 1.0)), "the new activation's parameters are known");
+        assert_eq!(voice.process_errors(), 0);
+        main.retire(voice);
+        assert_eq!(probe.calls("destroy").len(), 1);
+    }
+
+    #[test]
+    fn commands_sent_during_a_restart_reach_the_plugin_after_it() {
+        let (mut voice, mut main, probe) = host_probe();
+        render(&mut voice);
+        probe.request_restart();
+        main.service();
+        voice.push_rt(VoiceCmd::Param(ClapId::new(0), 0.5));
+        assert_eq!(render(&mut voice)[0], 0.0);
+        main.service();
+        assert_eq!(render(&mut voice)[0], 0.5);
+        main.retire(voice);
+    }
+
+    #[test]
+    fn a_second_restart_asked_before_the_first_set_was_adopted_is_served_too() {
+        let (mut voice, mut main, probe) = host_probe();
+        render(&mut voice);
+        probe.request_restart();
+        main.service();
+        render(&mut voice);
+        main.service();
+        // The new set waits for the audio side; the plugin asks again.
+        probe.request_restart();
+        main.service();
+        assert_eq!(render(&mut voice)[0], 0.0, "adopted and handed over in one block");
+        main.service();
+        assert_eq!(main.served().restarts, 2);
+        assert_eq!(render(&mut voice)[0], 0.25);
+        assert_eq!(probe.calls("activate").len(), 3);
+        assert_eq!(probe.calls("deactivate").len(), 2);
+        main.retire(voice);
+    }
+
+    #[test]
+    fn a_plugin_that_refuses_to_activate_again_stays_silent_and_is_flushed_on_the_main_thread() {
+        let (mut voice, mut main, probe) = host_probe();
+        render(&mut voice);
+
+        // Active: the next process() call is the flush.
+        probe.request_flush();
+        main.service();
+        assert!(probe.calls("flush").is_empty());
+
+        probe.refuse_activation.store(true, Ordering::SeqCst);
+        probe.request_restart();
+        main.service();
+        render(&mut voice);
+        main.service();
+        assert!(!main.is_active());
+        assert_eq!(render(&mut voice)[0], 0.0);
+
+        probe.request_flush();
+        main.service();
+        let flushes = probe.calls("flush");
+        assert_eq!(flushes.len(), 1, "an inactive plugin is flushed by params.flush");
+        assert_eq!(flushes[0].thread, std::thread::current().id());
+        assert_eq!(main.served().flushes, 1);
+
+        // It asks again and activates this time.
+        probe.request_restart();
+        main.service();
+        assert!(main.is_active());
+        assert_eq!(render(&mut voice)[0], 0.25);
+        assert_eq!(main.served().restarts, 1);
+        main.retire(voice);
+        assert_eq!(probe.calls("destroy").len(), 1);
+    }
+
+    #[test]
+    fn a_voice_retired_in_the_middle_of_a_restart_is_deactivated_once() {
+        // The processor is with the voice, on its way to the main side, or
+        // on its way back.
+        for stage in 0..3 {
+            let (mut voice, mut main, probe) = host_probe();
+            render(&mut voice);
+            probe.request_restart();
+            main.service();
+            if stage >= 1 {
+                render(&mut voice);
+            }
+            if stage >= 2 {
+                main.service();
+            }
+            main.retire(voice);
+            let calls = probe.sequence();
+            assert_eq!(calls.iter().filter(|c| **c == "activate").count(), calls.iter().filter(|c| **c == "deactivate").count(), "stage {stage}: {calls:?}");
+            assert_eq!(calls.last(), Some(&"destroy"), "stage {stage}");
+        }
     }
 }
 
@@ -1151,6 +1437,10 @@ pub struct ClapVoiceMain {
     shared_latency: Arc<std::sync::atomic::AtomicU32>,
     /// `StateGate::mark` of the last state load, until a block applied it.
     load_mark: Option<u64>,
+    link: MainLink,
+    restart: Restart,
+    served: Served,
+    sample_rate: f64,
     _entry: PluginEntry,
 }
 
@@ -1228,13 +1518,15 @@ impl ClapVoiceMain {
         }
     }
 
-    /// While the editor is open, run the plugin's main-thread callbacks: due
+    /// Serve the plugin's requests ([`Self::service`]) and, while the editor
+    /// is open, run the plugin's main-thread callbacks: due
     /// timers, ready file descriptors, the window's events and resize
     /// requests. Call it every UI frame; JUCE editors (Surge) paint only from
     /// these. Without an editor nothing runs: JUCE's timers drive its one
     /// process-wide message loop, and firing them from several threads (one
     /// per test) deadlocked the unit suite.
     pub fn pump(&mut self) {
+        self.service();
         if self.editor.is_none() {
             return;
         }
@@ -1251,6 +1543,104 @@ impl ClapVoiceMain {
             }
         }
         self.pump_editor();
+    }
+
+    /// Do what the plugin asked the host for since the last call. Main
+    /// thread; call it every UI frame, editor open or not (`pump` does).
+    ///
+    /// - `request_callback()`: one `on_main_thread()` call.
+    /// - `request_restart()`: the audio side stops processing and hands its
+    ///   processor over at its next block, then the plugin is deactivated
+    ///   and activated here, with ports, parameter ranges and buffers read
+    ///   anew, and processing starts again on the audio side. The voice is
+    ///   silent in between. A voice nothing renders restarts once it is
+    ///   rendered again.
+    /// - `params.request_flush()`: an active plugin is flushed by its next
+    ///   `process()` call, which carries the parameter events both ways. An
+    ///   inactive one gets `params.flush()` here.
+    pub fn service(&mut self) {
+        let (callback, flush) = self.instance.access_shared_handler(|h| {
+            (h.callback_requested.swap(false, Ordering::SeqCst), h.flush_requested.swap(false, Ordering::SeqCst))
+        });
+        if callback {
+            self.instance.call_on_main_thread_callback();
+            self.served.callbacks += 1;
+        }
+        self.step_restart();
+        if flush {
+            self.flush_inactive();
+        }
+    }
+
+    /// What `service` did so far.
+    pub fn served(&self) -> Served {
+        self.served
+    }
+
+    /// Whether the plugin is active (false only after it refused to
+    /// activate again in a restart).
+    pub fn is_active(&self) -> bool {
+        self.instance.is_active()
+    }
+
+    fn restart_requested(&self) -> bool {
+        self.instance.access_shared_handler(|h| h.restart_requested.swap(false, Ordering::SeqCst))
+    }
+
+    fn step_restart(&mut self) {
+        match self.restart {
+            Restart::Idle => {
+                if self.restart_requested() {
+                    self.link.stop.store(true, Ordering::SeqCst);
+                    self.restart = Restart::Stopping;
+                }
+            }
+            Restart::Stopping => {
+                let Ok(live) = self.link.from_audio.pop() else { return };
+                // Requests up to here are served by this deactivation.
+                self.restart_requested();
+                let Live { processor, .. } = *live;
+                self.instance.deactivate(processor.into_stopped());
+                self.reactivate();
+            }
+            Restart::Inactive => {
+                if self.restart_requested() {
+                    self.reactivate();
+                }
+            }
+        }
+    }
+
+    /// Activate the inactive plugin and send the audio side its new set.
+    fn reactivate(&mut self) {
+        match Live::activate(&mut self.instance, self.exts, self.sample_rate) {
+            Ok(live) => {
+                // CLAP lets a plugin change its latency on activation; publish the new value.
+                let latency = self.latency();
+                self.shared_latency.store(latency, Ordering::Relaxed);
+                // The ring is empty: the audio side adopted the last set
+                // before it could hand one back.
+                let _ = self.link.to_audio.push(live);
+                self.restart = Restart::Idle;
+                self.served.restarts += 1;
+                // Parameters may be new ones.
+                self.main_controls_rechecks = MAIN_CONTROLS_RECHECKS;
+            }
+            Err(e) => {
+                eprintln!("[host] the plugin did not activate again after its restart request: {e:#}");
+                self.restart = Restart::Inactive;
+            }
+        }
+    }
+
+    /// `params.flush()` for an inactive plugin, with no events to send.
+    /// What the plugin reports back is not kept: values are read from it.
+    fn flush_inactive(&mut self) {
+        let Some(params) = self.exts.params else { return };
+        let Some(mut handle) = self.instance.inactive_plugin_handle() else { return };
+        let (ev_in, mut ev_out) = (EventBuffer::new(), EventBuffer::new());
+        params.flush(&mut handle, &ev_in.as_input(), &mut ev_out.as_output());
+        self.served.flushes += 1;
     }
 
     /// Windows the plugin attached inside its editor window, while it is open.
@@ -1333,47 +1723,48 @@ impl ClapVoiceMain {
         Ok(())
     }
 
-    /// Deactivate the plugin after the audio thread returned the processor via
-    /// `ClapVoice::stop`. Consumes both sides (CLAP lifecycle rule).
-    pub fn deactivate(mut self, stopped: StoppedPluginAudioProcessor<TestHost>) {
-        self.instance.deactivate(stopped);
+    /// The processor wherever a restart left it: with the voice, on its way
+    /// to this side, or nowhere (the plugin is inactive).
+    fn take_processor(&mut self, voice: ClapVoice) -> Option<StoppedPluginAudioProcessor<TestHost>> {
+        voice.stop().or_else(|| self.link.from_audio.pop().ok().map(|live| live.processor.into_stopped()))
     }
 
     /// Stop `voice` and retire both halves (main thread only).
     /// `CLAP_NEVER_FREE` plugins are deactivated and parked for reuse —
     /// never destroyed: their destructor is unsafe while other plugin
     /// instances render (#52).
-    pub fn retire(self, voice: ClapVoice) {
+    pub fn retire(mut self, voice: ClapVoice) {
         let plugin_id = voice.plugin_id.clone();
-        let stopped = voice.stop();
+        if let Some(stopped) = self.take_processor(voice) {
+            self.instance.deactivate(stopped);
+        }
         if clap_never_free(&plugin_id) {
-            self.park(stopped, plugin_id);
-        } else {
-            self.deactivate(stopped);
+            self.park(plugin_id);
         }
     }
 
-    /// Deactivate a never-free instance and park it for the next
+    /// Park a deactivated never-free instance for the next
     /// `new_plugin` of the same id. If the pool cannot take it, leak it —
     /// never destroy (rule 56 class).
-    fn park(self, stopped: StoppedPluginAudioProcessor<TestHost>, plugin_id: String) {
+    fn park(self, plugin_id: String) {
         // `Drop` closes the editor and frees the instance; a parked plugin
         // is never freed, so take the fields out by hand.
         let mut me = std::mem::ManuallyDrop::new(self);
         me.close_editor();
-        me.instance.deactivate(stopped);
         // SAFETY: `me` is never used or dropped again, and each field is read
         // exactly once (the editor is closed, so there is nothing else to free).
-        let (instance, exts, entry, controls, gate) = unsafe {
+        let (instance, exts, entry, controls, gate, shared_latency, link) = unsafe {
             (
                 std::ptr::read(&me.instance),
                 std::ptr::read(&me.exts),
                 std::ptr::read(&me._entry),
                 std::ptr::read(&me.main_controls),
                 std::ptr::read(&me.gate),
+                std::ptr::read(&me.shared_latency),
+                std::ptr::read(&me.link),
             )
         };
-        drop((controls, gate));
+        drop((controls, gate, shared_latency, link));
         let parked = ParkedClap { plugin_id, instance, exts, _entry: entry };
         CLAP_PARKED.with(|pool| {
             if let Ok(mut pool) = pool.try_borrow_mut() {
@@ -1568,7 +1959,7 @@ pub fn run_test() -> Result<()> {
     let stats = Arc::new(Stats::default());
     // 0.5 s of interleaved stereo headroom.
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(sample_rate as usize);
-    let (tx, rx) = mpsc::sync_channel::<StoppedPluginAudioProcessor<TestHost>>(1);
+    let (tx, rx) = mpsc::sync_channel::<ClapVoice>(1);
     let proc_handle = {
         let stop = stop.clone();
         let stats = stats.clone();
@@ -1643,7 +2034,8 @@ pub fn run_test() -> Result<()> {
         main.load_state(&state_a)?;
         // Let the audio thread apply the restored state.
         std::thread::sleep(Duration::from_millis(300));
-        main.instance_mut().call_on_main_thread_callback();
+        main.service();
+        println!("plugin requests served: {:?}", main.served());
         let v2 = params
             .get_value(&main.instance_mut().plugin_handle(), mp.id)
             .ok_or_else(|| anyhow!("param {} vanished after load", mp.id.get()))?;
@@ -1670,7 +2062,7 @@ pub fn run_test() -> Result<()> {
     //     hand the processor back to the main thread for deactivation.
     drop(stream);
     stop.store(true, Ordering::SeqCst);
-    let stopped = rx
+    let voice = rx
         .recv_timeout(Duration::from_secs(10))
         .context("processing thread did not return the audio processor")?;
     let process_errors = proc_handle.join().map_err(|_| anyhow!("processing thread panicked"))??;
@@ -1695,7 +2087,7 @@ pub fn run_test() -> Result<()> {
     println!("arpeggio: AUDIBLE (peak {peak:.4})");
 
     // 11. Deactivate on the main thread, then drop everything.
-    main.deactivate(stopped);
+    main.retire(voice);
     println!("=== host-test PASS: Surge XT loads, plays, state round-trips ===");
     Ok(())
 }
@@ -1999,10 +2391,14 @@ pub fn run_state_race_test(seconds: u64, patches: &[PathBuf]) -> Result<()> {
         for key in [48, 55, 60, 64] {
             ctl.note_on(key, 0.9);
         }
+        // What the app does every UI frame: the plugin's requests, served
+        // beside the loads, the saves and the rendering.
+        main.service();
     }
     stop.store(true, Ordering::SeqCst);
     let (voice, blocks, peak) = render.join().map_err(|_| anyhow!("the render thread panicked"))?;
     println!("2. {loads} loads and {saves} saves against {blocks} rendered blocks (peak {peak:.3})");
+    println!("3. plugin requests served meanwhile: {:?}", main.served());
     anyhow::ensure!(voice.process_errors() == 0, "process() reported {} errors", voice.process_errors());
     anyhow::ensure!(peak > 1e-3, "the voice stayed silent: nothing was rendered between the loads");
     main.retire(voice);
@@ -2924,7 +3320,7 @@ fn voice_render_loop(
     stop: Arc<AtomicBool>,
     mut producer: rtrb::Producer<f32>,
     stats: Arc<Stats>,
-    tx: mpsc::SyncSender<StoppedPluginAudioProcessor<TestHost>>,
+    tx: mpsc::SyncSender<ClapVoice>,
 ) -> Result<u64> {
     let mut block = [0.0f32; BLOCK * 2];
     while !stop.load(Ordering::Relaxed) {
@@ -2954,8 +3350,7 @@ fn voice_render_loop(
 
     // Back to the main thread for deactivation (CLAP lifecycle rule).
     let errors = voice.process_errors();
-    let stopped = voice.stop();
-    let _ = tx.send(stopped);
+    let _ = tx.send(voice);
     Ok(errors)
 }
 

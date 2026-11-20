@@ -1289,6 +1289,17 @@ Learned so far (2026-11-15, UI polish pass):
     does too. Check with `CLAP_PATH=<dir with a foreign bundle> kabelsalat
     clap-scan-test` (`readelf -h` shows what a bundle is; `file` is not
     installed here).
+181. **A plugin's request to the host is served, on the thread CLAP names
+    for it:** `request_callback`, `request_restart` and `request_flush` set
+    flags nothing read (#180), so a plugin that defers work to the main
+    thread would wait for good (Surge XT asks for a callback on about nine
+    of ten state loads). `ClapVoiceMain::service` serves them on the main
+    thread every frame, editor or not; a restart moves the voice's `Live`
+    set to the main thread and a new one back, so the audio thread neither
+    allocates nor frees. A new host callback gets a test on the probe
+    plugin (`src/host/probe.rs`), which records the thread of every call
+    (`cargo test --bin kabelsalat host_request`), and
+    `kabelsalat state-race-test` prints what real Surge was served.
 
 ## Working on kabelsalat
 

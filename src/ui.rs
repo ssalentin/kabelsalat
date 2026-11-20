@@ -7124,6 +7124,9 @@ impl DemoApp {
         use crate::setlist::{Part, PartRig, Song};
         let n_rigs = self.rig_count();
         let parse_sig = |v: &serde_json::Value| -> Result<crate::transport::TimeSig, String> {
+            if let Some(s) = v.as_str() {
+                return crate::transport::TimeSig::parse(s);
+            }
             let num = v.get("numerator").and_then(|x| x.as_u64()).ok_or("time_signature.numerator required")?;
             let den = v.get("denominator").and_then(|x| x.as_u64()).ok_or("time_signature.denominator required")?;
             crate::transport::TimeSig::checked(num, den)
@@ -7157,9 +7160,14 @@ impl DemoApp {
             }
             Ok(out)
         };
-        let parsed_parts = match args.get("parts").and_then(|v| v.as_array()) {
-            Some(arr) => Some(parse_parts(arr)?),
-            None => None,
+        let parsed_parts = match args.get("parts") {
+            Some(serde_json::Value::Array(arr)) => Some(parse_parts(arr)?),
+            Some(serde_json::Value::String(s)) => {
+                let arr: Vec<serde_json::Value> = serde_json::from_str(s)
+                    .map_err(|e| format!("parts must be a JSON array: {e}"))?;
+                Some(parse_parts(&arr)?)
+            }
+            _ => None,
         };
         if let Some(idx) = args.get("song").and_then(|v| v.as_u64()).map(|n| n as usize) {
             if idx >= self.setlist.songs.len() {
@@ -14713,7 +14721,7 @@ impl DemoApp {
                         }
 
                         // ── Session document pill (● Name ▾) ──
-                        let session_max_w = if narrow { 82.0 } else if compact { 108.0 } else { 150.0 };
+                        let session_max_w = if narrow { 62.0 } else if compact { 104.0 } else { 150.0 };
                         let pill_name = self.session_pill_label();
                         let sp = session_pill_button(ui, &pill_name, self.session_is_saved(), self.session_popover_open, session_max_w)
                             .on_hover_text(format!("Session: {pill_name} · click to save, load or open templates (Ctrl+O)"));
@@ -14733,8 +14741,8 @@ impl DemoApp {
 
                             let left_used = ui.cursor().left();
                             let bar_right = ui.max_rect().right();
-                            let rig_budget = (bar_right - left_used - right_w - view_w - gap * 3.0 - 8.0).max(86.0);
-                            let active_max_w = if narrow { 72.0 } else if compact { 88.0 } else { 116.0 };
+                            let rig_budget = (bar_right - left_used - right_w - view_w - gap * 3.0 - 8.0).max(if narrow { 56.0 } else { 86.0 });
+                            let active_max_w = if narrow { 56.0 } else if compact { 84.0 } else { 116.0 };
                             let est_pills_w = active_max_w + (n.min(9).saturating_sub(1) as f32) * 30.0 + 30.0;
                             let needs_scroll = est_pills_w > rig_budget;
 
@@ -14822,12 +14830,13 @@ impl DemoApp {
                         nav_separator(ui);
 
                         // ── VIEW group: 5 live workspace views (Rack, Mixer, Matrix, Setlist, Plugins) ──
+                        let tight_views = win_w < 840.0;
                         let views = [
                             ("Rack", StageView::Rack),
                             ("Mixer", StageView::Mixer),
                             ("Matrix", StageView::Matrix),
-                            ("Setlist", StageView::Setlist),
-                            ("Plugins", StageView::Plugins),
+                            (if tight_views { "Set" } else { "Setlist" }, StageView::Setlist),
+                            (if tight_views { "Plug" } else { "Plugins" }, StageView::Plugins),
                         ];
                         let mut pick = None;
                         let group = ui.scope(|ui| {

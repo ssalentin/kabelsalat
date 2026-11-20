@@ -1,5 +1,86 @@
 # AGENTS.md — kabelsalat
 
+## Ground rules
+
+- **One branch per session (user, 2026-11-17):** the user runs several
+  sessions in parallel. Before your first edit, put your work on its own
+  branch in its own worktree:
+  `git worktree add ../kabelsalat-<topic> -b <topic> main`, then work only
+  there. Never edit on `main`. A branch alone is not enough: sessions that
+  share one checkout share its working tree, so a `git switch` in one moves
+  every other session's files too. Check `git branch --show-current` and
+  `pwd` before editing.
+- **Move the session into its worktree (user, 2026-11-18):** creating the
+  worktree is not enough. Switch the session itself into it before any
+  edit, build or git command (Claude Code: `EnterWorktree` with
+  `path: ../kabelsalat-<topic>`; other harnesses: their equivalent, or
+  start the session there). Every later command must run with the
+  worktree as its working directory, on the feature branch. Never rely on
+  a `cd` per command from the `main` checkout: the shell falls back to
+  `main` after each call, and one command without the `cd` edits `main`.
+  One session edited `src/ui.rs` on `main` this way, and the diff then had
+  to be moved by patch. If you find your work on `main`, move it to a
+  branch at once (patch or WIP commit; never a bare `git stash`, the stash
+  is shared across worktrees), then revert `main`.
+- **Finish the work — open a PR by default (user, 2026-11-20):** every
+  session that changes files opens a pull request by default when it finishes
+  — do not stop with uncommitted changes or ask "would you like me to commit
+  and open a PR?" unless the user explicitly told you not to open a PR yet
+  (or the task was a pure question/investigation with no repo changes). When
+  the work and its evidence are ready: commit, rebase and push the branch
+  with `scripts/sync-branch.sh --push` (gated per rule 50; next rule), open a
+  pull request against `main` (`gh pr create`) that references its issue,
+  shows the evidence and includes `## Bench test`, link it in T3 Code
+  (`link_pull_request`) when available, and queue it with
+  `gh pr merge --auto --squash` (see "Merging"). Never leave finished work
+  only on the local machine or only on a branch. Remove the worktree once
+  its PR is merged.
+- **Rebase before every push, on your own (user, 2026-11-20):** a session
+  never pushes a branch that is behind `origin/main` and never waits to be
+  told to update it. Every push goes through `scripts/sync-branch.sh --push`:
+  it fetches, rebases the branch onto `origin/main`, keeps both sides of
+  conflicts that only append to Markdown files, and pushes with
+  `--force-with-lease`. Run `scripts/sync-branch.sh` (no push) before the
+  gate tests and `--push` after them, so the tests run on the tree you
+  push. When the script stops on a real conflict
+  (exit 2), resolve it in the code, `git add`, `git rebase --continue`, run
+  the gate tests again and rerun the script; when main changed a file you
+  changed too (exit 3), run that file's test modules (rule 155) and rerun
+  it. Once the PR is open, keep it rebased until it merges: watch it, and on
+  the `merge-conflict` label, a `resolve-conflicts` bot merge, or a red CI
+  run caused by a newer `main`, run the script again at once. Never merge
+  `main` into a branch by hand (a rebase keeps the PR diff to your change),
+  never `git push --force` without `--with-lease`, and never rebase or
+  force-push a branch that is not your session's own.
+- **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
+  (admins included), and the required checks `test (x86_64)` and
+  `test (aarch64)` must pass.
+  Branches need not be up to date, so a green PR merges at once. GitHub merges a queued auto-merge PR once they
+  do; never merge by hand around a red or pending check, and never
+  `gh pr merge` without `--auto`. Everything merges on green CI, so the
+  evidence rules above are what keeps it safe. Self-tests with real plugins
+  and audio do not run in CI, so their output belongs in every PR body that
+  changes the code they cover; what this machine could not run goes under
+  `## Bench test` ("Bench tests" below). Branches are rebased onto `main`
+  before every push (previous rule); `resolve-conflicts.yml` still merges
+  `main` into open PRs whose conflicts are appended Markdown lines, and
+  `scripts/sync-branch.sh` drops that bot merge on your next push, so a
+  `git pull` is never needed. An open `main-red` issue means `main` is broken: fixing it comes
+  before new work (`docs/PACKAGING.md`, "Branch protection and a red main").
+- Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
+  spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
+  one near-black hero rack panel, one tomato accent (CTA/selection only).
+- **Plugin GUIs only in their own windows:** the main window is native
+  Wayland and never embeds X11. A plugin's own editor opens in a separate
+  `PluginWindow` (XWayland) on request; check with `kabelsalat editor-test`.
+- **egui 0.37 deadlock:** never call `Painter::add`/`galley` inside
+  `ctx.fonts_mut`/`ui.fonts_mut` — layout under the lock, paint after release.
+- RT discipline: the audio render path is allocation-free; UI animation reads
+  lock-free snapshots only.
+- The lead owns git commits and `Cargo.toml`. Subagents build with
+  `CARGO_TARGET_DIR=$HOME/.cache/ksalat-*-target` (never /tmp — tmpfs).
+- Keep the running app on the old binary until a change is verified.
+
 ## Evidence requirement (user, 2026-11-15)
 
 **Every change must be proven with evidence — and any UI/visual change MUST be
@@ -107,12 +188,91 @@ and never passed off as tested.**
   open issue the connected devices allow, the output as a comment, close on
   a pass, a bug labelled `bench-failed` on a fail.
 
+## Working on kabelsalat
+
+- **Where things live (one place each, never mirrored):** planned work, bugs
+  and ideas = [GitHub issues](https://github.com/ssalentin/kabelsalat/issues)
+  with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
+  `testing`) and milestones per release; how and why it is built =
+  `docs/ARCHITECTURE.md`; CI, packages and releases = `docs/PACKAGING.md`;
+  released changes = `CHANGELOG.md`, but add yours as a fragment
+  `changes/<branch>.md` (`changes/README.md`; never edit CHANGELOG.md in a
+  feature PR, parallel PRs conflict there); rules = this file. Read open issues with
+  `gh issue list -R ssalentin/kabelsalat`; reference them in commits
+  (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
+  becomes an issue, not a note in a doc.
+- **New features (user, 2026-11-18):** a feature is an issue labelled
+  `enhancement`, and the PR that implements it carries the label too. That
+  PR updates `README.md` in the same change — the feature's entry under
+  "What you can do" (or "Install") — and, when it changes what users see,
+  fresh screenshots for that entry (`scripts/shot.sh`, rule 108 review).
+  The `readme-check` workflow (rule 132) fails it otherwise and warns when
+  UI code changed without a screenshot.
+- **Releases:** SemVer tags `vX.Y.Z` on `main`, cut with
+  `gh workflow run prepare-release.yml -f bump=minor` (or patch/major): it
+  opens the release PR, its merge is tagged, and the tag builds every package
+  (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and publishes
+  the GitHub release. A `nightly` pre-release of `main` is rebuilt every
+  night. Details: `docs/PACKAGING.md` ("Releases", "Nightly").
+- **Build / run:** `cargo build`, then `./target/debug/kabelsalat` in the
+  desktop session's environment (this machine's values: local setup file).
+  The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
+  that starts it is killed at its time limit — say so to the user.
+- **Tests:** locally `cargo test --bin kabelsalat <filter>` for the code you
+  changed (the full suite runs in CI only, see the section near the top) and
+  CLI self-tests with real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
+  `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
+  `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
+  `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `send-test`, `cc-map-test`,
+  `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
+  temporary null sinks, so nothing is heard),
+  `state-race-test [seconds] [patch.fxp...]`,
+  `main-controls-test`, `engine-bench` (offline render timing and output hash),
+  `meter-test`, `target-test` (the master's loudness target on a real phrase),
+  `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
+  `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
+  `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `analysis-test [--save <dir>]` (spectra, master crackle, noise routing and
+  delay compensation through the engine without plugins; Surge adds a note),
+  `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
+  (calls the listening model; prints rankings and latency),
+  `catalog-install-test [id...]` (downloads distro packages without
+  installing them, runs release and source routes in a scratch home, then
+  loads and plays every card; a card with no route for this CPU plays the
+  bundle you put in `~/.clap`/`~/.lv2` by hand; wind cards are also blown
+  with CC2; default: every card that is not a source build)
+  (`./target/debug/kabelsalat <name>`).
+- **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
+  [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
+  (headless app, offline engine, real Surge voices, plus YANES and setBfree
+  for `yanes_bass` / `organ_jazz` / `organ_no_pad`; it calls the configured
+  model APIs and costs a few cents; `listen_bright` also calls the listening
+  model) and `kabelsalat jev-test` shows Jev's
+  decisions. A new shortcut row
+  needs an eval task and a `JEV_SAMPLES` line. Surge logs to stdout: filter
+  with
+  `| grep -E '^(  [a-z]|\||agent-eval)'`. Unit tests of the loop run on
+  `llm::fake::FakeTransport` (rule 37).
+- **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
+  the running app); one-shot: `kabelsalat send '<json>'`.
+- **Screenshots of the real app:** launch, wait until the compositor shows
+  your pid as the active window, fullscreen it (rule 55; commands: local
+  setup file), inject keys with `wtype -k F4` (rule 24), then
+  `scripts/shot.sh out.png <pid>` (rule 108). Click with
+  `scripts/click.sh <pid> <x> <y>` (window-relative logical px = egui
+  points; needs `wlrctl`).
+- **Window glitch:** the app process can run while its window stops
+  listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
+
 ## Every fixed error becomes a rule (user, 2026-11-15)
 
 **When you fix a bug, append a one-line rule to the list below so the same
 error is never repeated.** Rules must be specific and checkable (what to do /
 never do, and why), not vague advice. Review your diff against this list
 before committing; if a fix contradicts a rule, update the rule deliberately.
+(Some agent harnesses truncate `AGENTS.md` past ~24 KB; keep workflow rules
+above this section, and read/grep this file when touching an area or before
+appending a rule.)
 
 Learned so far (2026-11-15, UI polish pass):
 
@@ -1380,154 +1540,9 @@ Learned so far (2026-11-15, UI polish pass):
     keybed's octave had no pipes and drawn stops (32', 16', 4', mutations,
     mixtures) had no effect. Map all 128 `note_leds` through
     `aeolus::stop_semitones` onto the full C0–C8 compass (`pipe_facade_tests`).
-
-## Working on kabelsalat
-
-- **Where things live (one place each, never mirrored):** planned work, bugs
-  and ideas = [GitHub issues](https://github.com/ssalentin/kabelsalat/issues)
-  with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
-  `testing`) and milestones per release; how and why it is built =
-  `docs/ARCHITECTURE.md`; CI, packages and releases = `docs/PACKAGING.md`;
-  released changes = `CHANGELOG.md`, but add yours as a fragment
-  `changes/<branch>.md` (`changes/README.md`; never edit CHANGELOG.md in a
-  feature PR, parallel PRs conflict there); rules = this file. Read open issues with
-  `gh issue list -R ssalentin/kabelsalat`; reference them in commits
-  (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
-  becomes an issue, not a note in a doc.
-- **New features (user, 2026-11-18):** a feature is an issue labelled
-  `enhancement`, and the PR that implements it carries the label too. That
-  PR updates `README.md` in the same change — the feature's entry under
-  "What you can do" (or "Install") — and, when it changes what users see,
-  fresh screenshots for that entry (`scripts/shot.sh`, rule 108 review).
-  The `readme-check` workflow (rule 132) fails it otherwise and warns when
-  UI code changed without a screenshot.
-- **Releases:** SemVer tags `vX.Y.Z` on `main`, cut with
-  `gh workflow run prepare-release.yml -f bump=minor` (or patch/major): it
-  opens the release PR, its merge is tagged, and the tag builds every package
-  (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and publishes
-  the GitHub release. A `nightly` pre-release of `main` is rebuilt every
-  night. Details: `docs/PACKAGING.md` ("Releases", "Nightly").
-- **Build / run:** `cargo build`, then `./target/debug/kabelsalat` in the
-  desktop session's environment (this machine's values: local setup file).
-  The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
-  that starts it is killed at its time limit — say so to the user.
-- **Tests:** locally `cargo test --bin kabelsalat <filter>` for the code you
-  changed (the full suite runs in CI only, see the section near the top) and
-  CLI self-tests with real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
-  `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
-  `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
-  `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `send-test`, `cc-map-test`,
-  `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
-  temporary null sinks, so nothing is heard),
-  `state-race-test [seconds] [patch.fxp...]`,
-  `main-controls-test`, `engine-bench` (offline render timing and output hash),
-  `meter-test`, `target-test` (the master's loudness target on a real phrase),
-  `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
-  `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
-  `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
-  `analysis-test [--save <dir>]` (spectra, master crackle, noise routing and
-  delay compensation through the engine without plugins; Surge adds a note),
-  `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
-  (calls the listening model; prints rankings and latency),
-  `catalog-install-test [id...]` (downloads distro packages without
-  installing them, runs release and source routes in a scratch home, then
-  loads and plays every card; a card with no route for this CPU plays the
-  bundle you put in `~/.clap`/`~/.lv2` by hand; wind cards are also blown
-  with CC2; default: every card that is not a source build)
-  (`./target/debug/kabelsalat <name>`).
-- **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
-  [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
-  (headless app, offline engine, real Surge voices, plus YANES and setBfree
-  for `yanes_bass` / `organ_jazz` / `organ_no_pad`; it calls the configured
-  model APIs and costs a few cents; `listen_bright` also calls the listening
-  model) and `kabelsalat jev-test` shows Jev's
-  decisions. A new shortcut row
-  needs an eval task and a `JEV_SAMPLES` line. Surge logs to stdout: filter
-  with
-  `| grep -E '^(  [a-z]|\||agent-eval)'`. Unit tests of the loop run on
-  `llm::fake::FakeTransport` (rule 37).
-- **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
-  the running app); one-shot: `kabelsalat send '<json>'`.
-- **Screenshots of the real app:** launch, wait until the compositor shows
-  your pid as the active window, fullscreen it (rule 55; commands: local
-  setup file), inject keys with `wtype -k F4` (rule 24), then
-  `scripts/shot.sh out.png <pid>` (rule 108). Click with
-  `scripts/click.sh <pid> <x> <y>` (window-relative logical px = egui
-  points; needs `wlrctl`).
-- **Window glitch:** the app process can run while its window stops
-  listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
-
-## Ground rules
-
-- **One branch per session (user, 2026-11-17):** the user runs several
-  sessions in parallel. Before your first edit, put your work on its own
-  branch in its own worktree:
-  `git worktree add ../kabelsalat-<topic> -b <topic> main`, then work only
-  there. Never edit on `main`. A branch alone is not enough: sessions that
-  share one checkout share its working tree, so a `git switch` in one moves
-  every other session's files too. Check `git branch --show-current` and
-  `pwd` before editing.
-- **Move the session into its worktree (user, 2026-11-18):** creating the
-  worktree is not enough. Switch the session itself into it before any
-  edit, build or git command (Claude Code: `EnterWorktree` with
-  `path: ../kabelsalat-<topic>`; other harnesses: their equivalent, or
-  start the session there). Every later command must run with the
-  worktree as its working directory, on the feature branch. Never rely on
-  a `cd` per command from the `main` checkout: the shell falls back to
-  `main` after each call, and one command without the `cd` edits `main`.
-  One session edited `src/ui.rs` on `main` this way, and the diff then had
-  to be moved by patch. If you find your work on `main`, move it to a
-  branch at once (patch or WIP commit; never a bare `git stash`, the stash
-  is shared across worktrees), then revert `main`.
-- **Finish the work:** when the work is finished, commit it, rebase it and
-  push the branch with `scripts/sync-branch.sh --push` (gated per rule 50;
-  next rule), then open a pull request against `main` (`gh pr create`) that
-  references its issue and shows the evidence, then queue it with
-  `gh pr merge --auto --squash` (see "Merging"). Never leave finished work
-  only on the local machine or only on a branch. Remove the worktree once
-  its PR is merged.
-- **Rebase before every push, on your own (user, 2026-11-20):** a session
-  never pushes a branch that is behind `origin/main` and never waits to be
-  told to update it. Every push goes through `scripts/sync-branch.sh --push`:
-  it fetches, rebases the branch onto `origin/main`, keeps both sides of
-  conflicts that only append to Markdown files, and pushes with
-  `--force-with-lease`. Run `scripts/sync-branch.sh` (no push) before the
-  gate tests and `--push` after them, so the tests run on the tree you
-  push. When the script stops on a real conflict
-  (exit 2), resolve it in the code, `git add`, `git rebase --continue`, run
-  the gate tests again and rerun the script; when main changed a file you
-  changed too (exit 3), run that file's test modules (rule 155) and rerun
-  it. Once the PR is open, keep it rebased until it merges: watch it, and on
-  the `merge-conflict` label, a `resolve-conflicts` bot merge, or a red CI
-  run caused by a newer `main`, run the script again at once. Never merge
-  `main` into a branch by hand (a rebase keeps the PR diff to your change),
-  never `git push --force` without `--with-lease`, and never rebase or
-  force-push a branch that is not your session's own.
-- **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
-  (admins included), and the required checks `test (x86_64)` and
-  `test (aarch64)` must pass.
-  Branches need not be up to date, so a green PR merges at once. GitHub merges a queued auto-merge PR once they
-  do; never merge by hand around a red or pending check, and never
-  `gh pr merge` without `--auto`. Everything merges on green CI, so the
-  evidence rules above are what keeps it safe. Self-tests with real plugins
-  and audio do not run in CI, so their output belongs in every PR body that
-  changes the code they cover; what this machine could not run goes under
-  `## Bench test` ("Bench tests" above). Branches are rebased onto `main`
-  before every push (previous rule); `resolve-conflicts.yml` still merges
-  `main` into open PRs whose conflicts are appended Markdown lines, and
-  `scripts/sync-branch.sh` drops that bot merge on your next push, so a
-  `git pull` is never needed. An open `main-red` issue means `main` is broken: fixing it comes
-  before new work (`docs/PACKAGING.md`, "Branch protection and a red main").
-- Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
-  spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
-  one near-black hero rack panel, one tomato accent (CTA/selection only).
-- **Plugin GUIs only in their own windows:** the main window is native
-  Wayland and never embeds X11. A plugin's own editor opens in a separate
-  `PluginWindow` (XWayland) on request; check with `kabelsalat editor-test`.
-- **egui 0.37 deadlock:** never call `Painter::add`/`galley` inside
-  `ctx.fonts_mut`/`ui.fonts_mut` — layout under the lock, paint after release.
-- RT discipline: the audio render path is allocation-free; UI animation reads
-  lock-free snapshots only.
-- The lead owns git commits and `Cargo.toml`. Subagents build with
-  `CARGO_TARGET_DIR=$HOME/.cache/ksalat-*-target` (never /tmp — tmpfs).
-- Keep the running app on the old binary until a change is verified.
+186. **Workflow rules stay above the learned-rules list in `AGENTS.md`:**
+    harnesses that cap injected rule files around 24 KB truncated `AGENTS.md`
+    mid-list, so `## Ground rules` (at 100 KB) was invisible and finished
+    sessions asked whether to open a PR instead of opening one by default.
+    Keep `## Ground rules` and all operational sections at the top of
+    `AGENTS.md` (< 20 KB total), with the append-only learned rules last.

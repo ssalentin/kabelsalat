@@ -1215,6 +1215,10 @@ pub enum Command {
     /// Configure master transport count-in: `bars` (1..=4) of metronome
     /// clicks before the song clock starts at beat 0 when `enabled` is true.
     SetCountIn { enabled: bool, bars: u8 },
+    /// Set the time signature (#87): `num` beats of note value `den` per
+    /// bar. Bar-quantized actions, the metronome's accent, the count-in's
+    /// length and the clock hosted plugins get follow it.
+    SetTimeSignature { num: u8, den: u8 },
     /// Apply an installed LV2 preset (`pset:Preset` URI) to an LV2 node.
     LoadLv2Preset { node: NodeId, preset_uri: String },
     /// Restore an LV2 node's plugin state (a Vital patch for Vitalium), in
@@ -1428,6 +1432,7 @@ mod tests {
             Command::SetBpm { bpm: 128.0 },
             Command::SetCountIn { enabled: true, bars: 2 },
             Command::SetCountIn { enabled: false, bars: 1 },
+            Command::SetTimeSignature { num: 6, den: 8 },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 7, param: Some(0), target: crate::matrix::CcTarget::Knob, scale: Default::default() },

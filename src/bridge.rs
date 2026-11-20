@@ -459,6 +459,7 @@ fn handle_line_with_pub(
                     "count_in_beat": tp.count_in_beat,
                     "count_in_enabled": tp.count_in_enabled,
                     "count_in_bars": tp.count_in_bars,
+                    "time_signature": tp.time_sig.to_json(),
                     "record_sync": tp.record_sync,
                     "bpm": tp.bpm,
                     "buffer_frames": c.buffer_frames(),
@@ -747,6 +748,7 @@ mod tests {
                 count_in_enabled: true,
                 count_in_bars: 2,
                 bpm: 124.0,
+                time_sig: crate::transport::TimeSig { num: 6, den: 8 },
                 record_sync: false,
             },
             ..Default::default()
@@ -765,6 +767,7 @@ mod tests {
         assert_eq!(reply["data"]["count_in_enabled"], json!(true));
         assert_eq!(reply["data"]["count_in_bars"], json!(2));
         assert_eq!(reply["data"]["bpm"], json!(124.0));
+        assert_eq!(reply["data"]["time_signature"], json!({"numerator": 6, "denominator": 8}));
         assert_eq!(reply["data"]["transport_playing"], json!(false));
     }
 

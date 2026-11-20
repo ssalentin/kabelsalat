@@ -1,8 +1,103 @@
 //! Host transport: the engine's song clock, handed to every hosted CLAP
 //! voice each block so tempo-synced plugin features follow kabelsalat.
 
-/// Time signature reported to plugins (kabelsalat has no meter setting yet).
-pub const BEATS_PER_BAR: u16 = 4;
+pub const MAX_SIG_NUMERATOR: u8 = 12;
+/// Note values a beat can be: half, quarter, eighth, sixteenth.
+pub const SIG_DENOMINATORS: [u8; 4] = [2, 4, 8, 16];
+
+/// The session's time signature (#87): how many beats a bar has and which
+/// note value one beat is. It decides the bar length of every bar-quantized
+/// action, the metronome's accent and what hosted plugins are told. The song
+/// position itself stays in quarter notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TimeSig {
+    pub num: u8,
+    pub den: u8,
+}
+
+impl Default for TimeSig {
+    fn default() -> Self {
+        TimeSig::FOUR_FOUR
+    }
+}
+
+impl std::fmt::Display for TimeSig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.num, self.den)
+    }
+}
+
+impl TimeSig {
+    pub const FOUR_FOUR: TimeSig = TimeSig { num: 4, den: 4 };
+    /// What the metronome face steps through; every other signature is set
+    /// in Settings or by a tool.
+    pub const COMMON: [TimeSig; 6] = [
+        TimeSig::FOUR_FOUR,
+        TimeSig { num: 3, den: 4 },
+        TimeSig { num: 6, den: 8 },
+        TimeSig { num: 5, den: 4 },
+        TimeSig { num: 7, den: 8 },
+        TimeSig { num: 2, den: 4 },
+    ];
+
+    /// The common signature after this one (4/4 after the last, and after
+    /// any signature that is not on the list).
+    pub fn next_common(self) -> TimeSig {
+        let at = TimeSig::COMMON.iter().position(|s| *s == self);
+        at.map_or(TimeSig::FOUR_FOUR, |i| TimeSig::COMMON[(i + 1) % TimeSig::COMMON.len()])
+    }
+
+    /// A signature a tool or a person asked for: refused with the reason
+    /// when it is not one the clock can count.
+    pub fn checked(num: u64, den: u64) -> Result<TimeSig, String> {
+        if !(1..=MAX_SIG_NUMERATOR as u64).contains(&num) {
+            return Err(format!("numerator {num} is out of range: 1 to {MAX_SIG_NUMERATOR} beats per bar"));
+        }
+        if !SIG_DENOMINATORS.iter().any(|d| *d as u64 == den) {
+            return Err(format!("denominator {den} is not a beat value: use 2, 4, 8 or 16"));
+        }
+        Ok(TimeSig { num: num as u8, den: den as u8 })
+    }
+
+    /// Whatever arrives from a file or the command bus, made countable:
+    /// the numerator clamped, an unknown denominator read as quarters.
+    pub fn normalized(num: u8, den: u8) -> TimeSig {
+        TimeSig {
+            num: num.clamp(1, MAX_SIG_NUMERATOR),
+            den: if SIG_DENOMINATORS.contains(&den) { den } else { 4 },
+        }
+    }
+
+    /// "3/4", "6 / 8".
+    #[cfg(test)]
+    pub fn parse(text: &str) -> Result<TimeSig, String> {
+        let bad = || format!("'{text}' is not a time signature: write it like 3/4 or 6/8");
+        let (n, d) = text.split_once('/').ok_or_else(bad)?;
+        TimeSig::checked(n.trim().parse().map_err(|_| bad())?, d.trim().parse().map_err(|_| bad())?)
+    }
+
+    /// How tools and status answers spell it.
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({ "numerator": self.num, "denominator": self.den })
+    }
+
+    /// Length of one beat (one metronome click) in quarter notes.
+    pub fn beat_len(self) -> f64 {
+        4.0 / self.den as f64
+    }
+
+    /// Length of one bar in quarter notes: 4 in 4/4, 3 in 3/4 and in 6/8.
+    pub fn bar_beats(self) -> f64 {
+        self.num as f64 * self.beat_len()
+    }
+
+    /// Where song position `beats` (quarter notes) sits in its bar: the
+    /// beat of the bar (0 = the accented one) and the phase within it (0..1).
+    pub fn beat_in_bar(self, beats: f64) -> (u8, f64) {
+        let units = beats.max(0.0).rem_euclid(self.bar_beats()) / self.beat_len();
+        ((units.floor() as u8).min(self.num - 1), units.fract())
+    }
+}
 
 pub const MIN_BPM: f32 = 20.0;
 pub const MAX_BPM: f32 = 300.0;
@@ -28,9 +123,10 @@ impl CountInConfig {
         Self { enabled, bars: bars.clamp(1, MAX_COUNT_IN_BARS) }
     }
 
-    pub fn total_beats(self) -> f64 {
+    /// Length of the count-in in quarter notes: whole bars of `sig`.
+    pub fn total_beats(self, sig: TimeSig) -> f64 {
         if self.enabled {
-            self.bars.clamp(1, MAX_COUNT_IN_BARS) as f64 * BEATS_PER_BAR as f64
+            self.bars.clamp(1, MAX_COUNT_IN_BARS) as f64 * sig.bar_beats()
         } else {
             0.0
         }
@@ -54,12 +150,13 @@ impl MasterClock {
         !matches!(self, Self::Stopped)
     }
 
-    /// 1-based beat index within the count-in (1..=total_beats), or 0 when not counting in.
-    pub fn count_in_beat(self) -> u8 {
+    /// 1-based click of the count-in (1..=its number of clicks, counted in
+    /// the signature's beats), or 0 when not counting in.
+    pub fn count_in_beat(self, sig: TimeSig) -> u8 {
         match self {
             Self::CountingIn { remaining_beats, total_beats } => {
-                let elapsed = (total_beats - remaining_beats).max(0.0);
-                (elapsed.floor() as u8).saturating_add(1).min(total_beats.round() as u8)
+                let elapsed = (total_beats - remaining_beats).max(0.0) / sig.beat_len();
+                (elapsed.floor() as u8).saturating_add(1).min((total_beats / sig.beat_len()).round() as u8)
             }
             _ => 0,
         }
@@ -140,6 +237,7 @@ pub struct Transport {
     /// Song position in quarter notes.
     pub beats: f64,
     pub seconds: f64,
+    pub sig: TimeSig,
 }
 
 impl Default for Transport {
@@ -152,7 +250,7 @@ impl Default for Transport {
 
 impl Transport {
     pub fn stopped(bpm: f64) -> Self {
-        Transport { playing: false, bpm, beats: 0.0, seconds: 0.0 }
+        Transport { playing: false, bpm, beats: 0.0, seconds: 0.0, sig: TimeSig::FOUR_FOUR }
     }
 
     /// Beats one frame lasts. The metronome advances its phase with the same
@@ -179,18 +277,21 @@ impl Transport {
         }
     }
 
-    /// (bar number, beat the bar starts on), both from 0.
+    /// (bar number, song position the bar starts on in quarter notes), both
+    /// from 0. Bars are counted in the current signature from beat 0.
     pub fn bar(&self) -> (i32, f64) {
-        let bar = (self.beats / BEATS_PER_BAR as f64).floor();
-        (bar as i32, bar * BEATS_PER_BAR as f64)
+        let len = self.sig.bar_beats();
+        let bar = (self.beats / len).floor();
+        (bar as i32, bar * len)
     }
 }
 
 /// The next bar boundary strictly after `beats` (AUM's sync quantum, one
-/// bar): the file player's play-enable waits for it while the transport
-/// rolls. Beat 0 itself is not "next" — a start there begins immediately.
-pub fn next_bar_beats(beats: f64) -> f64 {
-    let bar = BEATS_PER_BAR as f64;
+/// bar of `sig`): the file player's play-enable and a recording's start and
+/// stop wait for it while the transport rolls. Beat 0 itself is not "next":
+/// a start there begins immediately.
+pub fn next_bar_beats(beats: f64, sig: TimeSig) -> f64 {
+    let bar = sig.bar_beats();
     (beats.max(0.0) / bar).floor() * bar + bar
 }
 
@@ -448,6 +549,34 @@ pub fn run_test() -> anyhow::Result<()> {
     );
     anyhow::ensure!(step2 == 2, "expected Surge on step 2 after count-in + 0.5 beat, got {step2}");
     bus.send(Command::TransportStop);
+
+    // Time signature (#87): in 3/4 the one-bar count-in is 3 beats = 150
+    // blocks, the song clock keeps the signature across Play, and Surge
+    // still starts on step 0 at beat 0 and follows the quarter-note tempo.
+    bus.send(Command::SetTimeSignature { num: 3, den: 4 });
+    bus.send(Command::TransportPlay);
+    for blk in 0..150 {
+        engine.render(&mut buf, 2);
+        let t = engine.transport();
+        anyhow::ensure!(blk == 149 || (!t.playing && t.beats == 0.0), "3/4 count-in leaked song playback at block {blk}: {t:?}");
+    }
+    let after = engine.transport();
+    anyhow::ensure!(
+        after.playing && after.beats == 0.0 && after.sig == (TimeSig { num: 3, den: 4 }),
+        "in 3/4 the song must start 150 blocks (3 beats) after Play: {after:?}"
+    );
+    let onsets = hold_note(&mut engine, &mut bus, 6.0);
+    let (step34, share34) = sequencer_step_at_start(&onsets, SR, STEP_HZ);
+    let steps34 = onset_grid_hz(&onsets, SR) * 60.0 / 120.0;
+    println!(
+        "transport-test: 3/4, after a 3-beat count-in at engine beat {:.2} → Surge's sequencer on step {step34:>2} ({:.0}% on sounding steps), {steps34:.3} steps per beat",
+        after.beats,
+        share34 * 100.0
+    );
+    anyhow::ensure!(step34 == 0, "expected Surge on step 0 after the 3/4 count-in, got {step34}");
+    anyhow::ensure!((steps34 - 4.0).abs() < 0.04, "the signature must not change the tempo Surge gets: {steps34:.3} steps per beat");
+    bus.send(Command::TransportStop);
+    bus.send(Command::SetTimeSignature { num: 4, den: 4 });
     bus.send(Command::SetCountIn { enabled: false, bars: 1 });
 
     println!("transport-test: OK — Surge follows the engine's tempo (4 steps per beat at 120/60/90 BPM), song position, play/stop, and count-in");
@@ -578,12 +707,61 @@ mod tests {
     }
 
     #[test]
+    fn bar_follows_the_signature() {
+        let mut t = Transport::stopped(120.0);
+        t.beats = 9.5;
+        t.sig = TimeSig { num: 3, den: 4 };
+        assert_eq!(t.bar(), (3, 9.0));
+        t.sig = TimeSig { num: 6, den: 8 };
+        assert_eq!(t.bar(), (3, 9.0), "a 6/8 bar is three quarters long");
+        t.sig = TimeSig { num: 7, den: 8 };
+        assert_eq!(t.bar(), (2, 7.0));
+        t.sig = TimeSig { num: 2, den: 2 };
+        assert_eq!(t.bar(), (2, 8.0));
+    }
+
+    #[test]
     fn next_bar_is_strictly_ahead() {
-        assert_eq!(next_bar_beats(0.0), 4.0);
-        assert_eq!(next_bar_beats(3.999), 4.0);
-        assert_eq!(next_bar_beats(4.0), 8.0);
-        assert_eq!(next_bar_beats(12.5), 16.0);
-        assert_eq!(next_bar_beats(-0.5), 4.0, "never played: the first downbeat");
+        let c = TimeSig::FOUR_FOUR;
+        assert_eq!(next_bar_beats(0.0, c), 4.0);
+        assert_eq!(next_bar_beats(3.999, c), 4.0);
+        assert_eq!(next_bar_beats(4.0, c), 8.0);
+        assert_eq!(next_bar_beats(12.5, c), 16.0);
+        assert_eq!(next_bar_beats(-0.5, c), 4.0, "never played: the first downbeat");
+        let waltz = TimeSig { num: 3, den: 4 };
+        assert_eq!(next_bar_beats(0.0, waltz), 3.0);
+        assert_eq!(next_bar_beats(3.0, waltz), 6.0);
+        assert_eq!(next_bar_beats(4.2, waltz), 6.0);
+        assert_eq!(next_bar_beats(4.2, TimeSig { num: 7, den: 8 }), 7.0);
+    }
+
+    #[test]
+    fn a_signature_is_checked_parsed_and_measured() {
+        assert_eq!(TimeSig::default(), TimeSig::FOUR_FOUR);
+        assert_eq!(TimeSig::checked(3, 4), Ok(TimeSig { num: 3, den: 4 }));
+        assert_eq!(TimeSig::parse("6/8"), Ok(TimeSig { num: 6, den: 8 }));
+        assert_eq!(TimeSig::parse(" 12 / 16 "), Ok(TimeSig { num: 12, den: 16 }));
+        assert_eq!(TimeSig { num: 5, den: 4 }.to_string(), "5/4");
+        for bad in ["0/4", "13/4", "4/3", "4/32", "4", "x/4", "4/"] {
+            assert!(TimeSig::parse(bad).is_err(), "{bad} must be refused");
+        }
+        assert!(TimeSig::checked(4, 5).unwrap_err().contains("2, 4, 8 or 16"));
+        assert_eq!(TimeSig::normalized(0, 3), TimeSig { num: 1, den: 4 });
+        assert_eq!(TimeSig::normalized(40, 8), TimeSig { num: 12, den: 8 });
+        assert_eq!((TimeSig::FOUR_FOUR.bar_beats(), TimeSig::FOUR_FOUR.beat_len()), (4.0, 1.0));
+        assert_eq!((TimeSig { num: 6, den: 8 }.bar_beats(), TimeSig { num: 6, den: 8 }.beat_len()), (3.0, 0.5));
+        assert_eq!(TimeSig { num: 3, den: 2 }.bar_beats(), 6.0);
+        // Position in the bar: beat index and phase.
+        let six = TimeSig { num: 6, den: 8 };
+        assert_eq!(six.beat_in_bar(0.0), (0, 0.0));
+        assert_eq!(six.beat_in_bar(2.75), (5, 0.5));
+        assert_eq!(six.beat_in_bar(3.0), (0, 0.0));
+        assert_eq!(TimeSig { num: 3, den: 4 }.beat_in_bar(7.25), (1, 0.25));
+        // The face steps through the common ones and comes back to 4/4.
+        let mut s = TimeSig::FOUR_FOUR;
+        let walk: Vec<String> = (0..7).map(|_| { s = s.next_common(); s.to_string() }).collect();
+        assert_eq!(walk, ["3/4", "6/8", "5/4", "7/8", "2/4", "4/4", "3/4"]);
+        assert_eq!(TimeSig { num: 11, den: 16 }.next_common(), TimeSig::FOUR_FOUR);
     }
 
     #[test]
@@ -654,19 +832,26 @@ mod tests {
         let def = CountInConfig::default();
         assert!(!def.enabled);
         assert_eq!(def.bars, 1);
-        assert_eq!(def.total_beats(), 0.0);
+        let c44 = TimeSig::FOUR_FOUR;
+        assert_eq!(def.total_beats(c44), 0.0);
 
         let one = CountInConfig::normalized(true, 1);
-        assert_eq!(one.total_beats(), 4.0);
+        assert_eq!(one.total_beats(c44), 4.0);
+        assert_eq!(one.total_beats(TimeSig { num: 3, den: 4 }), 3.0);
+        assert_eq!(CountInConfig::normalized(true, 2).total_beats(TimeSig { num: 6, den: 8 }), 6.0);
         assert_eq!(CountInConfig::normalized(true, 9).bars, MAX_COUNT_IN_BARS);
 
         let c = MasterClock::CountingIn { remaining_beats: 4.0, total_beats: 4.0 };
-        assert_eq!(c.count_in_beat(), 1);
+        assert_eq!(c.count_in_beat(c44), 1);
         let c2 = MasterClock::CountingIn { remaining_beats: 2.1, total_beats: 4.0 };
-        assert_eq!(c2.count_in_beat(), 2);
+        assert_eq!(c2.count_in_beat(c44), 2);
         let c4 = MasterClock::CountingIn { remaining_beats: 0.2, total_beats: 4.0 };
-        assert_eq!(c4.count_in_beat(), 4);
-        assert_eq!(MasterClock::Playing.count_in_beat(), 0);
+        assert_eq!(c4.count_in_beat(c44), 4);
+        assert_eq!(MasterClock::Playing.count_in_beat(c44), 0);
+        // One bar of 6/8 is three quarters long and has six clicks.
+        let six = TimeSig { num: 6, den: 8 };
+        let s = |remaining_beats| MasterClock::CountingIn { remaining_beats, total_beats: 3.0 }.count_in_beat(six);
+        assert_eq!((s(3.0), s(2.4), s(0.6), s(0.1)), (1, 2, 5, 6));
     }
 
     #[test]

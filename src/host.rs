@@ -56,7 +56,7 @@ use clack_host::utils::{BeatTime, SecondsTime};
 
 use crate::main_controls::{self, Candidate, MainControls, RemotePage};
 use crate::plugin_window::PluginWindow;
-use crate::transport::{Transport, BEATS_PER_BAR};
+use crate::transport::Transport;
 
 /// Frames per processing block. Small enough for live latency, big enough for Surge.
 const BLOCK: usize = 256;
@@ -887,7 +887,7 @@ impl ClapVoice {
     }
 }
 
-/// The CLAP view of the host transport: tempo, 4/4, and both timelines.
+/// The CLAP view of the host transport: tempo, time signature, and both timelines.
 fn transport_event(t: &Transport) -> TransportEvent {
     let mut flags = TransportFlags::HAS_TEMPO
         | TransportFlags::HAS_BEATS_TIMELINE
@@ -908,8 +908,8 @@ fn transport_event(t: &Transport) -> TransportEvent {
         loop_end_seconds: SecondsTime::from_int(0),
         bar_start: BeatTime::from_float(bar_start),
         bar_number,
-        time_signature_numerator: BEATS_PER_BAR,
-        time_signature_denominator: 4,
+        time_signature_numerator: t.sig.num as u16,
+        time_signature_denominator: t.sig.den as u16,
     }
 }
 
@@ -1222,6 +1222,21 @@ mod transport_event_tests {
         assert!((playing.song_pos_seconds.to_float() - 4.0).abs() < 1e-6);
         assert_eq!(playing.bar_number, 1);
         assert_eq!(playing.bar_start.to_float(), 4.0);
+    }
+
+    #[test]
+    fn plugins_get_the_time_signature_and_its_bars() {
+        let mut t = Transport::stopped(120.0);
+        t.sig = crate::transport::TimeSig { num: 7, den: 8 };
+        t.set_playing(true);
+        t.advance(48000 * 4, 48000.0); // 8 beats: 2 bars of 3.5 and one beat
+        let e = transport_event(&t);
+        assert_eq!((e.time_signature_numerator, e.time_signature_denominator), (7, 8));
+        assert_eq!((e.bar_number, e.bar_start.to_float()), (2, 7.0));
+        t.sig = crate::transport::TimeSig { num: 3, den: 4 };
+        let e = transport_event(&t);
+        assert_eq!((e.time_signature_numerator, e.time_signature_denominator), (3, 4));
+        assert_eq!((e.bar_number, e.bar_start.to_float()), (2, 6.0));
     }
 }
 

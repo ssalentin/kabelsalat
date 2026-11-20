@@ -124,6 +124,9 @@ pub struct Session {
     /// Virtual keyboard surface selection (#163): `None` = unspecified
     /// (older sessions/templates leave current mode alone), `Some(Auto)` or `Some(Pinned(..))`.
     pub keyboard_mode: Option<crate::keyboard::KeyboardMode>,
+    /// The time signature (#87). `None` = this session says nothing about
+    /// it (older files, templates): a load then leaves the clock's as it is.
+    pub time_sig: Option<crate::transport::TimeSig>,
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -181,6 +184,7 @@ impl Session {
             bus_outs: Vec::new(),
             master_target: None,
             keyboard_mode: None,
+            time_sig: None,
         }
     }
 
@@ -198,6 +202,7 @@ impl Session {
             && self.bus_outs == other.bus_outs
             && self.master_target == other.master_target
             && self.keyboard_mode == other.keyboard_mode
+            && self.time_sig == other.time_sig
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -553,6 +558,7 @@ impl Session {
             bus_outs: self.bus_outs.clone(),
             master_target: self.master_target,
             keyboard_mode: self.keyboard_mode,
+            time_signature: self.time_sig,
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -595,6 +601,8 @@ impl Session {
             bus_outs: manifest.bus_outs,
             master_target: manifest.master_target,
             keyboard_mode: manifest.keyboard_mode,
+            // A hand-edited file cannot give the clock a bar it cannot count.
+            time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
         };
         session.validate()?;
         Ok(session)
@@ -717,6 +725,9 @@ struct SessionFile {
     /// Virtual keyboard surface selection (#163); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keyboard_mode: Option<crate::keyboard::KeyboardMode>,
+    /// The time signature (#87); older sessions have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_signature: Option<crate::transport::TimeSig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1615,6 +1626,39 @@ mod tests {
         assert!(err.contains("newer kabelsalat"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_time_signature_round_trips_and_old_sessions_have_none() {
+        use crate::transport::TimeSig;
+        let dir = std::env::temp_dir().join(format!("ksalat-timesig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("t.ksalat");
+        let mut s = Session::new("t", Graph::demo_patch());
+        s.time_sig = Some(TimeSig { num: 7, den: 8 });
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert_eq!(loaded.time_sig, Some(TimeSig { num: 7, den: 8 }));
+        assert!(loaded.same_content(&s));
+        let mut other = s.clone();
+        other.time_sig = Some(TimeSig::FOUR_FOUR);
+        assert!(!other.same_content(&s), "another signature is another session");
+        // A file edited by hand to a bar the clock cannot count is made countable.
+        let file = pkg.join(SESSION_FILE);
+        let json = std::fs::read_to_string(&file).unwrap();
+        assert!(json.contains("\"time_signature\""), "{json}");
+        let mut v: Value = serde_json::from_str(&json).unwrap();
+        v["time_signature"] = serde_json::json!({"num": 99, "den": 5});
+        std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(Session::load(&pkg).unwrap().time_sig, Some(TimeSig { num: 12, den: 4 }));
+        // A session that says nothing has none (rule 165).
+        s.time_sig = None;
+        let pkg2 = dir.join("plain.ksalat");
+        s.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
+        assert!(!json.contains("time_signature"), "absent when unset: old readers stay happy");
+        assert_eq!(Session::load(&pkg2).unwrap().time_sig, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

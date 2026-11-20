@@ -27,7 +27,7 @@ use crate::capture::SystemCapture;
 use crate::meter::{MasterMeter, MasterTarget, MeterSnapshot};
 use crate::player::{read_frame, PlayerCfg, PlayerData};
 use crate::record::RecorderTap;
-use crate::transport::{CountInConfig, MasterClock, Transport};
+use crate::transport::{next_bar_beats, CountInConfig, MasterClock, TimeSig, Transport};
 
 /// Max hardware MIDI device ids pre-routed in the matrix (per-rig filter selects).
 pub const MAX_HW_DEVICES: u32 = 16;
@@ -357,35 +357,55 @@ struct DspSlot {
     transport: SlotTransport,
 }
 
-/// One transport-capable node's own clock: whether it runs, its phase within
-/// the beat (0..1), and the click envelope in flight. Per slot, so two
-/// metronomes never share (and double-advance) one phase.
+/// One transport-capable node's own clock: whether it runs, which beat of
+/// the bar it is on (0 = the accented one), its phase within that beat
+/// (0..1), and the click envelope in flight. Per slot, so two metronomes
+/// never share (and double-advance) one phase.
 #[derive(Clone, Copy, Default)]
 struct SlotTransport {
     playing: bool,
+    beat: u8,
     phase: f64,
     click_remaining: usize,
     click_phase: f32,
+    /// The click in flight is a bar's first beat.
+    click_accent: bool,
 }
 
 impl SlotTransport {
-    /// Start/stop at a block boundary. Start lands on the downbeat (the click
-    /// fires on the first rendered frame); stop cuts any click in flight.
+    /// Start/stop at a block boundary. Start lands on the downbeat (the
+    /// accented click fires on the first rendered frame); stop cuts any
+    /// click in flight.
     fn set_playing(&mut self, playing: bool) {
         if playing && !self.playing {
+            self.beat = 0;
             self.phase = 0.0;
             self.click_remaining = CLICK_FRAMES;
             self.click_phase = 0.0;
+            self.click_accent = true;
         }
         if !playing {
             self.click_remaining = 0;
         }
         self.playing = playing;
     }
+
+    /// The signature changed: stay inside the new bar. While the song plays
+    /// (`song_beats`), take the place in the bar from the song position, so
+    /// the accent sits on the bar lines everything else is quantized to.
+    fn resync(&mut self, sig: TimeSig, song_beats: Option<f64>) {
+        match song_beats {
+            Some(beats) if self.playing => (self.beat, self.phase) = sig.beat_in_bar(beats),
+            _ => self.beat %= sig.num,
+        }
+    }
 }
 
-/// Click length in frames (decaying 1 kHz burst).
+/// Click length in frames (a decaying burst).
 const CLICK_FRAMES: usize = 2400;
+/// Click pitch: every beat, and the higher first beat of a bar.
+const CLICK_HZ: f32 = 1000.0;
+const CLICK_ACCENT_HZ: f32 = 1500.0;
 
 /// Build the processor slot for a Dsp node, carrying the node's persisted
 /// playing flag into its transport (sessions/LoadGraph restore it).
@@ -999,6 +1019,7 @@ pub struct TransportPub {
     pub count_in_enabled: bool,
     pub count_in_bars: u8,
     pub bpm: f32,
+    pub time_sig: TimeSig,
     pub record_sync: bool,
 }
 
@@ -1011,6 +1032,7 @@ impl Default for TransportPub {
             count_in_enabled: false,
             count_in_bars: 1,
             bpm: 96.0,
+            time_sig: TimeSig::FOUR_FOUR,
             record_sync: false,
         }
     }
@@ -1951,7 +1973,7 @@ impl GraphEngine {
         if self.master_clock.is_counting_in() {
             0.0
         } else {
-            crate::transport::next_bar_beats(self.transport.beats)
+            next_bar_beats(self.transport.beats, self.transport.sig)
         }
     }
 
@@ -2160,9 +2182,7 @@ impl GraphEngine {
             if matches!(self.record_pending, Some((true, _))) {
                 return;
             }
-            let bpb = crate::transport::BEATS_PER_BAR as f64;
-            let next_bar = ((self.transport.beats / bpb).floor() + 1.0) * bpb;
-            self.record_pending = Some((true, next_bar));
+            self.record_pending = Some((true, next_bar_beats(self.transport.beats, self.transport.sig)));
             if let Some(rec) = &mut self.recorder {
                 rec.set_pending(true);
             }
@@ -2186,9 +2206,7 @@ impl GraphEngine {
         if matches!(self.record_pending, Some((false, _))) || self.master_clock != MasterClock::Playing {
             self.record_stop_now();
         } else {
-            let bpb = crate::transport::BEATS_PER_BAR as f64;
-            let next_bar = ((self.transport.beats / bpb).floor() + 1.0) * bpb;
-            self.record_pending = Some((false, next_bar));
+            self.record_pending = Some((false, next_bar_beats(self.transport.beats, self.transport.sig)));
             if let Some(rec) = &mut self.recorder {
                 rec.set_pending(true);
             }
@@ -2237,10 +2255,11 @@ impl GraphEngine {
         TransportPub {
             playing: self.transport.playing,
             counting_in: self.master_clock.is_counting_in(),
-            count_in_beat: self.master_clock.count_in_beat(),
+            count_in_beat: self.master_clock.count_in_beat(self.transport.sig),
             count_in_enabled: self.count_in.enabled,
             count_in_bars: self.count_in.bars,
             bpm: self.transport.bpm as f32,
+            time_sig: self.transport.sig,
             record_sync: self.record_sync,
         }
     }
@@ -4373,6 +4392,30 @@ impl GraphEngine {
                     self.transport_dirty = true;
                 }
             }
+            Command::SetTimeSignature { num, den } => {
+                let sig = TimeSig::normalized(num, den);
+                if self.transport.sig != sig {
+                    self.transport.sig = sig;
+                    let playing = self.master_clock == MasterClock::Playing;
+                    let song = playing.then_some(self.transport.beats);
+                    for d in &mut self.dsp {
+                        d.transport.resync(sig, song);
+                    }
+                    self.count_in_slot.resync(sig, None);
+                    // What waits for a bar line waits for the next one of
+                    // the new signature.
+                    if playing {
+                        let next = next_bar_beats(self.transport.beats, sig);
+                        if let Some((_, at)) = &mut self.record_pending {
+                            *at = next;
+                        }
+                        if let Some(p) = self.player.as_mut().filter(|p| p.pending) {
+                            p.target_beats = next;
+                        }
+                    }
+                    self.transport_dirty = true;
+                }
+            }
             Command::RecordStart => self.record_start(),
             Command::RecordStop => self.record_stop(),
             Command::SetRecordArm { rig, armed } => {
@@ -4423,14 +4466,14 @@ impl GraphEngine {
             if self.master_clock.is_active() {
                 return;
             }
-            self.transport = Transport::stopped(self.transport.bpm);
+            self.transport = Transport { sig: self.transport.sig, ..Transport::stopped(self.transport.bpm) };
             if self.count_in.enabled {
-                let total = self.count_in.total_beats();
+                let total = self.count_in.total_beats(self.transport.sig);
                 self.master_clock = MasterClock::CountingIn {
                     remaining_beats: total,
                     total_beats: total,
                 };
-                self.last_count_in_beat = self.master_clock.count_in_beat();
+                self.last_count_in_beat = self.master_clock.count_in_beat(self.transport.sig);
                 self.count_in_slot.set_playing(false);
                 self.count_in_slot.set_playing(true);
             } else {
@@ -4696,7 +4739,7 @@ impl GraphEngine {
         // 2a. Metronome nodes: click generators gated by their OWN playing
         // flag (per-instrument transport). Output reaches the master via
         // normal audio routing like any DSP node.
-        let (sr, bpm) = (self.sample_rate, self.transport.bpm);
+        let (sr, bpm, sig) = (self.sample_rate, self.transport.bpm, self.transport.sig);
         // MIDI clock send: the song position as of THIS block's first frame,
         // stamped with the monotonic clock (one vDSO read, no allocation).
         let block_wall_ns = match &self.clock_pos {
@@ -4726,12 +4769,12 @@ impl GraphEngine {
         );
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
-                render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, suppress_wrap_click);
+                render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, sig, suppress_wrap_click);
                 source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, 1.0, &mut d.buf[..n2]);
             }
         }
         if counting_in_this_block {
-            render_metronome(&mut self.count_in_slot, &mut self.count_in_buf[..n2], frames, sr, bpm, suppress_wrap_click);
+            render_metronome(&mut self.count_in_slot, &mut self.count_in_buf[..n2], frames, sr, bpm, sig, suppress_wrap_click);
         }
         // 2a-arp. Arpeggiator units step on the SONG CLOCK while the master
         // transport plays (rule 43: the pattern sits on the music's grid, and
@@ -4786,7 +4829,7 @@ impl GraphEngine {
                     }
                 } else {
                     self.master_clock = MasterClock::CountingIn { remaining_beats: rem, total_beats };
-                    let beat = self.master_clock.count_in_beat();
+                    let beat = self.master_clock.count_in_beat(self.transport.sig);
                     if beat != self.last_count_in_beat {
                         self.last_count_in_beat = beat;
                         self.transport_dirty = true;
@@ -5329,14 +5372,16 @@ fn shifted(note: u8, semis: i16) -> Option<u8> {
 }
 
 /// Generate one metronome's click into `buf` (stereo-interleaved): a
-/// decaying 1 kHz burst on each beat while ITS transport plays. Driven by
-/// SetNodePlaying / master TransportPlay·Stop / SetBpm; allocation-free.
+/// decaying burst on each beat of `sig` while ITS transport plays, 1 kHz and
+/// 1.5 kHz on the first beat of a bar. Driven by SetNodePlaying / master
+/// TransportPlay·Stop / SetBpm / SetTimeSignature; allocation-free.
 fn render_metronome(
     t: &mut SlotTransport,
     buf: &mut [f32],
     frames: usize,
     sample_rate: f64,
     bpm: f64,
+    sig: TimeSig,
     suppress_wrap_click: bool,
 ) {
     let frames = frames.min(buf.len() / 2);
@@ -5346,21 +5391,25 @@ fn render_metronome(
     }
     // Phase counts beats with the song clock's own factor, so a tempo change
     // mid-beat leaves a master-started click on the beats plugins see.
-    let beat_inc = Transport::beats_per_frame(bpm, sample_rate);
+    // One click per beat of the signature: a quarter in x/4, an eighth in x/8.
+    let beat_inc = Transport::beats_per_frame(bpm, sample_rate) / sig.beat_len();
     for i in 0..frames {
         if t.playing {
             t.phase += beat_inc;
             if t.phase >= 1.0 {
                 t.phase -= 1.0;
+                t.beat = (t.beat + 1) % sig.num;
                 if !suppress_wrap_click {
                     t.click_remaining = CLICK_FRAMES;
                     t.click_phase = 0.0;
+                    t.click_accent = t.beat == 0;
                 }
             }
         }
         if t.click_remaining > 0 {
             let env = t.click_remaining as f32 / CLICK_FRAMES as f32;
-            let click = (2.0 * std::f32::consts::PI * 1000.0 * t.click_phase / sample_rate as f32).sin()
+            let hz = if t.click_accent { CLICK_ACCENT_HZ } else { CLICK_HZ };
+            let click = (2.0 * std::f32::consts::PI * hz * t.click_phase / sample_rate as f32).sin()
                 * env
                 * 0.4;
             buf[i * 2] = click;
@@ -6399,6 +6448,102 @@ mod tests {
         }
     }
 
+    fn accents(clicks: &[super::HeardClick]) -> String {
+        clicks.iter().map(|c| if c.accent { 'X' } else { '.' }).collect()
+    }
+
+    #[test]
+    fn four_four_clicks_where_it_always_did_and_accents_each_bar() {
+        let (mut engine, mut bus, _m1, _m2, _pub) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::TransportPlay);
+        let clicks = super::heard_clicks(&mut engine, &mut bus, 9 * 24000 - 2400, |_, _| {});
+        assert_eq!(accents(&clicks), "X...X...X");
+        for (i, c) in clicks.iter().enumerate() {
+            assert!((c.frame as i64 - i as i64 * 24000).abs() <= 3, "click {i} at frame {}", c.frame);
+        }
+        assert_eq!(engine.transport().sig, crate::transport::TimeSig::FOUR_FOUR);
+    }
+
+    #[test]
+    fn in_three_four_the_metronome_accents_once_per_bar() {
+        let (mut engine, mut bus, _m1, _m2, pub_) = two_metronomes();
+        engine.set_graph_pub(pub_.clone());
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetTimeSignature { num: 3, den: 4 });
+        bus.send(Command::TransportPlay);
+        let clicks = super::heard_clicks(&mut engine, &mut bus, 9 * 24000 - 2400, |_, _| {});
+        assert_eq!(accents(&clicks), "X..X..X..");
+        for (i, c) in clicks.iter().enumerate() {
+            assert!((c.beats - i as f64).abs() < 1e-3, "click {i} at song beat {}", c.beats);
+        }
+        assert_eq!(pub_.lock().unwrap().transport.time_sig, crate::transport::TimeSig { num: 3, den: 4 }, "published back (rule 33)");
+        // Stop and play again: the signature stays, the bar starts over.
+        bus.send(Command::TransportStop);
+        bus.send(Command::TransportPlay);
+        let again = super::heard_clicks(&mut engine, &mut bus, 4 * 24000 - 2400, |_, _| {});
+        assert_eq!(accents(&again), "X..X");
+    }
+
+    #[test]
+    fn six_eight_clicks_eighths_and_accents_every_six() {
+        let (mut engine, mut bus, _m1, _m2, _pub) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetTimeSignature { num: 6, den: 8 });
+        bus.send(Command::TransportPlay);
+        let clicks = super::heard_clicks(&mut engine, &mut bus, 13 * 12000 - 2400, |_, _| {});
+        assert_eq!(accents(&clicks), "X.....X.....X");
+        for (i, c) in clicks.iter().enumerate() {
+            assert!((c.beats - i as f64 * 0.5).abs() < 1e-3, "click {i} at song beat {}", c.beats);
+        }
+    }
+
+    #[test]
+    fn a_signature_change_mid_song_puts_the_accent_on_the_new_bar_lines() {
+        let (mut engine, mut bus, _m1, _m2, _pub) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::TransportPlay);
+        // 4/4 until song beat 4.5, then 3/4: bar lines are now 6, 9, 12.
+        let clicks = super::heard_clicks(&mut engine, &mut bus, 13 * 24000 - 2400, |frame, bus| {
+            if frame == 108000 {
+                bus.send(Command::SetTimeSignature { num: 3, den: 4 });
+            }
+        });
+        assert_eq!(accents(&clicks), "X...X.X..X..X");
+        for (i, c) in clicks.iter().enumerate() {
+            assert!((c.beats - i as f64).abs() < 1e-3, "the change moved no click: {i} at {}", c.beats);
+        }
+        // A metronome that never ran gets a countable bar too.
+        bus.send(Command::TransportStop);
+        bus.send(Command::SetTimeSignature { num: 2, den: 4 });
+        bus.send(Command::TransportPlay);
+        let two = super::heard_clicks(&mut engine, &mut bus, 5 * 24000 - 2400, |_, _| {});
+        assert_eq!(accents(&two), "X.X.X");
+    }
+
+    #[test]
+    fn the_count_in_is_whole_bars_of_the_signature() {
+        let (mut engine, mut bus, _m1, _m2, pub_) = two_metronomes();
+        engine.set_graph_pub(pub_.clone());
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetTimeSignature { num: 6, den: 8 });
+        bus.send(Command::SetCountIn { enabled: true, bars: 2 });
+        bus.send(Command::TransportPlay);
+        let mut seen = Vec::new();
+        // Two 6/8 bars = 6 quarter notes = 144000 frames, twelve clicks.
+        let clicks = super::heard_clicks(&mut engine, &mut bus, 144000 + 7 * 12000 - 2400, |frame, _| {
+            if frame % 12000 == 6000 {
+                seen.push(pub_.lock().unwrap().transport.count_in_beat);
+            }
+        });
+        let counted: Vec<&super::HeardClick> = clicks.iter().filter(|c| c.counting_in).collect();
+        assert_eq!(counted.len(), 12, "{clicks:?}");
+        assert_eq!(accents(&clicks), "X.....X.....X.....X");
+        let first_song = clicks[12];
+        assert!((first_song.frame as i64 - 144000).abs() <= 3 && first_song.beats.abs() < 1e-3, "{first_song:?}");
+        assert_eq!(&seen[..13], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0], "the readout counts the signature's beats");
+    }
+
     #[test]
     fn master_started_metronome_clicks_on_the_song_clocks_beats() {
         // Also across a tempo change in the middle of a beat: the click and
@@ -7311,6 +7456,50 @@ pub fn edge_level_test() -> anyhow::Result<()> {
 /// click on TransportPlay and fall silent on TransportStop. Also verifies a
 /// patch WITHOUT a metronome node stays silent while playing (the click is no
 /// longer hardcoded into the master bus).
+/// One metronome click heard at the master.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeardClick {
+    pub frame: usize,
+    /// Song position when it began (0 during a count-in).
+    pub beats: f64,
+    pub counting_in: bool,
+    /// The higher click of a bar's first beat.
+    pub accent: bool,
+}
+
+/// The clicks at the master while `frames` frames render one at a time;
+/// `at(frame, bus)` runs before each frame. An onset is the first loud frame
+/// after the previous click died away. The accent is told by pitch: over
+/// 10 ms a 1 kHz click crosses zero 20 times, the 1.5 kHz one 30 times.
+pub(crate) fn heard_clicks(
+    engine: &mut GraphEngine,
+    bus: &mut crate::control::CommandBus,
+    frames: usize,
+    mut at: impl FnMut(usize, &mut crate::control::CommandBus),
+) -> Vec<HeardClick> {
+    let mut left = Vec::with_capacity(frames);
+    let mut onsets: Vec<HeardClick> = Vec::new();
+    let (mut buf, mut was_quiet) = ([0.0f32; 2], true);
+    for frame in 0..frames {
+        at(frame, bus);
+        engine.render(&mut [], 2); // apply what `at` sent, so the position read is this frame's
+        let (beats, counting_in) = (engine.transport.beats, engine.master_clock.is_counting_in());
+        engine.render(&mut buf, 2);
+        let loud = buf[0].abs() > 1e-4;
+        if loud && was_quiet && onsets.last().map_or(true, |c| frame - c.frame > CLICK_FRAMES) {
+            onsets.push(HeardClick { frame, beats, counting_in, accent: false });
+        }
+        was_quiet = !loud;
+        left.push(buf[0]);
+    }
+    for c in &mut onsets {
+        let heard = &left[c.frame..(c.frame + 480).min(left.len())];
+        let crossings = heard.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        c.accent = crossings > 25;
+    }
+    onsets
+}
+
 pub fn metro_test() -> anyhow::Result<()> {
     use crate::control::{command_bus, name_bytes, Command, DspKind, Graph, NodeKind, PortKind, PortRef};
     let sr = 48000.0;
@@ -7340,6 +7529,42 @@ pub fn metro_test() -> anyhow::Result<()> {
     }
     let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     anyhow::ensure!(peak < 0.05, "metronome did not stop (peak {peak})");
+    // Time signature (#87): one click per beat of the signature, the first
+    // of each bar accented (higher), and a count-in of whole bars.
+    use crate::transport::TimeSig;
+    for (num, den, click_frames) in [(4u8, 4u8, 24000usize), (3, 4, 24000), (6, 8, 12000), (7, 8, 12000), (2, 2, 48000)] {
+        let sig = TimeSig { num, den };
+        bus.send(Command::SetTimeSignature { num, den });
+        bus.send(Command::TransportPlay);
+        let bars = 3;
+        let clicks = heard_clicks(&mut engine, &mut bus, bars * num as usize * click_frames - 2400, |_, _| {});
+        bus.send(Command::TransportStop);
+        let pattern: String = clicks.iter().map(|c| if c.accent { 'X' } else { '.' }).collect();
+        println!("metro-test: {sig:>5} @120bpm, {bars} bars: {pattern}  ({} frames between clicks)", click_frames);
+        anyhow::ensure!(clicks.len() == bars * num as usize, "{sig}: expected {} clicks, heard {}", bars * num as usize, clicks.len());
+        for (i, c) in clicks.iter().enumerate() {
+            anyhow::ensure!(c.accent == (i % num as usize == 0), "{sig}: click {i} accent is {}: {pattern}", c.accent);
+            let off = c.frame as i64 - (i * click_frames) as i64;
+            anyhow::ensure!((0..=3).contains(&off), "{sig}: click {i} is {off} frames off its beat");
+            let in_bar = c.beats.rem_euclid(sig.bar_beats());
+            anyhow::ensure!(!c.accent || in_bar < 1e-3 || sig.bar_beats() - in_bar < 1e-3, "{sig}: accent at song beat {} is not on a bar line", c.beats);
+        }
+    }
+    // A one-bar count-in in 3/4 is three clicks (accent first), then the
+    // song starts on its own accented beat 0.
+    bus.send(Command::SetTimeSignature { num: 3, den: 4 });
+    bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+    bus.send(Command::TransportPlay);
+    let clicks = heard_clicks(&mut engine, &mut bus, 6 * 24000 - 2400, |_, _| {});
+    bus.send(Command::TransportStop);
+    bus.send(Command::SetCountIn { enabled: false, bars: 1 });
+    let pattern: String = clicks.iter().map(|c| match (c.counting_in, c.accent) {
+        (true, true) => 'C', (true, false) => 'c', (false, true) => 'X', (false, false) => '.',
+    }).collect();
+    println!("metro-test: 3/4 with a 1-bar count-in: {pattern}  (C/c = count-in, X = accent)");
+    anyhow::ensure!(pattern == "CccX..", "3/4 count-in + first bar must read CccX.., heard {pattern}");
+    anyhow::ensure!(clicks[3].beats.abs() < 1e-3 && (clicks[3].frame as i64 - 72000).abs() <= 3, "the song must start 3 beats in, at beat 0: {:?}", clicks[3]);
+    bus.send(Command::SetTimeSignature { num: 4, den: 4 });
     // No metronome node in the patch → playing transport must stay silent.
     bus.send(Command::LoadGraph { graph: Graph::demo_patch() });
     bus.send(Command::TransportPlay);

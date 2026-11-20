@@ -1705,11 +1705,9 @@ fn compact_add_rig_button(ui: &mut egui::Ui) -> egui::Response {
     resp
 }
 
-/// Three-dot `⋯` action trigger painted cleanly with circles (no font glyph).
-fn nav_more_button(ui: &mut egui::Ui, rect: Rect, id: egui::Id, active: bool) -> egui::Response {
-    let resp = ui.interact(rect, id, egui::Sense::click());
+/// Paint the three-dot `⋯` action trigger cleanly with circles (no font glyph).
+fn paint_nav_more(ui: &egui::Ui, rect: Rect, active: bool, hov: bool) {
     if ui.is_rect_visible(rect) {
-        let hov = resp.hovered();
         let p = ui.painter();
         if active || hov {
             p.rect_filled(rect, 2.0, theme::DARK_PANEL_HI);
@@ -1720,6 +1718,13 @@ fn nav_more_button(ui: &mut egui::Ui, rect: Rect, id: egui::Id, active: bool) ->
             p.circle_filled(c + Vec2::new(dx, 0.0), 1.15, col);
         }
     }
+}
+
+/// Three-dot `⋯` action trigger painted cleanly with circles (no font glyph).
+#[allow(dead_code)]
+fn nav_more_button(ui: &mut egui::Ui, rect: Rect, id: egui::Id, active: bool) -> egui::Response {
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    paint_nav_more(ui, rect, active, resp.hovered());
     if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
     resp
 }
@@ -2724,7 +2729,7 @@ fn sentence_first(s: &str) -> String {
 const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
-    "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
+    "set_audio_output", "list_app_streams", "set_app_stream", "add_rig", "clone_rig",
     "save_rig", "load_rig", "list_rig_presets", "load_template",
     "list_instruments", "install_instrument", "play_file", "stop_file",
     "set_scale", "set_arp",
@@ -5725,6 +5730,13 @@ impl DemoApp {
                 Some(n) => format!("Add rig · {n}"),
                 None => "Add rig".into(),
             },
+            "clone_rig" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                match args.get("name").and_then(|v| v.as_str()) {
+                    Some(n) => format!("Clone {} → {n}", self.rig_name(rig)),
+                    None => format!("Clone {}", self.rig_name(rig)),
+                }
+            }
             "delete_rig" => {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 format!("Delete {}", self.rig_name(rig))
@@ -8359,6 +8371,27 @@ impl DemoApp {
                 self.agent_activity.touch_rig(new_rig, now);
                 self.agent_activity.record(origin, format!("Add {}", self.rig_name(new_rig)), nodes, now);
                 format!("{} — now in view.{sound} {}", self.session_msg, self.rigs_json())
+            }
+            "clone_rig" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                let name = args.get("name").and_then(|v| v.as_str());
+                match self.clone_rig(rig, name) {
+                    Ok(new_rig) => {
+                        let nodes: Vec<u32> = self.units.iter()
+                            .filter(|u| u.rig as usize == new_rig)
+                            .map(|u| u.node_id)
+                            .collect();
+                        let edges: Vec<u32> = self.cables.iter()
+                            .filter(|c| self.units.get(c.src).is_some_and(|u| u.rig as usize == new_rig))
+                            .map(|c| c.id)
+                            .collect();
+                        for eid in edges { self.agent_activity.touch_edge(eid, now); }
+                        self.agent_activity.touch_rig(new_rig, now);
+                        self.agent_activity.record(origin, format!("Clone → {}", self.rig_name(new_rig)), nodes, now);
+                        format!("{} — now in view. {}", self.session_msg, self.rigs_json())
+                    }
+                    Err(e) => format!("clone_rig failed: {e}"),
+                }
             }
             "delete_rig" => {
                 let n = self.rig_count();
@@ -11111,7 +11144,8 @@ impl DemoApp {
                                                     let body_rect = Rect::from_min_max(rect.min, Pos2::new(more_rect.left() - 2.0, rect.bottom()));
                                                     let body_resp = ui.interact(body_rect, egui::Id::unique(("nav_rig", r_idx)), egui::Sense::click());
                                                     let menu_open_here = self.nav_rig_menu.is_some_and(|(mr, _)| mr == r_idx);
-                                                    let more_resp = nav_more_button(ui, more_rect, egui::Id::unique(("nav_rig_more", r_idx)), menu_open_here);
+                                                    let more_resp = ui.interact(more_rect, egui::Id::unique(("nav_rig_more", r_idx)), egui::Sense::click());
+                                                    if more_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
                                                     let hov = body_resp.hovered() || more_resp.hovered();
                                                     if body_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
 
@@ -11149,8 +11183,8 @@ impl DemoApp {
                                                         text_limit = brect.left() - 6.0;
                                                     }
 
-                                                    // Re-paint ⋯ on top of any active fill so it stays crisp.
-                                                    let _ = nav_more_button(ui, more_rect, egui::Id::unique(("nav_rig_more_paint", r_idx)), menu_open_here);
+                                                    // Paint ⋯ on top of any active fill without registering a second click target.
+                                                    paint_nav_more(ui, more_rect, menu_open_here, more_resp.hovered());
 
                                                     let col = if active { theme::INK } else { theme::INK_2 };
                                                     let text_x = rect.left() + 9.0;
@@ -11167,7 +11201,7 @@ impl DemoApp {
                                                     self.nav_rig_more_rects.push((r_idx, more_rect));
                                                     self.rig_chip_rects.push(rect);
 
-                                                    if more_resp.on_hover_text("Rig actions (rename, save preset, replace, delete)").clicked() {
+                                                    if more_resp.on_hover_text("Rig actions (rename, clone, save preset, replace, delete)").clicked() {
                                                         if menu_open_here {
                                                             self.nav_rig_menu = None;
                                                         } else {
@@ -11711,6 +11745,7 @@ impl DemoApp {
                         resp.clicked()
                     };
                     if menu_row(ui, "Rename rig…", false) { action = Some("rename"); close = true; }
+                    if n < Self::MAX_RIGS && menu_row(ui, "Clone rig", false) { action = Some("clone"); close = true; }
                     if menu_row(ui, "Save as rig preset…", false) { action = Some("save_preset"); close = true; }
                     if menu_row(ui, "Replace from preset…", false) { action = Some("replace_preset"); close = true; }
                     if menu_row(ui, "MIDI input → Matrix", false) { action = Some("matrix"); close = true; }
@@ -11726,6 +11761,11 @@ impl DemoApp {
 
         match action {
             Some("rename") => self.rename_rig_dialog = Some((rig, name)),
+            Some("clone") => {
+                if let Err(e) = self.clone_rig(rig, None) {
+                    self.session_msg = format!("Clone rig failed: {e}");
+                }
+            }
             Some("save_preset") => self.save_rig_dialog = Some((rig, name)),
             Some("replace_preset") => self.load_rig_dialog = Some(Some(rig)),
             Some("matrix") => {
@@ -12377,6 +12417,164 @@ impl DemoApp {
         self.editor_status.clear(); // not "rack reloaded" noise for a rig edit
     }
 
+    /// Clone an existing rig (units, cables, knobs, plugin states, matrix
+    /// routes, mixer strips, sends, bus outputs, MIDI device, voice switches
+    /// and rig mix) into a new independent rig, keeping every existing rig
+    /// intact. Switches view to the new clone and returns its rig index.
+    fn clone_rig(&mut self, rig: usize, new_name: Option<&str>) -> anyhow::Result<usize> {
+        let n = self.rig_count();
+        if n >= Self::MAX_RIGS {
+            anyhow::bail!("at most {} rigs", Self::MAX_RIGS);
+        }
+        if rig >= n {
+            anyhow::bail!("no rig {rig}: there are {n}");
+        }
+        let s = self.capture_session("Rigs")?;
+        let voice_rows = self.voice_rows();
+        let (graphs, old_bases) = crate::control::split_rigs(&s.graph);
+        if rig >= graphs.len() {
+            anyhow::bail!("rig {rig} has no graph");
+        }
+        let devices: Vec<Option<u32>> = {
+            let snap = self.rig_snapshot.lock().ok();
+            (0..graphs.len()).map(|i| snap.as_ref().and_then(|sn| sn.rigs.get(i).and_then(|m| m.midi_device))).collect()
+        };
+        let names: Vec<String> = (0..graphs.len()).map(|i| self.rig_name(i)).collect();
+        let clone_name = new_name
+            .map(|raw| raw.trim().chars().take(24).collect::<String>())
+            .filter(|raw| !raw.is_empty())
+            .unwrap_or_else(|| crate::control::unique_clone_rig_name(&names[rig], &names));
+
+        let mut list: Vec<crate::control::Rig> = graphs.into_iter().enumerate()
+            .map(|(i, g)| crate::control::Rig::new(names[i].clone(), g, devices[i]))
+            .collect();
+        let clone_graph = list[rig].graph.clone();
+        let clone_device = list[rig].midi_device;
+        list.push(crate::control::Rig::new(clone_name.clone(), clone_graph, clone_device));
+        let new_rig = list.len() - 1;
+
+        let new_bases = crate::control::rig_bases(&list);
+        let merged = crate::control::merge_rigs(&list);
+        let remap_existing = |old: u32| -> Option<u32> {
+            let o = s.graph.node(old)?.rig as usize;
+            Some(new_bases[o] + (old - old_bases[o]))
+        };
+        let remap_clone = |old: u32| -> Option<u32> {
+            let node = s.graph.node(old)?;
+            if node.rig as usize == rig {
+                Some(new_bases[new_rig] + (old - old_bases[rig]))
+            } else {
+                None
+            }
+        };
+
+        let mut ns = remap_session(&s, merged, remap_existing);
+        ns.rig_names = list.iter().map(|r| r.name.clone()).collect();
+        for p in s.params() {
+            if let Some(nid) = remap_clone(p.node) {
+                ns.set_param(nid, p.param, p.value);
+            }
+        }
+        for st in s.plugin_states() {
+            if let Some(nid) = remap_clone(st.node) {
+                ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone());
+            }
+        }
+        let mut rules: Vec<SavedRule> = ns.matrix()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let src_rules: Vec<SavedRule> = s.matrix()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        for mut r in src_rules {
+            if let Some(nid) = remap_clone(r.dest) {
+                r.dest = nid;
+                rules.push(r);
+            }
+        }
+        if !rules.is_empty() {
+            ns.set_matrix(serde_json::to_value(&rules).ok());
+        }
+        for st in s.strips() {
+            if let Some(node) = remap_clone(st.node) {
+                ns.set_strip(crate::session::StripSaved { node, ..*st });
+            }
+        }
+        let mut order: Vec<u32> = ns.strip_order().to_vec();
+        order.extend(s.strip_order().iter().filter_map(|&nid| remap_clone(nid)));
+        if !order.is_empty() {
+            ns.set_strip_order(order);
+        }
+        for (&old, label) in s.strip_knobs() {
+            if let Some(node) = remap_clone(old) {
+                ns.set_strip_knob(node, label.clone());
+            }
+        }
+        for m in s.midi_sources() {
+            if let Some(node) = remap_clone(m.node) {
+                ns.set_midi_sources(crate::session::MidiSources { node, ..m.clone() });
+            }
+        }
+        let mut sends = ns.sends().to_vec();
+        for x in s.sends() {
+            let from = match x.from {
+                SendSource::Rig(r) if r as usize == rig => Some(SendSource::Rig(new_rig as u8)),
+                SendSource::Node(nid) => remap_clone(nid).map(SendSource::Node),
+                _ => None,
+            };
+            if let (Some(from), Some(bus)) = (from, remap_existing(x.bus)) {
+                sends.push(AuxSend { from, bus, ..*x });
+            }
+        }
+        ns.set_sends(sends);
+        let mut outs = ns.bus_outs().to_vec();
+        for o in s.bus_outs() {
+            if o.bus == SendSource::Rig(rig as u8) {
+                outs.push(BusOut { bus: SendSource::Rig(new_rig as u8), ..*o });
+            }
+        }
+        ns.set_bus_outs(outs);
+
+        let mut mix = self.rig_mix;
+        mix[new_rig.min(7)] = self.rig_mix[rig.min(7)];
+        let mut arms = self.arm_rigs;
+        arms[new_rig.min(7)] = false;
+
+        self.load_as_rigs = Some((list.clone(), new_rig));
+        self.apply_session(&ns)?;
+        if let Ok(mut snap) = self.rig_snapshot.lock() {
+            snap.rigs = list.iter().map(|r| crate::control::RigMeta {
+                name: r.name.clone(),
+                midi_device: r.midi_device,
+            }).collect();
+            snap.active = new_rig;
+        }
+        self.adopt_rig_devices();
+        let mut new_voice_rows: Vec<VoiceRow> = Vec::new();
+        for r in &voice_rows {
+            if let Some(node) = remap_existing(r.node) {
+                new_voice_rows.push(VoiceRow { node, ..r.clone() });
+            }
+            if let Some(node) = remap_clone(r.node) {
+                new_voice_rows.push(VoiceRow { node, ..r.clone() });
+            }
+        }
+        self.restore_voice_rows(&new_voice_rows);
+        self.rig_mix = mix;
+        self.active_rig = usize::MAX;
+        self.set_active_rig(new_rig);
+        for i in 0..list.len() {
+            self.ui_mix_grace[i.min(7)] = self.ui_time + 0.6;
+            self.send_rig_mix(i);
+        }
+        for i in 0..8 {
+            self.set_record_arm(Some(i), if i < list.len() { arms[i] } else { false });
+        }
+        self.session_msg = format!("Cloned {} → {clone_name}", names[rig]);
+        self.editor_status.clear();
+        Ok(new_rig)
+    }
+
     /// "Delete rig?" confirmation (destructive: the rig's units, cables and
     /// synth state go away). Cancel / Esc keep everything.
     fn delete_rig_modal(&mut self, ctx: &egui::Context) {
@@ -12860,6 +13058,7 @@ impl DemoApp {
         const ROW_H: f32 = 26.0;
         let mut switch_rig: Option<usize> = None;
         let mut add_rig = false;
+        let mut clone_rig: Option<usize> = None;
         let n = self.rig_count();
         if !self.nav_open {
             self.rig_chip_rects.clear();
@@ -12995,6 +13194,10 @@ impl DemoApp {
                                     chip.context_menu(|ui| {
                                         if ui.button("Rename…").clicked() {
                                             self.rename_rig_dialog = Some((rig, name.clone()));
+                                            ui.close();
+                                        }
+                                        if n < Self::MAX_RIGS && ui.button("Clone rig").clicked() {
+                                            clone_rig = Some(rig);
                                             ui.close();
                                         }
                                         if ui.button("Save rig preset…").clicked() {
@@ -13217,6 +13420,11 @@ impl DemoApp {
 
         if let Some(r) = switch_rig { self.set_active_rig(r); }
         if add_rig { self.edit_rigs(None); }
+        if let Some(r) = clone_rig {
+            if let Err(e) = self.clone_rig(r, None) {
+                self.session_msg = format!("Clone rig failed: {e}");
+            }
+        }
     }
 
     fn recessed_input(ui: &mut egui::Ui, text: &mut String, width: f32, hint: &str) -> egui::Response {
@@ -27651,6 +27859,111 @@ mod rig_switch_tests {
         frame(&mut app, &ctx, key(Key::Escape));
         assert!(app.load_rig_dialog.is_none(), "Esc closes load modal");
         let _ = std::fs::remove_dir_all(&app.rig_presets_dir);
+    }
+
+    #[test]
+    fn clone_rig_duplicates_units_knobs_rules_mix_and_nav_menu() {
+        let (mut app, ctx) = two_rigs();
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 0, "name": "Lead Stack"}));
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 1, "name": "Pad"}));
+
+        let slot0_surge = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot0_master = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        let slot0_units = app.units.iter().filter(|u| u.rig == 0).count();
+        let slot0_cables: Vec<(u8, u8)> = app.cables.iter()
+            .filter(|c| app.units[c.src].rig == 0 && app.units[c.dst].rig == 0)
+            .map(|c| (c.src_port as u8, c.dst_port as u8))
+            .collect();
+
+        for u in &mut app.units {
+            if u.node_id == slot0_master {
+                if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(crate::engine::P_VOL)) {
+                    k.value = 0.37;
+                }
+            }
+        }
+        app.rig_mix[0] = crate::engine::RigMix { vol: 0.62, pan: -0.35, mute: false, solo: true };
+        app.rig_mix[1] = crate::engine::RigMix { vol: 0.88, pan: 0.25, mute: false, solo: false };
+        app.rig_sources[0] = (false, true);
+        app.patch_names[0] = Some("Brass".into());
+        app.rule_edits.insert(
+            (crate::matrix::SourceId::Keys, slot0_surge),
+            RuleEdit { transpose: 7, key_hi: 84, ..RuleEdit::default() },
+        );
+
+        // Clone rig 0 via agent tool (default name = "Lead Stack Copy").
+        let res = app.exec_tool("clone_rig", &serde_json::json!({"rig": 0}));
+        assert!(res.contains("Lead Stack Copy"), "{res}");
+        assert_eq!(app.rig_count(), 3);
+        assert_eq!(app.active_rig, 2);
+        assert_eq!(app.rig_name(0), "Lead Stack");
+        assert_eq!(app.rig_name(1), "Pad");
+        assert_eq!(app.rig_name(2), "Lead Stack Copy");
+        assert_eq!(app.units.iter().filter(|u| u.rig == 2).count(), slot0_units);
+        assert_eq!(app.rig_mix[2], crate::engine::RigMix { vol: 0.62, pan: -0.35, mute: false, solo: true });
+        assert_eq!(app.rig_mix[1], crate::engine::RigMix { vol: 0.88, pan: 0.25, mute: false, solo: false }, "other rigs keep mix");
+
+        let slot2_surge = app.units.iter().find(|u| u.rig == 2 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot2_master = app.units.iter().find(|u| u.rig == 2 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        assert_ne!(slot2_surge, slot0_surge, "clone gets distinct node ids");
+        let slot2_vol = app.units.iter().find(|u| u.node_id == slot2_master).unwrap()
+            .knobs.iter().find(|k| k.param == Some(crate::engine::P_VOL)).unwrap().value;
+        assert!((slot2_vol - 0.37).abs() < 1e-5, "knob copied: {slot2_vol}");
+        let slot2_cables: Vec<(u8, u8)> = app.cables.iter()
+            .filter(|c| app.units[c.src].rig == 2 && app.units[c.dst].rig == 2)
+            .map(|c| (c.src_port as u8, c.dst_port as u8))
+            .collect();
+        assert_eq!(slot2_cables, slot0_cables);
+        let slot2_rule = app.rule_edits.get(&(crate::matrix::SourceId::Keys, slot2_surge))
+            .expect("matrix rule copied to clone");
+        assert_eq!((slot2_rule.transpose, slot2_rule.key_hi), (7, 84));
+        let slot2_voice = app.clap_rigs().into_iter().find(|(_, nid)| *nid == slot2_surge).unwrap().0;
+        assert_eq!(app.rig_sources[slot2_voice], (false, true));
+        assert_eq!(app.patch_names[slot2_voice].as_deref(), Some("Brass"));
+
+        // Second clone of rig 0 increments the copy suffix ("Lead Stack Copy 2").
+        let res2 = app.exec_tool("clone_rig", &serde_json::json!({"rig": 0}));
+        assert!(res2.contains("Lead Stack Copy 2"), "{res2}");
+        assert_eq!(app.rig_count(), 4);
+        assert_eq!(app.rig_name(3), "Lead Stack Copy 2");
+
+        // Explicit custom name + omitted rig defaults to active rig.
+        let res3 = app.exec_tool("clone_rig", &serde_json::json!({"name": "Lead Double"}));
+        assert!(res3.contains("Lead Double"), "{res3}");
+        assert_eq!(app.rig_count(), 5);
+        assert_eq!(app.rig_name(4), "Lead Double");
+
+        // UI path: open the Left Rail ⋯ menu on rig 1 and click "Clone rig" (2nd row).
+        let press_click = |app: &mut DemoApp, pos: Pos2| {
+            frame(app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+            frame(app, &ctx, vec![egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE,
+            }]);
+            frame(app, &ctx, vec![egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE,
+            }]);
+            frame(app, &ctx, vec![]);
+        };
+        app.nav_open = true;
+        frame(&mut app, &ctx, vec![]);
+        let more_rect = app.nav_rig_more_rects.iter().find(|&&(r, _)| r == 1).expect("rig 1 ⋯ button").1;
+        press_click(&mut app, more_rect.center());
+        assert!(app.nav_rig_menu.is_some(), "rig menu opened");
+        let menu_rect = app.nav_rig_menu_rect;
+        // Row 0 = Rename rig… (24px), gap 2px, Row 1 = Clone rig (24px), inner margin 4px.
+        let clone_row = Pos2::new(menu_rect.center().x, menu_rect.top() + 4.0 + 24.0 + 2.0 + 12.0);
+        press_click(&mut app, clone_row);
+        assert_eq!(app.rig_count(), 6, "clicking Clone rig in nav menu clones rig 1");
+        assert_eq!(app.rig_name(5), "Pad Copy");
+        assert_eq!(app.active_rig, 5);
+
+        // Parity check: assistant::tools() + UI_BRIDGE_TOOLS both list clone_rig.
+        let tools = crate::assistant::tools();
+        let tool_names: Vec<&str> = tools.as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(tool_names.contains(&"clone_rig"), "assistant::tools missing clone_rig");
+        assert!(UI_BRIDGE_TOOLS.contains(&"clone_rig"), "UI_BRIDGE_TOOLS missing clone_rig");
     }
 
     #[test]

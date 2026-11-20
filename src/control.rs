@@ -891,6 +891,29 @@ pub fn bind_voices(graph: &Graph, voices: &[(u64, &str)]) -> Vec<(NodeId, Option
         .collect()
 }
 
+/// Pick a unique name (at most 24 chars) for a cloned rig: "<source> Copy",
+/// "<source> Copy 2", … avoiding collisions with `used`.
+pub fn unique_clone_rig_name(source: &str, used: &[String]) -> String {
+    let base = source.trim();
+    let base = if base.is_empty() { "Rig" } else { base };
+    let fit = |suffix: &str| -> String {
+        let max_base = 24usize.saturating_sub(suffix.chars().count());
+        let prefix: String = base.chars().take(max_base).collect();
+        format!("{}{}", prefix.trim_end(), suffix)
+    };
+    let first = fit(" Copy");
+    if !used.iter().any(|u| u == &first) {
+        return first;
+    }
+    for k in 2..=99 {
+        let cand = fit(&format!(" Copy {k}"));
+        if !used.iter().any(|u| u == &cand) {
+            return cand;
+        }
+    }
+    format!("Rig {}", used.len() + 1)
+}
+
 /// The standard new rig ("+ Rig", agent/MCP add_rig): Keys → Surge → Master
 /// (MIDI + stereo L/R); `with_synth = false` leaves the bare Keys + Master.
 pub fn standard_rig_graph(with_synth: bool) -> Graph {

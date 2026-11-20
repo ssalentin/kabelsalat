@@ -41,6 +41,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 | **Cardinal** (`cardinal`) | CLAP | **Partial** (`aarch64` Arch `cardinal-clap` loads; needs `cardinal-data`) | **Untested** (silent without `cardinal-data`) | **N/A** (modular patch) | **Untested** | **Untested** | Full 32-byte `ClapId` (`studio.kx.distrho.cardinal#synth`) loads cleanly. Playback with `cardinal-data` installed is open bench test #186; GUI window needed for patching. |
 | **Unsampled Piano** (`unsampled-piano`) | CLAP | **Untested** (`x86_64` release `v0.2.1` + `aarch64` source; plan/SHA-256 unit-tested) | **Untested** | **N/A** (physically modelled piano) | **Untested** | **Untested** | Added in #250; neither the `x86_64` prebuilt release nor the `aarch64` source build has been run in kabelsalat yet. |
 | **OneTrick KEYS** (`ot-keys`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.338) | **Untested** | **Untested** | **Untested** | Interactive install/play in open bench test #186. State, GUI window, `x86_64` untested. |
+| **Unsampled Piano** (`unsampled-piano`) | CLAP | **Headless** (`aarch64` source via `catalog-install-test`); **Untested** (`x86_64` release `v0.2.1`; plan/SHA-256 unit-tested) | **Headless** (`aarch64` probe chord peak 0.421) | **Untested** | **Untested** | **Untested** | Physically modelled grand with half-pedal, sostenuto and una corda; no sample download. Live play with sustain pedal and editor window is open bench test #253; `x86_64` prebuilt release untested at runtime. |
 | **OneTrick CHONK** (`ot-chonk`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.281) | **Untested** | **Untested** | **Untested** | Interactive play, state, GUI window, `x86_64` untested. |
 | **OneTrick CRYPTID** (`ot-cryptid`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.812; 12 output ports) | **Untested** | **Untested** | **Untested** | Plays GM drum notes (36/38). Interactive install/play in open bench test #186. State, GUI window, `x86_64` untested. |
 | **AVL Drumkits** (`avldrums`) | LV2 | **Headless** (`aarch64` source via `catalog-install-test`) | **Headless** (all 5 kits sound, peaks 0.516–0.685) | **N/A** (5 kit URIs) | **Untested** | **N/A** (LV2 GUI not hosted) | Async SF2 sample load handled with wall-clock wait (rule 178). Interactive play, state, `x86_64` untested. |
@@ -88,6 +89,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 - **Open plugin bench tests:**
   - `#177` — Plugins browser add-to-rig / Master FX / mixer `+ insert` with Surge XT, Guitarix, and LSP.
   - `#186` — Cardinal (`cardinal-data`), Starbreath (`x86_64` release), and live app play of OB-Xf, KR-106, OneTrick KEYS, and OneTrick CRYPTID.
+  - `#253` — live app play of Unsampled Piano (sustain pedal, Piano keyboard surface, plugin editor window).
 
 ---
 

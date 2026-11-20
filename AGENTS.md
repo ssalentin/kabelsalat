@@ -1388,12 +1388,30 @@ Learned so far (2026-11-15, UI polish pass):
   to be moved by patch. If you find your work on `main`, move it to a
   branch at once (patch or WIP commit; never a bare `git stash`, the stash
   is shared across worktrees), then revert `main`.
-- **Finish the work:** when the work is finished, commit it and push the
-  branch (`git push -u origin <topic>`, gated per rule 50), then open a
-  pull request against `main` (`gh pr create`) that references its issue
-  and shows the evidence, then queue it with `gh pr merge --auto --squash`
-  (see "Merging"). Never leave finished work only on the local machine or
-  only on a branch. Remove the worktree once its PR is merged.
+- **Finish the work:** when the work is finished, commit it, rebase it and
+  push the branch with `scripts/sync-branch.sh --push` (gated per rule 50;
+  next rule), then open a pull request against `main` (`gh pr create`) that
+  references its issue and shows the evidence, then queue it with
+  `gh pr merge --auto --squash` (see "Merging"). Never leave finished work
+  only on the local machine or only on a branch. Remove the worktree once
+  its PR is merged.
+- **Rebase before every push, on your own (user, 2026-11-20):** a session
+  never pushes a branch that is behind `origin/main` and never waits to be
+  told to update it. Every push goes through `scripts/sync-branch.sh --push`:
+  it fetches, rebases the branch onto `origin/main`, keeps both sides of
+  conflicts that only append to Markdown files, and pushes with
+  `--force-with-lease`. Run `scripts/sync-branch.sh` (no push) before the
+  gate tests and `--push` after them, so the tests run on the tree you
+  push. When the script stops on a real conflict
+  (exit 2), resolve it in the code, `git add`, `git rebase --continue`, run
+  the gate tests again and rerun the script; when main changed a file you
+  changed too (exit 3), run that file's test modules (rule 155) and rerun
+  it. Once the PR is open, keep it rebased until it merges: watch it, and on
+  the `merge-conflict` label, a `resolve-conflicts` bot merge, or a red CI
+  run caused by a newer `main`, run the script again at once. Never merge
+  `main` into a branch by hand (a rebase keeps the PR diff to your change),
+  never `git push --force` without `--with-lease`, and never rebase or
+  force-push a branch that is not your session's own.
 - **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
   (admins included), and the required checks `test (x86_64)` and
   `test (aarch64)` must pass.
@@ -1403,10 +1421,11 @@ Learned so far (2026-11-15, UI polish pass):
   evidence rules above are what keeps it safe. Self-tests with real plugins
   and audio do not run in CI, so their output belongs in every PR body that
   changes the code they cover; what this machine could not run goes under
-  `## Bench test` ("Bench tests" above). Update a branch only when it conflicts with
-  `main`; `resolve-conflicts.yml` merges `main` into PRs whose conflicts are
-  appended Markdown lines by itself, so `git pull` before you push again, and
-  resolve a PR labelled `merge-conflict` yourself. An open `main-red` issue means `main` is broken: fixing it comes
+  `## Bench test` ("Bench tests" above). Branches are rebased onto `main`
+  before every push (previous rule); `resolve-conflicts.yml` still merges
+  `main` into open PRs whose conflicts are appended Markdown lines, and
+  `scripts/sync-branch.sh` drops that bot merge on your next push, so a
+  `git pull` is never needed. An open `main-red` issue means `main` is broken: fixing it comes
   before new work (`docs/PACKAGING.md`, "Branch protection and a red main").
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,

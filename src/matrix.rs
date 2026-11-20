@@ -352,17 +352,27 @@ impl MixControl {
     }
 }
 
+fn cc_max_default() -> u8 { 127 }
+fn is_zero_u8(v: &u8) -> bool { *v == 0 }
+fn is_127_u8(v: &u8) -> bool { *v == 127 }
+
 /// How a controller value becomes the parameter value. Instruments send
 /// switches and stepped controls (an LED drawbar, a slow/fast button) as
 /// `steps` equal sections of 0..=127; each section lands on one value spread
 /// evenly from `lo` to `hi` (7-bit units, so 64 is the middle of a knob).
-/// `steps` 0 is continuous: `lo..=hi` scaled linearly. The default is the
-/// identity, which MIDI learn uses.
+/// `steps` 0 is continuous: input values in `in_lo..=in_hi` (default 0..=127,
+/// adapted by MIDI learn when a controller only spans a sub-range such as a
+/// wind controller's bite sensor) are normalized to 0..=1 (clamped) and then
+/// scaled linearly onto `lo..=hi`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CcScale {
     pub steps: u8,
     pub lo: u8,
     pub hi: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub in_lo: u8,
+    #[serde(default = "cc_max_default", skip_serializing_if = "is_127_u8")]
+    pub in_hi: u8,
 }
 
 impl Default for CcScale {
@@ -372,11 +382,11 @@ impl Default for CcScale {
 }
 
 impl CcScale {
-    pub const IDENTITY: CcScale = CcScale { steps: 0, lo: 0, hi: 127 };
+    pub const IDENTITY: CcScale = CcScale { steps: 0, lo: 0, hi: 127, in_lo: 0, in_hi: 127 };
 
     /// `steps` sections of the controller range onto `lo..=hi`.
     pub const fn stepped(steps: u8, lo: u8, hi: u8) -> Self {
-        CcScale { steps, lo, hi }
+        CcScale { steps, lo, hi, in_lo: 0, in_hi: 127 }
     }
 
     pub fn is_identity(&self) -> bool {
@@ -387,9 +397,28 @@ impl CcScale {
     /// of the parameter (normalized 0..=1), e.g. a pedal that only reaches
     /// 60 % drive.
     pub fn range(lo: f32, hi: f32) -> Self {
+        Self::IDENTITY.with_output_range(lo, hi)
+    }
+
+    /// Update the parameter output range (`lo..=hi`, normalized 0..=1) while
+    /// keeping any learned controller input range (`in_lo..=in_hi`).
+    pub fn with_output_range(self, lo: f32, hi: f32) -> Self {
         let q = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u8;
         let (lo, hi) = (q(lo), q(hi));
-        CcScale { steps: 0, lo: lo.min(hi), hi: lo.max(hi) }
+        CcScale { steps: 0, lo: lo.min(hi), hi: lo.max(hi), ..self }
+    }
+
+    /// A continuous binding that maps controller values `in_lo..=in_hi`
+    /// (7-bit CC) onto the full parameter range.
+    pub fn input_range(in_lo: u8, in_hi: u8) -> Self {
+        Self::IDENTITY.with_input_range(in_lo, in_hi)
+    }
+
+    /// Update the controller input range (`in_lo..=in_hi`, 0..=127) while
+    /// keeping any parameter output range (`lo..=hi`).
+    pub fn with_input_range(self, in_lo: u8, in_hi: u8) -> Self {
+        let (a, b) = (in_lo.min(127), in_hi.min(127));
+        CcScale { steps: 0, in_lo: a.min(b), in_hi: a.max(b), ..self }
     }
 
     /// Switch and step bindings (instrument profiles) keep their sections;
@@ -398,19 +427,34 @@ impl CcScale {
         self.steps < 2
     }
 
+    /// Whether the parameter output range is narrower than full 0..=100 %.
+    pub fn has_output_range(&self) -> bool {
+        self.lo > 0 || self.hi < 127
+    }
+
+    /// Whether the controller input range is narrower than full 0..=127.
+    pub fn has_input_range(&self) -> bool {
+        self.in_lo > 0 || self.in_hi < 127
+    }
+
     /// The normalized (0..=1) ends of the parameter range.
     pub fn bounds(&self) -> (f32, f32) {
         (self.lo.min(127) as f32 / 127.0, self.hi.min(127) as f32 / 127.0)
     }
 
+    /// The 7-bit (0..=127) ends of the controller input range.
+    pub fn input_bounds(&self) -> (u8, u8) {
+        (self.in_lo.min(127), self.in_hi.min(127))
+    }
+
     /// How agent tools report the scale: `[min, max]` (0..1, two decimals)
-    /// for a limited continuous range, null for the full range, the steps
-    /// for a stepped binding.
+    /// for a limited continuous output range, null for the full output range,
+    /// the steps for a stepped binding.
     pub fn range_json(&self) -> serde_json::Value {
         if !self.is_continuous() {
             return serde_json::json!({"steps": self.steps, "lo": self.lo, "hi": self.hi});
         }
-        if self.is_identity() {
+        if !self.has_output_range() {
             return serde_json::Value::Null;
         }
         let (lo, hi) = self.bounds();
@@ -418,13 +462,27 @@ impl CcScale {
         serde_json::json!([r2(lo), r2(hi)])
     }
 
+    /// How agent tools report an adapted controller input range: `[in_lo, in_hi]`
+    /// (0..=127) when narrower than full travel, null otherwise.
+    pub fn input_range_json(&self) -> serde_json::Value {
+        if !self.is_continuous() || !self.has_input_range() {
+            return serde_json::Value::Null;
+        }
+        let (lo, hi) = self.input_bounds();
+        serde_json::json!([lo, hi])
+    }
+
     /// The normalized (0..=1) parameter value of a controller value.
     pub fn norm(&self, value: u8) -> f64 {
-        let v = (value & 0x7F) as f64;
+        let raw = value & 0x7F;
+        let v = raw as f64;
         let (lo, hi) = (self.lo.min(127) as f64, self.hi.min(127) as f64);
+        let (in_lo, in_hi) = (self.in_lo.min(127) as f64, self.in_hi.min(127) as f64);
         let t = if self.steps >= 2 {
-            let section = ((value & 0x7F) as u32 * self.steps as u32 / 128).min(self.steps as u32 - 1);
+            let section = (raw as u32 * self.steps as u32 / 128).min(self.steps as u32 - 1);
             section as f64 / (self.steps - 1) as f64
+        } else if in_hi > in_lo {
+            ((v - in_lo) / (in_hi - in_lo)).clamp(0.0, 1.0)
         } else {
             v / 127.0
         };
@@ -771,6 +829,44 @@ mod tests {
         assert_eq!(CcScale::range(0.8, 0.2), CcScale::range(0.2, 0.8), "bounds are ordered");
         assert_eq!(CcScale::range(0.0, 1.0), CcScale::IDENTITY, "the full range is the plain binding");
         assert!(!CcScale::stepped(2, 64, 127).is_continuous());
+    }
+
+    #[test]
+    fn input_range_adapts_subrange_controller_to_full_or_capped_knob() {
+        // Bite sensor travelling 64..=104 maps onto full 0..=1 knob travel.
+        let bite = CcScale::input_range(64, 104);
+        assert!(bite.has_input_range());
+        assert!(!bite.has_output_range());
+        assert!((bite.norm(64) - 0.0).abs() < 1e-9, "rest sits at 0");
+        assert!((bite.norm(50) - 0.0).abs() < 1e-9, "below min clamps to 0");
+        assert!((bite.norm(84) - 0.5).abs() < 1e-9, "midpoint maps to 0.5");
+        assert!((bite.norm(104) - 1.0).abs() < 1e-9, "peak sits at 1");
+        assert!((bite.norm(127) - 1.0).abs() < 1e-9, "above max clamps to 1");
+        assert_eq!(bite.range_json(), serde_json::Value::Null);
+        assert_eq!(bite.input_range_json(), serde_json::json!([64, 104]));
+
+        // Full 0..=127 input range collapses to IDENTITY.
+        assert_eq!(CcScale::input_range(0, 127), CcScale::IDENTITY);
+
+        // Combining input range with an output cap keeps both.
+        let capped = bite.with_output_range(0.1, 0.6);
+        assert_eq!(capped.input_bounds(), (64, 104));
+        assert!((capped.norm(64) - 13.0 / 127.0).abs() < 1e-9);
+        assert!((capped.norm(104) - 76.0 / 127.0).abs() < 1e-9);
+
+        // Degenerate in_lo == in_hi does not NaN and falls back to 0..=127.
+        let deg = CcScale::input_range(64, 64);
+        assert!((deg.norm(64) - 64.0 / 127.0).abs() < 1e-9);
+
+        // Legacy JSON without in_lo/in_hi deserializes with full 0..=127 input range.
+        let legacy: CcScale = serde_json::from_str(r#"{"steps":0,"lo":13,"hi":76}"#).unwrap();
+        assert_eq!(legacy, CcScale::range(0.1, 0.6));
+        assert!(!legacy.has_input_range());
+
+        // Round-trip preserves input range.
+        let json = serde_json::to_string(&capped).unwrap();
+        let back: CcScale = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, capped);
     }
 
     // --- SPLITS -----------------------------------------------------------

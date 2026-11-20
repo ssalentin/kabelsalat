@@ -15,6 +15,15 @@ releases may still change behaviour and session files.
   and right-click MIDI menu), yielding an unbound main control when needed and
   prioritizing MIDI-controlled knobs on narrow faces. Clearing the binding
   removes the auto-added knob and restores the unit's main controls.
+- **Adaptive input range on MIDI learn:** moving a controller during MIDI
+  learn (e.g. a wind controller's bite CC spanning 64–104) tracks the min and
+  max values seen while learning, shows the live range on the badge, and
+  adapts the binding's input curve once the controller settles (1.5 s, or
+  press Enter / click *Finish MIDI learn*) so that partial travel steers the
+  full knob. The learned *Input range* appears in the knob's right-click menu
+  (editable 0–127, preserved when capping output *Controller range*, and
+  reset by *Full range*), is saved with the session, and is exposed to agents
+  via `set_cc_map` (`in_min`/`in_max`) and `list_cc_maps` (`input_range`).
 - **Controller range on a MIDI-mapped knob:** right-click a bound knob and
   set MIN / MAX under *Controller range*. The controller's whole travel then
   spans only that stretch, so an expression pedal on organ drive can be held

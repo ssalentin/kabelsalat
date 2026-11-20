@@ -24,7 +24,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 
 ---
 
-## Catalog instruments (18)
+## Catalog instruments (19)
 
 | Card (`id`) | Format | Install | Audio / Engine | Sound library | State / Session | Plugin GUI | Notes & untested gaps |
 |---|---|---|---|---|---|---|---|
@@ -46,6 +46,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 | **Starbreath** (`starbreath`) | CLAP | **Untested** (`x86_64` release `v0.9.0`; no `aarch64` release) | **Partial** (hand-installed `aarch64` beta passes `catalog-install-test` w/ CC2 breath) | **Untested** | **Untested** | **Untested** | Proprietary freeware for wind controllers (breath on CC2/CC11/aftertouch). Public `x86_64` release download & playback is open bench test #186. |
 | **Floe** (`floe`) | CLAP | **Untested** (`x86_64` release `v2.0.5` only; plan/SHA-256 unit-tested) | **Untested** | **Untested** | **Untested** | **Untested** | Requires external sample libraries from floe.audio. No `aarch64` build; never run on `x86_64` yet. |
 | **Aeolus** (`aeolus`) | CLAP | **Works** (`aarch64` source); **Untested** (`x86_64` release `v0.3.0`) | **Works** (`aarch64` `catalog-install-test` peak 0.281, `sound-library-test`) | **Works** (12 built-in registrations) | **Works** (initial principal chorus JSON + stop toggle readback) | **Works** (`editor-test`) | Custom stop-jamb panel on rack face verified in real app (#66). `x86_64` prebuilt release untested at runtime. |
+| **Unsampled Piano** (`unsampled-piano`) | CLAP | **Untested** (`x86_64` release `v0.2.1` + source; plan/SHA-256 unit-tested) | **Untested** | **Untested** | **Untested** | **Untested** | Added in #250; physically modelled acoustic grand piano. Runtime install, playback, state, and GUI window untested. |
 
 ---
 

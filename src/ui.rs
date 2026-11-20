@@ -1203,7 +1203,47 @@ impl RuleEdit {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+/// How long MIDI learn keeps listening after the last CC event on the
+/// captured controller so the player can move (e.g. bite and release) through
+/// its full min..max before locking in the adapted curve.
+const LEARN_SETTLE_SECS: f32 = 1.5;
+
+/// Minimum CC travel (`max - min`) observed during MIDI learn before adapting
+/// the input curve to `min..=max`. Keeps a single CC packet or 1–3 steps of
+/// pot jitter on a normal 0..=127 knob from collapsing the range, while still
+/// adapting narrow sensors like a wind controller's bite CC.
+const LEARN_MIN_SPAN: u8 = 4;
+
+#[derive(Clone, Debug, PartialEq)]
+struct CcLearnCapture {
+    source: SourceId,
+    cc: u8,
+    min: u8,
+    max: u8,
+    last_val: u8,
+    /// `ui_time` of the most recent CC sample on this controller.
+    last_at: f32,
+}
+
+impl CcLearnCapture {
+    fn scale(&self) -> crate::matrix::CcScale {
+        if self.max.saturating_sub(self.min) >= LEARN_MIN_SPAN {
+            crate::matrix::CcScale::input_range(self.min, self.max)
+        } else {
+            crate::matrix::CcScale::IDENTITY
+        }
+    }
+
+    fn tag(&self) -> String {
+        if self.max > self.min {
+            format!("CC {} · {}–{}", self.cc, self.min, self.max)
+        } else {
+            format!("CC {} · {}", self.cc, self.min)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct CcLearn {
     source: SourceId,
     dest: u32,
@@ -1211,6 +1251,31 @@ struct CcLearn {
     target: crate::matrix::CcTarget,
     /// When armed from a rack knob, replace any prior binding for that knob on completion.
     replace_existing: bool,
+    /// Populated once the first matching CC arrives; tracks the min..=max
+    /// values seen during learning until the controller settles.
+    capture: Option<CcLearnCapture>,
+}
+
+impl CcLearn {
+    fn new(
+        source: SourceId,
+        dest: u32,
+        param: u32,
+        target: crate::matrix::CcTarget,
+        replace_existing: bool,
+    ) -> Self {
+        Self { source, dest, param, target, replace_existing, capture: None }
+    }
+
+    fn is_switch(&self) -> bool {
+        self.target == CcTarget::Mix && MixControl::from_param(self.param).is_some_and(|c| c.is_switch())
+    }
+
+    fn capture_json(&self) -> Option<serde_json::Value> {
+        self.capture.as_ref().map(|c| serde_json::json!({
+            "cc": c.cc, "min": c.min, "max": c.max,
+        }))
+    }
 }
 
 /// The knob context menu, keyed by what the knob drives — never unit/knob
@@ -7421,6 +7486,7 @@ impl DemoApp {
                     }).collect::<Vec<_>>(),
                     "cc_learn": self.cc_learn.as_ref().map(|l| serde_json::json!({
                         "source": format!("{:?}", l.source), "node": l.dest, "param": l.param, "target": l.target.as_str(),
+                        "capture": l.capture_json(),
                     })),
                 }).to_string()
             }
@@ -7517,12 +7583,26 @@ impl DemoApp {
                     (Ok(_), Ok(_)) => return "set_cc_map needs min <= max".into(),
                     (Err(e), _) | (_, Err(e)) => return e,
                 };
-                self.set_cc_scaled(src, node, cc, param, target, crate::matrix::CcScale::range(lo as f32, hi as f32));
+                let in_bound = |key: &str, default: u8| match args.get(key) {
+                    None | Some(serde_json::Value::Null) => Ok(default),
+                    Some(v) => v.as_u64().filter(|&x| x <= 127).map(|x| x as u8)
+                        .ok_or(format!("set_cc_map '{key}' must be an integer 0..=127")),
+                };
+                let (in_lo, in_hi) = match (in_bound("in_min", 0), in_bound("in_max", 127)) {
+                    (Ok(lo), Ok(hi)) if lo <= hi => (lo, hi),
+                    (Ok(_), Ok(_)) => return "set_cc_map needs in_min <= in_max".into(),
+                    (Err(e), _) | (_, Err(e)) => return e,
+                };
+                let scale = crate::matrix::CcScale::range(lo as f32, hi as f32).with_input_range(in_lo, in_hi);
+                self.set_cc_scaled(src, node, cc, param, target, scale);
                 if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 self.agent_activity.touch_cell(src, node, now);
                 self.agent_activity.record(origin, format!("CC {cc} → {}", self.unit_display_name(node)), vec![node], now);
                 let map: Vec<_> = self.rule_edits.get(&(src, node))
-                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json()})).collect())
+                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({
+                        "cc": m.cc, "param": m.param, "target": m.target.as_str(),
+                        "range": m.scale.range_json(), "input_range": m.scale.input_range_json(),
+                    })).collect())
                     .unwrap_or_default();
                 serde_json::json!({"node": node, "source": source, "cc": cc, "param": param, "target": target.as_str(), "cc_map": map}).to_string()
             }
@@ -7611,7 +7691,10 @@ impl DemoApp {
                                 crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param),
                                 crate::matrix::CcTarget::ChannelPressure => Some("Channel pressure (breath)".to_string()),
                             };
-                            serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name, "range": m.scale.range_json()})
+                            serde_json::json!({
+                                "cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name,
+                                "range": m.scale.range_json(), "input_range": m.scale.input_range_json(),
+                            })
                         }).collect();
                         entries.push(serde_json::json!({
                             "source": Self::source_str(src),
@@ -7624,6 +7707,7 @@ impl DemoApp {
                     "cc_maps": entries,
                     "cc_learn": self.cc_learn.as_ref().map(|l| serde_json::json!({
                         "source": Self::source_str(l.source), "node": l.dest, "param": l.param, "target": l.target.as_str(),
+                        "capture": l.capture_json(),
                     })),
                 }).to_string()
             }
@@ -7692,7 +7776,7 @@ impl DemoApp {
                     Err(e) => return e,
                 };
                 let replace_existing = target != crate::matrix::CcTarget::PluginParam || args.get("knob").is_some();
-                self.cc_learn = Some(CcLearn { source: src, dest: node, param, target, replace_existing });
+                self.cc_learn = Some(CcLearn::new(src, node, param, target, replace_existing));
                 serde_json::json!({"armed": true, "node": node, "source": Self::source_str(src), "param": param, "target": target.as_str()}).to_string()
             }
             "set_rig_mix" => {
@@ -9803,7 +9887,7 @@ impl DemoApp {
             self.knob_menu = Some(menu);
         } else {
             self.knob_menu = None;
-            self.cc_learn = Some(CcLearn { source: SourceId::Keys, dest: node, param, target, replace_existing: true });
+            self.cc_learn = Some(CcLearn::new(SourceId::Keys, node, param, target, true));
         }
     }
 
@@ -9827,12 +9911,15 @@ impl DemoApp {
         }
     }
 
-    /// The tag a learnable control shows: "LEARN" while armed, its "CC n"
-    /// once bound.
+    /// The tag a learnable control shows: "LEARN" while armed, the live
+    /// captured range while sweeping, its "CC n" once bound.
     fn cc_tag(&self, dest: Option<CcDest>) -> Option<String> {
         let (node, param, target) = dest?;
-        if self.cc_learn.as_ref().is_some_and(|l| l.dest == node && l.param == param && l.target == target) {
-            return Some("LEARN".into());
+        if let Some(learn) = self.cc_learn.as_ref().filter(|l| l.dest == node && l.param == param && l.target == target) {
+            return Some(match &learn.capture {
+                Some(cap) => cap.tag(),
+                None => "LEARN".into(),
+            });
         }
         self.knob_cc_binding(node, param, target).map(|(_, cc)| format!("CC {cc}"))
     }
@@ -10187,8 +10274,17 @@ impl DemoApp {
         self.sync_midi_knobs_for_node(dest);
     }
 
-    fn complete_cc_learn(&mut self, incoming_src: SourceId, cc: u8) -> bool {
-        let Some(learn) = self.cc_learn.clone() else { return false };
+    /// Feed an incoming hardware CC into an active MIDI learn.
+    ///
+    /// Switches (Mute/Solo) bind and finish on the first CC. Continuous
+    /// controls lock onto the first CC and keep listening for
+    /// `LEARN_SETTLE_SECS` of stillness, tracking the observed `min..=max`
+    /// values and adapting the binding's input curve live so partial-range
+    /// controllers (e.g. a wind controller's bite CC) steer the full knob.
+    /// Returns `true` when the binding or its scale changed this event so the
+    /// caller resends a catch-up parameter update (rule 51).
+    fn feed_cc_learn(&mut self, incoming_src: SourceId, cc: u8, val: u8) -> bool {
+        let Some(mut learn) = self.cc_learn.clone() else { return false };
         let bind_src = match learn.source {
             SourceId::Hardware(d) if incoming_src == SourceId::Hardware(d) => incoming_src,
             SourceId::Hardware(_) => return false,
@@ -10196,20 +10292,68 @@ impl DemoApp {
             other if other == incoming_src => incoming_src,
             _ => return false,
         };
-        if learn.replace_existing {
-            self.clear_knob_bindings(learn.dest, learn.param, learn.target);
-        }
-        self.set_cc_binding(bind_src, learn.dest, cc, Some(learn.param), learn.target);
-        if learn.source == SourceId::Keys {
-            if let SourceId::Hardware(d) = bind_src {
-                if let Some((unit, _)) = self.rule_editor {
-                    self.rule_editor = Some((unit, MatrixRow::HwDev(d)));
+        let cc = cc & 0x7F;
+        let val = val & 0x7F;
+        if learn.is_switch() {
+            if learn.replace_existing {
+                self.clear_knob_bindings(learn.dest, learn.param, learn.target);
+            }
+            self.set_cc_binding(bind_src, learn.dest, cc, Some(learn.param), learn.target);
+            if learn.source == SourceId::Keys {
+                if let SourceId::Hardware(d) = bind_src {
+                    if let Some((unit, _)) = self.rule_editor {
+                        self.rule_editor = Some((unit, MatrixRow::HwDev(d)));
+                    }
                 }
             }
+            self.rule_cc_num = cc;
+            self.cc_learn = None;
+            return true;
         }
-        self.rule_cc_num = cc & 0x7F;
-        self.cc_learn = None;
-        true
+        match learn.capture.as_mut() {
+            None => {
+                if learn.replace_existing {
+                    self.clear_knob_bindings(learn.dest, learn.param, learn.target);
+                }
+                let cap = CcLearnCapture {
+                    source: bind_src,
+                    cc,
+                    min: val,
+                    max: val,
+                    last_val: val,
+                    last_at: self.ui_time,
+                };
+                self.set_cc_scaled(bind_src, learn.dest, cc, Some(learn.param), learn.target, cap.scale());
+                if learn.source == SourceId::Keys {
+                    if let SourceId::Hardware(d) = bind_src {
+                        if let Some((unit, _)) = self.rule_editor {
+                            self.rule_editor = Some((unit, MatrixRow::HwDev(d)));
+                        }
+                    }
+                }
+                self.rule_cc_num = cc;
+                learn.capture = Some(cap);
+                self.cc_learn = Some(learn);
+                true
+            }
+            Some(cap) => {
+                if cap.source != bind_src || cap.cc != cc {
+                    return false;
+                }
+                let prev_scale = cap.scale();
+                cap.min = cap.min.min(val);
+                cap.max = cap.max.max(val);
+                cap.last_val = val;
+                cap.last_at = self.ui_time;
+                let next_scale = cap.scale();
+                let changed = next_scale != prev_scale;
+                if changed {
+                    self.set_cc_scaled(cap.source, learn.dest, cap.cc, Some(learn.param), learn.target, next_scale);
+                }
+                self.cc_learn = Some(learn);
+                changed
+            }
+        }
     }
 
     /// Per-cell rule editor (right-click a matrix cell), inline beside the
@@ -10394,20 +10538,24 @@ impl DemoApp {
                     self.cc_learn = None;
                 }
             } else if theme::chip_button(ui, "Learn", false)
-                .on_hover_text("arm MIDI-learn: the next hardware CC binds to the chosen parameter")
+                .on_hover_text("arm MIDI-learn: move a hardware controller through its range to bind and adapt its curve")
                 .clicked()
             {
-                self.cc_learn = Some(CcLearn {
-                    source: src,
-                    dest: node,
-                    param: self.rule_param_id,
-                    target: crate::matrix::CcTarget::PluginParam,
-                    replace_existing: false,
-                });
+                self.cc_learn = Some(CcLearn::new(
+                    src,
+                    node,
+                    self.rule_param_id,
+                    crate::matrix::CcTarget::PluginParam,
+                    false,
+                ));
             }
         });
         if learning_here {
-            ui.label(egui::RichText::new("Move a hardware knob to bind… (Esc cancels)")
+            let hint = match self.cc_learn.as_ref().and_then(|l| l.capture.as_ref()) {
+                Some(cap) => format!("CC {} · range {}–{} · stop moving to lock in (Enter/Esc)", cap.cc, cap.min, cap.max),
+                None => "Move a hardware controller through its range… (Esc cancels)".into(),
+            };
+            ui.label(egui::RichText::new(hint)
                 .size(11.0).color(theme::ACCENT_BRIGHT));
         }
         ui.add_space(6.0);
@@ -19329,6 +19477,13 @@ impl DemoApp {
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
         self.ui_dt = dt;
+        if let Some(learn) = &self.cc_learn {
+            if let Some(cap) = &learn.capture {
+                if self.ui_time - cap.last_at >= LEARN_SETTLE_SECS {
+                    self.cc_learn = None;
+                }
+            }
+        }
         if self.autosave_due(dt) {
             self.autosave_now(&Self::sessions_dir());
         }
@@ -19892,6 +20047,11 @@ impl DemoApp {
             }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
+            }
+            if self.cc_learn.as_ref().is_some_and(|l| l.capture.is_some())
+                && i.consume_key(Modifiers::NONE, Key::Enter)
+            {
+                self.cc_learn = None;
             }
             if !(self.popup_open_at_start && !self.show_help) && i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
@@ -23314,14 +23474,15 @@ impl DemoApp {
         let hovered = matches!(self.hover, Some(Hit::Knob { unit, idx }) if unit == ui && idx == ki);
         let dragging = matches!(self.drag, Drag::Knob { unit, idx, .. } if unit == ui && idx == ki);
         let target = k.cc_target();
-        let is_learning = target.is_some_and(|(p, t)| {
-            self.cc_learn.as_ref().is_some_and(|l| l.dest == u.node_id && l.param == p && l.target == t)
+        let learning = target.and_then(|(p, t)| {
+            self.cc_learn.as_ref().filter(|l| l.dest == u.node_id && l.param == p && l.target == t)
         });
+        let is_learning = learning.is_some();
         let mapping = target.and_then(|(p, t)| self.knob_cc_mapping(u.node_id, p, t));
         let bound = mapping.map(|(src, m)| (src, m.cc));
         let range = mapping
             .map(|(_, m)| m.scale)
-            .filter(|s| s.is_continuous() && !s.is_identity())
+            .filter(|s| s.is_continuous() && s.has_output_range())
             .map(|s| s.bounds());
         let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
         let learn_col = mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse);
@@ -23374,7 +23535,11 @@ impl DemoApp {
         // Status plate (LEARN or CC nn) above the knob (rule 35 plate, rule 7 padding).
         let has_tag = (is_learning || bound.is_some()) && self.text_alpha > 0.01;
         if is_learning && self.text_alpha > 0.01 {
-            let g = painter.layout_no_wrap("LEARN".into(), theme::medium_font(9.5), theme::CREAM);
+            let label = match learning.and_then(|l| l.capture.as_ref()) {
+                Some(cap) => cap.tag(),
+                None => "LEARN".into(),
+            };
+            let g = painter.layout_no_wrap(label, theme::medium_font(9.5), theme::CREAM);
             let box_sz = g.size() + Vec2::new(16.0, 8.0);
             let local = Rect::from_min_size(Pos2::new(c.x - box_sz.x / 2.0, c.y - r - 6.5 - box_sz.y), box_sz);
             let sr = xf.rect(local);
@@ -23440,13 +23605,16 @@ impl DemoApp {
         // A mixer control (#75) has a binding and no knob: no value to reset.
         let knob = self.knob_menu_target(&menu);
         let Some(title) = self.cc_dest_title((node_id, param, target)) else { return close(self) };
-        let learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node_id && l.param == param && l.target == target);
+        let active_learn = self.cc_learn.as_ref().filter(|l| l.dest == node_id && l.param == param && l.target == target).cloned();
+        let learning = active_learn.is_some();
+        let capture = active_learn.as_ref().and_then(|l| l.capture.clone());
         let mapping = self.knob_cc_mapping(node_id, param, target);
         let binding = mapping.map(|(src, m)| (src, m.cc));
         if binding.is_none() && !learning {
             return close(self);
         }
         let mut relearn = false;
+        let mut finish_learn = false;
         let mut cancel_learn = false;
         let mut clear = false;
         let mut reset_val = false;
@@ -23456,7 +23624,9 @@ impl DemoApp {
             let (lo, hi) = m.scale.bounds();
             ((lo * 100.0).round(), (hi * 100.0).round())
         });
-        let mut new_range: Option<(f32, f32)> = None;
+        let has_in_range = ranged.is_some_and(|(_, m)| m.scale.has_input_range());
+        let (mut in_lo_v, mut in_hi_v) = ranged.map_or((0u8, 127u8), |(_, m)| m.scale.input_bounds());
+        let mut new_scale: Option<crate::matrix::CcScale> = None;
         let area = egui::Area::new(egui::Id::new("knob_midi_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
@@ -23476,21 +23646,28 @@ impl DemoApp {
                     .show(ui, |ui| {
                         ui.set_min_width(170.0);
                         ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
-                        let status = match binding {
-                            Some((src, cc)) if learning => format!("CC {cc} · {} · learning…", Self::source_str(src)),
-                            Some((src, cc)) => format!("CC {cc} · {}", Self::source_str(src)),
-                            None => "MIDI learn · move a controller".to_string(),
+                        let status = match (&capture, binding) {
+                            (Some(cap), _) => format!("CC {} · {} · range {}–{}…", cap.cc, Self::source_str(cap.source), cap.min, cap.max),
+                            (None, Some((src, cc))) if learning => format!("CC {cc} · {} · learning…", Self::source_str(src)),
+                            (None, Some((src, cc))) => format!("CC {cc} · {}", Self::source_str(src)),
+                            (None, None) => "MIDI learn · move a controller".to_string(),
                         };
                         ui.label(egui::RichText::new(status).size(11.0).color(theme::MIDI_BLUE));
                         ui.add_space(6.0);
                         if learning {
+                            if capture.is_some() {
+                                if theme::chip_button(ui, "Finish MIDI learn", false).clicked() {
+                                    finish_learn = true;
+                                }
+                                ui.add_space(4.0);
+                            }
                             if theme::chip_button(ui, "Cancel MIDI learn", false).clicked() {
                                 cancel_learn = true;
                             }
                         } else if theme::chip_button(ui, "MIDI learn again", false).clicked() {
                             relearn = true;
                         }
-                        if ranged.is_some() {
+                        if let Some((_, m)) = ranged {
                             ui.add_space(8.0);
                             theme::tracked_label(ui, "CONTROLLER RANGE", 9.0, 0.12, theme::INK_2);
                             ui.add_space(2.0);
@@ -23507,13 +23684,34 @@ impl DemoApp {
                                 let hi_changed = field(ui, "MAX", &mut hi_pct, lo_pct, 100.0,
                                     "how far the controller can turn the knob · drag");
                                 if lo_changed || hi_changed {
-                                    new_range = Some((lo_pct / 100.0, hi_pct / 100.0));
+                                    new_scale = Some(m.scale.with_output_range(lo_pct / 100.0, hi_pct / 100.0));
                                 }
                             });
-                            if lo_pct > 0.0 || hi_pct < 100.0 {
+                            if has_in_range {
+                                ui.add_space(6.0);
+                                theme::tracked_label(ui, "INPUT RANGE", 9.0, 0.12, theme::INK_2);
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    let field = |ui: &mut egui::Ui, label: &str, v: &mut u8, lo: u8, hi: u8, tip: &str| {
+                                        theme::tracked_label(ui, label, 9.0, 0.12, theme::INK_2);
+                                        let r = drag_only(ui.add(egui::DragValue::new(v).range(lo..=hi).speed(0.5)));
+                                        r.on_hover_text(tip).changed()
+                                    };
+                                    let in_lo_changed = field(ui, "MIN", &mut in_lo_v, 0, in_hi_v.saturating_sub(1),
+                                        "lowest CC value from the controller (maps to knob MIN) · drag");
+                                    ui.add_space(6.0);
+                                    let in_hi_changed = field(ui, "MAX", &mut in_hi_v, in_lo_v.saturating_add(1).min(127), 127,
+                                        "highest CC value from the controller (maps to knob MAX) · drag");
+                                    if in_lo_changed || in_hi_changed {
+                                        let base = new_scale.unwrap_or(m.scale);
+                                        new_scale = Some(base.with_input_range(in_lo_v, in_hi_v));
+                                    }
+                                });
+                            }
+                            if lo_pct > 0.0 || hi_pct < 100.0 || has_in_range {
                                 ui.add_space(4.0);
                                 if theme::chip_button(ui, "Full range", false).clicked() {
-                                    new_range = Some((0.0, 1.0));
+                                    new_scale = Some(crate::matrix::CcScale::IDENTITY);
                                 }
                             }
                         }
@@ -23532,21 +23730,25 @@ impl DemoApp {
                     });
             });
         self.knob_menu_rect = area.response.rect;
-        if let (Some((lo, hi)), Some((src, m))) = (new_range, ranged) {
-            self.set_cc_scaled(src, node_id, m.cc, Some(param), target, crate::matrix::CcScale::range(lo, hi));
+        if let (Some(scale), Some((src, m))) = (new_scale, ranged) {
+            self.set_cc_scaled(src, node_id, m.cc, Some(param), target, scale);
         }
-        if !(relearn || cancel_learn || clear || reset_val) {
+        if !(relearn || finish_learn || cancel_learn || clear || reset_val) {
             return;
         }
         close(self);
         if relearn {
-            self.cc_learn = Some(CcLearn {
-                source: SourceId::Keys,
-                dest: node_id,
+            self.cc_learn = Some(CcLearn::new(
+                SourceId::Keys,
+                node_id,
                 param,
                 target,
-                replace_existing: true,
-            });
+                true,
+            ));
+            return;
+        }
+        if finish_learn {
+            self.cc_learn = None;
             return;
         }
         // Every other choice ends a learn the right-click started, so a later
@@ -23554,7 +23756,11 @@ impl DemoApp {
         if learning {
             self.cc_learn = None;
         }
-        if clear {
+        if cancel_learn {
+            if let Some(cap) = capture {
+                self.set_cc_binding(cap.source, node_id, cap.cc, None, target);
+            }
+        } else if clear {
             self.clear_knob_bindings(node_id, param, target);
         } else if let (true, Some((unit, idx))) = (reset_val, knob) {
             let k = &mut self.units[unit].knobs[idx];
@@ -24648,7 +24854,7 @@ impl DemoApp {
     /// One app frame minus eframe plumbing (`ui()` delegates here) — tests
     /// drive the exact runtime path through a plain `egui::Context`.
     fn has_active_animations(&self) -> bool {
-        if self.flipping || self.assistant.busy || self.agent_activity.has_active(self.ui_time) {
+        if self.flipping || self.assistant.busy || self.agent_activity.has_active(self.ui_time) || self.cc_learn.is_some() {
             return true;
         }
         if self.reduce_motion {
@@ -24833,7 +25039,7 @@ impl DemoApp {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
             self.last_midi = Some(self.midi_event_text(src, &format!("CC{cc} {val}")));
-            let learned = self.complete_cc_learn(src, cc);
+            let learned = self.feed_cc_learn(src, cc, val);
             self.apply_cc_to_knobs(src, ch, cc, val, learned);
         }
 
@@ -29732,7 +29938,10 @@ mod split_bpm_tests {
         assert!(app.cc_learn.is_some());
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 100));
         frame(&mut app, &ctx, vec![]);
-        assert!(app.cc_learn.is_none(), "MIDI-learn disarms after binding");
+        assert!(app.cc_learn.as_ref().is_some_and(|l| l.capture.is_some()), "MIDI-learn captures the CC and waits to settle");
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "MIDI-learn disarms after settling");
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("learned binding stored");
         assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123, target: crate::matrix::CcTarget::PluginParam, scale: crate::matrix::CcScale::IDENTITY }]);
         let mut cmds = Vec::new();
@@ -29958,11 +30167,14 @@ mod split_bpm_tests {
         ]);
         assert!(app.cc_learn.is_none(), "Esc cancels knob learn on Rack");
 
-        // 4. Arm and send CC 74 from Hardware(2): binds for Hardware(2) and paints "CC 74".
+        // 4. Arm and send CC 74 from Hardware(2): binds for Hardware(2) and paints "CC 74" after settling.
         rclick(&mut app, &ctx, level_pos);
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(2), 0, 74, 50));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.as_ref().is_some_and(|l| l.capture.is_some()), "capturing range after first CC");
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
         let texts = frame(&mut app, &ctx, vec![]);
-        assert!(app.cc_learn.is_none(), "disarmed after binding");
+        assert!(app.cc_learn.is_none(), "disarmed after settling");
         assert!(texts.iter().any(|t| t == "CC 74"), "CC 74 tag painted: {texts:?}");
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
@@ -30019,6 +30231,8 @@ mod split_bpm_tests {
         rclick(&mut app, &ctx, pos);
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 30));
         frame(&mut app, &ctx, vec![]);
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(&mut app, &ctx, vec![]);
         assert!(app.cc_learn.is_none(), "CC 11 completed the learn");
         for v in [100u8, 10, 127] {
             app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, v));
@@ -30044,6 +30258,8 @@ mod split_bpm_tests {
         let pos = app.xf.p(app.knob_center(m, wi));
         rclick(&mut app, &ctx, pos);
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 30));
+        frame(&mut app, &ctx, vec![]);
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
         frame(&mut app, &ctx, vec![]);
         assert!(app.cc_learn.is_none(), "CC 11 completed the learn");
 
@@ -30081,6 +30297,103 @@ mod split_bpm_tests {
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 127));
         frame(&mut app, &ctx, vec![]);
         assert!((app.units[m].knobs[wi].display_value - 1.0).abs() < 1e-6);
+    }
+
+    /// MIDI learn observes the min..max CC range during learning (e.g. a wind
+    /// controller's bite sensor spanning 64..104) and adapts the curve so that
+    /// sub-range steers the full knob — live while capturing, locked in on
+    /// settle, editable in the knob menu, and preserved when capping output MAX.
+    #[test]
+    fn midi_learn_adapts_input_range_from_bite_cc_sweep() {
+        let (mut app, ctx) = demo();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame(&mut app, &ctx, vec![]);
+        drain.drain(|_| {});
+
+        let m = app.master_idx().unwrap();
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        let param = app.units[m].knobs[wi].param.unwrap();
+        let master_node = app.units[m].node_id;
+        let pos = app.xf.p(app.knob_center(m, wi));
+
+        // 1. Arm learn and sweep a bite sensor over 64..104 (with return to rest 64).
+        rclick(&mut app, &ctx, pos);
+        for v in [64u8, 72, 84, 104, 80, 64] {
+            app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 1, v));
+            let texts = frame(&mut app, &ctx, vec![]);
+            assert!(app.cc_learn.is_some(), "still capturing while moving");
+            if v == 104 {
+                assert!(texts.iter().any(|t| t == "CC 1 · 64–104"), "badge shows live captured range: {texts:?}");
+                assert!((app.units[m].knobs[wi].display_value - 1.0).abs() < 1e-6,
+                    "peak bite already steers the knob to 100 % live");
+            }
+        }
+        // Returning to rest 64 steers the knob to 0 % live.
+        assert!((app.units[m].knobs[wi].display_value - 0.0).abs() < 1e-6);
+
+        // 2. After stillness, learn settles with in_lo=64, in_hi=104.
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "learn settled after stillness");
+        assert!(texts.iter().any(|t| t == "CC 1"), "settled badge shows CC 1: {texts:?}");
+
+        let (_, mapping) = app.knob_cc_mapping(master_node, param, crate::matrix::CcTarget::Knob).unwrap();
+        assert_eq!(mapping.scale, crate::matrix::CcScale::input_range(64, 104));
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::MatrixCcMap { cc: 1, scale, .. } if *scale == crate::matrix::CcScale::input_range(64, 104)
+        )), "engine received the adapted input range: {cmds:?}");
+
+        // 3. Subsequent bite CC values follow the adapted curve (clamped at ends).
+        for (cc_val, want) in [(50u8, 0.0f32), (64, 0.0), (84, 0.5), (104, 1.0), (120, 1.0)] {
+            app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 1, cc_val));
+            frame(&mut app, &ctx, vec![]);
+            assert!((app.units[m].knobs[wi].display_value - want).abs() < 1e-5,
+                "bite CC {cc_val} -> want {want}, got {}", app.units[m].knobs[wi].display_value);
+        }
+
+        // 4. Knob menu shows INPUT RANGE (64..104) and Full range resets it;
+        //    capping output MAX preserves the learned input range.
+        rclick(&mut app, &ctx, pos);
+        let texts = frame(&mut app, &ctx, vec![]);
+        let painted = texts.concat();
+        assert!(painted.contains("INPUT RANGEMIN64MAX104"), "menu shows learned input range: {painted}");
+        assert!(texts.iter().any(|x| x == "Full range"), "Full range offered for adapted input range: {texts:?}");
+        let mut fields = range_fields(&ctx);
+        assert_eq!(fields.len(), 4, "output MIN/MAX + input MIN/MAX fields");
+        fields.sort_by(|a, b| a.top().total_cmp(&b.top()).then(a.left().total_cmp(&b.left())));
+        // Drag output MAX (row 1, col 2) down — input range 64..104 must survive.
+        let out_max = fields[1].center();
+        drag(&mut app, &ctx, out_max, out_max - Vec2::new(80.0, 0.0));
+        let (_, mapping) = app.knob_cc_mapping(master_node, param, crate::matrix::CcTarget::Knob).unwrap();
+        assert_eq!(mapping.scale.input_bounds(), (64, 104), "capping output MAX keeps learned input range");
+        assert!(mapping.scale.bounds().1 < 0.7, "output MAX was lowered: {:?}", mapping.scale.bounds());
+
+        // Full range resets both input and output range to IDENTITY.
+        let full = knob_menu_buttons(&ctx).into_iter()
+            .find(|r| r.center().y > fields[3].bottom())
+            .expect("Full range button below input range fields");
+        click(&mut app, &ctx, full.center());
+        let (_, mapping) = app.knob_cc_mapping(master_node, param, crate::matrix::CcTarget::Knob).unwrap();
+        assert!(mapping.scale.is_identity(), "Full range resets to IDENTITY: {:?}", mapping.scale);
+
+        // 5. Tiny 2-step jitter (60..62 < LEARN_MIN_SPAN) stays full 0..127.
+        rclick(&mut app, &ctx, pos);
+        // Right-click on already-bound knob opens menu; click "MIDI learn again".
+        frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, knob_menu_buttons(&ctx)[0].center());
+        assert!(app.cc_learn.is_some());
+        for v in [60u8, 62] {
+            app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 1, v));
+            frame(&mut app, &ctx, vec![]);
+        }
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(&mut app, &ctx, vec![]);
+        let (_, mapping) = app.knob_cc_mapping(master_node, param, crate::matrix::CcTarget::Knob).unwrap();
+        assert!(mapping.scale.is_identity(), "2-step jitter must not collapse 0..127 range: {:?}", mapping.scale);
     }
 
     /// The agent sets the same range through `set_cc_map` and reads it back.
@@ -36233,6 +36546,48 @@ mod mixer_parity_tests {
         }
     }
 
+    /// MIDI learn capturing a bite CC sub-range (64–104) and the resulting
+    /// knob menu with INPUT RANGE, as PNGs:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat midi_learn_range_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn midi_learn_range_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = Vec2::new(1600.0, 1000.0);
+
+        // 1. Live capture badge: "CC 1 · 64–104" while learning a bite CC.
+        let mut app = DemoApp::new_with_sink(None);
+        let m = app.master_idx().unwrap();
+        let node = app.units[m].node_id;
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        let (param, target) = app.units[m].knobs[wi].cc_target().unwrap();
+        app.cc_learn = Some(CcLearn::new(SourceId::Keys, node, param, target, true));
+        for v in [64u8, 84, 104, 84] {
+            app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 1, v));
+        }
+        super::offline_shots::shot(&mut app, size, &dir.join("midi-learn-capturing.png"));
+
+        // 2. Settled binding with learned input range (64..104) and knob menu open.
+        // Rule 148: each offline_shots::shot starts from a fresh DemoApp so
+        // cached galleys belong to the shot's own font atlas.
+        let mut probe = DemoApp::new_with_sink(None);
+        let m = probe.master_idx().unwrap();
+        let wi = probe.units[m].knob_index("WARM").unwrap();
+        super::offline_shots::shot(&mut probe, size, &dir.join("midi-learn-settled-closed.png"));
+        let pos = probe.xf.p(probe.knob_center(m, wi));
+
+        let mut app = DemoApp::new_with_sink(None);
+        let m = app.master_idx().unwrap();
+        let node = app.units[m].node_id;
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        let (param, target) = app.units[m].knobs[wi].cc_target().unwrap();
+        app.set_cc_scaled(SourceId::Hardware(1), node, 1, Some(param), target, crate::matrix::CcScale::input_range(64, 104));
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 1, 84));
+        app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack });
+        super::offline_shots::shot(&mut app, size, &dir.join("midi-learn-input-range-menu.png"));
+    }
+
     /// Every meter at a healthy −12 dBFS, rack and mixer, as PNGs:
     /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat healthy_meter_shots -- --ignored`
     #[test]
@@ -36797,8 +37152,11 @@ mod mixer_midi_learn_tests {
         assert!(texts.iter().any(|t| t.ends_with("· LEARN")), "the fader's readout shows LEARN: {texts:?}");
 
         // The next hardware CC binds it, and that CC is applied (rule 51).
-        let texts = cc(&mut app, &ctx, 2, 7, 64);
-        assert!(app.cc_learn.is_none(), "the CC completed the learn");
+        cc(&mut app, &ctx, 2, 7, 64);
+        assert!(app.cc_learn.as_ref().is_some_and(|l| l.capture.is_some()), "capturing range after first CC");
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "the CC settled and completed the learn");
         assert_eq!(mapping(&app, 2, fader).map(|m| m.cc), Some(7));
         assert_eq!(app.rig_mix[0].vol, 64.0 / 127.0, "the fader moves on screen (rule 109)");
         assert!(texts.iter().any(|t| t.ends_with("· CC 7")), "the fader's readout shows its CC: {texts:?}");
@@ -36843,7 +37201,9 @@ mod mixer_midi_learn_tests {
         assert!(texts.iter().any(|t| t == "LEARN"), "the send row says LEARN: {texts:?}");
 
         cc(&mut app, &ctx, 2, 20, 64);
-        assert!(app.cc_learn.is_none(), "the CC completed the learn");
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "the CC settled and completed the learn");
         assert_eq!(mapping(&app, 2, send).map(|m| m.cc), Some(20));
         assert_eq!(app.send_of(from, bus_node).level, 64.0 / 127.0, "the send moves on screen (rule 109)");
         let cmds = sent(&mut drain);
@@ -36875,6 +37235,10 @@ mod mixer_midi_learn_tests {
             rclick(app, &ctx, pos);
             assert!(app.cc_learn.is_some(), "right-click arms {dest:?}");
             cc(app, &ctx, 1, cc_num, value);
+            if app.cc_learn.is_some() {
+                app.ui_time += LEARN_SETTLE_SECS + 0.1;
+                frame(app, &ctx, vec![]);
+            }
             assert!(app.cc_learn.is_none() && mapping(app, 1, dest).is_some_and(|m| m.cc == cc_num), "{dest:?} is bound to CC {cc_num}");
         };
         // Rig bus: a button that latches at 127 mutes, its release unmutes.
@@ -36922,7 +37286,9 @@ mod mixer_midi_learn_tests {
         let (param, target) = app.units[unit].knobs[level].cc_target().unwrap();
         let pos = at(&app, (node, param, target));
         rclick(&mut app, &ctx, pos);
-        let texts = cc(&mut app, &ctx, 3, 12, 32);
+        cc(&mut app, &ctx, 3, 12, 32);
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        let texts = frame(&mut app, &ctx, vec![]);
         assert_eq!(app.knob_cc_binding(node, param, target), Some((SourceId::Hardware(3), 12)), "the rack knob carries the binding");
         assert!((app.units[unit].knobs[level].display_value - 32.0 / 127.0).abs() < 1e-6, "the knob and the fader follow");
         assert!(texts.iter().any(|t| t.ends_with("· CC 12")), "{texts:?}");
@@ -36935,6 +37301,8 @@ mod mixer_midi_learn_tests {
         let pos = at(&app, (master, param, target));
         rclick(&mut app, &ctx, pos);
         cc(&mut app, &ctx, 3, 13, 127);
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(&mut app, &ctx, vec![]);
         assert_eq!(app.knob_cc_binding(master, param, target), Some((SourceId::Hardware(3), 13)));
         assert!((app.units[m].knobs[vol].display_value - 1.0).abs() < 1e-6);
         // The bus fader on the same node is still unbound.
@@ -36999,6 +37367,8 @@ mod mixer_midi_learn_tests {
         let pos = at(&app, fader);
         rclick(&mut app, &ctx, pos);
         cc(&mut app, &ctx, 1, 7, 100);
+        app.ui_time += LEARN_SETTLE_SECS + 0.1;
+        frame(&mut app, &ctx, vec![]);
         let texts = rclick(&mut app, &ctx, pos);
         assert_eq!(texts.iter().filter(|t| *t == " %").count(), 2, "the MIN and MAX range fields: {texts:?}");
     }
@@ -37167,7 +37537,7 @@ mod mixer_midi_learn_tests {
             }
             if learning {
                 let node = app.rig_bus_node(1).unwrap();
-                app.cc_learn = Some(CcLearn { source: SourceId::Keys, dest: node, param: MixControl::Vol.param(), target: CcTarget::Mix, replace_existing: true });
+                app.cc_learn = Some(CcLearn::new(SourceId::Keys, node, MixControl::Vol.param(), CcTarget::Mix, true));
             }
             super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
         }

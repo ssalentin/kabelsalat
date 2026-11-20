@@ -620,6 +620,10 @@ struct SetCcMapArgs {
     min: Option<f32>,
     /// Highest parameter value the controller reaches (0..1, default 1), e.g. 0.6 so a pedal never pushes drive past 60 %.
     max: Option<f32>,
+    /// Lowest controller CC value mapped to `min` (0..=127, default 0), e.g. 64 for a bite sensor.
+    in_min: Option<u8>,
+    /// Highest controller CC value mapped to `max` (0..=127, default 127), e.g. 104 for a bite sensor.
+    in_max: Option<u8>,
 }
 
 /// Arguments for `clear_cc_map`.
@@ -2297,6 +2301,8 @@ impl McpServer {
                     "mix": args.mix,
                     "min": args.min,
                     "max": args.max,
+                    "in_min": args.in_min,
+                    "in_max": args.in_max,
                 }),
             );
         }
@@ -2304,7 +2310,11 @@ impl McpServer {
         if !(0.0..=1.0).contains(&lo) || !(0.0..=1.0).contains(&hi) || lo > hi {
             return tool_err("min and max must be 0..1 with min <= max");
         }
-        let scale = crate::matrix::CcScale::range(lo, hi);
+        let (in_lo, in_hi) = (args.in_min.unwrap_or(0), args.in_max.unwrap_or(127));
+        if in_lo > 127 || in_hi > 127 || in_lo > in_hi {
+            return tool_err("in_min and in_max must be 0..=127 with in_min <= in_max");
+        }
+        let scale = crate::matrix::CcScale::range(lo, hi).with_input_range(in_lo, in_hi);
         let source = match Self::parse_rule_source(&args.source) {
             Ok(s) => s,
             Err(e) => return tool_err(e),
@@ -2363,7 +2373,7 @@ impl McpServer {
             None => entry.retain(|m| m.cc != args.cc),
         }
         let map: Vec<Value> = st.cc_maps.get(&(source, args.node))
-            .map(|v| v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json()})).collect())
+            .map(|v| v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json(), "input_range": m.scale.input_range_json()})).collect())
             .unwrap_or_default();
         if map.is_empty() {
             st.cc_maps.remove(&(source, args.node));
@@ -2484,7 +2494,7 @@ impl McpServer {
                     other => format!("{other:?}"),
                 },
                 "node": node,
-                "bindings": v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json()})).collect::<Vec<_>>(),
+                "bindings": v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json(), "input_range": m.scale.input_range_json()})).collect::<Vec<_>>(),
             }))
             .collect();
         ok_json(json!({"cc_maps": entries}))
@@ -4418,6 +4428,8 @@ mod tests {
             mix: None,
             min: None,
             max: None,
+            in_min: None,
+            in_max: None,
         })));
         assert_eq!(res["cc"], json!(74));
         assert_eq!(res["param"], json!(42));
@@ -4432,6 +4444,8 @@ mod tests {
             mix: None,
             min: None,
             max: Some(0.6),
+            in_min: None,
+            in_max: None,
         })));
         assert_eq!(res_knob["param"], json!(0));
         assert_eq!(res_knob["cc_map"][0]["range"], json!([0.0, 0.6]), "{res_knob}");
@@ -4477,7 +4491,7 @@ mod tests {
         let master = server.state.lock().unwrap().graph.nodes.iter()
             .find(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).unwrap();
         let set = |node: NodeId, cc: u8, mix: &str| server.set_cc_map(Parameters(SetCcMapArgs {
-            node, source: "hw:0".into(), cc, param: None, target: None, knob: None, mix: Some(mix.into()), min: None, max: None,
+            node, source: "hw:0".into(), cc, param: None, target: None, knob: None, mix: Some(mix.into()), min: None, max: None, in_min: None, in_max: None,
         }));
         let res = tool_json(&set(master, 20, "vol"));
         assert_eq!((&res["target"], &res["param"]), (&json!("mix"), &json!(0)), "{res}");
@@ -4570,7 +4584,7 @@ mod tests {
 
         // A controller rebound by hand since stays; the rest goes with "none".
         tool_json(&server.set_cc_map(Parameters(SetCcMapArgs {
-            node: organ, source: "hw:1".into(), cc: 111, param: Some(crate::organ::P_REVERB), target: Some("knob".into()), knob: None, mix: None, min: None, max: None,
+            node: organ, source: "hw:1".into(), cc: 111, param: Some(crate::organ::P_REVERB), target: Some("knob".into()), knob: None, mix: None, min: None, max: None, in_min: None, in_max: None,
         })));
         let off = tool_json(&set(1, "none"));
         assert_eq!((&off["profile"], &off["drives"]), (&Value::Null, &json!([])), "{off}");

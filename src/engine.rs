@@ -2497,9 +2497,14 @@ impl GraphEngine {
         for f in 0..n_fx {
             if self.fx_done[f] { continue; }
             first.get_or_insert(f);
-            let node_f = self.fx_node(f);
-            let waits = (0..n_fx).any(|g| {
-                g != f && !self.fx_done[g] && self.graph.has_route(self.fx_node(g), node_f, PortKind::Audio)
+            // Waits for an effect wired into it that has not run: one pass
+            // over the cables, then the few that end here are looked up
+            // (asking every other effect for a route walked all cables for
+            // each of them, for each effect, every block).
+            let to = self.fx_node(f);
+            let waits = self.graph.edges.iter().any(|e| {
+                e.kind == PortKind::Audio && e.to.node == to && e.from.node != to
+                    && (0..n_fx).any(|g| !self.fx_done[g] && self.fx_node(g) == e.from.node)
             });
             if !waits { return Some(f); }
         }
@@ -2688,8 +2693,23 @@ impl GraphEngine {
     fn sum_audio_into(&mut self, dest: NodeId, out: &mut [f32]) {
         out.fill(0.0);
         let (graph, pdc) = (&self.graph, &mut self.pdc);
+        // Who is wired into `dest`, from one pass over the cables: asking
+        // the graph per source walked all of them for every unit.
+        let mut wired = [NodeId::MAX; 16];
+        let mut n_wired = 0;
+        for e in &graph.edges {
+            if e.kind == PortKind::Audio && e.to.node == dest {
+                if n_wired < wired.len() {
+                    wired[n_wired] = e.from.node;
+                }
+                n_wired += 1;
+            }
+        }
+        let routed = |src: NodeId| {
+            if n_wired <= wired.len() { wired[..n_wired].contains(&src) } else { graph.has_route(src, dest, PortKind::Audio) }
+        };
         let mut add = |src: NodeId, buf: &[f32]| {
-            if src != dest && graph.has_route(src, dest, PortKind::Audio) {
+            if src != dest && routed(src) {
                 pdc.mix(src, dest, buf, false, (1.0, 1.0), out);
             }
         };
@@ -5534,6 +5554,8 @@ mod held_notes;
 mod latent;
 mod pdc;
 mod probe;
+mod bench;
+pub use bench::bench;
 pub mod analysis_test;
 
 #[cfg(test)]
@@ -9801,87 +9823,6 @@ mod midifx_cc_tests {
             assert_eq!(semis(&engine, fx), -MIDIFX_SEMI_MAX, "{target:?}: zero CC = bottom");
         }
     }
-}
-
-/// `kabelsalat engine-bench`: time `GraphEngine::render` offline, with no
-/// audio device and no plugins. Two metronomes stand in for the demo rack's
-/// synths. Prints the median ns per frame over `REPS` runs, the master
-/// limiter's share of it, and an FNV hash of every output sample so two
-/// builds can be compared for bit-identical audio.
-pub fn bench() -> anyhow::Result<()> {
-    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
-    const REPS: usize = 9;
-    const SECONDS: usize = 20;
-    let sr = 48000.0;
-
-    let mut g = Graph::default();
-    g.reserve(64, 256);
-    let src_a = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("SRC A"));
-    let delay_a = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY A"));
-    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
-    let src_b = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("SRC B"));
-    let delay_b = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY B"));
-    let edges = [(3, src_a, delay_a, 0), (4, delay_a, master, 0), (5, src_a, master, 1),
-                 (7, src_b, delay_b, 0), (8, delay_b, master, 0), (9, src_b, master, 2)];
-    for (id, from, to, port) in edges {
-        anyhow::ensure!(g.connect_with_id(id, PortRef { node: from, port: 0 }, PortRef { node: to, port }, PortKind::Audio));
-    }
-
-    let median = |mut v: Vec<f64>| {
-        v.sort_by(|a, b| a.total_cmp(b));
-        (v[v.len() / 2], v[0], v[v.len() - 1])
-    };
-    println!("engine-bench: {SECONDS} s of audio per run, median of {REPS} runs");
-    for frames in [128usize, 256, 512] {
-        let blocks = SECONDS * sr as usize / frames;
-        let mut runs = Vec::with_capacity(REPS);
-        let (mut hash, mut peak) = (0u64, 0.0f32);
-        for _ in 0..REPS {
-            let (mut bus, drain) = command_bus();
-            let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
-            bus.send(Command::LoadGraph { graph: g.clone() });
-            bus.send(Command::TransportPlay);
-            let mut buf = vec![0.0f32; frames * 2];
-            hash = 0xcbf29ce484222325;
-            peak = 0.0;
-            let mut spent = std::time::Duration::ZERO;
-            for _ in 0..blocks {
-                let t = std::time::Instant::now();
-                engine.render(std::hint::black_box(&mut buf), 2);
-                spent += t.elapsed();
-                for s in &buf {
-                    hash = (hash ^ s.to_bits() as u64).wrapping_mul(0x100000001b3);
-                    peak = peak.max(s.abs());
-                }
-            }
-            runs.push(spent.as_nanos() as f64 / (blocks * frames) as f64);
-        }
-        let (med, lo, hi) = median(runs);
-        println!(
-            "render  buffer={frames:<4} median={med:7.2} ns/frame  range={lo:.2}..{hi:.2}  block={:6.2} us  peak={peak:.3}  hash={hash:016x}",
-            med * frames as f64 / 1000.0,
-        );
-    }
-    for (label, warm) in [("default warm", 0.15f32), ("warm 60%", 0.6)] {
-        let drive = 1.0 + warm * 3.0;
-        let n = SECONDS * sr as usize;
-        let mut runs = Vec::with_capacity(REPS);
-        let mut hash = 0u64;
-        for _ in 0..REPS {
-            let mut lim = MasterLimiter::new(sr);
-            hash = 0xcbf29ce484222325;
-            let t = std::time::Instant::now();
-            for i in 0..n {
-                let x = (i as f32 * 0.031).sin() * 0.9;
-                let (l, r) = lim.process(std::hint::black_box(x), x * 0.5, drive, 0.75);
-                hash = (hash ^ l.to_bits() as u64 ^ ((r.to_bits() as u64) << 32)).wrapping_mul(0x100000001b3);
-            }
-            runs.push(t.elapsed().as_nanos() as f64 / n as f64);
-        }
-        let (med, lo, hi) = median(runs);
-        println!("limiter {label:<12} median={med:7.2} ns/frame  range={lo:.2}..{hi:.2}  hash={hash:016x}");
-    }
-    Ok(())
 }
 
 /// `kabelsalat send-test` (issue #5): two rigs with a real Surge XT each send

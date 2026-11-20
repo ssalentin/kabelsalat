@@ -37943,6 +37943,9 @@ mod voice_host_tests {
     }
 }
 
+mod bench;
+pub use bench::run as run_ui_bench;
+
 /// Times loading saved session packages (args: package paths) on the
 /// offline-engine app with real plugins: the UI-thread `apply_session`, and
 /// the slowest of the frames that follow while plugins load.

@@ -884,18 +884,36 @@ impl Comb {
     fn new(len: usize) -> Self {
         Self { buf: vec![0.0; len.max(4)], idx: 0, store: 0.0 }
     }
+}
 
-    #[inline]
-    fn process(&mut self, input: f32, feedback: f32, damp: f32) -> f32 {
-        let out = self.buf[self.idx];
-        self.store = flush(out * (1.0 - damp) + self.store * damp);
-        self.buf[self.idx] = input + self.store * feedback;
-        self.idx += 1;
-        if self.idx == self.buf.len() {
-            self.idx = 0;
+/// Four combs over one chunk: `l0, r0, l1, r1` add into `wl, wr` in that
+/// order, frame by frame. Their state lives in locals for the chunk, so the
+/// four damping recurrences run side by side instead of each frame loading
+/// and storing every comb's index and filter state through memory.
+#[inline]
+fn run_combs(combs: [&mut Comb; 4], input: &[f32], fb: &[f32], damp: &[f32], wl: &mut [f32], wr: &mut [f32]) {
+    let n = input.len();
+    let (fb, damp, wl, wr) = (&fb[..n], &damp[..n], &mut wl[..n], &mut wr[..n]);
+    let [a, b, c, d] = combs;
+    let mut idx = [a.idx, b.idx, c.idx, d.idx];
+    let mut store = [a.store, b.store, c.store, d.store];
+    let bufs = [&mut a.buf[..], &mut b.buf[..], &mut c.buf[..], &mut d.buf[..]];
+    for f in 0..n {
+        let mut out = [0.0f32; 4];
+        for k in 0..4 {
+            out[k] = bufs[k][idx[k]];
+            store[k] = flush(out[k] * (1.0 - damp[f]) + store[k] * damp[f]);
+            bufs[k][idx[k]] = input[f] + store[k] * fb[f];
+            idx[k] += 1;
+            if idx[k] == bufs[k].len() {
+                idx[k] = 0;
+            }
         }
-        out
+        wl[f] = (wl[f] + out[0]) + out[2];
+        wr[f] = (wr[f] + out[1]) + out[3];
     }
+    (a.idx, b.idx, c.idx, d.idx) = (idx[0], idx[1], idx[2], idx[3]);
+    (a.store, b.store, c.store, d.store) = (store[0], store[1], store[2], store[3]);
 }
 
 struct Allpass {
@@ -908,16 +926,22 @@ impl Allpass {
         Self { buf: vec![0.0; len.max(4)], idx: 0 }
     }
 
+    /// One chunk in place.
     #[inline]
-    fn process(&mut self, input: f32) -> f32 {
-        let bufout = self.buf[self.idx];
-        let out = bufout - input;
-        self.buf[self.idx] = input + bufout * 0.5;
-        self.idx += 1;
-        if self.idx == self.buf.len() {
-            self.idx = 0;
+    fn run(&mut self, w: &mut [f32]) {
+        let mut idx = self.idx;
+        let buf = &mut self.buf[..];
+        for x in w.iter_mut() {
+            let bufout = buf[idx];
+            let out = bufout - *x;
+            buf[idx] = *x + bufout * 0.5;
+            idx += 1;
+            if idx == buf.len() {
+                idx = 0;
+            }
+            *x = out;
         }
-        out
+        self.idx = idx;
     }
 }
 
@@ -958,36 +982,42 @@ impl Reverb {
 
 impl Processor for Reverb {
     fn process(&mut self, io: &mut [f32], frames: usize) {
+        /// Frames per pass: the parameter ramps and the wet sums of a pass
+        /// stay on the stack.
+        const CHUNK: usize = 64;
         let n = frame_count(io, frames);
-        for f in 0..n {
-            let fb = self.fb.next();
-            let damp = self.damp.next();
-            let mix = self.mix.next();
-            let width = self.width.next();
-
-            let l = io[2 * f];
-            let r = io[2 * f + 1];
-            let input = (l + r) * 0.01; // fixed input gain, keeps the tank tame
-
-            let mut wl = 0.0;
-            let mut wr = 0.0;
-            for i in 0..8 {
-                wl += self.combs_l[i].process(input, fb, damp);
-                wr += self.combs_r[i].process(input, fb, damp);
+        let (mut fb, mut damp, mut mix, mut width) = ([0.0f32; CHUNK], [0.0f32; CHUNK], [0.0f32; CHUNK], [0.0f32; CHUNK]);
+        let (mut input, mut wl, mut wr) = ([0.0f32; CHUNK], [0.0f32; CHUNK], [0.0f32; CHUNK]);
+        for io in io[..2 * n].chunks_mut(2 * CHUNK) {
+            let m = io.len() / 2;
+            for (f, fr) in io.chunks_exact(2).enumerate() {
+                fb[f] = self.fb.next();
+                damp[f] = self.damp.next();
+                mix[f] = self.mix.next();
+                width[f] = self.width.next();
+                input[f] = (fr[0] + fr[1]) * 0.01; // fixed input gain, keeps the tank tame
+            }
+            wl[..m].fill(0.0);
+            wr[..m].fill(0.0);
+            let (mut cl, mut cr) = (self.combs_l.iter_mut(), self.combs_r.iter_mut());
+            while let (Some(l0), Some(r0), Some(l1), Some(r1)) = (cl.next(), cr.next(), cl.next(), cr.next()) {
+                run_combs([l0, r0, l1, r1], &input[..m], &fb, &damp, &mut wl, &mut wr);
             }
             for ap in self.aps_l.iter_mut() {
-                wl = ap.process(wl);
+                ap.run(&mut wl[..m]);
             }
             for ap in self.aps_r.iter_mut() {
-                wr = ap.process(wr);
+                ap.run(&mut wr[..m]);
             }
-
-            let w1 = width * 0.5 + 0.5;
-            let w2 = (1.0 - width) * 0.5;
-            let wet_l = (wl * w1 + wr * w2) * 2.0;
-            let wet_r = (wr * w1 + wl * w2) * 2.0;
-            io[2 * f] = l * (1.0 - mix) + wet_l * mix;
-            io[2 * f + 1] = r * (1.0 - mix) + wet_r * mix;
+            for (f, fr) in io.chunks_exact_mut(2).enumerate() {
+                let (l, r) = (fr[0], fr[1]);
+                let w1 = width[f] * 0.5 + 0.5;
+                let w2 = (1.0 - width[f]) * 0.5;
+                let wet_l = (wl[f] * w1 + wr[f] * w2) * 2.0;
+                let wet_r = (wr[f] * w1 + wl[f] * w2) * 2.0;
+                fr[0] = l * (1.0 - mix[f]) + wet_l * mix[f];
+                fr[1] = r * (1.0 - mix[f]) + wet_r * mix[f];
+            }
         }
     }
 
@@ -1542,6 +1572,93 @@ pub(crate) mod tests {
         p.process(&mut io, 1000); // frames > buffer: must clamp, not panic
         p.process(&mut io, 0);
         p.process(&mut [], 0);
+    }
+
+    /// The tank as Freeverb states it, one frame at a time: every comb,
+    /// then the allpasses, then the mix. `Reverb::process` runs the same
+    /// arithmetic in chunks with the combs four at a time, so its output
+    /// must be this one bit for bit, however the caller cuts its blocks and
+    /// while SIZE, DAMPING, MIX and WIDTH glide.
+    #[test]
+    fn the_reverb_is_the_frame_by_frame_tank_bit_for_bit_at_any_block_size() {
+        struct Line { buf: Vec<f32>, idx: usize, store: f32 }
+        impl Line {
+            fn new(len: usize) -> Self { Self { buf: vec![0.0; len], idx: 0, store: 0.0 } }
+            fn step(&mut self) { self.idx = (self.idx + 1) % self.buf.len(); }
+        }
+        let len = |t: usize| ((t as f64) * (SR / 44100.0)).round() as usize;
+        let mut combs: Vec<[Line; 2]> = COMB_TUNING.iter().map(|&t| [Line::new(len(t)), Line::new(len(t) + STEREO_SPREAD)]).collect();
+        let mut aps: Vec<[Line; 2]> = ALLPASS_TUNING.iter().map(|&t| [Line::new(len(t)), Line::new(len(t) + STEREO_SPREAD)]).collect();
+        let mut slews = [Slew::new(SR, 20.0, 0.70 + 0.28 * 0.5), Slew::new(SR, 20.0, 0.5 * 0.4), Slew::new(SR, 10.0, 0.3), Slew::new(SR, 10.0, 1.0)];
+
+        const FRAMES: usize = 6000;
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let input: Vec<f32> = (0..FRAMES * 2)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect();
+        // The knobs move a third of the way in.
+        let moved = [(0u32, 0.9f32), (1, 0.8), (2, 0.6), (3, 0.2)];
+        let turn_at = FRAMES / 3;
+
+        let mut want = input.clone();
+        for (f, fr) in want.chunks_exact_mut(2).enumerate() {
+            if f == turn_at {
+                slews[0].set(0.70 + 0.28 * 0.9);
+                slews[1].set(0.4 * 0.8);
+                slews[2].set(0.6);
+                slews[3].set(0.2);
+            }
+            let [fb, damp, mix, width] = [slews[0].next(), slews[1].next(), slews[2].next(), slews[3].next()];
+            let (l, r) = (fr[0], fr[1]);
+            let x = (l + r) * 0.01;
+            let mut w = [0.0f32; 2];
+            for pair in combs.iter_mut() {
+                for (c, w) in pair.iter_mut().zip(&mut w) {
+                    let out = c.buf[c.idx];
+                    c.store = flush(out * (1.0 - damp) + c.store * damp);
+                    c.buf[c.idx] = x + c.store * fb;
+                    c.step();
+                    *w += out;
+                }
+            }
+            for pair in aps.iter_mut() {
+                for (a, w) in pair.iter_mut().zip(&mut w) {
+                    let bufout = a.buf[a.idx];
+                    a.buf[a.idx] = *w + bufout * 0.5;
+                    a.step();
+                    *w = bufout - *w;
+                }
+            }
+            let (w1, w2) = (width * 0.5 + 0.5, (1.0 - width) * 0.5);
+            fr[0] = l * (1.0 - mix) + (w[0] * w1 + w[1] * w2) * 2.0 * mix;
+            fr[1] = r * (1.0 - mix) + (w[1] * w1 + w[0] * w2) * 2.0 * mix;
+        }
+        assert!(peak(&want[FRAMES..]) > 0.05, "the reference tank is silent");
+
+        for block in [1usize, 37, 64, 65, 256, 1000] {
+            let mut p = build_processor(&DspKind::Reverb, SR);
+            let mut got = input.clone();
+            let mut done = 0;
+            while done < FRAMES {
+                // A block never straddles the knob move.
+                let until = if done < turn_at { turn_at } else { FRAMES };
+                let n = block.min(until - done);
+                if done == turn_at {
+                    for (id, v) in moved {
+                        p.set_param(id, v);
+                    }
+                }
+                p.process(&mut got[done * 2..(done + n) * 2], n);
+                done += n;
+            }
+            let first = got.iter().zip(&want).position(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(first, None, "blocks of {block}: the first sample that differs from the frame-by-frame tank");
+        }
     }
 
     // -- RT proof: allocation counter ----------------------------------------------

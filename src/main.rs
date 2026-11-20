@@ -98,6 +98,7 @@ fn main() -> anyhow::Result<()> {
         "catalog-install-test" => catalog::install_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "session-test" => ui::run_session_test(),
         "engine-bench" => engine::bench(),
+        "ui-bench" => ui::run_ui_bench(&std::env::args().skip(2).collect::<Vec<_>>()),
         "session-load-bench" => ui::run_session_load_bench(&std::env::args().skip(2).collect::<Vec<_>>()),
         "agent-eval" => ui::run_agent_eval(),
         "jev-test" => assistant::run_jev_test(),

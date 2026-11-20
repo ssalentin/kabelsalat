@@ -1565,3 +1565,10 @@ Learned so far (2026-11-15, UI polish pass):
     any PR that adds a catalog plugin, verifies a plugin on real hardware or
     another CPU, or changes a plugin's support status updates `docs/PLUGINS.md`
     in the same PR.
+189. **Pin buttons in parameter lists sit right-first and evict auto main controls:**
+    in `param_editor_window`, `Slider::text(...)` does not truncate long
+    parameter names, pushing `+ knob` past the scroll area's clip rect where
+    it cannot be clicked; lay out `+ knob` / `− knob` first in `right_to_left`
+    with truncated labels, show `editor_status` inside the window, and have
+    `toggle_pin` evict the last auto-selected `KnobSource::Main` knob when
+    `MAX_PINS` is full (`pin_button_in_param_editor_replaces_main_knob_and_stays_clickable_for_long_names`).

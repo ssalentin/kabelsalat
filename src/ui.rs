@@ -8972,6 +8972,7 @@ impl DemoApp {
         let mut pin_req: Option<crate::host::ParamDesc> = None;
         egui::Window::new(egui::RichText::new(format!("{name} — sound & parameters"))
                 .font(theme::medium_font(16.0)).color(theme::INK))
+            .id(egui::Id::new("param_editor_window"))
             .open(&mut open)
             .collapsible(false)
             .fixed_size([480.0, 700.0])
@@ -9055,6 +9056,9 @@ impl DemoApp {
                     }
                 });
                 ui.separator();
+                if !self.editor_status.is_empty() {
+                    ui.label(egui::RichText::new(&self.editor_status).size(11.5).color(theme::ACCENT_DEEP));
+                }
                 let filter = self.editor_filter.to_lowercase();
                 // Which params are pinned on this synth's face (for the toggles).
                 let pin_node = self.clap_rigs().into_iter().find(|(s, _)| *s == rig).map(|(_, n)| n);
@@ -9101,28 +9105,62 @@ impl DemoApp {
                                     shown += 1;
                                     let mut value = p.value;
                                     ui.horizontal(|ui| {
-                                        let w = ui.available_width();
-                                        // Param name: micro-caps INK_2 (§4.18).
-                                        let resp = ui.add_sized(
-                                            [(w - 96.0).max(120.0), 18.0],
-                                            egui::Slider::new(&mut value, p.min..=p.max)
-                                                .text(egui::RichText::new(p.name.to_uppercase())
-                                                    .size(10.0).color(theme::INK_2)),
-                                        );
-                                        if resp.changed() {
-                                            changes.push((p.id, value));
-                                        }
-                                        let text = pool_idx
+                                        let row_w = ui.available_width();
+                                        let is_pinned = pinned.contains(&p.id);
+                                        let pin_label = if is_pinned { "− knob" } else { "+ knob" };
+                                        let pin_w = theme::chip_button_width(ui, pin_label);
+                                        let val_text = pool_idx
                                             .and_then(|i| mains.get_mut(i))
                                             .map(|m| m.param_text(p.id, value))
                                             .unwrap_or_default();
-                                        ui.label(egui::RichText::new(text)
-                                            .font(theme::medium_font(13.0)).color(theme::INK));
-                                        // Pin this parameter as a knob on the synth's face.
-                                        let is_pinned = pinned.contains(&p.id);
-                                        if theme::chip_button(ui, if is_pinned { "− knob" } else { "+ knob" }, is_pinned)
-                                            .on_hover_text(if is_pinned { "remove this knob from the Surge face" } else { "put this parameter as a knob on the Surge face" })
-                                            .clicked() { pin_req = Some(p.clone()); }
+                                        // Place the pin button on the right first so long
+                                        // parameter names or value strings can never push
+                                        // it past the scroll area's clip rect.
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(row_w, 22.0),
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if theme::chip_button(ui, pin_label, is_pinned)
+                                                    .on_hover_text(if is_pinned { "remove this knob from the synth face" } else { "put this parameter as a knob on the synth face" })
+                                                    .clicked()
+                                                {
+                                                    pin_req = Some(p.clone());
+                                                }
+                                                let val_w = 68.0_f32.min((row_w - pin_w - 160.0).max(40.0));
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(val_w, 18.0),
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.add(egui::Label::new(
+                                                            egui::RichText::new(&val_text)
+                                                                .font(theme::medium_font(12.5))
+                                                                .color(theme::INK),
+                                                        ).truncate());
+                                                    },
+                                                );
+                                                let left_w = ui.available_width().max(100.0);
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(left_w, 18.0),
+                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                    |ui| {
+                                                        let slider_w = (left_w * 0.42).clamp(80.0, 140.0);
+                                                        ui.spacing_mut().slider_width = slider_w;
+                                                        let resp = ui.add(
+                                                            egui::Slider::new(&mut value, p.min..=p.max).show_value(false),
+                                                        );
+                                                        if resp.changed() {
+                                                            changes.push((p.id, value));
+                                                        }
+                                                        ui.add(egui::Label::new(
+                                                            egui::RichText::new(p.name.to_uppercase())
+                                                                .size(10.0)
+                                                                .color(theme::INK_2),
+                                                        ).truncate())
+                                                        .on_hover_text(&p.name);
+                                                    },
+                                                );
+                                            },
+                                        );
                                     });
                                 }
                             });
@@ -18604,10 +18642,16 @@ impl DemoApp {
             u.knobs.remove(i);
             return format!("unpinned {}", p.name);
         }
-        let plugin_knobs = u.knobs.iter().filter(|k| k.clap.is_some()).count();
-        if plugin_knobs >= MAX_PINS {
-            return format!("at most {MAX_PINS} plugin knobs per synth: remove one first");
+        if u.knobs.iter().filter(|k| k.clap.is_some()).count() >= MAX_PINS {
+            // Replace the last auto-selected main-control knob so the user can
+            // always pin custom parameters without manually removing one first.
+            if let Some(last_main) = u.knobs.iter().rposition(|k| k.clap.is_some() && matches!(k.source, KnobSource::Main(_))) {
+                u.knobs.remove(last_main);
+            } else {
+                return format!("at most {MAX_PINS} pinned knobs per synth: remove one first");
+            }
         }
+        let plugin_knobs = u.knobs.iter().filter(|k| k.clap.is_some()).count();
         let span = (p.max - p.min).max(1e-9);
         let norm = (((p.value - p.min) / span) as f32).clamp(0.0, 1.0);
         // After the other plugin knobs, left of the unit's own.
@@ -28123,6 +28167,67 @@ mod rig_switch_tests {
         app.publish_pins(); // no controllers headless: must not panic
         assert!(app.toggle_pin(0, &p).starts_with("unpinned"));
         assert_eq!(app.units[surge].knobs.len(), before);
+    }
+
+    #[test]
+    fn pin_button_in_param_editor_replaces_main_knob_and_stays_clickable_for_long_names() {
+        let mut app = DemoApp::new_with_sink(None);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        // Fill all MAX_PINS slots with auto-selected Main knobs (as Starbreath/Surge do on load).
+        main_control_tests::give_clap_units_main_knobs(&mut app);
+        assert_eq!(app.units[surge].knobs.iter().filter(|k| k.clap.is_some()).count(), MAX_PINS);
+
+        // 1. toggle_pin evicts the last Main knob rather than failing silently.
+        let long_p = crate::host::ParamDesc {
+            id: 999,
+            name: "Oscillator 1 Harmonic Resonance Modulation Depth".into(),
+            module: "Osc 1".into(),
+            min: 0.0,
+            max: 1.0,
+            value: 0.5,
+            default: 0.5,
+            automatable: true,
+            stepped: false,
+            hidden: false,
+            readonly: false,
+        };
+        app.editor_open = true;
+        app.editor_rig = 0;
+        app.lv2_editor_node = None;
+        app.editor_filter = "Oscillator 1 Harmonic".into();
+        app.editor_params = vec![long_p.clone()];
+
+        let ctx = egui::Context::default();
+        // Run two frames so the egui::Window lays out and settles its position/size.
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Find the "+ knob" button rect in the rendered egui memory/shapes via widget_rect?
+        // Easier: find the "+ knob" text galley or interactable in ctx, or inspect the window rect.
+        let win_rect = ctx.memory(|m| m.area_rect(egui::Id::new("param_editor_window")))
+            .expect("parameter editor window laid out");
+        // Scan horizontally near the right edge of the window inside the scroll area
+        // where the "+ knob" button sits, until hovering reports the pin tooltip or we click it.
+        let mut clicked_pin = false;
+        'scan: for y_off in (80..300).step_by(8) {
+            for x_off in (20..100).step_by(12) {
+                let pos = Pos2::new(win_rect.right() - x_off as f32, win_rect.top() + y_off as f32);
+                for ev in click(pos) {
+                    frame(&mut app, &ctx, ev);
+                }
+                if app.units[surge].knobs.iter().any(|k| k.clap.map_or(false, |c| c.id == 999)) {
+                    clicked_pin = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(clicked_pin, "+ knob button must be clickable even for long parameter names (status: {})", app.editor_status);
+        assert_eq!(app.units[surge].knobs.iter().filter(|k| k.clap.is_some()).count(), MAX_PINS);
+        assert!(app.units[surge].knobs.iter().any(|k| matches!(k.source, KnobSource::Pinned(_)) && k.clap.map_or(false, |c| c.id == 999)));
+        if let Ok(dir) = std::env::var("KABELSALAT_SHOTS_DIR") {
+            let _ = std::fs::create_dir_all(&dir);
+            super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &std::path::Path::new(&dir).join("param-editor-pin.png"));
+        }
     }
 
     #[test]

@@ -94,7 +94,17 @@ both sides of a Markdown file: `scripts/ci/resolve_appends.py` keeps both
 It pushes the merge and dispatches CI. Any other conflict, including every
 conflict in code, gets the label `merge-conflict` and a comment; the branch's
 author resolves it (the script also works locally inside a conflicted
-`git merge`). Changelog entries are fragments (below), so they never conflict.
+`git merge` or `git rebase`). Changelog entries are fragments (below), so they
+never conflict.
+
+Agents do not wait for the bot: every push goes through
+`scripts/sync-branch.sh --push`, which fetches, rebases the branch onto
+`origin/main` (append-only Markdown conflicts resolved with the same script),
+and pushes with `--force-with-lease`. It stops with exit 2 on a conflict it
+cannot resolve and with exit 3 when `main` changed a file the branch changes
+too, so the author re-runs those tests before the push (AGENTS.md, "Rebase
+before every push"). A bot merge already on the branch is dropped by the
+rebase; its content is in `main`.
 
 ## Release packages
 

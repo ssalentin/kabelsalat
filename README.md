@@ -114,7 +114,8 @@ Floe (sample libraries), Guitarix, Dragonfly Reverb (Hall, Room, Plate and Early
 Reflections CLAP reverbs), Airwindows Consolidated (hundreds of Chris Johnson's
 studio processors in one CLAP effect) and the x42 MIDI filters (chord, strum,
 mono legato, CC remap). A card says when a plugin has no build for your CPU, and
-links its source code and website.
+links its source code and website. See [docs/PLUGINS.md](docs/PLUGINS.md) for
+which plugins have been tested, what works, and what is still untested.
 
 ### Put MIDI effects in front of an instrument
 A **MIDI strip** sits between your keys and the instrument and changes the notes

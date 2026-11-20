@@ -1657,4 +1657,18 @@ mod tests {
         assert_eq!(install_hint(&[]), "");
         assert!(super::missing(&["aeolus"], |_| true).is_empty());
     }
+
+    #[test]
+    fn every_catalog_entry_is_tracked_in_docs_plugins_md() {
+        let doc = include_str!("../docs/PLUGINS.md");
+        let missing: Vec<&str> = CATALOG
+            .iter()
+            .map(|e| e.id)
+            .filter(|id| !doc.contains(&format!("`{id}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/PLUGINS.md is missing catalog entries: {missing:?}"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 ---
 name: verify-held-notes
-description: Exhaustively checks that releasing a key always silences what it started, across every interleaving of split, MIDI-matrix, MIDI-cable, node-removal and template-load edits, by driving the real GraphEngine::apply. Use when a change touches note routing in src/engine.rs (NoteOn/NoteOff, keys_gate, release_all, SetNodeSplit, MatrixRule, Connect/Disconnect, RemoveNode, SetRigSource/SetRigDevice, LoadGraph/LoadRigs), src/matrix.rs (Rule::transform, route_into) or Graph::set_split/connect/disconnect in src/control.rs, or when chasing a stuck/hanging note.
+description: Exhaustively checks that releasing a key always silences what it started, across every interleaving of split, MIDI-matrix, MIDI-cable, node-removal, song-switch and template-load edits, by driving the real GraphEngine::apply. Use when a change touches note routing in src/engine.rs (NoteOn/NoteOff, keys_gate, release_all, SetNodeSplit, MatrixRule, Connect/Disconnect, RemoveNode, SetRigSource/SetRigDevice, SetRigZones, LoadGraph/LoadRigs), src/matrix.rs (Rule::transform, route_into) or Graph::set_split/connect/disconnect in src/control.rs, or when chasing a stuck/hanging note.
 ---
 
 # Verify held notes
@@ -48,6 +48,18 @@ held key is released nothing sounds at all (chords of two held keys can share
 a pitch, so single releases are not judged). Expect about 16k states to a
 fixpoint, ~5 s. States are hashed (`u64`), so memory stays small; keep the
 alphabet short, a bigger one does not reach its fixpoint.
+
+## Zones scenario (issue #204)
+
+`held_notes_are_released_across_song_switches` starts from the same patch
+with Surge B in rig 1, so one Keys node plays two rigs. Its alphabet is the
+notes, `SetRigZones` with each song of `SONGS` (both rigs open; only A; only
+B; A below 60 and B from 60 up, +12; A +2 with B sent out of the song with
+−12, which must keep B's stored transpose), the routing edits the zone
+transpose stacks on (Keys → A transpose +12 / 0, split at 60 / none, cable 6
+out / in) and `LoadStart` (which opens every zone). The engine's
+`rig_zones` are part of the fingerprint. Property as in the routing
+scenario: a released key leaves nothing it started sounding.
 
 ## How it works (enough to judge a result)
 
@@ -134,8 +146,8 @@ release: stuck about 0.2–0.3, released 0.00). Fixed in the commit after
 
 | Check covers | Where |
 |---|---|
-| Note dispatch | `src/engine.rs`: `apply` arms `NoteOn`, `NoteOff`; `keys_gate`; `release_all` |
-| Routing edits | `src/engine.rs`: `apply` arms `SetNodeSplit`, `MatrixRule`, `Connect`, `Disconnect`, `RemoveNode`, `LoadGraph` |
+| Note dispatch | `src/engine.rs`: `apply` arms `NoteOn`, `NoteOff`; `keys_gate`; `release_all`; `zone_of` |
+| Routing edits | `src/engine.rs`: `apply` arms `SetNodeSplit`, `MatrixRule`, `Connect`, `Disconnect`, `RemoveNode`, `LoadGraph`, `SetRigZones` (`set_rig_zones`) |
 | Matrix | `src/matrix.rs`: `Matrix::route_into`, `Rule::transform`, `transpose_note` |
 | Graph edits | `src/control.rs`: `Graph::set_split`, `connect_with_id`, `disconnect`, `split_port` |
 

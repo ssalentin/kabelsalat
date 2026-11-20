@@ -14,7 +14,14 @@ agents are in [AGENTS.md](../AGENTS.md).
 
 - `control.rs` — the typed control plane: `Command` (one API for UI, assistant,
   CLI and MCP), `Graph`/`Node`/`Edge` (nodes carry their `rig`), `Rig`,
-  `RigSnapshot`, `merge_rigs`/`split_rigs`, the lock-free `command_bus()` (rtrb).
+  `RigSnapshot`, `RigZone` (`Command::SetRigZones`), `merge_rigs`/`split_rigs`,
+  the lock-free `command_bus()` (rtrb).
+- `setlist.rs` — gig setlist model (#204): `Setlist`, `Song` (optional BPM and
+  time signature), `Part` (per-rig `PartRig` key range, transpose, level and
+  stored `ParamValue` knobs), `FootSwitch` CC bindings, stepping, validation and
+  node/rig remapping across rig edits. Persisted inside `Session`; switching
+  parts sends `Command::SetRigZones` so the engine gates only new notes while
+  held notes, releases, pedal-ups and effect tails finish uninterrupted.
 - `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
   atomics, read once), `NodeTimes` (lock-free render time per unit) and the
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`

@@ -96,6 +96,8 @@ struct State {
     rig_presets_dir: std::path::PathBuf,
     /// Virtual keyboard surface selection (#163, headless mirror).
     keyboard_mode: crate::keyboard::KeyboardMode,
+    /// Headless setlist mirror (#204); in Remote mode the GUI app owns it.
+    setlist: crate::setlist::Setlist,
 }
 
 #[derive(Clone)]
@@ -207,6 +209,128 @@ struct LoadTemplateArgs {
 /// Every starter template id, for the "use …" hints.
 fn template_ids() -> String {
     crate::session::Template::ALL.iter().map(|t| t.id()).collect::<Vec<_>>().join(", ")
+}
+
+fn setlist_json(sl: &crate::setlist::Setlist) -> Value {
+    let songs: Vec<Value> = sl.songs.iter().enumerate().map(|(si, s)| {
+        let parts: Vec<Value> = s.parts.iter().enumerate().map(|(pi, p)| {
+            let rigs: Vec<Value> = p.rigs.iter().map(|r| json!({
+                "rig": r.rig,
+                "key_lo": r.key_lo,
+                "key_hi": r.key_hi,
+                "transpose": r.transpose,
+                "level": r.level,
+            })).collect();
+            json!({ "index": pi, "name": p.name, "rigs": rigs, "params_count": p.params.len() })
+        }).collect();
+        json!({
+            "index": si,
+            "name": s.name,
+            "bpm": s.bpm,
+            "time_signature": s.time_sig.map(|t| t.to_json()),
+            "parts": parts,
+        })
+    }).collect();
+    let active = sl.current().map(|(s, p, pos)| json!({
+        "song": pos.song,
+        "part": pos.part,
+        "song_name": s.name,
+        "part_name": p.name,
+    }));
+    let fs = |f: Option<crate::setlist::FootSwitch>| f.map(|x| json!({"cc": x.cc, "channel": x.channel}));
+    json!({
+        "songs": songs,
+        "active": active,
+        "foot_switch": { "next_cc": fs(sl.next_cc), "prev_cc": fs(sl.prev_cc) },
+    })
+}
+
+fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Result<(), String> {
+    use crate::setlist::{Part, PartRig, Song};
+    let parse_sig = |v: &Value| -> Result<crate::transport::TimeSig, String> {
+        let num = v.get("numerator").and_then(Value::as_u64).ok_or("time_signature.numerator required")?;
+        let den = v.get("denominator").and_then(Value::as_u64).ok_or("time_signature.denominator required")?;
+        crate::transport::TimeSig::checked(num, den)
+    };
+    let parse_parts = |ps: &[SetlistPartArg]| -> Result<Vec<Part>, String> {
+        if ps.is_empty() { return Err("a song needs at least one part".into()); }
+        let mut out = Vec::with_capacity(ps.len());
+        for p in ps {
+            let name = p.name.trim();
+            if name.is_empty() { return Err("part name cannot be empty".into()); }
+            let mut part = Part::new(name, Vec::new());
+            if let Some(rigs) = &p.rigs {
+                for r in rigs {
+                    if (r.rig as usize) >= crate::setlist::MAX_RIGS {
+                        return Err(format!("rig {} is out of range (0..{})", r.rig, crate::setlist::MAX_RIGS));
+                    }
+                    part.set_rig(PartRig {
+                        rig: r.rig,
+                        key_lo: r.key_lo.unwrap_or(0).min(127),
+                        key_hi: r.key_hi.unwrap_or(127).min(127),
+                        transpose: r.transpose.unwrap_or(0).clamp(-48, 48),
+                        level: r.level.unwrap_or(1.0).clamp(0.0, 1.0),
+                    });
+                }
+            }
+            out.push(part);
+        }
+        Ok(out)
+    };
+    if let Some(idx) = args.song {
+        if idx >= st.setlist.songs.len() {
+            return Err(format!("no song at index {idx} (setlist has {})", st.setlist.songs.len()));
+        }
+        if args.remove == Some(true) {
+            st.setlist.remove_song(idx);
+            return Ok(());
+        }
+        if let Some(name) = &args.name {
+            let t = name.trim();
+            if t.is_empty() { return Err("song name cannot be empty".into()); }
+            st.setlist.songs[idx].name = t.to_string();
+        }
+        if let Some(bpm_opt) = args.bpm {
+            if let Some(b) = bpm_opt {
+                if !b.is_finite() || !(20.0..=300.0).contains(&b) { return Err("bpm must be 20..300".into()); }
+            }
+            st.setlist.songs[idx].bpm = bpm_opt;
+        }
+        if let Some(sig_opt) = &args.time_signature {
+            st.setlist.songs[idx].time_sig = match sig_opt {
+                Some(v) => Some(parse_sig(v)?),
+                None => None,
+            };
+        }
+        if let Some(ps) = &args.parts {
+            st.setlist.songs[idx].parts = parse_parts(ps)?;
+        }
+        if let Some(to) = args.move_to {
+            if to >= st.setlist.songs.len() {
+                return Err(format!("move_to {to} is out of range"));
+            }
+            st.setlist.move_song(idx, to);
+        }
+        st.setlist.clamp_active();
+        Ok(())
+    } else {
+        let name = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            .ok_or("name is required when creating a song")?;
+        let parts = match &args.parts {
+            Some(ps) => parse_parts(ps)?,
+            None => vec![Part::new("Main", vec![PartRig::new(0)])],
+        };
+        let mut song = Song::new(name, parts);
+        if let Some(Some(b)) = args.bpm {
+            if !b.is_finite() || !(20.0..=300.0).contains(&b) { return Err("bpm must be 20..300".into()); }
+            song.bpm = Some(b);
+        }
+        if let Some(Some(v)) = &args.time_signature {
+            song.time_sig = Some(parse_sig(v)?);
+        }
+        st.setlist.songs.push(song);
+        Ok(())
+    }
 }
 
 /// Arguments for `remove_node`.
@@ -484,6 +608,82 @@ struct PlayDemoArgs {
     rig: Option<u8>,
     /// Optional phrase kind override: "keys", "bass", "lead", "pad", "organ", "drums", or "wind". Omit to choose from the rig's sound.
     phrase: Option<String>,
+}
+
+/// One rig entry inside a `set_setlist_song` part.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetlistPartRigArg {
+    /// 0-based rig index.
+    rig: u8,
+    /// Lowest played MIDI note (0..=127, default 0).
+    key_lo: Option<u8>,
+    /// Highest played MIDI note (0..=127, default 127).
+    key_hi: Option<u8>,
+    /// Semitone transpose (-48..=48, default 0).
+    transpose: Option<i8>,
+    /// Rig mixer level (0.0..=1.0, default 1.0).
+    level: Option<f32>,
+}
+
+/// One part inside `set_setlist_song`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetlistPartArg {
+    /// Part name (e.g. "Verse", "Chorus", "Solo").
+    name: String,
+    /// Live rigs in this part.
+    rigs: Option<Vec<SetlistPartRigArg>>,
+    /// Snapshot the current knob values of those rigs into this part.
+    capture_knobs: Option<bool>,
+}
+
+/// Arguments for `set_setlist_song`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetSetlistSongArgs {
+    /// 0-based song index to update/move/remove; omit to append a new song.
+    song: Option<usize>,
+    /// Song title (required when creating).
+    name: Option<String>,
+    /// Optional song tempo in BPM (20..=300; null clears).
+    bpm: Option<Option<f32>>,
+    /// Optional time signature `{numerator, denominator}` (null clears).
+    time_signature: Option<Option<Value>>,
+    /// Ordered parts of the song.
+    parts: Option<Vec<SetlistPartArg>>,
+    /// Reorder `song` to this 0-based index.
+    move_to: Option<usize>,
+    /// Set true with `song` to delete that song.
+    remove: Option<bool>,
+}
+
+/// Arguments for `select_setlist_part`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SelectSetlistPartArgs {
+    /// Step action: "next_part" | "prev_part" | "next_song" | "prev_song" | "clear".
+    action: Option<String>,
+    /// 0-based song index to jump to (when `action` is omitted).
+    song: Option<usize>,
+    /// 0-based part index (defaults to 0 when `song` is given).
+    part: Option<usize>,
+}
+
+/// Arguments for `add_song_from_session`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct AddSongFromSessionArgs {
+    /// Saved session name (from `list_sessions`).
+    session: String,
+    /// Optional song name (defaults to the session name).
+    name: Option<String>,
+}
+
+/// Arguments for `set_setlist_footswitch`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetSetlistFootswitchArgs {
+    /// Which step to bind: "next" | "prev".
+    action: String,
+    /// MIDI CC number (0..=127), or null/omitted to clear.
+    cc: Option<u8>,
+    /// Optional MIDI channel (0..=15); omit for any channel.
+    channel: Option<u8>,
 }
 
 /// Arguments for `set_count_in`.
@@ -3645,6 +3845,105 @@ impl McpServer {
         ok_json(json!({"playing": false}))
     }
 
+    /// Read the session's setlist (#204).
+    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level and stored knob count), the active song/part (null = all rigs open), and any learned foot-switch CCs.")]
+    fn get_setlist(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("get_setlist", json!({}));
+        }
+        ok_json(setlist_json(&st.setlist))
+    }
+
+    /// Add, update, reorder, or remove a song in the setlist (#204).
+    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?}]) and optional capture_knobs.")]
+    fn set_setlist_song(&self, Parameters(args): Parameters<SetSetlistSongArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_setlist_song", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        if let Err(e) = apply_setlist_song_headless(&mut st, &args) {
+            return tool_err(e);
+        }
+        ok_json(setlist_json(&st.setlist))
+    }
+
+    /// Select or step the active setlist song/part without a gap (#204).
+    #[tool(name = "select_setlist_part", description = "Switch the active setlist song/part without changing routing: held notes on outgoing rigs keep sounding until released and effect tails ring out, while new notes play only the new part's rigs. Pass action ('next_part' | 'prev_part' | 'next_song' | 'prev_song' | 'clear') OR song (0-based index) with optional part (default 0).")]
+    fn select_setlist_part(&self, Parameters(args): Parameters<SelectSetlistPartArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("select_setlist_part", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        match args.action.as_deref() {
+            Some("next_part") => { st.setlist.next_part(); }
+            Some("prev_part") => { st.setlist.prev_part(); }
+            Some("next_song") => { st.setlist.next_song(); }
+            Some("prev_song") => { st.setlist.prev_song(); }
+            Some("clear") => { st.setlist.active = None; }
+            Some(other) => return tool_err(format!("unknown action '{other}' (use next_part, prev_part, next_song, prev_song or clear)")),
+            None => {
+                let Some(song) = args.song else {
+                    return tool_err("pass either action or song");
+                };
+                let part = args.part.unwrap_or(0);
+                if st.setlist.select(song, part).is_none() {
+                    return tool_err(format!("song {song} part {part} is out of range"));
+                }
+            }
+        }
+        let zones = st.setlist.active_zones();
+        if let Err(e) = send_cmd(&mut st, Command::SetRigZones { zones }) {
+            return tool_err(e);
+        }
+        if let Some((song, part, _)) = st.setlist.current().map(|(s, p, pos)| (s.clone(), p.clone(), pos)) {
+            if let Some(bpm) = song.bpm {
+                let _ = send_cmd(&mut st, Command::SetBpm { bpm });
+            }
+            if let Some(sig) = song.time_sig {
+                let _ = send_cmd(&mut st, Command::SetTimeSignature { num: sig.num, den: sig.den });
+            }
+            for pr in &part.rigs {
+                let _ = send_cmd(&mut st, Command::SetRigMix { rig: pr.rig, vol: Some(pr.level), pan: None, mute: None, solo: None });
+            }
+        }
+        ok_json(setlist_json(&st.setlist))
+    }
+
+    /// Import a saved session's rigs into the current gig as a new setlist song (#204).
+    #[tool(name = "add_song_from_session", description = "Import a saved session's rigs into the current gig (up to 8 rigs total) and append a new song in the setlist pointing at those imported rigs. session = saved session name from list_sessions; optional name overrides the song title.")]
+    fn add_song_from_session(&self, Parameters(args): Parameters<AddSongFromSessionArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("add_song_from_session", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        tool_err("add_song_from_session requires the running app (connect with --attach)")
+    }
+
+    /// Bind or clear a hardware MIDI CC foot-switch for stepping the setlist (#204).
+    #[tool(name = "set_setlist_footswitch", description = "Bind or clear a hardware MIDI CC foot-switch to step the setlist on rising edge (value >= 64). action: 'next' | 'prev'. cc: 0..127 (omit or null to clear). channel: optional 0..15 (omit = any channel).")]
+    fn set_setlist_footswitch(&self, Parameters(args): Parameters<SetSetlistFootswitchArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_setlist_footswitch", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        let fs = args.cc.map(|cc| crate::setlist::FootSwitch {
+            cc: cc & 0x7F,
+            channel: args.channel.map(|c| c & 0x0F),
+        });
+        match args.action.as_str() {
+            "next" => st.setlist.next_cc = fs,
+            "prev" => st.setlist.prev_cc = fs,
+            other => return tool_err(format!("unknown action '{other}' (use 'next' or 'prev')")),
+        }
+        ok_json(setlist_json(&st.setlist))
+    }
+
     /// Configure master transport count-in.
     #[tool(name = "set_count_in", description = "Configure master transport count-in (Command::SetCountIn): plays N bars (1..=4, default 1) of metronome clicks before the song clock starts at beat 0. Pass enabled (bool) and/or bars (0 disables, 1..=4 enables).")]
     fn set_count_in(&self, Parameters(args): Parameters<SetCountInArgs>) -> Result<CallToolResult, McpError> {
@@ -4015,6 +4314,7 @@ pub fn run() -> anyhow::Result<()> {
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
         keyboard_mode: crate::keyboard::KeyboardMode::Auto,
+        setlist: crate::setlist::Setlist::default(),
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
     let result = serve_stdio(server, rpc_stdout, &mut audio.mains);
@@ -4053,6 +4353,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
         keyboard_mode: crate::keyboard::KeyboardMode::Auto,
+        setlist: crate::setlist::Setlist::default(),
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
     // here as an actionable error ("start the app"), not mid-tool-call.
@@ -4188,6 +4489,7 @@ mod tests {
                 .unwrap_or_else(std::env::temp_dir)
                 .join(format!("test-mcp-rig-presets-{}", std::process::id())),
             keyboard_mode: crate::keyboard::KeyboardMode::Auto,
+        setlist: crate::setlist::Setlist::default(),
         };
         let server = McpServer {
             state: Arc::new(Mutex::new(state)),
@@ -4797,6 +5099,55 @@ mod tests {
         }
         engine.render(&mut buf, 2);
         assert_eq!(engine.transport().sig, crate::transport::TimeSig { num: 6, den: 8 });
+    }
+
+    #[test]
+    fn setlist_tools_drive_engine_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 480 * 2];
+        let added = tool_json(&server.set_setlist_song(Parameters(SetSetlistSongArgs {
+            song: None,
+            name: Some("Opener".into()),
+            bpm: Some(Some(114.0)),
+            time_signature: Some(Some(json!({"numerator": 3, "denominator": 4}))),
+            parts: Some(vec![
+                SetlistPartArg {
+                    name: "Verse".into(),
+                    rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9) }]),
+                    capture_knobs: None,
+                },
+                SetlistPartArg {
+                    name: "Chorus".into(),
+                    rigs: Some(vec![SetlistPartRigArg { rig: 1, key_lo: Some(48), key_hi: Some(96), transpose: Some(12), level: Some(0.8) }]),
+                    capture_knobs: None,
+                },
+            ]),
+            move_to: None,
+            remove: None,
+        })));
+        assert_eq!(added["songs"].as_array().unwrap().len(), 1);
+        let sel = tool_json(&server.select_setlist_part(Parameters(SelectSetlistPartArgs {
+            action: None,
+            song: Some(0),
+            part: Some(0),
+        })));
+        assert_eq!(sel["active"]["part_name"], json!("Verse"));
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.transport().sig, crate::transport::TimeSig { num: 3, den: 4 });
+        let stepped = tool_json(&server.select_setlist_part(Parameters(SelectSetlistPartArgs {
+            action: Some("next_part".into()),
+            song: None,
+            part: None,
+        })));
+        assert_eq!(stepped["active"]["part_name"], json!("Chorus"));
+        let fs = tool_json(&server.set_setlist_footswitch(Parameters(SetSetlistFootswitchArgs {
+            action: "next".into(),
+            cc: Some(64),
+            channel: None,
+        })));
+        assert_eq!(fs["foot_switch"]["next_cc"]["cc"], json!(64));
+        let got = tool_json(&server.get_setlist());
+        assert_eq!(got["active"]["part"], json!(1));
     }
 
     #[test]

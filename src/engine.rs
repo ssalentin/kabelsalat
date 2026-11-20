@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use crate::control::{AuxSend, BusOut, SendSource, SinkName};
 use crate::control::{
     split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
-    NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
+    NodeId, NodeKind, ParamId, PortKind, RigSnapshot, RigZone,
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
@@ -778,6 +778,30 @@ fn strip_gains_of(
     Some((g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt()))
 }
 
+/// The zone of the rig `node` belongs to (#204). A node the graph does not
+/// know, or a rig past the table, is never gated. Free function on field
+/// references, like `strip_gains_of`: the render loops borrow the slots.
+fn zone_of(zones: &[RigZone; 8], graph: &Graph, node: NodeId) -> RigZone {
+    graph.node(node).and_then(|n| zones.get(n.rig as usize)).copied().unwrap_or(RigZone::OPEN)
+}
+
+/// Does `m` return a control to rest? Such a message always reaches a rig
+/// that is not live (#204), so leaving a song never leaves a pedal down, a
+/// note bent or a key pressed: note-off, sustain/sostenuto/soft pedal up,
+/// all-sound-off and all-notes-off, bend centre, pressure 0.
+fn at_rest(m: &MidiMsg) -> bool {
+    use crate::matrix::{CHANNEL_AFTERTOUCH, CONTROL_CHANGE, PITCH_BEND, POLY_AFTERTOUCH};
+    let [d1, d2] = m.data;
+    match m.status {
+        _ if m.is_note_off() => true,
+        CONTROL_CHANGE => matches!(d1, 120 | 123) || (matches!(d1, 64 | 66 | 67) && d2 < 64),
+        PITCH_BEND => m.pitch_bend_value() == 0,
+        CHANNEL_AFTERTOUCH => d1 == 0,
+        POLY_AFTERTOUCH => d2 == 0,
+        _ => false,
+    }
+}
+
 /// Aux buses the render path serves per block (issue #5); a ninth bus is
 /// silent. Their send accumulators are one allocation made in the constructor.
 pub const MAX_BUSES: usize = 8;
@@ -851,7 +875,8 @@ impl BusTaps<'_> {
 
 /// One source's output stage: the pre-fader send tap, its level, the strip
 /// mix (mute/solo/pan, #73) and the post-fader send tap, in that order. A
-/// muted or soloed-out source sends nothing, pre or post.
+/// muted or soloed-out source sends nothing, pre or post; `muted` mutes it
+/// the same way (a generator whose rig is not live, #204).
 #[allow(clippy::too_many_arguments)]
 fn source_out(
     strips: &[(NodeId, StripMix)],
@@ -862,9 +887,10 @@ fn source_out(
     pdc: &mut pdc::Pdc,
     node: NodeId,
     level: f32,
+    muted: bool,
     buf: &mut [f32],
 ) {
-    let gains = strip_gains_of(strips, graph, node, solo_rigs);
+    let gains = if muted { Some((0.0, 0.0)) } else { strip_gains_of(strips, graph, node, solo_rigs) };
     let silenced = gains == Some((0.0, 0.0));
     // A silenced source sends nothing; a delayed send still runs, at zero,
     // or its delay line would replay stale audio when the source returns.
@@ -989,6 +1015,7 @@ impl Default for GraphPub {
             graph: Graph::default(),
             rules: Vec::new(),
             mix: [RigMix::DEFAULT; 8],
+            zones: [RigZone::OPEN; 8],
             strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
             sends: [NO_SEND; MAX_SENDS],
             bus_outs: [NO_BUS_OUT; MAX_BUS_OUTS],
@@ -1114,6 +1141,8 @@ pub struct GraphPub {
     /// array copy — never a graph clone on the audio thread). Lets the UI
     /// mixer mirror remote (MCP/CLI/agent) mix changes.
     pub mix: [RigMix; 8],
+    /// Per-rig zones (#204), published with the mix (same `mix_rev`).
+    pub zones: [RigZone; 8],
     /// Per-node strip state (#73/#74): pan/mute/solo on sources, bypass on
     /// FX nodes — same publication discipline as `mix` (fixed-size copy).
     pub strips: [StripPub; MAX_STRIP_MIXES],
@@ -1307,6 +1336,9 @@ pub struct GraphEngine {
     // Per-rig mixer (SetRigMix): vol/pan/mute/solo applied at each rig's
     // MasterOut when summing. Fixed 8 slots — no allocation on the audio path.
     rig_mix: [RigMix; 8],
+    /// Per-rig zone (SetRigZones, #204): what each rig takes from its
+    /// sources. All OPEN = no gate. Read only through `zone_of`.
+    rig_zones: [RigZone; 8],
     /// Per-node strip state (SetStripMix/SetStripBypass): pan/mute/solo on
     /// sources, bypass on FX nodes. Capacity is fixed (MAX_STRIP_MIXES): a
     /// node past it keeps playing at unity. Linear scans, like the rest.
@@ -1539,6 +1571,7 @@ impl GraphEngine {
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; 8],
+            rig_zones: [RigZone::OPEN; 8],
             strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
             latency_dirty: false,
@@ -2391,6 +2424,7 @@ impl GraphEngine {
                 self.latency_unpublished = false;
                 g.rules = self.matrix.rules.clone();
                 g.mix = self.rig_mix;
+                g.zones = self.rig_zones;
                 g.system_gain = self.system_gain;
                 g.master_mute = self.master_mute;
                 g.mix_rev = g.mix_rev.wrapping_add(1);
@@ -2710,10 +2744,10 @@ impl GraphEngine {
             let solo = if source { solo_rigs } else { &[false; 8] };
             let strips = &self.strips;
             match taps.as_deref_mut() {
-                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, &mut self.pdc, node, 1.0, &mut buf[..n2]),
+                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, &mut self.pdc, node, 1.0, false, &mut buf[..n2]),
                 None => {
                     let mut none = BusTaps { nodes: [NodeId::MAX; MAX_BUSES], n: 0, acc: &mut [], span: 0 };
-                    source_out(strips, &self.graph, solo, &[], &mut none, &mut self.pdc, node, 1.0, &mut buf[..n2]);
+                    source_out(strips, &self.graph, solo, &[], &mut none, &mut self.pdc, node, 1.0, false, &mut buf[..n2]);
                 }
             }
             self.node_timer.record(node, node_t0.elapsed());
@@ -2822,6 +2856,10 @@ impl GraphEngine {
         self.matrix.route_into(source, msg, &mut self.route_out);
         for i in 0..self.route_out.len() {
             let (dest, m) = self.route_out[i];
+            // A rig that is not live takes only what returns to rest (#204).
+            if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) {
+                continue;
+            }
             let has_midi = self.has_midi_cable(dest);
             let (wire, len) = m.wire();
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
@@ -3215,6 +3253,35 @@ impl GraphEngine {
         self.mix_dirty = true;
     }
 
+    /// Every rig's zone (SetRigZones, #204). A live zone replaces the rig's,
+    /// after releasing the rig when its transpose moves (the release would
+    /// take the new pitch, rule 41); one that is not live keeps the range and
+    /// transpose, so what still sounds is released where it started.
+    /// Allocation-free: index loops over the graph.
+    fn set_rig_zones(&mut self, zones: [RigZone; 8]) {
+        let before = self.rig_zones;
+        for (rig, z) in zones.into_iter().enumerate() {
+            if !z.live {
+                self.rig_zones[rig].live = false;
+                continue;
+            }
+            if z.transpose != self.rig_zones[rig].transpose {
+                for i in 0..self.graph.nodes.len() {
+                    let n = &self.graph.nodes[i];
+                    let dest = matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. } | NodeKind::Arp | NodeKind::MidiFx { .. });
+                    if dest && n.rig as usize == rig {
+                        let id = n.id;
+                        self.release_all(id);
+                    }
+                }
+            }
+            self.rig_zones[rig] = z;
+        }
+        if self.rig_zones != before {
+            self.mix_dirty = true;
+        }
+    }
+
     /// One source strip's pan/mute/solo (SetStripMix, or a CC bound to it).
     /// The table is allocated once (`MAX_STRIP_MIXES`); a strip past it is
     /// dropped.
@@ -3503,9 +3570,17 @@ impl GraphEngine {
                 return;
             }
         }
-        let Some(route) = self.keys_route_in_rig(rig, dest, played) else { return };
-        let Some(out) = Self::routed_note(&m, &route) else { return };
         let on = m.status == 0x90;
+        // The rig's zone (#204) gates live input, never the rig demo: only a
+        // live rig starts a note, only for a played note in its range, and
+        // its transpose comes last, so the note-off finds the same pitch.
+        // A note-off is never gated.
+        let zone = if rig.is_none() { zone_of(&self.rig_zones, &self.graph, dest) } else { RigZone::OPEN };
+        if on && !zone.starts(played) {
+            return;
+        }
+        let Some(route) = self.keys_route_in_rig(rig, dest, played) else { return };
+        let Some(out) = Self::routed_note(&m, &route).and_then(|n| shifted(n, zone.transpose.into())) else { return };
         if self.arp.iter().any(|a| a.node == dest) {
             if on {
                 let now = self.arp_clock(dest);
@@ -4097,6 +4172,7 @@ impl GraphEngine {
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
                 self.master_mute = false;
+                self.rig_zones = [RigZone::OPEN; 8];
                 self.strips.clear();
                 self.sends.clear();
                 self.bus_outs.clear();
@@ -4223,6 +4299,7 @@ impl GraphEngine {
             Command::SetRigMix { rig, vol, pan, mute, solo } => {
                 self.set_rig_mix(rig, crate::matrix::MixEdit { vol, pan, mute, solo, send: None });
             }
+            Command::SetRigZones { zones } => self.set_rig_zones(zones),
             Command::SetStripMix { node, pan, mute, solo } => {
                 self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo, send: None });
             }
@@ -4405,6 +4482,11 @@ impl GraphEngine {
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
                         }
+                        continue;
+                    }
+                    // A learned mixer control (above) always works; a rig that
+                    // is not live takes no other CC unless it returns to rest.
+                    if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) {
                         continue;
                     }
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
@@ -4935,6 +5017,7 @@ impl GraphEngine {
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     g.mix = self.rig_mix;
+                    g.zones = self.rig_zones;
                     g.strips = self.strips_pub();
                     g.sends = [NO_SEND; MAX_SENDS];
                     g.sends[..self.sends.len()].copy_from_slice(&self.sends);
@@ -4995,7 +5078,7 @@ impl GraphEngine {
             // Level and strip mix (mute/solo/pan) at the source's own output:
             // the edge levels published from this buffer stay post-fader
             // (rule 53). Sends tap on either side of it.
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, s.level, &mut s.scratch[..n2]);
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, s.level, false, &mut s.scratch[..n2]);
             // One clock read per voice: each ends where the next begins.
             let now = std::time::Instant::now();
             self.node_timer.record(s.node, now - node_t0);
@@ -5005,8 +5088,11 @@ impl GraphEngine {
         // 1a. Audio In nodes: pull the input ring into each node's stereo
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
+        // A generator plays no notes, so a rig that is not live (#204) mutes
+        // it here, at its own output: its effects ring out.
         for a in &mut self.audio_in {
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, a.node, 1.0, &mut a.buf[..n2]);
+            let muted = !zone_of(&self.rig_zones, &self.graph, a.node).live;
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, a.node, 1.0, muted, &mut a.buf[..n2]);
         }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
@@ -5043,7 +5129,8 @@ impl GraphEngine {
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, sig, suppress_wrap_click);
-                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, 1.0, &mut d.buf[..n2]);
+                let muted = !zone_of(&self.rig_zones, &self.graph, d.node).live;
+                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, 1.0, muted, &mut d.buf[..n2]);
             }
         }
         if counting_in_this_block {
@@ -5732,6 +5819,7 @@ mod probe;
 mod bench;
 pub use bench::bench;
 pub mod analysis_test;
+pub mod setlist_test;
 
 #[cfg(test)]
 mod master_target_tests {
@@ -7629,6 +7717,174 @@ mod tests {
         bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: Some(60), value: 70 });
         engine.render(&mut buf, 2);
         assert_eq!(engine.cc_passthrough_log, vec![(1, 100, 0), (4, 100, 0), (1, 60, 70), (4, 60, 70)], "channel and poly pressure reach both rigs");
+    }
+
+    // ---- #204: rig zones (setlist parts) -------------------------------
+
+    const OFF: crate::control::RigZone = crate::control::RigZone { live: false, ..crate::control::RigZone::OPEN };
+
+    /// SetRigZones with rig A (0) and rig B (1) set, every other rig open.
+    fn zones(a: crate::control::RigZone, b: crate::control::RigZone) -> Command {
+        let mut zones = [crate::control::RigZone::OPEN; 8];
+        zones[0] = a;
+        zones[1] = b;
+        Command::SetRigZones { zones }
+    }
+
+    /// The synth of rig `rig` in a `load_two_rigs` engine.
+    fn synth_of(e: &super::GraphEngine, rig: u8) -> u32 {
+        e.graph().nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. })).expect("each rig has a synth").id
+    }
+
+    #[test]
+    fn a_rig_that_leaves_the_song_releases_its_held_note_and_starts_no_new_one() {
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let (a, b) = (synth_of(&e, 0), synth_of(&e, 1));
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(a, 60, true), (b, 60, true)], "every rig open: both play");
+        assert!(play(&mut e, &mut bus, zones(OFF, crate::control::RigZone::OPEN)).is_empty(), "leaving the song releases nothing by itself");
+        assert_eq!(play(&mut e, &mut bus, on(64)), vec![(b, 64, true)], "a new note reaches only the live rig");
+        assert_eq!(play(&mut e, &mut bus, off(60)), vec![(a, 60, false), (b, 60, false)], "the note held on A still gets its release");
+        assert!(play(&mut e, &mut bus, off(64)).contains(&(b, 64, false)));
+    }
+
+    #[test]
+    fn a_key_range_gates_note_ons_and_never_a_release() {
+        use crate::control::RigZone;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let (a, b) = (synth_of(&e, 0), synth_of(&e, 1));
+        play(&mut e, &mut bus, zones(RigZone { key_hi: 59, ..RigZone::OPEN }, RigZone { key_lo: 60, ..RigZone::OPEN }));
+        assert_eq!(play(&mut e, &mut bus, on(59)), vec![(a, 59, true)], "59 is A's");
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(b, 60, true)], "60 is B's");
+        // The ranges swap while both keys are held: a range alone releases nothing.
+        assert!(play(&mut e, &mut bus, zones(RigZone { key_lo: 60, ..RigZone::OPEN }, RigZone { key_hi: 59, ..RigZone::OPEN })).is_empty());
+        assert!(play(&mut e, &mut bus, off(59)).contains(&(a, 59, false)), "59 is now outside A's range, its release still arrives");
+        assert!(play(&mut e, &mut bus, off(60)).contains(&(b, 60, false)));
+    }
+
+    #[test]
+    fn a_rigs_transpose_moves_its_notes_and_their_releases() {
+        use crate::control::RigZone;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let (a, b) = (synth_of(&e, 0), synth_of(&e, 1));
+        let up = |t: i8| RigZone { transpose: t, ..RigZone::OPEN };
+        play(&mut e, &mut bus, zones(up(2), OFF));
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(a, 62, true)]);
+        assert!(play(&mut e, &mut bus, off(60)).contains(&(a, 62, false)), "the release takes the same transpose");
+        // A transpose pushed past the keyboard drops the note.
+        play(&mut e, &mut bus, zones(up(12), OFF));
+        assert!(play(&mut e, &mut bus, on(120)).is_empty(), "120 + 12 is no MIDI note");
+        play(&mut e, &mut bus, off(120));
+        // A live rig whose transpose moves is released first: the release
+        // would otherwise take the new pitch (rule 41).
+        play(&mut e, &mut bus, on(60));
+        assert_eq!(play(&mut e, &mut bus, zones(up(5), OFF)), vec![(a, 255, false)], "only A moved, only A is released");
+        assert!(play(&mut e, &mut bus, zones(up(5), OFF)).is_empty(), "the same zones again release nothing");
+        play(&mut e, &mut bus, off(60));
+        // A rig sent out of the song with another transpose keeps its own:
+        // what it holds is released at the pitch it started on.
+        play(&mut e, &mut bus, zones(up(3), up(0)));
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(a, 63, true), (b, 60, true)]);
+        assert!(play(&mut e, &mut bus, zones(RigZone { transpose: -7, ..OFF }, up(0))).is_empty(), "leaving the song releases nothing");
+        assert_eq!(play(&mut e, &mut bus, off(60)), vec![(a, 63, false), (b, 60, false)]);
+    }
+
+    #[test]
+    fn a_rig_that_is_not_live_takes_only_controls_returning_to_rest_and_its_mixer_bindings() {
+        use crate::matrix::MixControl;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let (a, b) = (synth_of(&e, 0), synth_of(&e, 1));
+        let master_a = e.graph().nodes.iter().find(|n| n.rig == 0 && matches!(n.kind, NodeKind::MasterOut)).unwrap().id;
+        let dev = SourceId::Hardware(0);
+        bus.send(Command::MatrixCcMap { source: dev, dest: master_a, cc: 7, param: Some(MixControl::Vol.param()), target: CcTarget::Mix, scale: Default::default() });
+        bus.send(Command::MatrixCcMap { source: dev, dest: a, cc: 74, param: Some(super::P_LEVEL), target: CcTarget::Knob, scale: Default::default() });
+        play(&mut e, &mut bus, zones(OFF, crate::control::RigZone::OPEN));
+        let sent = |e: &mut super::GraphEngine, bus: &mut crate::control::CommandBus, cmd: Command| {
+            e.cc_passthrough_log.clear();
+            e.cc_log.clear();
+            play(e, bus, cmd);
+            let mut log = e.cc_passthrough_log.clone();
+            log.sort_unstable();
+            log
+        };
+        let cc = |cc: u8, value: u8| Command::Cc { source: SourceId::Keys, channel: 0, cc, value };
+        assert_eq!(sent(&mut e, &mut bus, cc(1, 127)), vec![(b, 1, 127)], "the mod wheel reaches only the live rig");
+        assert_eq!(sent(&mut e, &mut bus, cc(64, 127)), vec![(b, 64, 127)], "sustain down reaches only the live rig");
+        assert_eq!(sent(&mut e, &mut bus, cc(64, 0)), vec![(a, 64, 0), (b, 64, 0)], "sustain up reaches every rig");
+        assert_eq!(sent(&mut e, &mut bus, cc(123, 0)), vec![(a, 123, 0), (b, 123, 0)], "all-notes-off reaches every rig");
+        let bend = |value: i16| Command::PitchBend { source: SourceId::Keys, channel: 0, value };
+        assert_eq!(sent(&mut e, &mut bus, bend(4095)), vec![(b, 127, 95)], "a bend reaches only the live rig");
+        assert_eq!(sent(&mut e, &mut bus, bend(0)), vec![(a, 0, 64), (b, 0, 64)], "bend centre reaches every rig");
+        let press = |value: u8| Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value };
+        assert_eq!(sent(&mut e, &mut bus, press(100)), vec![(b, 100, 0)]);
+        assert_eq!(sent(&mut e, &mut bus, press(0)), vec![(a, 0, 0), (b, 0, 0)], "pressure 0 reaches every rig");
+        // A learned knob of rig A waits; its mixer fader still follows the controller.
+        sent(&mut e, &mut bus, Command::Cc { source: dev, channel: 0, cc: 74, value: 127 });
+        assert!(e.cc_log.is_empty(), "the knob binding of a rig that is not live moves nothing: {:?}", e.cc_log);
+        sent(&mut e, &mut bus, Command::Cc { source: dev, channel: 0, cc: 7, value: 32 });
+        assert_eq!(e.rig_mix[0].vol, 32.0 / 127.0, "a learned mixer control always works");
+    }
+
+    #[test]
+    fn a_generator_in_a_rig_that_is_not_live_is_silent_and_plays_again_when_it_returns() {
+        use crate::control::{DspKind, RigZone};
+        let mut g = crate::control::Graph::default();
+        let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("CLICK"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: metro, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        bus.send(Command::SetNodePlaying { node: metro, playing: true });
+        assert!(peak_1s(&mut engine) > 0.01, "the click plays while its rig is live");
+        bus.send(zones(OFF, RigZone::OPEN));
+        // Flush the master's tails first (rule 133).
+        peak_1s(&mut engine);
+        let off = peak_1s(&mut engine);
+        assert!(off < 1e-4, "a generator of a rig that is not live is silent at the master: peak {off}");
+        bus.send(zones(RigZone::OPEN, RigZone::OPEN));
+        assert!(peak_1s(&mut engine) > 0.01, "back in the song, it clicks again");
+    }
+
+    #[test]
+    fn a_load_opens_every_zone_and_the_engine_publishes_the_zones_it_plays() {
+        use crate::control::RigZone;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        e.set_graph_pub(pub_.clone());
+        let a = synth_of(&e, 0);
+        let rev = pub_.lock().unwrap().mix_rev;
+        let song = RigZone { key_lo: 36, key_hi: 72, transpose: -3, ..RigZone::OPEN };
+        play(&mut e, &mut bus, zones(song, OFF));
+        {
+            let p = pub_.lock().unwrap();
+            assert!(p.mix_rev > rev, "a zone change is published under mix_rev");
+            assert_eq!((p.zones[0], p.zones[1].live, p.zones[2]), (song, false, RigZone::OPEN));
+        }
+        play(&mut e, &mut bus, Command::LoadGraph { graph: rig_graph() });
+        assert_eq!(e.rig_zones, [RigZone::OPEN; 8], "a load opens every zone");
+        assert_eq!(pub_.lock().unwrap().zones, [RigZone::OPEN; 8], "and publishes it");
+        let a_after = synth_of(&e, 0);
+        assert_eq!(play(&mut e, &mut bus, on(80)), vec![(a_after, 80, true)], "the old range and transpose are gone (was node {a})");
+    }
+
+    #[test]
+    fn an_arp_in_a_rig_that_leaves_the_song_stops_when_its_keys_are_released() {
+        let (mut e, mut bus) = split_engine(None, false);
+        let arp = add_arp(&mut e, &mut bus);
+        play(&mut e, &mut bus, on(60));
+        play(&mut e, &mut bus, on(64));
+        e.arp_test_step();
+        assert!(!e.arp_sounding(arp).is_empty(), "the arp plays the held keys");
+        play(&mut e, &mut bus, zones(OFF, OFF));
+        assert!(play(&mut e, &mut bus, on(67)).is_empty() && e.arp_held(arp) == vec![60, 64], "a new key does not join the hold");
+        e.note_log.clear();
+        e.arp_test_step();
+        assert!(e.note_log.iter().any(|x| x.2), "the held keys keep arping: {:?}", e.note_log);
+        play(&mut e, &mut bus, off(60));
+        play(&mut e, &mut bus, off(64));
+        assert!(e.arp_sounding(arp).is_empty() && e.arp_held(arp).is_empty(), "releasing the keys stops the arp");
+        e.note_log.clear();
+        e.arp_test_step();
+        assert!(!e.note_log.iter().any(|x| x.2), "nothing plays after the release: {:?}", e.note_log);
     }
 
     /// GitHub #97, the audible half: a full pitch bend (+2 st at Surge's

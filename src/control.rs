@@ -1008,6 +1008,29 @@ pub fn split_rigs(merged: &Graph) -> (Vec<Graph>, Vec<NodeId>) {
     (graphs, bases)
 }
 
+/// What one rig takes from its sources right now (a setlist part, #204).
+/// The zone gates what STARTS in the rig and never routing: a release, and
+/// any message that returns a control to rest, always passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RigZone {
+    /// False: the rig takes no new notes.
+    pub live: bool,
+    /// Played-note range (inclusive, before any transpose) that starts notes.
+    pub key_lo: u8,
+    pub key_hi: u8,
+    /// Semitones added to what the rig plays, last of every transform.
+    pub transpose: i8,
+}
+
+impl RigZone {
+    pub const OPEN: Self = Self { live: true, key_lo: 0, key_hi: 127, transpose: 0 };
+
+    /// Does a note-on of `played` start a note in this rig?
+    pub fn starts(&self, played: u8) -> bool {
+        self.live && (self.key_lo..=self.key_hi).contains(&played)
+    }
+}
+
 /// `SetRigSource` wire body: the current `{node, keyboard, hardware}` pair or
 /// the pre-unification `{node, keys, laptop, hardware}` triple. Missing
 /// flags default to on.
@@ -1071,6 +1094,13 @@ pub enum Command {
         mute: Option<bool>,
         solo: Option<bool>,
     },
+    /// Every rig's zone at once (index = rig), so a song switch flips all
+    /// rigs in the same block and changes no routing. A `live` zone replaces
+    /// the rig's; a zone that is not live only clears `live` and keeps the
+    /// range and transpose, so a held note is released at the pitch it
+    /// started. A live rig whose transpose changes is released first
+    /// (rule 41). Resets to [`RigZone::OPEN`] on graph loads.
+    SetRigZones { zones: [RigZone; 8] },
     /// Per-SOURCE strip mix (#73): pan and mute/solo on one instrument /
     /// audio-in / generator node, applied to the node's own output (post its
     /// LEVEL knob — the strip fader) before anything downstream hears it, so
@@ -1366,6 +1396,8 @@ impl Command {
             | Command::NoteOff { .. }
             | Command::RenameRig { .. }
             | Command::SetRigMix { .. }
+            // Zones gate live input; the demo plays past them.
+            | Command::SetRigZones { .. }
             | Command::SetStripMix { .. }
             | Command::SetSend { .. }
             | Command::SetBusOutput { .. }
@@ -1550,6 +1582,7 @@ mod tests {
             Command::SetCountIn { enabled: true, bars: 2 },
             Command::SetCountIn { enabled: false, bars: 1 },
             Command::SetTimeSignature { num: 6, den: 8 },
+            Command::SetRigZones { zones: [RigZone { live: false, key_lo: 36, key_hi: 59, transpose: -2 }, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN] },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 7, param: Some(0), target: crate::matrix::CcTarget::Knob, scale: Default::default() },

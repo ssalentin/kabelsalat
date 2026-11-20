@@ -27,11 +27,15 @@
 //! reach, so the halves run separately and the FX half records every edit as
 //! one kind (which kinds a key saw is part of the state).
 //!
+//! The zones scenario (#204) puts Surge B in rig 1 and switches songs: each
+//! `SetRigZones` sets both rigs (live or not, key range, transpose), next to
+//! the routing edits whose transforms the zone transpose stacks on.
+//!
 //! Run + interpret: `.claude/skills/verify-held-notes/SKILL.md`.
 
 use super::GraphEngine;
 use crate::arp::{Scale, ScaleChoice};
-use crate::control::{command_bus, name_bytes, Command, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef};
+use crate::control::{command_bus, name_bytes, Command, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef, RigZone};
 use crate::matrix::SourceId;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -64,6 +68,8 @@ pub(super) enum Kind {
     Source,
     /// Starting or stopping a rig demo phrase (#200).
     Demo,
+    /// A song switch (`SetRigZones`).
+    Zone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +122,8 @@ enum Edit {
     DemoPlay(crate::demo::PhraseKind),
     /// Stop the running demo phrase (#200).
     DemoStop,
+    /// SetRigZones with `SONGS[n]` for rigs 0 (Surge A) and 1 (Surge B).
+    Zones(u8),
 }
 
 /// Which scenario a search runs: the plain rack, the arp (#90), the rack
@@ -127,6 +135,7 @@ enum Scenario {
     RoutingWithStrip,
     Fx,
     Demo,
+    Zones,
 }
 
 /// C# major pentatonic: B (59) snaps down to A#, C (60) up to C#. Two keys
@@ -176,6 +185,40 @@ const FX_EDITS: [Edit; 18] = [
     Edit::Source { keyboard: false },
 ];
 
+const OFF: RigZone = RigZone { live: false, ..RigZone::OPEN };
+
+/// The songs of the zones scenario, as (rig 0, rig 1): live flips both ways,
+/// a key range per rig, and transposes that move while notes are held. The
+/// last one sends rig 1 a transpose while taking it out of the song: the
+/// stored one must stay, or its held note is released at the wrong pitch.
+const SONGS: [[RigZone; 2]; 5] = [
+    [RigZone::OPEN, RigZone::OPEN],
+    [RigZone::OPEN, OFF],
+    [OFF, RigZone::OPEN],
+    [
+        RigZone { key_hi: 59, ..RigZone::OPEN },
+        RigZone { key_lo: 60, transpose: 12, ..RigZone::OPEN },
+    ],
+    [RigZone { transpose: 2, ..RigZone::OPEN }, RigZone { transpose: -12, ..OFF }],
+];
+
+/// Edits of the zones scenario: every song, and the routing edits that
+/// change what the zone's transpose is added to (matrix transpose, split
+/// port) or whether a note reaches the rig at all (cable).
+const ZONE_EDITS: [Edit; 11] = [
+    Edit::Zones(0),
+    Edit::Zones(1),
+    Edit::Zones(2),
+    Edit::Zones(3),
+    Edit::Zones(4),
+    Edit::Rule { dest: SURGE_A, transpose: 12, enabled: true },
+    Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
+    Edit::Split(Some(60)),
+    Edit::Split(None),
+    Edit::Unplug(6),
+    Edit::Plug { id: 6, port: 0, dest: SURGE_B },
+];
+
 /// Edits of the arp scenario. Knob percents land on the stepped knobs'
 /// positions: MODE 0 = up, 75 = chord.
 const ARP_EDITS: [Edit; 7] = [
@@ -220,6 +263,7 @@ impl Edit {
             Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
             Edit::Source { .. } => Kind::Source,
             Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
+            Edit::Zones(_) => Kind::Zone,
         }
     }
 
@@ -299,6 +343,11 @@ impl Edit {
             Edit::Source { keyboard } => Command::SetRigSource { node: SURGE_A, keyboard, hardware: true },
             Edit::DemoPlay(phrase) => Command::DemoPlay { rig: 0, phrase },
             Edit::DemoStop => Command::DemoStop,
+            Edit::Zones(n) => {
+                let mut zones = [RigZone::OPEN; 8];
+                zones[..2].copy_from_slice(&SONGS[n as usize]);
+                Command::SetRigZones { zones }
+            }
         }
     }
 }
@@ -344,10 +393,18 @@ fn start_graph_with_strip() -> Graph {
     g
 }
 
+/// The plain rack with Surge B in rig 1: one Keys node plays two rigs.
+fn start_graph_two_rigs() -> Graph {
+    let mut g = start_graph();
+    g.set_rig(SURGE_B, 1);
+    g
+}
+
 fn start_graph_for(scn: Scenario) -> Graph {
     match scn {
         Scenario::RoutingWithStrip | Scenario::Fx => start_graph_with_strip(),
         Scenario::Routing | Scenario::Arp | Scenario::Demo => start_graph(),
+        Scenario::Zones => start_graph_two_rigs(),
     }
 }
 
@@ -500,7 +557,7 @@ impl Run {
         // Hashed: 100k states of a kilobyte of JSON each is memory the check
         // does not need to keep.
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{routing}|{fx:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}", self.held, self.sounding, self.arp_added).hash(&mut h);
+        format!("{routing}|{fx:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}", self.held, self.sounding, self.arp_added, self.engine.rig_zones).hash(&mut h);
         h.finish()
     }
 }
@@ -543,6 +600,7 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::Source { keyboard }) => format!("SetRigSource Surge A keyboard {keyboard}"),
         Step::Edit(Edit::DemoPlay(kind)) => format!("DemoPlay rig 0 {kind:?}"),
         Step::Edit(Edit::DemoStop) => "DemoStop".to_string(),
+        Step::Edit(Edit::Zones(n)) => format!("SetRigZones (rig 0, rig 1) = {:?}", SONGS[n as usize]),
         Step::Tick => "Tick (time passes)".to_string(),
     }
 }
@@ -599,6 +657,14 @@ pub(super) fn explore_demo(max_states: usize) -> Report {
     alphabet.extend(DEMO_EDITS.iter().map(|&e| Step::Edit(e)));
     alphabet.push(Step::Edit(Edit::LoadStart));
     explore_with(&alphabet, max_states, Scenario::Demo)
+}
+
+/// Song switches over two rigs (#204).
+pub(super) fn explore_zones(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.extend(ZONE_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::Zones)
 }
 
 fn explore_with(alphabet: &[Step], max_states: usize, scn: Scenario) -> Report {
@@ -659,6 +725,21 @@ fn held_notes_are_released_with_the_arp_and_the_scale_snap() {
     }
     assert!(report.stuck.is_empty(), "stuck notes with the arp (traces above)");
     assert!(report.complete, "state bound hit before fixpoint: the arp alphabet's state space grew");
+}
+
+#[test]
+fn held_notes_are_released_across_song_switches() {
+    let report = explore_zones(100_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (zones): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes across song switches (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the zones alphabet's state space grew");
 }
 
 #[test]

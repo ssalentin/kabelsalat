@@ -2849,9 +2849,6 @@ struct VoiceRow {
     patch_name: Option<String>,
 }
 
-/// Width of the Mixer's loudness column beside Master out.
-const LOUDNESS_W: f32 = 152.0;
-
 /// A dB/LU value with a real minus sign and an explicit plus: "\u{2212}14", "+7.1".
 fn signed_db(v: f32, decimals: usize) -> String {
     let body = format!("{:.*}", decimals, v.abs());
@@ -3328,6 +3325,7 @@ struct DemoApp {
     /// Grace deadlines (`ui_time`) so echoes of direct UI edits never light
     /// up agent highlights.
     ui_mix_grace: [f32; 8],
+    ui_master_mute_grace: f32,
     /// Last frame's dt (peak-hold decay and strip animations read it).
     ui_dt: f32,
     ui_transport_grace: f32,
@@ -3912,6 +3910,7 @@ impl DemoApp {
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
             ui_mix_grace: [-1.0; 8],
+            ui_master_mute_grace: -1.0,
             ui_dt: 1.0 / 60.0,
             ui_transport_grace: -1.0,
             ui_node_grace: std::collections::HashMap::new(),
@@ -5246,7 +5245,9 @@ impl DemoApp {
                 }
             }
             self.rig_mix = g.mix;
-            self.master_mute = g.master_mute;
+            if now >= self.ui_master_mute_grace {
+                self.master_mute = g.master_mute;
+            }
             // Sends (issue #5): the engine's table is the truth (rule 33),
             // once a local edit's echo is back.
             if now >= self.ui_send_grace {
@@ -6876,6 +6877,7 @@ impl DemoApp {
 
     fn set_master_mute(&mut self, muted: bool) {
         self.master_mute = muted;
+        self.ui_master_mute_grace = self.ui_time + 0.6;
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetMasterMute { muted });
         }
@@ -7034,6 +7036,7 @@ impl DemoApp {
         self.bus_outs.clear();
         self.strip_order.clear();
         self.strip_knobs.clear();
+        self.master_mute = false;
         self.mixer_knob_drag = None;
         self.begin_load_fade();
         self.sync_clap_slots(&merged, None);
@@ -21515,8 +21518,8 @@ impl DemoApp {
                                 w + gap
                             }).sum::<f32>()
                         };
-                        let kabelsalat_w = 15.0 + gap + STRIP_W;
-                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + kabelsalat_w + 152.0 + LOUDNESS_W + 3.0 * gap;
+                        let kabelsalat_w = 15.0 + gap + STRIP_W + gap;
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + kabelsalat_w + 152.0 + gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
@@ -21652,13 +21655,6 @@ impl DemoApp {
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                 ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
                                 self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
-                                // Loudness target (#12): its own column of the
-                                // master section, so it never pushes the fader
-                                // or falls under the fold of a short window.
-                                ui.vertical(|ui| {
-                                    ui.set_width(LOUDNESS_W);
-                                    self.master_target_ui(ui);
-                                });
                             });
                         });
                     });
@@ -22084,8 +22080,7 @@ impl DemoApp {
                 ui.label(egui::RichText::new(rigs).size(10.5).color(theme::INK_2))
                     .on_hover_text("peak meter of everything kabelsalat plays");
                 ui.add_space(4.0);
-                let fr = self.strip_fader_ui(ui, MASTER_STRIP_KEY, &mut gain, self.meter, fader_h, fader_dest);
-                self.mixer_fader_rects.push(fr);
+                let _ = self.strip_fader_ui(ui, MASTER_STRIP_KEY, &mut gain, self.meter, fader_h, fader_dest);
                 ui.add_space(2.0);
                 self.fader_readout_ui(ui, gain, 11.0, fader_dest)
                     .on_hover_text("master volume · the last stage is the limiter, then warmth");
@@ -22176,6 +22171,13 @@ impl DemoApp {
             {
                 self.pending_bus_edit = Some(BusEdit::Add);
             }
+            // Loudness target (#12) sits right below Master out's controls now
+            // that the master fader lives in the Kabelsalat strip.
+            ui.add_space(8.0);
+            let (rule, _) = ui.allocate_exact_size(egui::vec2(144.0, 5.0), egui::Sense::hover());
+            ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+            ui.add_space(4.0);
+            self.master_target_ui(ui);
         });
     }
 
@@ -39260,7 +39262,7 @@ mod window_size_layout_tests {
     /// Text that leaves the window, is cut by its clip, or overlaps other
     /// text. Text a scroll area clips at its edge is scrolled, not broken,
     /// so a clip cut only counts outside `scrolled` regions.
-    fn audit(texts: &[Text], size: Vec2) -> Vec<String> {
+    fn audit(texts: &[Text], size: Vec2, scroll_x_clip: Option<f32>) -> Vec<String> {
         let screen = Rect::from_min_size(Pos2::ZERO, size);
         let mut bad = Vec::new();
         let vis: Vec<(&Text, Rect)> = texts.iter()
@@ -39268,7 +39270,15 @@ mod window_size_layout_tests {
             .filter(|(_, v)| v.width() > 0.5 && v.height() > 0.5)
             .collect();
         for (t, v) in &vis {
-            if !screen.expand(0.5).contains_rect(t.rect) {
+            let clipped_in_scroll_x = scroll_x_clip.is_some_and(|sx| {
+                t.clip.right() <= sx + 0.5
+                    && t.clip.right() < screen.right() - 0.5
+                    && t.rect.right() > t.clip.right() + 0.5
+                    && t.rect.left() >= screen.left() - 0.5
+                    && t.rect.top() >= screen.top() - 0.5
+                    && t.rect.bottom() <= screen.bottom() + 0.5
+            });
+            if !screen.expand(0.5).contains_rect(t.rect) && !clipped_in_scroll_x {
                 bad.push(format!("{:?} {:?} leaves the window", t.s, t.rect));
             } else if v.width() < t.rect.width() - 1.0 || v.height() < t.rect.height() - 1.0 {
                 bad.push(format!("{:?} {:?} cut by its clip {:?}", t.s, t.rect, t.clip));
@@ -39295,7 +39305,10 @@ mod window_size_layout_tests {
                 let ctx = egui::Context::default();
                 let size = Vec2::new(w, h);
                 let t = texts(&mut app, &ctx, size);
-                for v in audit(&t, size) { all.push(format!("[{w}x{h} {dname}] {v}")); }
+                let scroll_x_clip = (app.stage_view == StageView::Mixer).then(|| {
+                    app.stage_sheet_rects(Rect::from_min_size(Pos2::ZERO, size), 200.0).1.right()
+                });
+                for v in audit(&t, size, scroll_x_clip) { all.push(format!("[{w}x{h} {dname}] {v}")); }
                 if app.stage_view == StageView::Rack && app.rack_overflow != Vec2::ZERO {
                     let what = if app.rack_overflow.x > 0.0 { "rack overflows sideways" } else { "rack pans vertically" };
                     all.push(format!("[{w}x{h} {dname}] {what}: {:?}", app.rack_overflow));

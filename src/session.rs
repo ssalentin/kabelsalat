@@ -1861,6 +1861,24 @@ mod tests {
     }
 
     #[test]
+    fn master_mute_round_trips_and_defaults_false() {
+        let dir = std::env::temp_dir().join(format!("ksalat-mastermute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("muted.ksalat");
+        let mut s = Session::new("m", Graph::demo_patch());
+        s.master_mute = true;
+        s.save(&pkg).unwrap();
+        assert!(Session::load(&pkg).unwrap().master_mute);
+        s.master_mute = false;
+        let pkg2 = dir.join("unmuted.ksalat");
+        s.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
+        assert!(!json.contains("master_mute"), "absent when false: old readers stay happy");
+        assert!(!Session::load(&pkg2).unwrap().master_mute);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn keyboard_mode_round_trips_and_old_sessions_have_none() {
         use crate::keyboard::{KeyboardMode, KeyboardType};
         let dir = std::env::temp_dir().join(format!("ksalat-kbmode-{}", std::process::id()));

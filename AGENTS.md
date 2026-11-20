@@ -196,6 +196,7 @@ and never passed off as tested.**
   with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
   `testing`) and milestones per release; how and why it is built =
   `docs/ARCHITECTURE.md`; CI, packages and releases = `docs/PACKAGING.md`;
+  plugin compatibility and test status = `docs/PLUGINS.md`;
   released changes = `CHANGELOG.md`, but add yours as a fragment
   `changes/<branch>.md` (`changes/README.md`; never edit CHANGELOG.md in a
   feature PR, parallel PRs conflict there); rules = this file. Read open issues with
@@ -1557,3 +1558,10 @@ Learned so far (2026-11-15, UI polish pass):
     asked for 1000 Hz and failed on `main` before its routing and delay
     sections. Before a push, `grep` the self-tests for the constant or
     behaviour you changed and run the ones that name it.
+188. **Keep `docs/PLUGINS.md` in sync with plugin testing:** `docs/PLUGINS.md`
+    tracks which plugins have been tested, what works, and what is untested.
+    Every `CATALOG` entry must appear there
+    (`catalog::tests::every_catalog_entry_is_tracked_in_docs_plugins_md`), and
+    any PR that adds a catalog plugin, verifies a plugin on real hardware or
+    another CPU, or changes a plugin's support status updates `docs/PLUGINS.md`
+    in the same PR.

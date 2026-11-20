@@ -24,7 +24,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 
 ---
 
-## Catalog instruments (18)
+## Catalog instruments (19)
 
 | Card (`id`) | Format | Install | Audio / Engine | Sound library | State / Session | Plugin GUI | Notes & untested gaps |
 |---|---|---|---|---|---|---|---|
@@ -39,6 +39,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 | **Six Sines** (`six-sines`) | CLAP | **Headless** (`aarch64` source); **Untested** (`x86_64` release `v1.2.1`) | **Headless** (`aarch64` probe chord peak 0.385) | **Untested** | **Untested** | **Untested** | `x86_64` prebuilt release is SHA-256/plan-tested only. Interactive play, state, GUI window untested. |
 | **JC303** (`jc303`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.279) | **Untested** | **Untested** | **Untested** | Interactive play, state, GUI window, `x86_64` untested. |
 | **Cardinal** (`cardinal`) | CLAP | **Partial** (`aarch64` Arch `cardinal-clap` loads; needs `cardinal-data`) | **Untested** (silent without `cardinal-data`) | **N/A** (modular patch) | **Untested** | **Untested** | Full 32-byte `ClapId` (`studio.kx.distrho.cardinal#synth`) loads cleanly. Playback with `cardinal-data` installed is open bench test #186; GUI window needed for patching. |
+| **Unsampled Piano** (`unsampled-piano`) | CLAP | **Untested** (`x86_64` release `v0.2.1` + `aarch64` source; plan/SHA-256 unit-tested) | **Untested** | **N/A** (physically modelled piano) | **Untested** | **Untested** | Added in #250; neither the `x86_64` prebuilt release nor the `aarch64` source build has been run in kabelsalat yet. |
 | **OneTrick KEYS** (`ot-keys`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.338) | **Untested** | **Untested** | **Untested** | Interactive install/play in open bench test #186. State, GUI window, `x86_64` untested. |
 | **OneTrick CHONK** (`ot-chonk`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.281) | **Untested** | **Untested** | **Untested** | Interactive play, state, GUI window, `x86_64` untested. |
 | **OneTrick CRYPTID** (`ot-cryptid`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.812; 12 output ports) | **Untested** | **Untested** | **Untested** | Plays GM drum notes (36/38). Interactive install/play in open bench test #186. State, GUI window, `x86_64` untested. |

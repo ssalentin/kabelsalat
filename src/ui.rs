@@ -26698,6 +26698,162 @@ mod rig_switch_tests {
         assert_eq!(app.rig_count(), 2);
     }
 
+    const FM1_PORT: &str = "M-Wave FM-1:M-Wave FM-1 MIDI 1";
+    const U6_PORT: &str = "U6MIDI Pro:U6MIDI Pro MIDI 1";
+
+    /// The hardware ports as the MIDI thread would list them, with ALSA's
+    /// client:port numbers (tests never scan the machine, rule 48).
+    fn list_midi_ports(app: &mut DemoApp, ports: &[(&str, &str)]) {
+        let names: Vec<String> = ports.iter().map(|(port, alsa)| format!("{port} {alsa}")).collect();
+        *app.hw_midi.devices.lock().unwrap() = names.iter().map(|n| (n.clone(), true)).collect();
+        app.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+        app.hw_live = vec![true; names.len()];
+        app.hw_devices = names;
+    }
+
+    fn clap_unit(app: &DemoApp, rig: u8) -> usize {
+        app.units.iter().position(|u| u.rig == rig && matches!(u.node_kind, UnitKind::Clap)).expect("the rig's synth")
+    }
+
+    /// Keyboard, hardware and device of a rig's synth, the device by name.
+    fn input_selection(app: &DemoApp, rig: u8) -> (bool, bool, Option<String>) {
+        let slot = app.rig_of_unit(clap_unit(app, rig)).unwrap();
+        let (keyboard, hardware) = app.rig_sources[slot];
+        let device = app.rig_device[slot].map(|d| midi_port_key(&app.hw_devices[d as usize]).to_string());
+        (keyboard, hardware, device)
+    }
+
+    /// The package of a two-rig session whose rig A synth plays from the
+    /// keyboard only and whose rig B synth from the U6MIDI Pro only, saved
+    /// while the FM-1 was device 0 and the U6MIDI Pro device 1.
+    fn saved_session_with_input_selections(name: &str) -> std::path::PathBuf {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        list_midi_ports(&mut app, &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+        let (a, b) = (clap_unit(&app, 0), clap_unit(&app, 1));
+        app.matrix_toggle(a, MatrixRow::HwAll, false);
+        app.matrix_toggle(b, MatrixRow::Keys, false);
+        app.matrix_toggle(b, MatrixRow::HwDev(1), true);
+        assert_eq!(input_selection(&app, 0), (true, false, None));
+        assert_eq!(input_selection(&app, 1), (false, true, Some(U6_PORT.into())));
+        let pkg = crate::session::Session::package_path(&DemoApp::sessions_dir(), name).unwrap();
+        app.capture_session(name).unwrap().save(&pkg).unwrap();
+        pkg
+    }
+
+    /// A new app with `ports` listed, after it loaded `session`: the app and
+    /// the commands the engine got, in order.
+    fn reopened(session: &crate::session::Session, ports: &[(&str, &str)]) -> (DemoApp, Vec<Command>) {
+        let mut app = DemoApp::new_with_sink(None);
+        list_midi_ports(&mut app, ports);
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        app.apply_session(session).unwrap();
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        (app, sent)
+    }
+
+    /// What the engine was told about `node`'s inputs after the load:
+    /// (keyboard, hardware) and the device index, the last word of each.
+    fn engine_inputs(sent: &[Command], node: u32) -> (Option<(bool, bool)>, Option<Option<u32>>) {
+        let load = sent.iter().rposition(|c| matches!(c, Command::LoadRigs { .. } | Command::LoadGraph { .. })).expect("a load");
+        let after = &sent[load + 1..];
+        let sources = after.iter().rev().find_map(|c| match c {
+            Command::SetRigSource { node: n, keyboard, hardware } if *n == node => Some((*keyboard, *hardware)),
+            _ => None,
+        });
+        let device = after.iter().rev().find_map(|c| match c {
+            Command::SetRigDevice { node: n, device } if *n == node => Some(*device),
+            _ => None,
+        });
+        (sources, device)
+    }
+
+    /// #124: a reopened session had every CLAP synth on the keyboard and all
+    /// hardware again. Here the devices also come up in the other scan order
+    /// under new ALSA client numbers, as after a restart or a re-plug.
+    #[test]
+    fn a_reopened_session_keeps_each_synths_keyboard_hardware_and_device() {
+        let pkg = saved_session_with_input_selections("inputs-two-rigs");
+        let loaded = crate::session::Session::load(&pkg).unwrap();
+        let (app, sent) = reopened(&loaded, &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+
+        assert_eq!(input_selection(&app, 0), (true, false, None), "rig A: keyboard only");
+        assert_eq!(input_selection(&app, 1), (false, true, Some(U6_PORT.into())), "rig B: the U6MIDI Pro only");
+        let slot_b = app.rig_of_unit(clap_unit(&app, 1)).unwrap();
+        assert_eq!(app.rig_device[slot_b], Some(0), "the U6MIDI Pro is device 0 in this scan");
+        let (node_a, node_b) = (app.units[clap_unit(&app, 0)].node_id, app.units[clap_unit(&app, 1)].node_id);
+        assert_eq!(engine_inputs(&sent, node_a), (Some((true, false)), Some(None)), "the engine's rig A synth");
+        assert_eq!(engine_inputs(&sent, node_b), (Some((false, true)), Some(Some(0))), "the engine's rig B synth");
+
+        // A unit removed from rig A shifts rig B's node ids on load (rule 44).
+        let mut gapped = loaded.clone();
+        let gap = gapped.graph.nodes.iter()
+            .find(|n| n.rig == 0 && !matches!(n.kind, NodeKind::Keys | NodeKind::MasterOut | NodeKind::Clap { .. }))
+            .map(|n| n.id).expect("a removable rig-A unit");
+        gapped.graph.remove_node(gap);
+        gapped.prune_to_graph();
+        let (app, sent) = reopened(&gapped, &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+        let moved_b = app.units[clap_unit(&app, 1)].node_id;
+        assert_ne!(moved_b, node_b, "rig B's synth has another id now");
+        assert_eq!(input_selection(&app, 0), (true, false, None));
+        assert_eq!(input_selection(&app, 1), (false, true, Some(U6_PORT.into())));
+        assert_eq!(engine_inputs(&sent, moved_b), (Some((false, true)), Some(Some(0))));
+    }
+
+    /// A device the session names but that is not plugged in stays the
+    /// synth's device: it never falls back to all hardware or to another
+    /// keyboard, it takes its place when it is plugged in, and the next save
+    /// still names it.
+    #[test]
+    fn a_device_missing_at_load_stays_the_synths_device() {
+        let pkg = saved_session_with_input_selections("inputs-device-missing");
+        let loaded = crate::session::Session::load(&pkg).unwrap();
+        let (mut app, sent) = reopened(&loaded, &[(FM1_PORT, "24:0")]);
+
+        assert_eq!(input_selection(&app, 1), (false, true, Some(U6_PORT.into())));
+        let slot_b = app.rig_of_unit(clap_unit(&app, 1)).unwrap();
+        let dev = app.rig_device[slot_b].expect("a device, not all hardware");
+        assert_ne!(dev, 0, "not the FM-1");
+        assert_eq!(app.hw_live.get(dev as usize), Some(&false), "listed as not plugged in");
+        let node_b = app.units[clap_unit(&app, 1)].node_id;
+        assert_eq!(engine_inputs(&sent, node_b), (Some((false, true)), Some(Some(dev))));
+
+        // The hot-plug pass gives the device that index when it shows up.
+        let listed = app.hw_midi.devices.lock().unwrap().clone();
+        assert_eq!(match_midi_device(&listed, &format!("{U6_PORT} 40:0")), Ok(Some(dev as usize)));
+
+        let again = app.capture_session("still-missing").unwrap();
+        let (app, _) = reopened(&again, &[(U6_PORT, "28:0")]);
+        assert_eq!(input_selection(&app, 1), (false, true, Some(U6_PORT.into())), "saved again while it was unplugged");
+    }
+
+    /// A session file from before #124 says nothing about inputs: it loads,
+    /// and every synth listens to the keyboard and all hardware as it did.
+    #[test]
+    fn a_session_file_without_input_selections_loads_with_the_defaults() {
+        let pkg = saved_session_with_input_selections("inputs-older-file");
+        let manifest = pkg.join("session.json");
+        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("midi_sources");
+        std::fs::write(&manifest, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        let older = crate::session::Session::load(&pkg).expect("an older file still loads");
+        let (app, sent) = reopened(&older, &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+        for rig in 0..2 {
+            assert_eq!(input_selection(&app, rig), (true, true, None), "rig {rig}");
+            let node = app.units[clap_unit(&app, rig)].node_id;
+            assert_eq!(engine_inputs(&sent, node), (None, None), "the load's defaults stand, rig {rig}");
+        }
+
+        // A session with nothing selected writes no such field.
+        let mut plain = DemoApp::new_with_sink(None);
+        plain.load_multi_rig_demo();
+        let pkg = crate::session::Session::package_path(&DemoApp::sessions_dir(), "inputs-plain").unwrap();
+        plain.capture_session("inputs-plain").unwrap().save(&pkg).unwrap();
+        assert!(!std::fs::read_to_string(pkg.join("session.json")).unwrap().contains("midi_sources"));
+    }
+
     #[test]
     fn assistant_chat_content_stays_inside_its_panel() {
         let (mut app, ctx) = two_rigs();

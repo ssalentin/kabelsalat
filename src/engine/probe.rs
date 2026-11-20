@@ -411,6 +411,25 @@ pub fn hard_clipped(x: &[f32]) -> Vec<f32> {
     x.iter().map(|s| (s * 2.0).clamp(-MASTER_KNEE, MASTER_KNEE)).collect()
 }
 
+/// One second of white noise at the master, through `kind` as a strip
+/// insert (Audio In → unit → Master) or as a master insert (Audio In →
+/// Master, Master OUT → unit): the same unit on the same signal either way,
+/// because one source at unity is the whole mix. Stereo interleaved.
+pub fn noise_through_insert(kind: DspKind, on_master: bool) -> Vec<f32> {
+    let mut g = Graph::default();
+    let ain = audio_in(&mut g, "IN");
+    let unit = g.add_node(NodeKind::Dsp(kind), name_bytes("UNIT"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    let (from, to) = if on_master { (ain, master) } else { (unit, master) };
+    wire(&mut g, 1, from, to, 0);
+    wire(&mut g, 2, from, to, 1);
+    if on_master { wire(&mut g, 3, master, unit, 0) } else { wire(&mut g, 3, ain, unit, 0) }
+    let mut probe = Probe::new(g);
+    probe.feed("noise", ain, noise(7));
+    let blocks = SR as usize / probe.block;
+    probe.run(blocks, &[]).master
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +467,22 @@ mod tests {
             assert!(m.at_knee == 0.0 && m.flat_top < FLAT_TOP_MAX && m.above_8k < HF_MAX, "loud {l:?}, quiet {q:?}");
         }
         assert!(c.at_knee > 0.05 && c.flat_top > FLAT_TOP_MAX && c.above_8k > HF_MAX, "clipped {c:?}");
+    }
+
+    /// A master insert runs once per block, on the mix (#154): a unit with
+    /// state sounds the same after Master OUT as it does in a strip. Run a
+    /// second time on silence, a Delay played a block of its line and then
+    /// skipped one, and a Limiter's gain recovered between the blocks.
+    #[test]
+    fn a_master_insert_sounds_like_the_same_unit_in_a_strip() {
+        for kind in [DspKind::Gain, DspKind::Delay, DspKind::Reverb, DspKind::Limiter, DspKind::Filter] {
+            let strip = noise_through_insert(kind.clone(), false);
+            let master = noise_through_insert(kind.clone(), true);
+            let diff: Vec<f32> = strip.iter().zip(&master).map(|(a, b)| a - b).collect();
+            let rms_of = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+            let (rms, off) = (rms_of(&strip), rms_of(&diff));
+            assert!(rms > 0.01, "{kind:?}: the strip insert is heard, rms {rms}");
+            assert!(off < rms * 1e-3, "{kind:?}: master insert differs from the strip insert, rms {off} of {rms}");
+        }
     }
 }

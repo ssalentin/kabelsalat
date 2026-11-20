@@ -15,7 +15,7 @@ use std::thread::ThreadId;
 
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{clap_event_param_value, clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE};
-use clap_sys::ext::audio_ports::{clap_audio_port_info, clap_plugin_audio_ports, CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_STEREO};
+use clap_sys::ext::audio_ports::{clap_audio_port_info, clap_plugin_audio_ports, CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO};
 use clap_sys::ext::params::{clap_host_params, clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE};
 use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
 use clap_sys::host::clap_host;
@@ -27,6 +27,7 @@ use clap_sys::version::CLAP_VERSION;
 use super::{ClapVoice, ClapVoiceMain};
 
 pub const PROBE_ID: &CStr = c"org.kabelsalat.test-probe";
+pub const PROBE_FX_ID: &CStr = c"org.kabelsalat.test-probe#fx";
 
 /// One call the plugin received, with the thread it came on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,8 +43,15 @@ pub struct Probe {
     pub blocks: AtomicU64,
     /// Parameters the next `count()` reports (ids 0..n, range 0..1).
     pub params: AtomicU32,
-    /// The value on both output channels, as f32 bits.
+    /// The value on both output channels (instrument), or the gain applied
+    /// to the main input port (effect), as f32 bits.
     level: AtomicU32,
+    /// Input ports `(channel_count, is_main)`; empty for an instrument.
+    in_ports: Vec<(u32, bool)>,
+    /// Output port 0's channel count (1 = mono, 2 = stereo).
+    out_channels: u32,
+    /// Highest sample magnitude seen on any non-main (sidechain) input port.
+    sidechain_peak: AtomicU32,
     /// The next `activate()` answers false.
     pub refuse_activation: AtomicBool,
     host: AtomicPtr<clap_host>,
@@ -51,14 +59,25 @@ pub struct Probe {
 
 impl Probe {
     fn new() -> Arc<Probe> {
+        Self::with_ports(Vec::new(), 2, 0.25)
+    }
+
+    fn with_ports(in_ports: Vec<(u32, bool)>, out_channels: u32, level: f32) -> Arc<Probe> {
         Arc::new(Probe {
             calls: Mutex::new(Vec::new()),
             blocks: AtomicU64::new(0),
             params: AtomicU32::new(1),
-            level: AtomicU32::new(0.25f32.to_bits()),
+            level: AtomicU32::new(level.to_bits()),
+            in_ports,
+            out_channels,
+            sidechain_peak: AtomicU32::new(0.0f32.to_bits()),
             refuse_activation: AtomicBool::new(false),
             host: AtomicPtr::new(std::ptr::null_mut()),
         })
+    }
+
+    pub fn sidechain_peak(&self) -> f32 {
+        f32::from_bits(self.sidechain_peak.load(Ordering::SeqCst))
     }
 
     fn record(&self, what: &'static str) {
@@ -120,6 +139,18 @@ pub fn host_probe() -> (ClapVoice, ClapVoiceMain, Arc<Probe>) {
     (voice, main, probe)
 }
 
+/// An audio-effect probe with `in_ports` (`(channels, is_main)`) and
+/// `out_channels` on its main output port. Scales its main audio input by
+/// `Level` (default 0.5) and measures what arrives on any other input port.
+pub fn host_probe_effect(in_ports: &[(u32, bool)], out_channels: u32) -> (ClapVoice, ClapVoiceMain, Arc<Probe>) {
+    let probe = Probe::with_ports(in_ports.to_vec(), out_channels, 0.5);
+    NEXT.with(|n| *n.borrow_mut() = Some(probe.clone()));
+    // SAFETY: `ENTRY` is a valid CLAP entry for the life of the process.
+    let entry = unsafe { clack_host::prelude::PluginEntry::load_from_raw(&ENTRY, c"/test/probe.clap") }.expect("the probe entry loads");
+    let (voice, main) = ClapVoice::instantiate_entry(entry, CString::from(PROBE_FX_ID), 48_000.0).expect("the effect probe instantiates");
+    (voice, main, probe)
+}
+
 struct Instance {
     plugin: clap_plugin,
     probe: Arc<Probe>,
@@ -132,6 +163,7 @@ unsafe fn probe_of<'a>(plugin: *const clap_plugin) -> &'a Probe {
 struct SyncPtrs([*const c_char; 2]);
 unsafe impl Sync for SyncPtrs {}
 static FEATURES: SyncPtrs = SyncPtrs([c"instrument".as_ptr(), std::ptr::null()]);
+static FX_FEATURES: SyncPtrs = SyncPtrs([c"audio-effect".as_ptr(), std::ptr::null()]);
 
 static DESCRIPTOR: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
@@ -144,6 +176,19 @@ static DESCRIPTOR: clap_plugin_descriptor = clap_plugin_descriptor {
     version: c"1".as_ptr(),
     description: c"host test plugin".as_ptr(),
     features: FEATURES.0.as_ptr(),
+};
+
+static FX_DESCRIPTOR: clap_plugin_descriptor = clap_plugin_descriptor {
+    clap_version: CLAP_VERSION,
+    id: PROBE_FX_ID.as_ptr(),
+    name: c"Probe FX".as_ptr(),
+    vendor: c"kabelsalat".as_ptr(),
+    url: c"".as_ptr(),
+    manual_url: c"".as_ptr(),
+    support_url: c"".as_ptr(),
+    version: c"1".as_ptr(),
+    description: c"host test audio effect".as_ptr(),
+    features: FX_FEATURES.0.as_ptr(),
 };
 
 static ENTRY: clap_plugin_entry = clap_plugin_entry {
@@ -172,20 +217,29 @@ static FACTORY: clap_plugin_factory = clap_plugin_factory {
 };
 
 unsafe extern "C" fn factory_count(_f: *const clap_plugin_factory) -> u32 {
-    1
+    2
 }
 unsafe extern "C" fn factory_descriptor(_f: *const clap_plugin_factory, index: u32) -> *const clap_plugin_descriptor {
-    if index == 0 { &DESCRIPTOR } else { std::ptr::null() }
+    match index {
+        0 => &DESCRIPTOR,
+        1 => &FX_DESCRIPTOR,
+        _ => std::ptr::null(),
+    }
 }
 unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const clap_host, id: *const c_char) -> *const clap_plugin {
-    if CStr::from_ptr(id) != PROBE_ID {
+    let cid = CStr::from_ptr(id);
+    let desc: *const clap_plugin_descriptor = if cid == PROBE_ID {
+        &DESCRIPTOR
+    } else if cid == PROBE_FX_ID {
+        &FX_DESCRIPTOR
+    } else {
         return std::ptr::null();
-    }
+    };
     let Some(probe) = NEXT.with(|n| n.borrow_mut().take()) else { return std::ptr::null() };
     probe.host.store(host as *mut clap_host, Ordering::SeqCst);
     let instance = Box::into_raw(Box::new(Instance {
         plugin: clap_plugin {
-            desc: &DESCRIPTOR,
+            desc,
             plugin_data: std::ptr::null_mut(),
             init: Some(plugin_init),
             destroy: Some(plugin_destroy),
@@ -259,11 +313,42 @@ unsafe extern "C" fn plugin_process(p: *const clap_plugin, process: *const clap_
     let process = &*process;
     apply_events(probe, process.in_events);
     let level = f32::from_bits(probe.level.load(Ordering::SeqCst));
-    for port in 0..process.audio_outputs_count as usize {
-        let buffer = &*process.audio_outputs.add(port);
-        for ch in 0..buffer.channel_count as usize {
-            let data = *buffer.data32.add(ch);
-            std::slice::from_raw_parts_mut(data, process.frames_count as usize).fill(level);
+    let n = process.frames_count as usize;
+    if probe.in_ports.is_empty() || process.audio_inputs_count == 0 {
+        for port in 0..process.audio_outputs_count as usize {
+            let buffer = &*process.audio_outputs.add(port);
+            for ch in 0..buffer.channel_count as usize {
+                let data = *buffer.data32.add(ch);
+                std::slice::from_raw_parts_mut(data, n).fill(level);
+            }
+        }
+    } else {
+        let main_in = probe.in_ports.iter().position(|&(_, is_main)| is_main).unwrap_or(0);
+        let mut sc_peak = f32::from_bits(probe.sidechain_peak.load(Ordering::SeqCst));
+        for port in 0..process.audio_inputs_count as usize {
+            if port == main_in {
+                continue;
+            }
+            let buffer = &*process.audio_inputs.add(port);
+            for ch in 0..buffer.channel_count as usize {
+                let data = std::slice::from_raw_parts(*buffer.data32.add(ch), n);
+                for &s in data {
+                    sc_peak = sc_peak.max(s.abs());
+                }
+            }
+        }
+        probe.sidechain_peak.store(sc_peak.to_bits(), Ordering::SeqCst);
+        let in_buf = &*process.audio_inputs.add(main_in);
+        let in_ch = in_buf.channel_count as usize;
+        for port in 0..process.audio_outputs_count as usize {
+            let out_buf = &*process.audio_outputs.add(port);
+            for ch in 0..out_buf.channel_count as usize {
+                let src = std::slice::from_raw_parts(*in_buf.data32.add(ch.min(in_ch.saturating_sub(1))), n);
+                let dst = std::slice::from_raw_parts_mut(*out_buf.data32.add(ch), n);
+                for i in 0..n {
+                    dst[i] = src[i] * level;
+                }
+            }
         }
     }
     CLAP_PROCESS_CONTINUE
@@ -288,19 +373,30 @@ fn write_name(dst: &mut [c_char], name: &str) {
 
 static AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports { count: Some(ports_count), get: Some(ports_get) };
 
-unsafe extern "C" fn ports_count(_p: *const clap_plugin, is_input: bool) -> u32 {
-    if is_input { 0 } else { 1 }
+unsafe extern "C" fn ports_count(p: *const clap_plugin, is_input: bool) -> u32 {
+    if is_input { probe_of(p).in_ports.len() as u32 } else { 1 }
 }
-unsafe extern "C" fn ports_get(_p: *const clap_plugin, index: u32, is_input: bool, info: *mut clap_audio_port_info) -> bool {
-    if is_input || index != 0 {
+unsafe extern "C" fn ports_get(p: *const clap_plugin, index: u32, is_input: bool, info: *mut clap_audio_port_info) -> bool {
+    let probe = probe_of(p);
+    let info = &mut *info;
+    if is_input {
+        let Some(&(chs, is_main)) = probe.in_ports.get(index as usize) else { return false };
+        info.id = index;
+        write_name(&mut info.name, if is_main { "In" } else { "Sidechain" });
+        info.flags = if is_main { CLAP_AUDIO_PORT_IS_MAIN } else { 0 };
+        info.channel_count = chs;
+        info.port_type = if chs == 1 { CLAP_PORT_MONO.as_ptr() } else { CLAP_PORT_STEREO.as_ptr() };
+        info.in_place_pair = CLAP_INVALID_ID;
+        return true;
+    }
+    if index != 0 {
         return false;
     }
-    let info = &mut *info;
     info.id = 0;
     write_name(&mut info.name, "Out");
     info.flags = CLAP_AUDIO_PORT_IS_MAIN;
-    info.channel_count = 2;
-    info.port_type = CLAP_PORT_STEREO.as_ptr();
+    info.channel_count = probe.out_channels;
+    info.port_type = if probe.out_channels == 1 { CLAP_PORT_MONO.as_ptr() } else { CLAP_PORT_STEREO.as_ptr() };
     info.in_place_pair = CLAP_INVALID_ID;
     true
 }

@@ -247,6 +247,107 @@ fn surge(clips: &mut Vec<Clip>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Real CLAP audio effect (`Dragonfly Hall Reverb` or `Surge XT Effects`)
+/// wired `Audio In → CLAP FX → Master`: proves audio passes through a hosted
+/// CLAP effect and is changed by it (#181).
+fn clap_effect(clips: &mut Vec<Clip>) -> anyhow::Result<()> {
+    use crate::control::{AudioInChannel, ClapId, PortKind, PortRef};
+    let candidates = [
+        ("michaelwillis.dragonfly.hall", "DragonflyHallReverb.clap"),
+        ("org.surge-synth-team.surge-xt-fx", "Surge XT Effects.clap"),
+    ];
+    let mut loaded = None;
+    for (id, bundle_name) in candidates {
+        if let Ok((v, m)) = crate::host::ClapVoice::new_plugin(SR as f64, id) {
+            loaded = Some((id, v, m));
+            break;
+        }
+        for root in [
+            "/var/lib/openbot/.cache/ksalat-clapfx/root/usr/lib/clap",
+            "/var/lib/openbot/.cache/ksalat-issue29/root/usr/lib/clap",
+            "/usr/lib/clap",
+        ] {
+            let path = Path::new(root).join(bundle_name);
+            if path.exists() {
+                if let Ok((v, m)) = crate::host::ClapVoice::new_from_bundle(SR as f64, &path, id) {
+                    loaded = Some((id, v, m));
+                    break;
+                }
+            }
+        }
+        if loaded.is_some() {
+            break;
+        }
+    }
+    let Some((plugin_id, voice, main)) = loaded else {
+        println!("clap effect: SKIP — neither Dragonfly Hall Reverb nor Surge XT Effects is installed");
+        return Ok(());
+    };
+    anyhow::ensure!(voice.is_effect(), "{plugin_id} should classify as a CLAP effect");
+
+    let mut g = Graph::default();
+    let src = g.add_node(
+        NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo },
+        name_bytes("IN"),
+    );
+    let fx = g.add_node(
+        NodeKind::Clap { plugin_id: ClapId::new(plugin_id) },
+        name_bytes("CLAP FX"),
+    );
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: src, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+    probe::wire(&mut g, 2, fx, master, 0);
+    probe::wire(&mut g, 3, fx, master, 1);
+
+    let mut p = probe::Probe::with_voices(g, vec![(fx, voice)]);
+    // 8 blocks (~42 ms) of a 440 Hz tone burst into the CLAP effect, then 40 blocks of silence.
+    let burst_frames = 8 * crate::bridge::BUFFER_FRAMES as usize;
+    p.feed(
+        "burst",
+        src,
+        (0..burst_frames)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * (i as f32 / SR)).sin())
+            .chain(std::iter::repeat(0.0)),
+    );
+    let burst = p.run(8, &[probe::Tap::Node(fx), probe::Tap::MasterL]);
+    let tail = p.run(40, &[probe::Tap::Node(fx), probe::Tap::MasterL]);
+
+    let rms = |xs: &[f32]| -> f32 {
+        if xs.is_empty() {
+            return 0.0;
+        }
+        (xs.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>() / xs.len() as f64).sqrt() as f32
+    };
+    let dry = &burst.feeds[0].1;
+    // Tap::Node is L + R; scale by 0.5 to compare against the per-channel dry signal.
+    let wet: Vec<f32> = burst.taps[0].1.iter().map(|s| 0.5 * *s).collect();
+    let tail_l: Vec<f32> = tail.taps[0].1.iter().map(|s| 0.5 * *s).collect();
+    let burst_peak = analysis::peak(&wet);
+    let tail_rms = rms(&tail_l);
+    let diff_rms = rms(
+        &dry.iter().zip(wet.iter()).map(|(a, b)| a - b).collect::<Vec<f32>>(),
+    );
+    println!(
+        "clap effect ({plugin_id}): burst peak {burst_peak:.3}, diff vs dry rms {diff_rms:.4}, reverb tail rms {tail_rms:.4}"
+    );
+    anyhow::ensure!(burst_peak > 0.01, "CLAP effect output was silent (peak {burst_peak})");
+    anyhow::ensure!(
+        diff_rms > 0.01 || tail_rms > 1e-4,
+        "CLAP effect did not alter the audio (diff_rms {diff_rms}, tail_rms {tail_rms})"
+    );
+    let mut samples = burst.master;
+    samples.extend_from_slice(&tail.master);
+    clips.push(Clip {
+        file: "clap-effect-burst",
+        listen: "a short 440 Hz tone burst through a hosted CLAP effect with an audible reverb tail",
+        samples,
+    });
+    if let Some(slot) = std::mem::take(&mut p.engine.voices).into_iter().next() {
+        main.retire(slot.into_voice());
+    }
+    Ok(())
+}
+
 /// Write each clip as WAV, named with what to listen for, and read it back
 /// with the app's own reader (rule 54).
 fn save(dir: &Path, clips: &[Clip]) -> anyhow::Result<()> {
@@ -277,6 +378,7 @@ pub fn run(save_dir: Option<&Path>) -> anyhow::Result<()> {
     routing()?;
     compensation(&mut clips)?;
     surge(&mut clips)?;
+    clap_effect(&mut clips)?;
     println!("by ear:");
     for c in &clips {
         println!("  listen for: {} ({})", c.listen, c.file);

@@ -2492,18 +2492,35 @@ impl GraphEngine {
     /// The next effect to run: the first not-yet-run one whose wired effect
     /// inputs have all run; in a feedback loop, the first not-yet-run one.
     /// Allocation-free (linear scans over a handful of nodes).
-    fn next_effect(&self, n_dsp: usize, n_fx: usize) -> Option<usize> {
-        let node = |f: usize| if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
+    fn next_effect(&self, n_fx: usize) -> Option<usize> {
         let mut first = None;
         for f in 0..n_fx {
             if self.fx_done[f] { continue; }
             first.get_or_insert(f);
+            let node_f = self.fx_node(f);
             let waits = (0..n_fx).any(|g| {
-                g != f && !self.fx_done[g] && self.graph.has_route(node(g), node(f), PortKind::Audio)
+                g != f && !self.fx_done[g] && self.graph.has_route(self.fx_node(g), node_f, PortKind::Audio)
             });
             if !waits { return Some(f); }
         }
         first
+    }
+
+    /// Whether `self.voices[i]` runs in the effect stage (#181): its CLAP
+    /// descriptor is an audio effect (or utility), or an audio cable feeds
+    /// its node.
+    fn voice_is_effect(&self, i: usize) -> bool {
+        let Some(v) = self.voices.get(i) else { return false };
+        v.node != NodeId::MAX
+            && (v.voice.is_effect()
+                || self.graph.edges.iter().any(|e| {
+                    e.kind == PortKind::Audio && e.to.node == v.node && e.from.node != v.node
+                }))
+    }
+
+    /// Total effect slots across built-in DSP, LV2 and hosted CLAP voices.
+    fn fx_count(&self) -> usize {
+        self.dsp.len() + self.lv2.len() + self.voices.len()
     }
 
     /// Mark the effects that sit in a bus's insert chain (`fx_after_bus`,
@@ -2511,8 +2528,7 @@ impl GraphEngine {
     /// rig sums, because a rig's send only exists then. Returns whether the
     /// graph has a bus at all. Allocation-free (the table is reserved).
     fn mark_after_bus(&mut self) -> bool {
-        let n_dsp = self.dsp.len();
-        let n_fx = n_dsp + self.lv2.len();
+        let n_fx = self.fx_count();
         self.fx_after_bus.clear();
         self.fx_after_bus.extend(std::iter::repeat(false).take(n_fx));
         if !self.dsp.iter().any(|d| d.kind == DspKind::Bus) { return false; }
@@ -2521,9 +2537,12 @@ impl GraphEngine {
             for f in 0..n_fx {
                 if self.fx_after_bus[f] || self.fx_is_bus(f) { continue; }
                 let to = self.fx_node(f);
+                if to == NodeId::MAX { continue; }
                 let fed = (0..n_fx).any(|g| {
-                    g != f && (self.fx_after_bus[g] || self.fx_is_bus(g))
-                        && self.graph.has_route(self.fx_node(g), to, PortKind::Audio)
+                    let from = self.fx_node(g);
+                    g != f && from != NodeId::MAX
+                        && (self.fx_after_bus[g] || self.fx_is_bus(g))
+                        && self.graph.has_route(from, to, PortKind::Audio)
                 });
                 if fed {
                     self.fx_after_bus[f] = true;
@@ -2541,11 +2560,12 @@ impl GraphEngine {
     fn master_inserts(&self) -> ([usize; MAX_MASTER_INSERTS], usize) {
         let mut chain = [usize::MAX; MAX_MASTER_INSERTS];
         let mut n = 0usize;
-        let n_fx = self.dsp.len() + self.lv2.len();
+        let n_fx = self.fx_count();
         while n < MAX_MASTER_INSERTS {
             let next = (0..n_fx).find(|f| {
                 let node = self.fx_node(*f);
-                !chain[..n].contains(f)
+                node != NodeId::MAX
+                    && !chain[..n].contains(f)
                     && if n == 0 {
                         self.graph.nodes.iter().any(|m| {
                             matches!(m.kind, NodeKind::MasterOut) && self.graph.has_route(m.id, node, PortKind::Audio)
@@ -2561,9 +2581,17 @@ impl GraphEngine {
         (chain, n)
     }
 
-    /// Node of effect `f` (DSP slots first, then LV2 slots).
+    /// Node of effect `f` (DSP slots first, then LV2 slots, then CLAP voices).
     fn fx_node(&self, f: usize) -> NodeId {
-        if f < self.dsp.len() { self.dsp[f].node } else { self.lv2[f - self.dsp.len()].node }
+        let n_dsp = self.dsp.len();
+        let n_lv2 = self.lv2.len();
+        if f < n_dsp {
+            self.dsp[f].node
+        } else if f < n_dsp + n_lv2 {
+            self.lv2[f - n_dsp].node
+        } else {
+            self.voices[f - n_dsp - n_lv2].node
+        }
     }
 
     fn fx_is_bus(&self, f: usize) -> bool {
@@ -2576,17 +2604,18 @@ impl GraphEngine {
             && (0..self.fx_after_bus.len()).any(|f| self.fx_after_bus[f] && self.fx_node(f) == node)
     }
 
-    /// Run every effect `fx_done` leaves open — built-in DSP and LV2 alike —
-    /// in signal-flow order, each summing EVERY audio source wired into it:
-    /// instruments (CLAP and LV2), audio inputs, metronomes, buses and other
-    /// effects. A feedback loop reads the previous block's output of the
-    /// effect not yet run. `taps` = the send taps of this pass (None for a
-    /// bus's own chain, which cannot send).
+    /// Run every effect `fx_done` leaves open — built-in DSP, LV2 and CLAP
+    /// audio effects alike — in signal-flow order, each summing EVERY audio
+    /// source wired into it: instruments (CLAP and LV2), audio inputs,
+    /// metronomes, buses and other effects. A feedback loop reads the
+    /// previous block's output of the effect not yet run. `taps` = the send
+    /// taps of this pass (None for a bus's own chain, which cannot send).
     fn run_effects(&mut self, bus: &mut [f32], frames: usize, solo_rigs: &[bool; 8], mut taps: Option<&mut BusTaps>) {
         let n2 = frames * 2;
         let n_dsp = self.dsp.len();
-        let n_fx = n_dsp + self.lv2.len();
-        while let Some(f) = self.next_effect(n_dsp, n_fx) {
+        let n_lv2 = self.lv2.len();
+        let n_fx = n_dsp + n_lv2 + self.voices.len();
+        while let Some(f) = self.next_effect(n_fx) {
             let node_t0 = std::time::Instant::now();
             self.fx_done[f] = true;
             let node = self.fx_node(f);
@@ -2600,7 +2629,7 @@ impl GraphEngine {
                 if !bypassed {
                     d.proc.process(&mut d.buf[..n2], frames);
                 }
-            } else {
+            } else if f < n_dsp + n_lv2 {
                 let slot = &mut self.lv2[f - n_dsp];
                 if bypassed {
                     slot.buf[..n2].copy_from_slice(&bus[..n2]);
@@ -2613,11 +2642,29 @@ impl GraphEngine {
                         self.latency_dirty = true;
                     }
                 }
+            } else {
+                let slot = &mut self.voices[f - n_dsp - n_lv2];
+                if bypassed {
+                    slot.scratch[..n2].copy_from_slice(&bus[..n2]);
+                } else {
+                    slot.voice.process(&bus[..n2], &mut slot.scratch[..n2], self.transport);
+                    let latency = slot.voice.latency();
+                    if latency != slot.latency {
+                        slot.latency = latency;
+                        self.latency_dirty = true;
+                    }
+                }
             }
             // A bypassed unit with a lookahead still delays by it, so the
             // paths it meets stay in phase.
-            let source = f >= n_dsp && self.lv2[f - n_dsp].plugin.is_instrument();
-            let buf = if f < n_dsp { &mut self.dsp[f].buf } else { &mut self.lv2[f - n_dsp].buf };
+            let source = f >= n_dsp && f < n_dsp + n_lv2 && self.lv2[f - n_dsp].plugin.is_instrument();
+            let buf = if f < n_dsp {
+                &mut self.dsp[f].buf
+            } else if f < n_dsp + n_lv2 {
+                &mut self.lv2[f - n_dsp].buf
+            } else {
+                &mut self.voices[f - n_dsp - n_lv2].scratch
+            };
             self.pdc.bypass(node, &bus[..n2], &mut buf[..n2], bypassed);
             // Another source's solo silences sources, never effects: it took
             // the soloed source's own chain with it. An LV2 instrument is a
@@ -2671,6 +2718,7 @@ impl GraphEngine {
     pub fn node_out(&self, node: NodeId) -> Option<&[f32]> {
         self.dsp.iter().find(|d| d.node == node).map(|d| d.buf.as_slice())
             .or_else(|| self.lv2.iter().find(|l| l.node == node).map(|l| l.buf.as_slice()))
+            .or_else(|| self.voices.iter().find(|v| v.node == node).map(|v| v.scratch.as_slice()))
     }
 
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
@@ -4710,9 +4758,13 @@ impl GraphEngine {
         // 1. Every instrument renders and applies its level.
         self.node_timer.begin_block();
         let mut node_t0 = std::time::Instant::now();
-        for s in &mut self.voices {
-            // A free voice (no Clap node bound): skip the plugin entirely.
-            if s.node == NodeId::MAX { continue; }
+        for i in 0..self.voices.len() {
+            // A free voice (no Clap node bound) or a CLAP audio effect (runs
+            // in step 2b / bus chain / master insert): skip here.
+            if self.voices[i].node == NodeId::MAX || self.voice_is_effect(i) {
+                continue;
+            }
+            let s = &mut self.voices[i];
             s.voice.render(&mut s.scratch[..n2], self.transport);
             let latency = s.voice.latency();
             if latency != s.latency {
@@ -4867,12 +4919,14 @@ impl GraphEngine {
         // for the mix: run here too, on the silence a MasterOut is as a
         // source, a Delay or Limiter advanced its state twice a block (#154).
         let mut bus = std::mem::take(&mut self.lv2_in);
-        let n_dsp = self.dsp.len();
+        let (n_dsp, n_lv2) = (self.dsp.len(), self.lv2.len());
         let (inserts, n_ins) = self.master_inserts();
         self.fx_done.clear();
-        for f in 0..n_dsp + self.lv2.len() {
+        for f in 0..self.fx_count() {
             let later = self.fx_is_bus(f) || self.fx_after_bus[f] || inserts[..n_ins].contains(&f);
-            self.fx_done.push(later || (f < n_dsp && self.dsp[f].kind == DspKind::Metronome));
+            let skip = (f < n_dsp && self.dsp[f].kind == DspKind::Metronome)
+                || (f >= n_dsp + n_lv2 && !self.voice_is_effect(f - n_dsp - n_lv2));
+            self.fx_done.push(later || skip);
         }
         self.run_effects(&mut bus, frames, &solo_rigs, Some(&mut taps));
         self.lv2_in = bus;
@@ -4930,7 +4984,7 @@ impl GraphEngine {
             }
             // A soloed bus leaves only the returns in the mix.
             let bus_solo = has_bus && self.strips.iter().any(|(n, m)| m.solo && self.graph.is_bus(*n));
-            let n_dsp = self.dsp.len();
+            let (n_dsp, n_lv2) = (self.dsp.len(), self.lv2.len());
             let acc = &mut acc_v[..n2];
             for x in acc.iter_mut() {
                 *x = 0.0;
@@ -4953,8 +5007,8 @@ impl GraphEngine {
                     // master except the buses and their chains (the returns),
                     // each through its compensation delay when the plan has
                     // one.
-                    for v in &self.voices {
-                        if v.node != NodeId::MAX {
+                    for (i, v) in self.voices.iter().enumerate() {
+                        if v.node != NodeId::MAX && !self.fx_after_bus[n_dsp + n_lv2 + i] {
                             add_routed(&self.graph, &mut self.pdc, v.node, master, &v.scratch[..n2], rig_buf);
                         }
                     }
@@ -5050,6 +5104,15 @@ impl GraphEngine {
                             add_routed(&self.graph, &mut self.pdc, slot.node, master, &slot.buf[..n2], dest);
                         }
                     }
+                    for (i, v) in self.voices.iter().enumerate() {
+                        if v.node != NodeId::MAX && self.fx_after_bus[n_dsp + n_lv2 + i] {
+                            let dest = match if routed { self.return_slot(n_dsp + n_lv2 + i) } else { None } {
+                                Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
+                                None => &mut acc[..],
+                            };
+                            add_routed(&self.graph, &mut self.pdc, v.node, master, &v.scratch[..n2], dest);
+                        }
+                    }
                 }
             }
             // Audio In monitoring: a monitor-ON node is added dry (post-gain) to
@@ -5108,13 +5171,26 @@ impl GraphEngine {
                         d.proc.process(&mut d.buf[..n2], frames);
                         acc.copy_from_slice(&d.buf[..n2]);
                     }
-                } else {
+                } else if f < n_dsp + n_lv2 {
                     let slot = &mut self.lv2[f - n_dsp];
                     if bypassed {
                         slot.buf[..n2].copy_from_slice(&acc[..n2]);
                     } else {
                         slot.plugin.process(&acc[..n2], &mut slot.buf[..n2], frames);
                         acc.copy_from_slice(&slot.buf[..n2]);
+                    }
+                } else {
+                    let slot = &mut self.voices[f - n_dsp - n_lv2];
+                    if bypassed {
+                        slot.scratch[..n2].copy_from_slice(&acc[..n2]);
+                    } else {
+                        slot.voice.process(&acc[..n2], &mut slot.scratch[..n2], self.transport);
+                        let latency = slot.voice.latency();
+                        if latency != slot.latency {
+                            slot.latency = latency;
+                            self.latency_dirty = true;
+                        }
+                        acc.copy_from_slice(&slot.scratch[..n2]);
                     }
                 }
                 self.node_timer.record(node, node_t0.elapsed());
@@ -10240,5 +10316,65 @@ mod send_tests {
         assert!(r.render(400) > 0.05, "the master plays on");
         let (n, _) = drain(&taps, 0);
         assert!(n > 0 && n % (N * 2) == 0, "whole blocks only: {n}");
+    }
+
+    #[test]
+    fn a_clap_effect_runs_in_a_rig_chain_an_aux_bus_and_as_a_master_insert() {
+        use crate::control::{AudioInChannel, ClapId, PortKind, PortRef};
+        let plugin_id = ClapId::new("org.kabelsalat.test-probe#fx");
+        let (fx_rig_v, fx_rig_m, fx_rig_p) = crate::host::probe::host_probe_effect(&[(2, true)], 2);
+        let (fx_bus_v, fx_bus_m, fx_bus_p) = crate::host::probe::host_probe_effect(&[(2, true)], 2);
+        let (fx_mst_v, fx_mst_m, fx_mst_p) = crate::host::probe::host_probe_effect(&[(2, true)], 2);
+        fx_rig_v.controller().set_param(clack_host::utils::ClapId::new(0), 0.5);
+        fx_bus_v.controller().set_param(clack_host::utils::ClapId::new(0), 0.25);
+        fx_mst_v.controller().set_param(clack_host::utils::ClapId::new(0), 0.5);
+
+        let mut g = Graph::default();
+        let src = g.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes("IN"));
+        let fx_rig = g.add_node(NodeKind::Clap { plugin_id }, name_bytes("FX RIG"));
+        let aux = g.add_node(NodeKind::Dsp(DspKind::Bus), name_bytes("BUS A"));
+        let fx_bus = g.add_node(NodeKind::Clap { plugin_id }, name_bytes("FX BUS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let fx_mst = g.add_node(NodeKind::Clap { plugin_id }, name_bytes("FX MST"));
+
+        // IN -> FX_RIG -> MASTER
+        g.connect_with_id(1, PortRef { node: src, port: 0 }, PortRef { node: fx_rig, port: 0 }, PortKind::Audio);
+        probe::wire(&mut g, 2, fx_rig, master, 0);
+        probe::wire(&mut g, 3, fx_rig, master, 1);
+        // BUS A -> FX_BUS -> MASTER
+        g.connect_with_id(4, PortRef { node: aux, port: 0 }, PortRef { node: fx_bus, port: 0 }, PortKind::Audio);
+        probe::wire(&mut g, 5, fx_bus, master, 0);
+        probe::wire(&mut g, 6, fx_bus, master, 1);
+        // MASTER -> FX_MST (master insert)
+        g.connect_with_id(7, PortRef { node: master, port: 0 }, PortRef { node: fx_mst, port: 0 }, PortKind::Audio);
+
+        let mut p = probe::Probe::with_voices(
+            g,
+            vec![(fx_rig, fx_rig_v), (fx_bus, fx_bus_v), (fx_mst, fx_mst_v)],
+        );
+        p.send(Command::SetSend { from: SendSource::Node(src), bus: aux, level: Some(1.0), pre: Some(false) });
+        p.feed(
+            "sine",
+            src,
+            (0usize..).map(|i| 0.4 * (2.0 * std::f32::consts::PI * 220.0 * (i as f32 / probe::SR)).sin()),
+        );
+        p.settle(8);
+        let before = fx_mst_p.blocks.load(Ordering::SeqCst);
+        let run = p.run(4, &[probe::Tap::Node(fx_rig), probe::Tap::Node(fx_bus), probe::Tap::Node(fx_mst)]);
+        // Master insert runs once per block, not twice (rule 179).
+        assert_eq!(fx_mst_p.blocks.load(Ordering::SeqCst) - before, 4);
+        assert!(fx_rig_p.blocks.load(Ordering::SeqCst) >= 12 && fx_bus_p.blocks.load(Ordering::SeqCst) >= 12);
+        // Tap::Node sums L + R, so halve for the per-channel peak.
+        let peak_rig = 0.5 * crate::analysis::peak(&run.taps[0].1);
+        let peak_bus = 0.5 * crate::analysis::peak(&run.taps[1].1);
+        let peak_mst = 0.5 * crate::analysis::peak(&run.taps[2].1);
+        assert!((peak_rig - 0.2).abs() < 0.02, "rig CLAP effect scaled 0.4 by 0.5 -> {peak_rig}");
+        assert!((peak_bus - 0.1).abs() < 0.02, "bus CLAP effect scaled 0.4 by 0.25 -> {peak_bus}");
+        assert!((peak_mst - 0.15).abs() < 0.02, "master CLAP insert scaled (0.2 + 0.1) by 0.5 -> {peak_mst}");
+
+        let [v0, v1, v2]: [VoiceSlot; 3] = std::mem::take(&mut p.engine.voices).try_into().ok().expect("3 voices");
+        fx_rig_m.retire(v0.into_voice());
+        fx_bus_m.retire(v1.into_voice());
+        fx_mst_m.retire(v2.into_voice());
     }
 }

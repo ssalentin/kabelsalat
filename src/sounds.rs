@@ -32,6 +32,9 @@ impl Instrument {
         match kind {
             NodeKind::Clap { plugin_id } => {
                 let id = plugin_id.as_str();
+                if crate::plugins::clap_id_is_effect(id, &[]) {
+                    return None;
+                }
                 // Graphs written before plugin ids name Surge by its label.
                 Some(Instrument::Clap(if id.is_empty() || id == "Surge XT" { SURGE_ID.to_string() } else { id.to_string() }))
             }
@@ -746,7 +749,7 @@ mod tests {
 
     #[test]
     fn a_node_names_its_instrument() {
-        use crate::control::{name_bytes, Lv2Uri};
+        use crate::control::Lv2Uri;
         assert_eq!(Instrument::of(&NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.yanes.native") }), Some(Instrument::Clap("org.yanes.native".into())));
         assert_eq!(Instrument::of(&NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }), Some(Instrument::Clap(SURGE_ID.into())));
         assert_eq!(Instrument::of(&NodeKind::Lv2 { uri: Lv2Uri::new("urn:distrho:vitalium") }), Some(Instrument::Lv2("urn:distrho:vitalium".into())));

@@ -68,8 +68,12 @@ pub struct Probe {
 
 impl Probe {
     pub fn new(graph: Graph) -> Self {
+        Self::with_voices(graph, vec![])
+    }
+
+    pub fn with_voices(graph: Graph, voices: Vec<(NodeId, crate::host::ClapVoice)>) -> Self {
         let (bus, drain) = command_bus();
-        let mut engine = GraphEngine::new(graph, drain, SR as f64, vec![]);
+        let mut engine = GraphEngine::new(graph, drain, SR as f64, voices);
         let (side, side_rx) = rtrb::RingBuffer::new(16);
         engine.set_audio_in_channel(side_rx);
         Self { engine, bus, side, feeds: Vec::new(), block: crate::bridge::BUFFER_FRAMES as usize }

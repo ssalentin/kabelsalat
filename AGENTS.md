@@ -1300,6 +1300,18 @@ Learned so far (2026-11-15, UI polish pass):
     plugin (`src/host/probe.rs`), which records the thread of every call
     (`cargo test --bin kabelsalat host_request`), and
     `kabelsalat state-race-test` prints what real Surge was served.
+182. **A CLAP audio input buffer is handed to clack as `InputChannel::variable`,
+    never `constant`, and an effect voice runs in `run_effects`, not the
+    instrument pass:** `InputChannels::from_constant` sets CLAP's
+    `constant_mask`, telling the plugin to read only sample 0 of each buffer;
+    `in_port!` wraps each preallocated input channel with
+    `InputChannel::variable`, feeds stereo (or mono `L`, rule 173) into the
+    main input port and silence into any sidechain ports, and centers a mono
+    main output to L and R (#181). In `GraphEngine`, a `NodeKind::Clap` node
+    fed by an audio cable is an effect in `run_effects` / aux-bus chains /
+    `master_inserts` (skipped by step 1's instrument loop so its state never
+    advances twice, rule 179). Check with `kabelsalat analysis-test` and
+    `cargo test --bin kabelsalat a_clap_effect`.
 
 ## Working on kabelsalat
 

@@ -436,10 +436,39 @@ pub fn classify_clap(p: &ClapPluginInfo) -> PluginSubtype {
     PluginSubtype::Synth
 }
 
-/// Can kabelsalat host this CLAP plugin? Only CLAP instruments run today
-/// (`ClapVoice`); CLAP audio and note effects are listed but not hosted.
-pub fn clap_hostable(p: &ClapPluginInfo) -> bool {
+/// Is this CLAP plugin an instrument (synth, organ, sampler, drum machine)?
+pub fn clap_is_instrument(p: &ClapPluginInfo) -> bool {
     classify_clap(p).plugin_type() == PluginType::Instrument
+}
+
+/// Can this CLAP plugin go into an audio insert slot (channel, bus or master)?
+/// Audio effects and audio utilities can; instruments and MIDI-only units
+/// cannot.
+pub fn clap_is_audio_insert(p: &ClapPluginInfo) -> bool {
+    matches!(classify_clap(p).plugin_type(), PluginType::Effect | PluginType::Utility)
+}
+
+/// Can kabelsalat host this CLAP plugin? CLAP instruments and audio effects
+/// (including audio utilities/analyzers) run in `ClapVoice`; CLAP note
+/// effects are listed but not hosted yet.
+pub fn clap_hostable(p: &ClapPluginInfo) -> bool {
+    clap_is_instrument(p) || clap_is_audio_insert(p)
+}
+
+/// Is `id` a CLAP audio effect (or utility) rather than an instrument?
+/// Uses the scanned descriptor when available, and recognizes the known
+/// effect plugin IDs before a scan has run.
+pub fn clap_id_is_effect(id: &str, scanned: &[ClapPluginInfo]) -> bool {
+    if let Some(p) = scanned.iter().find(|p| p.id == id) {
+        return clap_is_audio_insert(p);
+    }
+    let low = id.to_ascii_lowercase();
+    low == "org.surge-synth-team.surge-xt-fx"
+        || low.starts_with("michaelwillis.dragonfly.")
+        || low == "com.airwindows.consolidated"
+        || low.starts_with("com.chowdsp.")
+        || low.ends_with("#fx")
+        || (low.starts_with("in.lsp-plug.") && !low.contains("multisampler"))
 }
 
 /// The subcategory of a scanned LV2 plugin: the scan's `is_instrument` /
@@ -941,15 +970,19 @@ mod tests {
             &["audio-effect", "filter", "delay", "reverb", "multi-effects"],
         );
         assert_eq!(classify_clap(&surge_fx), PluginSubtype::MultiFx);
-        assert!(!clap_hostable(&surge_fx));
+        assert!(clap_hostable(&surge_fx));
+        assert!(!clap_is_instrument(&surge_fx));
+        assert!(clap_is_audio_insert(&surge_fx));
 
         let arp = clap("org.example.arp", "BlueArp", &["note-effect"]);
         assert_eq!(classify_clap(&arp), PluginSubtype::Arpeggiator);
         assert!(!clap_hostable(&arp));
+        assert!(!clap_is_audio_insert(&arp));
 
         let scope = clap("org.example.scope", "Oscilloscope", &["analyzer"]);
         assert_eq!(classify_clap(&scope), PluginSubtype::Analyzer);
-        assert!(!clap_hostable(&scope));
+        assert!(clap_hostable(&scope));
+        assert!(clap_is_audio_insert(&scope));
     }
 
     #[test]

@@ -312,9 +312,20 @@ impl VoiceController {
     }
 }
 
-// Named fn (not a closure) so the lifetime elision ties input and output.
+// Named fns (not closures) so the lifetime elision ties input and output.
 fn as_mut_slice_f32(b: &mut Vec<f32>) -> &mut [f32] {
     b.as_mut_slice()
+}
+fn as_variable_input_f32(b: &mut Vec<f32>) -> InputChannel<'_, f32> {
+    InputChannel::variable(b.as_mut_slice())
+}
+macro_rules! in_port {
+    ($p:ident) => {
+        AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_input_only($p.iter_mut().map(as_variable_input_f32)),
+        }
+    };
 }
 macro_rules! out_port {
     ($p:ident) => {
@@ -395,9 +406,11 @@ struct Live {
     processor: PluginAudioProcessor<TestHost>,
     /// Sorted `(id, min, max)`, read once per activation for lock-free CC scaling.
     param_ranges: Vec<(u32, f64, f64)>,
-    in_count: usize,
+    main_in: Option<usize>,
     main_out: usize,
-    in_bufs: Vec<Vec<f32>>,
+    /// One buffer set per input port: `main_in` receives the unit's audio
+    /// input when the plugin runs as an effect; sidechain ports receive silence.
+    in_bufs: Vec<Vec<Vec<f32>>>,
     /// One buffer set per output port; only `main_out` is heard. Drum
     /// machines (OneTrick CRYPTID: 12 ports) put each drum on its own port
     /// and the mix on the main one.
@@ -410,7 +423,7 @@ impl Live {
     /// Activate the inactive `plugin` for `sample_rate` and size everything
     /// to the ports and parameters it declares now. Main thread.
     fn activate(plugin: &mut PluginInstance<TestHost>, exts: Exts, sample_rate: f64) -> Result<Box<Live>> {
-        let (in_count, in_ch, out_chs, main_out) = inspect_audio_ports(plugin, exts.audio_ports)?;
+        let (in_chs, main_in, out_chs, main_out) = inspect_audio_ports(plugin, exts.audio_ports)?;
         let audio_config = PluginAudioConfiguration {
             sample_rate,
             min_frames_count: 1,
@@ -433,11 +446,11 @@ impl Live {
         Ok(Box::new(Live {
             processor: stopped.into(),
             param_ranges,
-            in_count,
+            main_in,
             main_out,
-            in_bufs: (0..in_ch.max(1)).map(|_| vec![0.0; BLOCK]).collect(),
+            in_bufs: in_chs.iter().map(|&chs| (0..chs).map(|_| vec![0.0; BLOCK]).collect()).collect(),
             out_bufs: out_chs.iter().map(|&chs| (0..chs).map(|_| vec![0.0; BLOCK]).collect()).collect(),
-            in_ports: AudioPorts::with_capacity(in_ch.max(1), 1),
+            in_ports: AudioPorts::with_capacity(in_chs.iter().sum(), in_chs.len()),
             out_ports: AudioPorts::with_capacity(out_chs.iter().sum(), out_chs.len()),
         }))
     }
@@ -501,6 +514,9 @@ pub struct Served {
 pub struct ClapVoice {
     voice_id: u64,
     plugin_id: String,
+    /// True when the plugin declared itself an audio effect (or utility), not
+    /// an instrument (`crate::plugins::clap_is_audio_insert`).
+    is_effect: bool,
     /// None while a restart has the set on the main thread: silence.
     live: Option<Box<Live>>,
     link: AudioLink,
@@ -523,10 +539,33 @@ pub struct ClapVoice {
     latency: Arc<std::sync::atomic::AtomicU32>,
 }
 
+fn entry_is_effect(entry: &PluginEntry, id_str: &str) -> bool {
+    let Some(factory) = entry.get_plugin_factory() else { return false };
+    for d in factory.plugin_descriptors() {
+        let id = d.id().unwrap_or(c"").to_string_lossy();
+        if id == id_str {
+            let info = ClapPluginInfo {
+                id: id.into_owned(),
+                name: d.name().unwrap_or(c"").to_string_lossy().into_owned(),
+                vendor: d.vendor().unwrap_or(c"").to_string_lossy().into_owned(),
+                features: d.features().map(|f| f.to_string_lossy().into_owned()).collect(),
+            };
+            return crate::plugins::clap_is_audio_insert(&info);
+        }
+    }
+    false
+}
+
 impl ClapVoice {
     /// The plugin's reported latency, in frames. Allocation- and lock-free.
     pub fn latency(&self) -> u32 {
         self.latency.load(Ordering::Relaxed)
+    }
+
+    /// Whether this voice hosts a CLAP audio effect (or utility) rather than
+    /// an instrument. Allocation- and lock-free.
+    pub fn is_effect(&self) -> bool {
+        self.is_effect
     }
 
     /// Load Surge XT from the CLAP search paths, instantiate, activate and start
@@ -634,9 +673,11 @@ impl ClapVoice {
 
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
         let gate = Arc::new(StateGate::default());
+        let is_effect = entry_is_effect(&entry, &id_str);
         let voice = ClapVoice {
             voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             plugin_id: id_str.clone(),
+            is_effect,
             live: Some(live),
             link: audio_link,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
@@ -763,13 +804,30 @@ impl ClapVoice {
         let mut done = 0usize;
         while done < frames {
             let n = (frames - done).min(BLOCK);
-            self.render_block(n, &mut out[done * 2..(done + n) * 2], &transport);
+            self.render_block(n, None, &mut out[done * 2..(done + n) * 2], &transport);
             transport.advance(n, self.sample_rate);
             done += n;
         }
     }
 
-    fn render_block(&mut self, n: usize, out: &mut [f32], transport: &Transport) {
+    /// Process `out.len() / 2` stereo-interleaved frames of `inp` into `out`
+    /// with the host `transport` as of the first frame (#181). Feeds `inp` to
+    /// the plugin's main input port (L and R for stereo, L for mono) and
+    /// silence to any sidechain ports; centers a mono main output to L and R.
+    /// RT-safe: no allocation, no locks, no syscalls. Audio thread only.
+    pub fn process(&mut self, inp: &[f32], out: &mut [f32], mut transport: Transport) {
+        let frames = (out.len() / 2).min(inp.len() / 2);
+        let mut done = 0usize;
+        while done < frames {
+            let n = (frames - done).min(BLOCK);
+            let range = done * 2..(done + n) * 2;
+            self.render_block(n, Some(&inp[range.clone()]), &mut out[range], &transport);
+            transport.advance(n, self.sample_rate);
+            done += n;
+        }
+    }
+
+    fn render_block(&mut self, n: usize, inp: Option<&[f32]>, out: &mut [f32], transport: &Transport) {
         self.hand_over();
         // No set (a restart has it) or a plugin that will not start: silence.
         // The commands wait in their queues for the block that renders.
@@ -777,7 +835,7 @@ impl ClapVoice {
             out[..n * 2].fill(0.0);
             return;
         };
-        let Live { processor, param_ranges, in_count, main_out, in_bufs, out_bufs, in_ports, out_ports } = live;
+        let Live { processor, param_ranges, main_in, main_out, in_bufs, out_bufs, in_ports, out_ports } = live;
         let Ok(processor) = processor.ensure_processing_started() else {
             self.process_errors += 1;
             out[..n * 2].fill(0.0);
@@ -815,20 +873,36 @@ impl ClapVoice {
             self.sched_idx += 1;
         }
 
-        let in_port = AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_input_only(
-                in_bufs.iter_mut().map(|b| InputChannel::constant(b.as_mut_slice())),
-            ),
-        };
-        let mut input = if *in_count == 1 {
-            in_ports.with_input_buffers([in_port])
-        } else {
-            // Zero input ports: same concrete type, empty iterator.
-            in_ports.with_input_buffers([in_port].into_iter().take(0))
-        };
-        // Port configs from an iterator (no heap alloc: `out_ports` holds
-        // room for every port and channel).
+        // Fill input ports: when `inp` is provided, the main input port takes
+        // L and R (or L for a mono input, rule 173); every other port
+        // (sidechains, instrument sidechains) receives silence.
+        let target_in = inp.is_some().then(|| main_in.unwrap_or(0)).filter(|&p| p < in_bufs.len());
+        for (port_idx, port_bufs) in in_bufs.iter_mut().enumerate() {
+            if Some(port_idx) == target_in {
+                let src = inp.unwrap();
+                let chs = port_bufs.len();
+                if chs >= 2 {
+                    for i in 0..n {
+                        port_bufs[0][i] = src[i * 2];
+                        port_bufs[1][i] = src[i * 2 + 1];
+                    }
+                    for ch in &mut port_bufs[2..] {
+                        ch[..n].fill(0.0);
+                    }
+                } else if chs == 1 {
+                    for i in 0..n {
+                        port_bufs[0][i] = src[i * 2];
+                    }
+                }
+            } else {
+                for ch in port_bufs.iter_mut() {
+                    ch[..n].fill(0.0);
+                }
+            }
+        }
+        // Port configs from an iterator (no heap alloc: `in_ports` and
+        // `out_ports` hold room for every port and channel).
+        let mut input = in_ports.with_input_buffers(in_bufs.iter_mut().map(|p| in_port!(p)));
         let mut output = out_ports.with_output_buffers(out_bufs.iter_mut().map(|p| out_port!(p)));
         // Buffers are BLOCK-sized; process exactly n frames.
         input.truncate(n as u32);
@@ -847,12 +921,24 @@ impl ClapVoice {
             self.process_errors += 1;
         }
 
-        // Mix the MAIN output port (stereo) into `out`; Scene A/B are rendered
-        // but unused. On process failure output silence.
+        // Copy the MAIN output port into `out` (stereo, or mono centered to
+        // L and R); auxiliary output ports are rendered but unused. On
+        // process failure output silence.
         let failed = status.is_err();
-        for i in 0..n {
-            out[i * 2] = if failed { 0.0 } else { out_bufs[*main_out][0][i] };
-            out[i * 2 + 1] = if failed { 0.0 } else { out_bufs[*main_out][1][i] };
+        let main_chs = &out_bufs[*main_out];
+        if failed || main_chs.is_empty() {
+            out[..n * 2].fill(0.0);
+        } else if main_chs.len() >= 2 {
+            for i in 0..n {
+                out[i * 2] = main_chs[0][i];
+                out[i * 2 + 1] = main_chs[1][i];
+            }
+        } else {
+            for i in 0..n {
+                let s = main_chs[0][i];
+                out[i * 2] = s;
+                out[i * 2 + 1] = s;
+            }
         }
         self.frame += n as u64;
     }
@@ -946,7 +1032,7 @@ fn push_cmd(ev_in: &mut EventBuffer, params: &[(u32, f64, f64)], time: u32, cmd:
 }
 
 #[cfg(test)]
-mod probe;
+pub(crate) mod probe;
 
 #[cfg(test)]
 mod host_request_tests {
@@ -1119,6 +1205,80 @@ mod host_request_tests {
             let calls = probe.sequence();
             assert_eq!(calls.iter().filter(|c| **c == "activate").count(), calls.iter().filter(|c| **c == "deactivate").count(), "stage {stage}: {calls:?}");
             assert_eq!(calls.last(), Some(&"destroy"), "stage {stage}");
+        }
+    }
+
+    #[test]
+    fn a_stereo_clap_effect_hears_left_and_right_apart_and_feeds_sidechain_silence() {
+        let (mut voice, main, probe) = super::probe::host_probe_effect(&[(2, true), (2, false)], 2);
+        assert!(voice.is_effect(), "audio-effect descriptor is marked as an effect");
+        let mut inp = [0.0f32; BLOCK * 2];
+        for i in 0..BLOCK {
+            inp[i * 2] = 0.8;
+            inp[i * 2 + 1] = -0.4;
+        }
+        let mut out = [0.0f32; BLOCK * 2];
+        voice.process(&inp, &mut out, Transport::default());
+        assert!((out[0] - 0.4).abs() < 1e-6, "left scaled by 0.5: {}", out[0]);
+        assert!((out[1] - -0.2).abs() < 1e-6, "right scaled by 0.5: {}", out[1]);
+        assert_eq!(probe.sidechain_peak(), 0.0, "sidechain input port is fed silence");
+        main.retire(voice);
+    }
+
+    #[test]
+    fn a_mono_in_mono_out_clap_effect_takes_left_and_centers_to_stereo() {
+        let (mut voice, main, _probe) = super::probe::host_probe_effect(&[(1, true)], 1);
+        assert!(voice.is_effect());
+        let mut inp = [0.0f32; BLOCK * 2];
+        for i in 0..BLOCK {
+            inp[i * 2] = 0.6;
+            inp[i * 2 + 1] = 0.0;
+        }
+        let mut out = [0.0f32; BLOCK * 2];
+        voice.process(&inp, &mut out, Transport::default());
+        assert!((out[0] - 0.3).abs() < 1e-6, "mono out centered to L: {}", out[0]);
+        assert!((out[1] - 0.3).abs() < 1e-6, "mono out centered to R: {}", out[1]);
+        main.retire(voice);
+    }
+
+    #[test]
+    fn real_clap_effects_stereo_mono_and_sidechain_pass_test_tone_when_installed() {
+        let cases = [
+            ("/var/lib/openbot/.cache/ksalat-clapfx/root/usr/lib/clap/DragonflyHallReverb.clap", "michaelwillis.dragonfly.hall"),
+            ("/var/lib/openbot/.cache/ksalat-issue29/root/usr/lib/clap/Surge XT Effects.clap", "org.surge-synth-team.surge-xt-fx"),
+            ("/var/lib/openbot/.cache/ksalat-clapfx/root/usr/lib/clap/lsp-plugins.clap", "in.lsp-plug.comp_delay_mono"),
+            ("/var/lib/openbot/.cache/ksalat-clapfx/root/usr/lib/clap/lsp-plugins.clap", "in.lsp-plug.sc_compressor_stereo"),
+        ];
+        for (bundle_path, id) in cases {
+            let p = std::path::Path::new(bundle_path);
+            if !p.exists() {
+                continue;
+            }
+            let (mut voice, main) = match ClapVoice::new_from_bundle(48_000.0, p, id) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("skip {id}: {e:#}");
+                    continue;
+                }
+            };
+            assert!(voice.is_effect(), "{id} should be marked as a CLAP effect");
+            let mut inp = [0.0f32; 512 * 2];
+            let mut out = [0.0f32; 512 * 2];
+            let mut peak = 0.0f32;
+            for b in 0..40 {
+                for i in 0..512 {
+                    let s = (2.0 * std::f32::consts::PI * 220.0 * ((b * 512 + i) as f32 / 48_000.0)).sin() * 0.5;
+                    inp[i * 2] = s;
+                    inp[i * 2 + 1] = s;
+                }
+                voice.process(&inp, &mut out, Transport::default());
+                if b > 10 {
+                    peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+                }
+            }
+            main.retire(voice);
+            println!("real CLAP effect {id}: test tone peak {peak:.3}");
+            assert!(peak >= 1e-3, "{id} output was silent (peak {peak})");
         }
     }
 }
@@ -2306,7 +2466,7 @@ pub fn run_preset_test() -> Result<()> {
     let (mut voice, mut main) = ClapVoice::new(sr)?;
     let ctl = voice.controller();
     // Zero-crossing rate + RMS of 0.4 s of note 60 — a cheap timbre fingerprint.
-    let mut measure = |voice: &mut ClapVoice| -> (f32, f32) {
+    let measure = |voice: &mut ClapVoice| -> (f32, f32) {
         let mut buf = vec![0.0f32; 512 * 2];
         for _ in 0..20 { voice.render(&mut buf, Transport::default()); } // settle
         ctl.note_on(60, 0.9);
@@ -3248,13 +3408,13 @@ fn inspect_params(plugin: &mut PluginInstance<TestHost>, params: Option<PluginPa
 fn inspect_audio_ports(
     plugin: &mut PluginInstance<TestHost>,
     ports: Option<PluginAudioPorts>,
-) -> Result<(usize, usize, Vec<usize>, usize)> {
+) -> Result<(Vec<usize>, Option<usize>, Vec<usize>, usize)> {
     let Some(ports) = ports else {
         println!("audio-ports: extension not supported; assuming stereo out, no in");
-        return Ok((0, 0, vec![2], 0));
+        return Ok((Vec::new(), None, vec![2], 0));
     };
-    let mut in_count = 0usize;
-    let mut in_ch = 0usize;
+    let mut in_chs: Vec<usize> = Vec::new();
+    let mut main_in: Option<usize> = None;
     let mut out_chs: Vec<usize> = Vec::new();
     let mut main_out: Option<usize> = None;
     let mut buf = AudioPortInfoBuffer::default();
@@ -3276,10 +3436,12 @@ fn inspect_audio_ports(
                     info.channel_count
                 );
                 if is_input {
-                    in_count += 1;
-                    in_ch = info.channel_count as usize;
+                    if is_main && main_in.is_none() {
+                        main_in = Some(in_chs.len());
+                    }
+                    in_chs.push(info.channel_count as usize);
                 } else {
-                    if is_main {
+                    if is_main && main_out.is_none() {
                         main_out = Some(out_chs.len());
                     }
                     out_chs.push(info.channel_count as usize);
@@ -3287,14 +3449,13 @@ fn inspect_audio_ports(
             }
         }
     }
-    if in_count > 1 {
-        bail!("P0 host supports at most 1 input port, Surge reports {in_count}");
+    let main_out = main_out
+        .or_else(|| (!out_chs.is_empty()).then_some(0))
+        .ok_or_else(|| anyhow!("plugin exposes no audio output port"))?;
+    if out_chs[main_out] == 0 {
+        bail!("main output port has 0 channels");
     }
-    let main_out = main_out.ok_or_else(|| anyhow!("Surge exposes no main output port"))?;
-    if out_chs[main_out] != 2 {
-        bail!("P0 host expects a stereo main output, got {} channels", out_chs[main_out]);
-    }
-    Ok((in_count, in_ch, out_chs, main_out))
+    Ok((in_chs, main_in, out_chs, main_out))
 }
 
 // ---------------------------------------------------------------------------

@@ -1342,6 +1342,19 @@ Learned so far (2026-11-15, UI polish pass):
     stamp their folders (`sounds::dirs_stamp`) before each scan and re-scan
     whenever the stamp changes, and `serve_ui_inbox` defers `SOUND_TOOLS`
     until the rescan finishes so the first bridge call sees the new patches.
+185. **A reused plugin instance starts as a new one does: its own state
+    reset and nothing sounding:** `take_parked` put a parked Vitalium's
+    control ports back to their defaults, but the JUCE wrapper pushes a port
+    only when its value changed, so the patch the last unit restored kept
+    playing (A3 read 440 Hz after a +12 patch), and a note whose note-off
+    never reached a `run()` droned in the next unit (peak 0.36 with no key
+    down). `a_restored_vital_patch_is_what_vitalium_plays` failed 4 of 20
+    parallel runs for it (#174), whenever another test had the instance
+    first. `Lv2Plugin::load` keeps the first instance's saved state
+    (`INIT_STATE`), and a reuse sends All Sound Off and All Notes Off and
+    restores it (`a_reused_vitalium_plays_the_init_patch_not_the_last_units`).
+    A test of a pooled instance takes every parked one, not the one it hopes
+    to get.
 
 ## Working on kabelsalat
 

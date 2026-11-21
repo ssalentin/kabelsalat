@@ -290,7 +290,10 @@ the dropouts (xruns) the sound card reported. Click it for **Engine info**:
 sample rate and buffer, inputs and outputs, late blocks and xruns, the
 latencies kabelsalat measures, and the render time of every instrument and
 effect, most expensive first, so you see which unit to swap when the load
-climbs. Adjust the audio **Buffer size** (64–2048 frames, default 256) live
+climbs. Press **F3** (or toggle **Rack CPU · F3** in Engine info) to paint a
+live CPU meter directly on every unit of the rack — front and back — with a
+hairline micro-bar and its share of the audio buffer budget (cream normal,
+amber above 15 %, red above 30 %). Adjust the audio **Buffer size** (64–2048 frames, default 256) live
 with **− / +** in Engine info or from **Settings → Audio** — smaller lowers latency,
 larger prevents xruns — and the choice is remembered across restarts. The
 assistant and MCP agents read and adjust the same engine settings

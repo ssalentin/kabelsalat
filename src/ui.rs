@@ -1900,6 +1900,52 @@ fn fmt_us(us: f64) -> String {
     if us < 10.0 { format!("{us:.1} µs") } else { format!("{us:.0} µs") }
 }
 
+/// Per-unit CPU overlay badge metrics (rack-local px, fixed monospace size
+/// so window resizes never grow the font atlas — rule 17).
+const CPU_BADGE_H: f32 = 19.0;
+const CPU_BADGE_PAD_X: f32 = 5.0;
+const CPU_BADGE_BAR_H: f32 = 2.0;
+const CPU_BADGE_FONT_SIZE: f32 = 10.0;
+
+struct CpuBadgeLayout {
+    rect: Rect,
+    /// `None` only on ultra-narrow units where even compact `%` would collide:
+    /// the hairline micro-bar still paints without overlapping any label.
+    text: Option<String>,
+    percent: Option<f64>,
+}
+
+/// Per-unit CPU meter colors `(bar_fill, border, text)` on dark plates:
+/// cream normal (`<= 15 %`), amber warm (`> 15 %`), tomato/red hot (`> 30 %`).
+fn cpu_overlay_colors(percent: f64) -> (Color32, Color32, Color32) {
+    use crate::engine_info::UnitLoadLevel;
+    match UnitLoadLevel::of(percent) {
+        UnitLoadLevel::Normal => (theme::CREAM, theme::HAIRLINE, theme::CREAM),
+        UnitLoadLevel::Warm => (theme::CABLE_AMBER, theme::CABLE_AMBER, theme::CABLE_AMBER),
+        UnitLoadLevel::Hot => (theme::CLIP_RED, theme::CLIP_RED, theme::CLIP_BRIGHT),
+    }
+}
+
+/// Compact render time for the per-unit rack CPU badge.
+fn fmt_cpu_us(us: f64) -> String {
+    if us < 10.0 {
+        format!("{us:.1}µs")
+    } else if us < 10_000.0 {
+        format!("{us:.0}µs")
+    } else {
+        format!("{:.1}ms", us / 1000.0)
+    }
+}
+
+/// Compact percentage for the per-unit rack CPU badge.
+fn fmt_cpu_pct(percent: f64) -> String {
+    if percent < 100.0 {
+        format!("{percent:.1}%")
+    } else {
+        format!("{percent:.0}%")
+    }
+}
+
 const ENGINE_INFO_ROW_H: f32 = 21.0;
 /// Right-aligned number columns of the node table (avg, max, share).
 const ENGINE_INFO_COLS: [f32; 3] = [66.0, 66.0, 52.0];
@@ -3707,6 +3753,8 @@ struct DemoApp {
     engine_stats: crate::engine_info::EngineStats,
     engine_stats_at: f32,
     engine_info_open: bool,
+    /// Per-unit live CPU meter overlay on rack units (F3, issue #302).
+    show_cpu_overlay: bool,
     engine_info_rect: Rect,
     dsp_chip_rect: Rect,
     /// Stands in for the audio callback's counters, which no test has.
@@ -4168,6 +4216,9 @@ impl DemoApp {
             engine_stats: Default::default(),
             engine_stats_at: f32::NEG_INFINITY,
             engine_info_open: false,
+            show_cpu_overlay: crate::assistant::load_config_value("ui_cpu_overlay")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             engine_info_rect: Rect::NOTHING,
             dsp_chip_rect: Rect::NOTHING,
             #[cfg(test)]
@@ -4704,6 +4755,7 @@ impl DemoApp {
                 (&["Ctrl", "S"], "save current session"),
                 (&[","], "settings"),
                 (&["I"], "MIDI + performance info"),
+                (&["F3"], "per-unit CPU meters on the rack"),
             ]),
         ];
         self.help_foot_g = Some(tracked("ESC OR ? TO CLOSE", 10.0, 0.14));
@@ -23668,6 +23720,7 @@ impl DemoApp {
         let mut load_tpl: Option<Template> = None;
         let mut load_demo = false;
         let mut load_multi = false;
+        let mut toggle_cpu_overlay = false;
         let mut rig_switch: Option<usize> = None;
         let mut rig_cycle: i8 = 0;
         let mut setlist_step: Option<&'static str> = None;
@@ -23705,6 +23758,8 @@ impl DemoApp {
             if i.consume_key(Modifiers::SHIFT, Key::PageDown) { setlist_step = Some("next_song"); }
             if i.consume_key(Modifiers::NONE, Key::PageUp) { setlist_step = Some("prev_part"); }
             if i.consume_key(Modifiers::NONE, Key::PageDown) { setlist_step = Some("next_part"); }
+            // Per-unit live CPU meter overlay on the rack (issue #302).
+            if i.consume_key(Modifiers::NONE, Key::F3) { toggle_cpu_overlay = true; }
             // Multi-rig demo (two independent rigs), F4.
             if i.consume_key(Modifiers::NONE, Key::F4) { load_multi = true; }
             // Starter templates on F5–F7 and Shift+F5–F7 (template_key),
@@ -23806,6 +23861,7 @@ impl DemoApp {
             self.notify_patch(&msg);
         }
         if toggle_play { self.toggle_play(); }
+        if toggle_cpu_overlay { self.set_cpu_overlay(!self.show_cpu_overlay); }
         if tap_tempo {
             self.ui_transport_grace = self.ui_time + 0.6;
             self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
@@ -26084,6 +26140,8 @@ impl DemoApp {
                 };
                 self.draw_agent_badge(painter, badge, agent_t);
             }
+
+            self.draw_cpu_badge(&label_painter, ui, Side::Front);
         }
         self.draw_fading_units(painter);
     }
@@ -26718,6 +26776,244 @@ impl DemoApp {
         self.engine_stats_at = f32::NEG_INFINITY;
     }
 
+    fn set_cpu_overlay(&mut self, on: bool) {
+        if self.show_cpu_overlay == on {
+            return;
+        }
+        self.show_cpu_overlay = on;
+        let _ = crate::assistant::save_config_value("ui_cpu_overlay", serde_json::Value::Bool(on));
+        if on {
+            self.engine_stats_at = f32::NEG_INFINITY;
+            self.refresh_engine_stats();
+        }
+    }
+
+    /// Rack-local obstacle rects on `unit` for `side` so the per-unit CPU
+    /// overlay badge never collides with titles, subtitles, LEDs, chips,
+    /// knobs, jacks, or agent badges.
+    fn cpu_badge_obstacles(&self, unit: usize, side: Side) -> Vec<Rect> {
+        let Some(u) = self.units.get(unit) else { return Vec::new() };
+        let Some(&r) = self.unit_rects.get(unit) else { return Vec::new() };
+        let mut obs = Vec::with_capacity(16);
+        let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+        let sz = |g: &Option<Arc<theme::TrackedLabel>>| g.as_ref().map_or(Vec2::ZERO, |g| g.size);
+        match side {
+            Side::Front => {
+                obs.push(Rect::from_min_size(r.min + Vec2::new(FACE_X, 17.0), u.name_g.as_ref().map_or(Vec2::ZERO, |g| g.size())));
+                obs.push(Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g)));
+                obs.push(Rect::from_center_size(r.right_top() + Vec2::new(-20.0, 20.0), Vec2::splat(15.0)));
+                if Self::agent_badge_alpha(agent_t) > 0.05 {
+                    let badge = if self.split_rects(unit).is_some() {
+                        Rect::from_min_size(Pos2::new(r.right() - 60.0, r.top() + 40.0), Vec2::new(46.0, 16.0))
+                    } else {
+                        Rect::from_min_size(Pos2::new(r.right() - 84.0, r.top() + 12.0), Vec2::new(46.0, 16.0))
+                    };
+                    obs.push(badge);
+                }
+                for (ki, k) in u.knobs.iter().enumerate() {
+                    if k.hidden { continue; }
+                    let c = self.knob_center(unit, ki).to_pos2();
+                    let lw = sz(&k.label_g).x;
+                    let label = Rect::from_min_size(Pos2::new(c.x - lw / 2.0, c.y + KNOB_R + KNOB_LABEL_GAP), Vec2::new(lw, KNOB_LABEL_H));
+                    let ring = Rect::from_center_size(c, Vec2::splat(2.0 * KNOB_R + 4.0));
+                    obs.push(ring.union(label));
+                }
+                let has_display = matches!(u.node_kind, UnitKind::Keys | UnitKind::Clap | UnitKind::AudioIn)
+                    || matches!(u.node_kind, UnitKind::Dsp(_)) && !u.transport;
+                if has_display {
+                    let (start, width) = self.display_area(unit);
+                    if width >= 40.0 {
+                        let y = self.knob_row_y(unit);
+                        obs.push(Rect::from_min_max(
+                            Pos2::new(start, y - 20.0),
+                            Pos2::new(start + width, y + KNOB_R + KNOB_LABEL_GAP + KNOB_LABEL_H),
+                        ));
+                    }
+                }
+                if matches!(u.node_kind, UnitKind::AudioIn) {
+                    if let Some(m) = self.audio_in_monitor_rect(unit) { obs.push(m); }
+                    if let Some(d) = self.audio_in_device_rect(unit) { obs.push(d); }
+                    if let Some(c) = self.audio_in_channel_rect(unit) { obs.push(c); }
+                }
+                if matches!(u.node_kind, UnitKind::Master) {
+                    let (x, bottom, pitch) = self.meter_geom(unit);
+                    let top = bottom - METER_SEGS as f32 * pitch;
+                    obs.push(Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + METER_SEG_W, bottom)));
+                    if self.meter_caption_shown(unit) {
+                        obs.push(Rect::from_min_size(Pos2::new(x, top - 18.0), sz(&self.caption_output_g)));
+                    }
+                }
+                if let Some((chip, readout)) = self.split_rects(unit) { obs.push(chip.union(readout)); }
+                if let Some((chip, readout)) = self.scale_rects(unit) { obs.push(chip.union(readout)); }
+                if let Some(f) = self.arp_status_rect(unit) { obs.push(f); }
+                if let Some(b) = self.drawbar_rects(unit) {
+                    obs.push(b[0].union(b[crate::organ::DRAWBARS - 1]));
+                }
+                if let Some(a) = self.aeolus_rects(unit) {
+                    obs.push(a.tabs[0].union(a.tabs[3]));
+                    obs.push(a.stops.iter().fold(Rect::NOTHING, |acc, rr| acc.union(*rr)));
+                }
+                if let Some(z) = self.zone_rects(unit) {
+                    obs.push(z[0].all());
+                    obs.push(z[1].all());
+                }
+                if let Some(c) = self.transport_chip_rect(unit) {
+                    obs.push(c.union(Rect::from_center_size(Pos2::new(c.right() + 16.0, c.center().y), Vec2::splat(14.0))));
+                }
+                if let Some(b) = self.bpm_rects(unit) {
+                    let mut br = b.value;
+                    if let Some(m) = b.minus { br = br.union(m); }
+                    if let Some(p) = b.plus { br = br.union(p); }
+                    obs.push(br);
+                }
+                if let Some(m) = self.metro_action_rects(unit) {
+                    obs.push(m.tap.union(m.count_in).union(m.sig.unwrap_or(m.count_in)));
+                }
+            }
+            Side::Back => {
+                obs.push(Rect::from_min_size(r.min + Vec2::new(32.0, 10.0), sz(&u.back_g)));
+                if Self::agent_badge_alpha(agent_t) > 0.05 {
+                    obs.push(Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0)));
+                }
+                for (ji, j) in u.jacks.iter().enumerate() {
+                    let c = self.jack_pos(unit, ji);
+                    obs.push(Rect::from_center_size(c.to_pos2(), Vec2::splat(26.0)));
+                    let (jw, jh) = j.label_g.as_ref().map_or((0.0, 0.0), |g| (g.size.x, g.size.y));
+                    if jw > 0.0 {
+                        obs.push(Rect::from_min_size((c + Vec2::new(-jw / 2.0 - 3.0, 16.0)).to_pos2(), Vec2::new(jw + 6.0, jh + 2.0)));
+                    }
+                }
+            }
+        }
+        obs
+    }
+
+    /// Collision-free rack-local placement of `unit`'s CPU meter overlay badge.
+    /// Tries the full `% · µs` badge first, then compact `%`, then a bare
+    /// hairline micro-bar on ultra-cramped windows so labels never overlap.
+    fn cpu_badge_layout(&self, unit: usize, side: Side, measure: impl Fn(&str) -> f32) -> Option<CpuBadgeLayout> {
+        if !self.show_cpu_overlay {
+            return None;
+        }
+        let u = self.units.get(unit)?;
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) || !(r.height() > 0.0) {
+            return None;
+        }
+        let stat = self.engine_stats.nodes.iter().find(|n| n.node == u.node_id);
+        let (full, compact, percent) = match stat {
+            Some(s) if self.engine_stats.audio_live => (
+                format!("{} · {}", fmt_cpu_pct(s.percent), fmt_cpu_us(s.avg_us)),
+                fmt_cpu_pct(s.percent),
+                Some(s.percent),
+            ),
+            Some(s) => (fmt_cpu_us(s.avg_us), fmt_cpu_us(s.avg_us), Some(s.percent)),
+            None => ("–".to_string(), "–".to_string(), None),
+        };
+        let inner = Rect::from_min_max(r.min + Vec2::new(20.0, 8.0), r.max - Vec2::new(10.0, 10.0));
+        let obs = self.cpu_badge_obstacles(unit, side);
+        let header_ctl_left = match side {
+            Side::Front => self
+                .split_rects(unit)
+                .map(|(c, _)| c.left())
+                .or_else(|| self.arp_status_rect(unit).map(|f| f.left())),
+            Side::Back => None,
+        };
+        let find_slot = |w: f32, h: f32| -> Option<Rect> {
+            let mut slots: Vec<Pos2> = Vec::with_capacity(6);
+            match side {
+                Side::Front => {
+                    slots.push(Pos2::new(r.right() - 32.0 - w, r.top() + 12.0));
+                    slots.push(Pos2::new(r.right() - 88.0 - w, r.top() + 12.0));
+                    if let Some(cl) = header_ctl_left {
+                        slots.push(Pos2::new(cl - 6.0 - w, r.top() + 12.0));
+                    }
+                    slots.push(Pos2::new(r.right() - 12.0 - w, r.top() + 41.0));
+                    slots.push(Pos2::new(r.left() + FACE_X, r.top() + 60.0));
+                    slots.push(Pos2::new(r.right() - 12.0 - w, r.top() + 60.0));
+                }
+                Side::Back => {
+                    slots.push(Pos2::new(r.right() - 12.0 - w, r.top() + 8.0));
+                    slots.push(Pos2::new(r.right() - 60.0 - w, r.top() + 8.0));
+                    slots.push(Pos2::new(r.right() - 12.0 - w, r.top() + 29.0));
+                    slots.push(Pos2::new(r.left() + 32.0, r.top() + 29.0));
+                }
+            }
+            for pos in slots {
+                let cand = Rect::from_min_size(pos, Vec2::new(w, h));
+                if !inner.contains_rect(cand) {
+                    continue;
+                }
+                let clear = obs.iter().all(|o| !o.is_positive() || !cand.expand(2.5).intersects(*o));
+                if clear {
+                    return Some(cand);
+                }
+            }
+            None
+        };
+        let full_w = (measure(&full) + CPU_BADGE_PAD_X * 2.0).ceil().max(28.0);
+        if let Some(rect) = find_slot(full_w, CPU_BADGE_H) {
+            return Some(CpuBadgeLayout { rect, text: Some(full), percent });
+        }
+        if compact != full {
+            let compact_w = (measure(&compact) + CPU_BADGE_PAD_X * 2.0).ceil().max(28.0);
+            if let Some(rect) = find_slot(compact_w, CPU_BADGE_H) {
+                return Some(CpuBadgeLayout { rect, text: Some(compact), percent });
+            }
+        }
+        find_slot(28.0, 6.0).map(|rect| CpuBadgeLayout { rect, text: None, percent })
+    }
+
+    /// Paint the Hurricane per-unit CPU meter overlay badge on `unit` (`F3`).
+    fn draw_cpu_badge(&self, painter: &egui::Painter, unit: usize, side: Side) {
+        if !self.show_cpu_overlay || self.text_alpha <= 0.01 {
+            return;
+        }
+        let font = FontId::monospace(CPU_BADGE_FONT_SIZE);
+        let Some(layout) = self.cpu_badge_layout(unit, side, |s| {
+            painter.layout_no_wrap(s.to_owned(), font.clone(), theme::CREAM).size().x
+        }) else {
+            return;
+        };
+        let a = self.text_alpha;
+        let (bar_col, border_col, text_col) = match layout.percent {
+            Some(pct) => cpu_overlay_colors(pct),
+            None => (theme::METER_TRACK, theme::HAIRLINE, theme::CREAM_DIM),
+        };
+        let sr = self.xf.rect(layout.rect);
+        painter.rect_filled(sr, 2.0, alpha(theme::PAPER_SINK, a));
+        painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(border_col, a)), egui::StrokeKind::Inside);
+
+        let bar_left = layout.rect.left() + 3.0;
+        let bar_w = (layout.rect.width() - 6.0).max(4.0);
+        let (bar_y, bar_h) = if layout.text.is_some() {
+            (layout.rect.bottom() - 4.0, CPU_BADGE_BAR_H)
+        } else {
+            (layout.rect.center().y - 1.0, 2.0)
+        };
+        let track = Rect::from_min_size(Pos2::new(bar_left, bar_y), Vec2::new(bar_w, bar_h));
+        painter.rect_filled(self.xf.rect(track), 1.0, alpha(theme::METER_TRACK, a));
+        if let Some(pct) = layout.percent {
+            if pct > 0.0 {
+                let frac = (pct as f32 / 100.0).clamp(0.0, 1.0);
+                let fill_w = (bar_w * frac).max(2.0).min(bar_w);
+                let fill = Rect::from_min_size(Pos2::new(bar_left, bar_y), Vec2::new(fill_w, bar_h));
+                painter.rect_filled(self.xf.rect(fill), 1.0, alpha(bar_col, a));
+            }
+        }
+        if let Some(text) = layout.text {
+            let g = painter.layout_no_wrap(text, font, text_col);
+            let text_h = layout.rect.height() - 4.0;
+            let pos = self.xf.p(Vec2::new(
+                layout.rect.center().x - g.size().x * 0.5,
+                layout.rect.top() + (text_h - g.size().y) * 0.5,
+            ));
+            let mut tp = painter.clone();
+            tp.set_opacity(a);
+            tp.galley(pos, g, text_col);
+        }
+    }
+
     /// The DSP readout's texts, laid out: the average render time as a
     /// share of one buffer, and the xrun count once the device reported any.
     /// The value's slot is as wide as "100 %", so the readout's width
@@ -26774,7 +27070,7 @@ impl DemoApp {
         if st.xruns > 0 {
             tip.push_str(&format!("\n{} xruns (dropouts the audio device reported) since the last reset", st.xruns));
         }
-        tip.push_str("\nClick for Engine Info");
+        tip.push_str("\nClick for Engine Info · F3 toggles per-unit rack meters");
         resp.on_hover_text(tip)
     }
 
@@ -26799,7 +27095,9 @@ impl DemoApp {
         let configured_buf = self.buffer_frames;
         let buf_err = self.buffer_size_err.clone();
         let mut reset = false;
+        let mut toggle_cpu_overlay = false;
         let mut new_buffer: Option<u32> = None;
+        let cpu_overlay_on = self.show_cpu_overlay;
         let area = egui::Area::new(egui::Id::unique("engine_info"))
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::RIGHT_TOP)
@@ -26817,6 +27115,12 @@ impl DemoApp {
                                 .clicked()
                             {
                                 reset = true;
+                            }
+                            if theme::chip_button(ui, "Rack CPU · F3", cpu_overlay_on)
+                                .on_hover_text("toggle per-unit live CPU meters on every rack unit (F3)")
+                                .clicked()
+                            {
+                                toggle_cpu_overlay = true;
                             }
                         });
                     });
@@ -26905,6 +27209,9 @@ impl DemoApp {
         self.engine_info_rect = area.response.rect;
         if let Some(frames) = new_buffer {
             let _ = self.set_buffer_frames(frames);
+        }
+        if toggle_cpu_overlay {
+            self.set_cpu_overlay(!self.show_cpu_overlay);
         }
         if reset {
             self.reset_engine_peaks();
@@ -27681,12 +27988,15 @@ impl DemoApp {
         for (ui, u) in self.units.iter().enumerate() {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
+            let sr = xf.rect(r);
             self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             if Self::agent_badge_alpha(agent_t) > 0.05 {
                 let badge = Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0));
                 self.draw_agent_badge(painter, badge, agent_t);
             }
+            let label_painter = painter.with_clip_rect(sr.intersect(painter.clip_rect()));
+            self.draw_cpu_badge(&label_painter, ui, Side::Back);
             for (ji, j) in u.jacks.iter().enumerate() {
                 let c = self.jack_pos(ui, ji);
                 let (jw, jh) = j.label_g.as_ref().map_or((0.0, 0.0), |g| (g.size.x, g.size.y));
@@ -32559,7 +32869,7 @@ mod rig_switch_tests {
         let keys: Vec<String> = app.help_cols.iter()
             .flat_map(|c| c.rows.iter().flat_map(|r| r.keys.iter().map(|g| g.text().to_owned())))
             .collect();
-        for k in ["Tab", "Space", "Ctrl", "Del", "double-click", "F4", "F5–F7", "F8", "F9", "F10", "F11", "F12", "1–9", "R", "I", "SPLIT"] {
+        for k in ["Tab", "Space", "Ctrl", "Del", "double-click", "F3", "F4", "F5–F7", "F8", "F9", "F10", "F11", "F12", "1–9", "R", "I", "SPLIT"] {
             assert!(keys.iter().any(|x| x == k), "help lists {k}");
         }
         assert!(descs_has_mixer(&app), "F10 is the mixer now (the Transport window is gone)");
@@ -37691,6 +38001,11 @@ mod face_layout_tests {
             v.push(("bpm".into(), br));
         }
         if let Some(m) = app.metro_action_rects(ui) { v.push(("metro".into(), m.tap.union(m.count_in).union(m.sig.unwrap_or(m.count_in)))); }
+        if app.show_cpu_overlay {
+            if let Some(b) = app.cpu_badge_layout(ui, Side::Front, |s| s.chars().count() as f32 * 6.5) {
+                v.push(("cpu badge".into(), b.rect));
+            }
+        }
         v
     }
 
@@ -37739,6 +38054,41 @@ mod face_layout_tests {
     #[test]
     fn demo_faces_are_padded_and_clear() {
         check(DemoApp::new_with_sink(None), "demo");
+    }
+
+    #[test]
+    fn cpu_overlay_faces_are_padded_and_clear() {
+        let seed_cpu = |app: &mut DemoApp| {
+            app.test_counters = Some(crate::engine_info::EngineCounters {
+                sample_rate: 48_000,
+                callback_frames: 256,
+                render_avg_ns: 2_800_000,
+                ..Default::default()
+            });
+            let mut timer = crate::engine_info::NodeTimer::new();
+            timer.begin_block();
+            for (i, u) in app.units.iter().enumerate() {
+                if matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) {
+                    continue;
+                }
+                let us = [1800u64, 900, 320, 45][i % 4];
+                timer.record(u.node_id, std::time::Duration::from_micros(us));
+            }
+            timer.end_block();
+            app.node_times = Some(timer.handle());
+            app.show_cpu_overlay = true;
+            app.engine_stats_at = f32::NEG_INFINITY;
+        };
+        let mut demo = DemoApp::new_with_sink(None);
+        seed_cpu(&mut demo);
+        check(demo, "demo cpu overlay");
+
+        let mut arp = arp_rack();
+        let k = arp.keys_unit.unwrap();
+        arp.set_keys_split(k, Some(60));
+        arp.set_keys_scale(k, Some(crate::arp::ScaleChoice { scale: crate::arp::Scale::MinorPentatonic, key: 9 }));
+        seed_cpu(&mut arp);
+        check(arp, "arp split scale cpu overlay");
     }
 
     #[test]
@@ -42363,6 +42713,179 @@ mod engine_info_tests {
             }
         }
     }
+
+    #[test]
+    fn f3_and_engine_info_toggle_the_rack_cpu_overlay_on_front_and_back() {
+        let (mut app, ctx) = app_at(counters(42.0), SIZE);
+        let surge = app.units.iter().find(|u| u.name == "SURGE A").unwrap().node_id;
+        let delay = app.units.iter().find(|u| u.name == "DELAY A").unwrap().node_id;
+        let mut timer = NodeTimer::new();
+        timer.begin_block();
+        timer.record(surge, Duration::from_micros(960)); // 18.0% of 5333 µs
+        timer.record(delay, Duration::from_micros(160)); // 3.0% of 5333 µs
+        timer.end_block();
+        app.node_times = Some(timer.handle());
+        app.engine_stats_at = f32::NEG_INFINITY;
+
+        assert!(!app.show_cpu_overlay, "overlay starts off");
+        let off_texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(!off_texts.iter().any(|t| !t.panel && t.s.contains("960µs")), "no rack badge while off");
+
+        // F3 toggles the overlay ON without touching F4's multi-rig demo.
+        let rigs_before = app.rig_count();
+        run_frame(&mut app, &ctx, SIZE, key(Key::F3));
+        assert!(app.show_cpu_overlay, "F3 turns the rack CPU overlay on");
+        assert_eq!(app.rig_count(), rigs_before, "F3 does not trigger F4 multi-rig demo");
+
+        let front_texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        let surge_badge = front_texts.iter().find(|t| !t.panel && t.s == "18.0% · 960µs")
+            .unwrap_or_else(|| panic!("front Surge badge missing in {:?}", front_texts.iter().map(|t| &t.s).collect::<Vec<_>>()));
+        let delay_badge = front_texts.iter().find(|t| !t.panel && t.s == "3.0% · 160µs")
+            .unwrap_or_else(|| panic!("front Delay badge missing in {:?}", front_texts.iter().map(|t| &t.s).collect::<Vec<_>>()));
+        assert_eq!(surge_badge.color, theme::CABLE_AMBER, "18.0% is > 15% -> amber");
+        assert_eq!(delay_badge.color, theme::CREAM, "3.0% is <= 15% -> cream");
+
+        // Flip to the back face: badges still render cleanly without colliding with titles.
+        app.side = Side::Back;
+        app.flipping = false;
+        let back_texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(back_texts.iter().any(|t| !t.panel && t.s == "18.0% · 960µs"), "back face shows Surge CPU badge");
+        assert!(back_texts.iter().any(|t| !t.panel && t.s == "3.0% · 160µs"), "back face shows Delay CPU badge");
+        app.side = Side::Front;
+
+        // Second F3 press turns it OFF.
+        run_frame(&mut app, &ctx, SIZE, key(Key::F3));
+        assert!(!app.show_cpu_overlay, "second F3 turns it off");
+        let off_again = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(!off_again.iter().any(|t| !t.panel && t.s.contains("960µs")), "badges disappear when toggled off");
+
+        // Engine Info popup has a matching toggle button.
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open);
+        let toggle_btn = find(&texts, "Rack CPU · F3").rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, toggle_btn);
+        assert!(app.engine_info_open, "toggling Rack CPU keeps Engine Info open");
+        assert!(app.show_cpu_overlay, "Engine Info button turns the rack overlay on");
+        assert!(texts.iter().any(|t| !t.panel && t.s == "18.0% · 960µs"), "rack paints the badge immediately");
+
+        // F4 still loads multi-rig demo as before.
+        app.engine_info_open = false;
+        run_frame(&mut app, &ctx, SIZE, key(Key::F4));
+        assert!(app.rig_count() >= 2, "F4 multi-rig shortcut stays intact");
+    }
+
+    #[test]
+    fn cpu_overlay_threshold_colors_match_15_and_30_percent_bands() {
+        assert_eq!(cpu_overlay_colors(0.0), (theme::CREAM, theme::HAIRLINE, theme::CREAM));
+        assert_eq!(cpu_overlay_colors(15.0), (theme::CREAM, theme::HAIRLINE, theme::CREAM));
+        assert_eq!(cpu_overlay_colors(15.1), (theme::CABLE_AMBER, theme::CABLE_AMBER, theme::CABLE_AMBER));
+        assert_eq!(cpu_overlay_colors(30.0), (theme::CABLE_AMBER, theme::CABLE_AMBER, theme::CABLE_AMBER));
+        assert_eq!(cpu_overlay_colors(30.1), (theme::CLIP_RED, theme::CLIP_RED, theme::CLIP_BRIGHT));
+
+        // Verify all three threshold colors actually paint on real units in one frame.
+        let (mut app, ctx) = app_at(counters(55.0), SIZE);
+        let surge = app.units.iter().find(|u| u.name == "SURGE A").unwrap().node_id;
+        let delay = app.units.iter().find(|u| u.name == "DELAY A").unwrap().node_id;
+        app.show_cpu_overlay = true;
+
+        let mut timer = NodeTimer::new();
+        // 5333.3 µs budget: 800 µs = 15.0% (cream), 1800 µs = 33.75% (red)
+        timer.begin_block();
+        timer.record(surge, Duration::from_micros(1800));
+        timer.record(delay, Duration::from_micros(800));
+        timer.end_block();
+        app.node_times = Some(timer.handle());
+        app.engine_stats_at = f32::NEG_INFINITY;
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert_eq!(find(&texts, "33.8% · 1800µs").color, theme::CLIP_BRIGHT, "> 30% paints hot red text");
+        assert_eq!(find(&texts, "15.0% · 800µs").color, theme::CREAM, "exact 15.0% stays cream");
+
+        // 854 µs = 16.0% (amber)
+        let mut timer = NodeTimer::new();
+        timer.begin_block();
+        timer.record(surge, Duration::from_micros(854));
+        timer.end_block();
+        app.node_times = Some(timer.handle());
+        app.engine_stats_at = f32::NEG_INFINITY;
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert_eq!(find(&texts, "16.0% · 854µs").color, theme::CABLE_AMBER, "> 15% paints amber text");
+    }
+
+    #[test]
+    fn changing_cpu_overlay_numbers_never_grow_the_font_atlas() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        app.show_cpu_overlay = true;
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = |m: u64| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) % m };
+        let mut timer = NodeTimer::new();
+        let mut cycle = |app: &mut DemoApp, frames: usize| {
+            for f in 0..frames {
+                app.side = if f % 2 == 0 { Side::Front } else { Side::Back };
+                set_counters(app, counters(next(10_000) as f64 / 100.0));
+                timer.begin_block();
+                for u in &app.units {
+                    if !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) {
+                        timer.record(u.node_id, Duration::from_nanos(next(3_000_000)));
+                    }
+                }
+                timer.end_block();
+                app.node_times = Some(timer.handle());
+                run_frame(app, &ctx, SIZE, vec![]);
+            }
+        };
+        let atlas = || ctx.fonts(|f| (f.font_atlas_fill_ratio(), f.font_image_size()));
+        cycle(&mut app, 100);
+        let warm = atlas();
+        cycle(&mut app, 1_000);
+        let after = atlas();
+        assert_eq!(after, warm, "1000 more frames of changing per-unit CPU numbers grew the font atlas");
+        assert!(after.0 < 0.5, "far from egui's 80 % clear: {}", after.0);
+    }
+
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat cpu_overlay_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn cpu_overlay_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_app = |side: Side, info_open: bool, surge_us: u64, delay_us: u64| -> DemoApp {
+            let mut app = DemoApp::new_with_sink(None);
+            app.side = side;
+            app.show_cpu_overlay = true;
+            app.engine_info_open = info_open;
+            let total_pct = (surge_us + delay_us) as f64 / (256.0 / 48_000.0 * 1e6) * 100.0;
+            app.test_counters = Some(EngineCounters {
+                render_max_us: (surge_us + delay_us + 240) as u32,
+                midi_latency_us: 380,
+                ..counters(total_pct)
+            });
+            let mut timer = NodeTimer::new();
+            timer.begin_block();
+            for u in &app.units {
+                match u.name.as_str() {
+                    "SURGE A" => timer.record(u.node_id, Duration::from_micros(surge_us)),
+                    "DELAY A" => timer.record(u.node_id, Duration::from_micros(delay_us)),
+                    "SURGE B" => timer.record(u.node_id, Duration::from_micros(960)),
+                    "DELAY B" => timer.record(u.node_id, Duration::from_micros(110)),
+                    _ => {}
+                }
+            }
+            timer.end_block();
+            app.node_times = Some(timer.handle());
+            app
+        };
+        // Rule 148: build a fresh app per image so the font atlas stays clean.
+        for (name, side, info, s_us, d_us, size) in [
+            ("front-thresholds-1600x1000.png", Side::Front, false, 1850, 920, Vec2::new(1600.0, 1000.0)),
+            ("back-thresholds-1600x1000.png", Side::Back, false, 1850, 920, Vec2::new(1600.0, 1000.0)),
+            ("front-engine-info-1600x1000.png", Side::Front, true, 960, 120, Vec2::new(1600.0, 1000.0)),
+            ("front-small-760x520.png", Side::Front, false, 1850, 920, Vec2::new(760.0, 520.0)),
+        ] {
+            let mut app = seed_app(side, info, s_us, d_us);
+            super::offline_shots::shot(&mut app, size, &dir.join(name));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -42729,9 +43252,46 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 32] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 34] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
+            ("rack cpu overlay", &|a| {
+                a.show_cpu_overlay = true;
+                a.test_counters = Some(crate::engine_info::EngineCounters {
+                    sample_rate: 48_000,
+                    callback_frames: 256,
+                    render_avg_ns: 2_800_000,
+                    ..Default::default()
+                });
+                let mut timer = crate::engine_info::NodeTimer::new();
+                timer.begin_block();
+                for (i, u) in a.units.iter().enumerate() {
+                    if !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) {
+                        timer.record(u.node_id, std::time::Duration::from_micros([1850u64, 920, 210][i % 3]));
+                    }
+                }
+                timer.end_block();
+                a.node_times = Some(timer.handle());
+            }),
+            ("rack back cpu overlay", &|a| {
+                a.side = Side::Back;
+                a.show_cpu_overlay = true;
+                a.test_counters = Some(crate::engine_info::EngineCounters {
+                    sample_rate: 48_000,
+                    callback_frames: 256,
+                    render_avg_ns: 2_800_000,
+                    ..Default::default()
+                });
+                let mut timer = crate::engine_info::NodeTimer::new();
+                timer.begin_block();
+                for (i, u) in a.units.iter().enumerate() {
+                    if !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) {
+                        timer.record(u.node_id, std::time::Duration::from_micros([1850u64, 920, 210][i % 3]));
+                    }
+                }
+                timer.end_block();
+                a.node_times = Some(timer.handle());
+            }),
             ("two rigs", &|a| a.load_multi_rig_demo()),
             ("mixer", &|a| a.stage_view = StageView::Mixer),
             ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),

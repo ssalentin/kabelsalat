@@ -132,16 +132,21 @@ fn supervise() -> anyhow::Result<i32> {
     let mut recover = false;
     let mut report: Option<PathBuf> = None;
     loop {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(&args).env(SUPERVISED, "1").env_remove(RECOVER).env_remove(CRASH_REPORT);
-        if recover {
-            cmd.env(RECOVER, "1");
-        }
-        if let Some(r) = &report {
-            cmd.env(CRASH_REPORT, r);
-        }
+        let command = |exe: &Path| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(&args).env(SUPERVISED, "1").env_remove(RECOVER).env_remove(CRASH_REPORT);
+            if recover {
+                cmd.env(RECOVER, "1");
+            }
+            if let Some(r) = &report {
+                cmd.env(CRASH_REPORT, r);
+            }
+            cmd
+        };
         let started = SystemTime::now();
-        let mut child = cmd.spawn()?;
+        // An upgrade may have replaced the file since the start; the kernel
+        // still runs the image this watchdog came from.
+        let mut child = command(&exe).spawn().or_else(|_| command(Path::new("/proc/self/exe")).spawn())?;
         let pid = child.id();
         CHILD.store(pid as i32, Ordering::Relaxed);
         let status = child.wait()?;

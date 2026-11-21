@@ -331,6 +331,14 @@ offset and three latency modes (none, output, input) line the clock up with what
 you hear.
 
 ### Control knobs and the mixer from your controller
+Drag any rack or mixer knob vertically; hold **Shift** while dragging for 10×
+fine-tune control (holding **Ctrl** drags a unit to rearrange it), and
+**double-click** any knob to reset it to its default. Hovering or dragging shows
+real physical units (`Hz`, `ms`, `dB`, `%`, semitones, or the CLAP plugin's own
+readout). Open a knob's right-click menu to type an exact value (`440 Hz`,
+`250 ms`, `−6 dB`, `75%`, …) and press **Enter** — without getting in the way of
+quick MIDI learn.
+
 Right-click any knob, turn a knob on your MIDI controller — bound. The knob
 shows its CC number and follows your hardware from then on.
 

@@ -554,10 +554,13 @@ impl PortKind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side { Front, Back }
 
 const KNOB_GLIDE_SECS: f32 = 0.20;
+const KNOB_DRAG_SENSITIVITY: f32 = 0.006;
+/// Holding Shift while dragging a knob slows travel by 10x for fine adjustments (#304).
+const KNOB_FINE_FACTOR: f32 = 0.1;
 const CABLE_DRAW_IN_SECS: f32 = 0.28;
 const UNIT_FADE_SECS: f32 = 0.24;
 const AGENT_PULSE_SECS: f32 = 0.38;
@@ -587,6 +590,9 @@ struct Knob {
     clap: Option<ClapPin>,
     /// Where the knob comes from: the unit's own table, or a plugin parameter.
     source: KnobSource,
+    /// Cached CLAP `value_to_text` readout `(normalized_value, formatted_text)`
+    /// refreshed lazily while hovered, dragged, or open in the knob menu (#304).
+    cached_text: Option<(f32, String)>,
     label_g: Option<Arc<theme::TrackedLabel>>,
 }
 
@@ -816,6 +822,7 @@ fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
         sent: None,
         clap: None,
         source: KnobSource::BuiltIn,
+        cached_text: None,
         label_g: None,
     }
 }
@@ -864,6 +871,7 @@ fn main_knob(c: &crate::main_controls::MainControl, value: f64, target: MainTarg
         clap: matches!(target, MainTarget::Clap)
             .then_some(ClapPin { id: c.id, min: c.min, max: c.max, sent: norm, hold_until: 0.0 }),
         source: KnobSource::Main(c.name.clone()),
+        cached_text: None,
         label_g: None,
     }
 }
@@ -2914,7 +2922,10 @@ struct InstallState {
 
 enum Drag {
     None,
-    Knob { unit: usize, idx: usize, start_val: f32, press_y: f32 },
+    /// Incremental knob drag: `accum` tracks continuous travel (so stepped knobs
+    /// and mid-drag Shift fine-tune toggles never jump), `last_y` is the previous
+    /// frame's pointer y, and `fine` records whether Shift is currently held (#304).
+    Knob { unit: usize, idx: usize, accum: f32, last_y: f32, fine: bool },
     /// Holding a plug: `id` is the cable id, `end` the held end.
     Plug { id: u32, end: Dir },
     Cable { id: u32, u: f32 },
@@ -3610,6 +3621,11 @@ struct DemoApp {
     cc_learn: Option<CcLearn>,
     knob_menu: Option<KnobMenu>,
     knob_menu_rect: Rect,
+    /// Target the numeric input in `knob_menu` was seeded for, its edit buffer,
+    /// and whether the last Enter submission failed to parse (#304).
+    knob_menu_seed: Option<CcDest>,
+    knob_menu_text: String,
+    knob_menu_error: bool,
     /// Learnable controls rendered in the keyboard dock / expanded console this frame.
     kb_learn_rects: Vec<(CcDest, Rect)>,
     /// The Keys-face scale picker (issue #90), open on a SCALE readout.
@@ -4199,6 +4215,9 @@ impl DemoApp {
             cc_learn: None,
             knob_menu: None,
             knob_menu_rect: Rect::NOTHING,
+            knob_menu_seed: None,
+            knob_menu_text: String::new(),
+            knob_menu_error: false,
             kb_learn_rects: Vec::new(),
             scale_menu: None,
             scale_menu_rect: Rect::NOTHING,
@@ -22608,6 +22627,7 @@ impl DemoApp {
                 sent,
                 clap: is_clap.then_some(ClapPin { id: param, min, max, sent: norm, hold_until: 0.0 }),
                 source: KnobSource::Midi { name, resolved },
+                cached_text: None,
                 label_g: None,
             };
             let insert_at = self.units[ui]
@@ -22688,7 +22708,7 @@ impl DemoApp {
             default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
             param: None, hidden: false, sent: Some(norm), steps: 0,
             clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm, hold_until: 0.0 }),
-            source: KnobSource::Pinned(p.name.clone()), label_g: None,
+            source: KnobSource::Pinned(p.name.clone()), cached_text: None, label_g: None,
         });
         format!("pinned {} to the face", p.name)
     }
@@ -24215,10 +24235,10 @@ impl DemoApp {
             }
         }
 
-        let (pointer, pressed, down, released, right_clicked, ctrl, shift) = ctx.input(|i| {
+        let (pointer, pressed, down, released, double_clicked, right_clicked, ctrl, shift) = ctx.input(|i| {
             (i.pointer.hover_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(),
-             i.pointer.primary_released(), i.pointer.secondary_clicked(), i.modifiers.ctrl,
-             i.modifiers.shift)
+             i.pointer.primary_released(), i.pointer.button_double_clicked(egui::PointerButton::Primary),
+             i.pointer.secondary_clicked(), i.modifiers.ctrl, i.modifiers.shift)
         });
 
         let Some(s) = pointer else {
@@ -24391,7 +24411,13 @@ impl DemoApp {
             if !matches!(self.drag, Drag::Unit { .. }) {
                 match hit {
                     Hit::Knob { unit, idx } => {
-                        self.drag = Drag::Knob { unit, idx, start_val: self.units[unit].knobs[idx].value, press_y: s.y };
+                        self.drag = Drag::Knob {
+                            unit,
+                            idx,
+                            accum: self.units[unit].knobs[idx].value,
+                            last_y: s.y,
+                            fine: shift,
+                        };
                     }
                     Hit::Jack { unit, jack } if self.side == Side::Back => {
                         let j = &self.units[unit].jacks[jack];
@@ -24432,9 +24458,18 @@ impl DemoApp {
 
         if down {
             match self.drag {
-                Drag::Knob { unit, idx, start_val, press_y } => {
-                    let v = (start_val + (press_y - s.y) * 0.006).clamp(0.0, 1.0);
-                    self.units[unit].knobs[idx].set_immediate(v);
+                Drag::Knob { unit, idx, mut accum, last_y, .. } => {
+                    let dy = last_y - s.y;
+                    if dy != 0.0 {
+                        let sens = if shift {
+                            KNOB_DRAG_SENSITIVITY * KNOB_FINE_FACTOR
+                        } else {
+                            KNOB_DRAG_SENSITIVITY
+                        };
+                        accum = (accum + dy * sens).clamp(0.0, 1.0);
+                        self.units[unit].knobs[idx].set_immediate(accum);
+                    }
+                    self.drag = Drag::Knob { unit, idx, accum, last_y: s.y, fine: shift };
                 }
                 Drag::Plug { id, end } => {
                     match self.live_cable(id) {
@@ -24547,6 +24582,10 @@ impl DemoApp {
 
             if moved < 6.0 && !was_plug {
                 match press_hit {
+                    Some(Hit::Knob { unit, idx }) if double_clicked && !ctrl && self.side == Side::Front => {
+                        let def = self.units[unit].knobs[idx].default;
+                        self.set_unit_knob(unit, idx, def);
+                    }
                     Some(Hit::Play) => self.toggle_play(),
                     Some(Hit::Jack { unit, jack }) if self.side == Side::Back => {
                         let j = &self.units[unit].jacks[jack];
@@ -25875,11 +25914,13 @@ impl DemoApp {
         }
         if resp.dragged() {
             let dy = resp.drag_delta().y;
+            let fine = ui.input(|i| i.modifiers.shift);
+            let sens = if fine { KNOB_DRAG_SENSITIVITY * KNOB_FINE_FACTOR } else { KNOB_DRAG_SENSITIVITY };
             let mut accum = match self.mixer_knob_drag {
                 Some((n, idx, cur)) if n == node_id && idx == ki => cur,
                 _ => val,
             };
-            accum = (accum - dy * 0.006).clamp(0.0, 1.0);
+            accum = (accum - dy * sens).clamp(0.0, 1.0);
             self.mixer_knob_drag = Some((node_id, ki, accum));
             self.set_unit_knob(unit, ki, accum);
         }
@@ -25936,8 +25977,8 @@ impl DemoApp {
             self.strip_knobs.insert(node_id, choice);
         }
         let tip_name = full_name.as_deref().unwrap_or(&label);
-        let cur_v = self.units[unit].knobs[ki].value;
-        resp.on_hover_text(format!("{tip_name}: {cur_v:.2} · drag to adjust · double-click: reset · right-click: assign knob"));
+        let cur_text = self.knob_value_text(unit, ki);
+        resp.on_hover_text(format!("{tip_name}: {cur_text} · drag (Shift: fine) · double-click: reset · right-click: assign knob"));
     }
 
     /// Send rows (issue #5) under a strip: one per aux bus. The knob is the
@@ -26565,6 +26606,7 @@ impl DemoApp {
             self.draw_cpu_badge(&label_painter, ui, Side::Front);
         }
         self.draw_fading_units(painter);
+        self.draw_knob_readout(painter);
     }
 
     /// Is the pointer over rack-local `rect` of `unit` (front face hover)?
@@ -27998,7 +28040,6 @@ impl DemoApp {
         self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + KNOB_LABEL_GAP), &k.label_g, SUBTEXT);
 
         // Status plate (LEARN or CC nn) above the knob (rule 35 plate, rule 7 padding).
-        let has_tag = (is_learning || bound.is_some()) && self.text_alpha > 0.01;
         if is_learning && self.text_alpha > 0.01 {
             let label = match learning.and_then(|l| l.capture.as_ref()) {
                 Some(cap) => cap.tag(),
@@ -28026,19 +28067,303 @@ impl DemoApp {
                 tp.galley(xf.p(local.min.to_vec2() + Vec2::new(8.0, 4.0)), g, theme::CREAM);
             }
         }
+    }
 
-        // Drag chip: a dark sticker with the value in Medium 13px cream.
+    /// Physical unit formatter for knob `(unit, ki)` (#304).
+    fn knob_format(&self, unit: usize, ki: usize) -> KnobFormat {
+        let Some(u) = self.units.get(unit) else {
+            return KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None };
+        };
+        let Some(k) = u.knobs.get(ki) else {
+            return KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None };
+        };
+        if let Some(pin) = k.clap {
+            return KnobFormat::PlainRange { min: pin.min, max: pin.max };
+        }
+        // LV2 non-organ control ports carry min..max metadata in the cached scan.
+        if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(u.node_id).map(|n| &n.kind) {
+            if !crate::organ::is_organ(&NodeKind::Lv2 { uri: uri.clone() }) {
+                if let (Some(p), Some(descs)) = (k.param, crate::lv2::control_descs_cached(uri.as_str())) {
+                    if let Some(d) = descs.iter().find(|d| d.index as u32 == p) {
+                        return KnobFormat::PlainRange { min: d.min as f64, max: d.max as f64 };
+                    }
+                }
+            }
+        }
+        if let Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) =
+            self.base_graph.node(u.node_id).map(|n| &n.kind)
+        {
+            if let (Some(p), Some(descs)) = (k.param, crate::lv2::control_descs_cached(uri.as_str())) {
+                if let Some(d) = descs.iter().find(|d| d.index as u32 == p) {
+                    return KnobFormat::PlainRange { min: d.min as f64, max: d.max as f64 };
+                }
+            }
+        }
+        let param = k.param;
+        if self.is_organ_unit(unit) {
+            return match param {
+                Some(crate::organ::P_LESLIE) => KnobFormat::OrganLeslie,
+                Some(crate::organ::P_PERC) => KnobFormat::OrganPerc,
+                _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+            };
+        }
+        match &u.node_kind {
+            UnitKind::Master => match param {
+                Some(P_VOL) => KnobFormat::LinearDb,
+                Some(P_WARM) => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+            },
+            UnitKind::Clap => match param {
+                Some(P_LEVEL) => KnobFormat::LinearDb,
+                _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+            },
+            UnitKind::AudioIn => match param {
+                Some(P_AUDIO_IN_GAIN) => KnobFormat::LinearDb,
+                _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+            },
+            UnitKind::Dsp(dk) => match dk {
+                DspKind::Delay => match param {
+                    Some(P_TIME) => KnobFormat::LogSecs { lo: crate::dsp::DELAY_MIN_S, hi: crate::dsp::DELAY_MAX_S },
+                    Some(P_MIX) => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                    _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                },
+                DspKind::Reverb => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                DspKind::Gain => match param {
+                    Some(crate::engine::P_SYSTEM_GAIN) => KnobFormat::LinearDb,
+                    Some(0) => KnobFormat::GainQuadDb,
+                    _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                },
+                DspKind::Filter => match param {
+                    Some(0) => KnobFormat::LogHz { lo: 20.0, hi: 20000.0 },
+                    Some(1) => KnobFormat::FilterQ,
+                    _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                },
+                DspKind::Eq3 => KnobFormat::DbRange { lo: -18.0, hi: 18.0, signed: true },
+                DspKind::Limiter => match param {
+                    Some(0) => KnobFormat::DbRange { lo: -12.0, hi: 0.0, signed: false },
+                    Some(1) => KnobFormat::DbRange { lo: 0.0, hi: 24.0, signed: true },
+                    _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                },
+                DspKind::Saturation => match param {
+                    Some(0) => KnobFormat::DbRange { lo: 0.0, hi: 20.0 * 40.0f32.log10(), signed: true },
+                    _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                },
+                DspKind::Pan => KnobFormat::Pan,
+                DspKind::Bus => KnobFormat::LinearDb,
+                DspKind::Metronome => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+            },
+            UnitKind::MidiFx => match param {
+                Some(crate::engine::P_MIDIFX_SEMI) => KnobFormat::Semitones(crate::engine::MIDIFX_SEMI_MAX),
+                _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+            },
+            UnitKind::Arp => match param {
+                Some(crate::arp::P_ARP_MODE) => KnobFormat::ArpMode,
+                Some(crate::arp::P_ARP_RATE) => KnobFormat::ArpRate,
+                Some(crate::arp::P_ARP_OCTAVE) => KnobFormat::ArpOctaves,
+                Some(crate::arp::P_ARP_GATE) => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: Some(0.05) },
+                Some(crate::arp::P_ARP_SWING) => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+                Some(crate::arp::P_ARP_CHORD) => KnobFormat::ArpChord,
+                _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+            },
+            UnitKind::Keys => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
+        }
+    }
+
+    /// Resolve cached LV2 control metadata (including units and scale points) for
+    /// non-organ LV2 knobs without touching lilv on the UI thread (rule 127).
+    fn knob_lv2_info(&self, unit: usize, ki: usize) -> Option<crate::lv2::Lv2ControlInfo> {
+        let u = self.units.get(unit)?;
+        let p = u.knobs.get(ki)?.param?;
+        let uri = match self.base_graph.node(u.node_id).map(|n| &n.kind) {
+            Some(k @ NodeKind::Lv2 { uri }) if !crate::organ::is_organ(k) => uri.as_str(),
+            Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => uri.as_str(),
+            _ => return None,
+        };
+        crate::lv2::control_infos_cached(uri)?
+            .into_iter()
+            .find(|info| info.index as u32 == p)
+    }
+
+    /// Human-readable formatted value for knob `(unit, ki)`: uses CLAP
+    /// `value_to_text` cache where available, LV2 unit/scale-point metadata when
+    /// cached, else the built-in unit formatter (#304).
+    fn knob_value_text(&self, unit: usize, ki: usize) -> String {
+        let Some(k) = self.units.get(unit).and_then(|u| u.knobs.get(ki)) else {
+            return String::new();
+        };
+        if k.clap.is_some() {
+            if let Some((v, ref text)) = k.cached_text {
+                if (v - k.value).abs() < 1e-4 && !text.is_empty() {
+                    return text.clone();
+                }
+            }
+        }
+        if let Some(info) = self.knob_lv2_info(unit, ki) {
+            let native = crate::lv2::lv2_norm_to_native(&info, k.value);
+            return crate::lv2::format_lv2_control_value(&info, native);
+        }
+        self.knob_format(unit, ki).format(k.value)
+    }
+
+    /// Lazily query CLAP `value_to_text` for the currently dragged, hovered,
+    /// or menu-open CLAP knob so `draw_knob_readout` stays read-only & fast (#304).
+    fn refresh_knob_readouts(&mut self) {
+        let mut targets: Vec<(usize, usize)> = Vec::new();
+        if let Drag::Knob { unit, idx, .. } = self.drag {
+            targets.push((unit, idx));
+        }
+        if let Some(Hit::Knob { unit, idx }) = self.hover {
+            if !targets.contains(&(unit, idx)) {
+                targets.push((unit, idx));
+            }
+        }
+        if let Some(menu) = self.knob_menu {
+            if let Some(t) = self.knob_menu_target(&menu) {
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let slots = self.clap_rigs();
+        for (ui, ki) in targets {
+            let Some((node_id, val, pin, stale)) = self.units.get(ui).and_then(|u| {
+                let k = u.knobs.get(ki)?;
+                let pin = k.clap?;
+                let stale = k.cached_text.as_ref().map_or(true, |(cv, _)| (cv - k.value).abs() >= 1e-4);
+                Some((u.node_id, k.value, pin, stale))
+            }) else {
+                continue;
+            };
+            if !stale {
+                continue;
+            }
+            let Some(pool_idx) = slots
+                .iter()
+                .find(|(_, n)| *n == node_id)
+                .and_then(|(slot, _)| self.clap_pool_idx(*slot))
+            else {
+                continue;
+            };
+            let Some(main) = self._surge_main.get_mut(pool_idx) else { continue };
+            let plain = pin.min + val as f64 * (pin.max - pin.min);
+            if let Some(text) = main.param_text_opt(pin.id, plain) {
+                if let Some(k) = self.units.get_mut(ui).and_then(|u| u.knobs.get_mut(ki)) {
+                    k.cached_text = Some((val, text));
+                }
+            }
+        }
+    }
+
+    /// Parse exact numeric input for knob `(unit, ki)` into a normalized 0..1
+    /// value, trying CLAP `text_to_value` first when a live plugin is hosted (#304).
+    fn parse_knob_value(&mut self, unit: usize, ki: usize, text: &str) -> Option<f32> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let pin_info = self.units.get(unit).and_then(|u| {
+            let k = u.knobs.get(ki)?;
+            Some((u.node_id, k.clap?))
+        });
+        if let Some((node_id, pin)) = pin_info {
+            let slots = self.clap_rigs();
+            if let Some(main) = slots
+                .iter()
+                .find(|(_, n)| *n == node_id)
+                .and_then(|(slot, _)| self.clap_pool_idx(*slot))
+                .and_then(|idx| self._surge_main.get_mut(idx))
+            {
+                let ascii = trimmed.replace('\u{2212}', "-");
+                if let Some(plain) = main.param_text_to_value(pin.id, &ascii) {
+                    let span = (pin.max - pin.min).max(1e-9);
+                    return Some((((plain - pin.min) / span) as f32).clamp(0.0, 1.0));
+                }
+            }
+        }
+        if let Some(info) = self.knob_lv2_info(unit, ki) {
+            let ascii = trimmed.replace('\u{2212}', "-");
+            if let Some(native) = crate::lv2::parse_lv2_control_text(&info, &ascii) {
+                return Some(crate::lv2::lv2_native_to_norm(&info, native));
+            }
+        }
+        self.knob_format(unit, ki).parse(trimmed)
+    }
+
+    /// Paint the active knob's formatted drag chip (elevated, accented when
+    /// Shift fine-tuning) or the hovered knob's subtle formatted readout (#304).
+    /// Runs after all units in `draw_front` so neighbor plates never clip it.
+    fn draw_knob_readout(&self, painter: &egui::Painter) {
+        let active = match self.drag {
+            Drag::Knob { unit, idx, fine, .. } => Some((unit, idx, true, fine)),
+            _ if self.text_alpha > 0.01 && self.knob_menu.is_none() && !self.show_help => {
+                match self.hover {
+                    Some(Hit::Knob { unit, idx }) => Some((unit, idx, false, false)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((ui, ki, dragging, fine)) = active else { return };
+        if !self.visible(ui) { return; }
+        let Some(u) = self.units.get(ui) else { return };
+        let Some(k) = u.knobs.get(ki) else { return };
+        if k.hidden { return; }
+        let xf = &self.xf;
+        let c = self.knob_center(ui, ki);
+        let r = KNOB_R;
+        let target = k.cc_target();
+        let is_learning = target.is_some_and(|(p, t)| {
+            self.cc_learn.as_ref().is_some_and(|l| l.dest == u.node_id && l.param == p && l.target == t)
+        });
+        let has_bound = target.is_some_and(|(p, t)| self.knob_cc_mapping(u.node_id, p, t).is_some());
+        let has_tag = (is_learning || has_bound) && self.text_alpha > 0.01;
+        let text = self.knob_value_text(ui, ki);
+        let bounds = painter.clip_rect().shrink(4.0);
+
         if dragging {
-            let g = painter.layout(format!("{:.2}", k.value), theme::medium_font(13.0), theme::INK, f32::INFINITY);
-            let y_off = if has_tag { -r - 52.0 } else { -r - 30.0 };
-            let chip = Rect::from_min_size(
-                xf.p(c + Vec2::new(-g.size().x / 2.0 - 8.0, y_off)),
-                g.size() + Vec2::new(16.0, 10.0),
-            );
+            let g = painter.layout_no_wrap(text, theme::medium_font(13.0), theme::INK);
+            let pad = Vec2::new(8.0, 5.0);
+            let sz = g.size() + pad * 2.0;
+            let top_y = if has_tag { -r - 32.0 - sz.y } else { -r - 10.0 - sz.y };
+            let mut pos = xf.p(c + Vec2::new(-sz.x / 2.0, top_y));
+            if bounds.width() > sz.x {
+                pos.x = pos.x.clamp(bounds.left(), bounds.right() - sz.x);
+            }
+            if bounds.height() > sz.y {
+                pos.y = pos.y.clamp(bounds.top(), bounds.bottom() - sz.y);
+            }
+            let chip = Rect::from_min_size(pos, sz);
             theme::drop_shadow(painter, chip, 6.0);
             painter.rect_filled(chip, 6.0, theme::PAPER_SINK);
-            painter.rect_stroke(chip, 6.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-            painter.galley(chip.min + Vec2::new(8.0, 5.0), g, theme::INK);
+            let stroke = if fine {
+                Stroke::new(1.2, theme::ACCENT)
+            } else {
+                Stroke::new(1.0, theme::HAIRLINE)
+            };
+            painter.rect_stroke(chip, 6.0, stroke, egui::StrokeKind::Inside);
+            painter.galley(chip.min + pad, g, theme::INK);
+        } else {
+            // Subtle hover readout: quiet flat plate, rule 7 padding (8x4), no shadow.
+            let g = painter.layout_no_wrap(text, theme::medium_font(10.5), theme::CREAM_MID);
+            let pad = Vec2::new(8.0, 4.0);
+            let sz = g.size() + pad * 2.0;
+            let top_y = if has_tag { -r - 30.0 - sz.y } else { -r - 9.0 - sz.y };
+            let mut pos = xf.p(c + Vec2::new(-sz.x / 2.0, top_y));
+            if bounds.width() > sz.x {
+                pos.x = pos.x.clamp(bounds.left(), bounds.right() - sz.x);
+            }
+            if bounds.height() > sz.y {
+                pos.y = pos.y.clamp(bounds.top(), bounds.bottom() - sz.y);
+            }
+            let chip = Rect::from_min_size(pos, sz);
+            painter.rect_filled(chip, 3.0, theme::PAPER_SINK);
+            painter.rect_stroke(chip, 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            let mut tp = painter.clone();
+            tp.set_opacity(self.text_alpha);
+            tp.galley(chip.min + pad, g, theme::CREAM_MID);
         }
     }
 
@@ -28049,15 +28374,36 @@ impl DemoApp {
         Some((unit, idx))
     }
 
+    fn close_knob_menu(&mut self, ctx: &egui::Context) {
+        self.knob_menu = None;
+        self.knob_menu_rect = Rect::NOTHING;
+        self.knob_menu_seed = None;
+        self.knob_menu_text.clear();
+        self.knob_menu_error = false;
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("knob_value_edit")));
+    }
+
     fn knob_menu_ui(&mut self, ctx: &egui::Context) {
+        let edit_id = egui::Id::unique("knob_value_edit");
         let Some(menu) = self.knob_menu else {
             self.knob_menu_rect = Rect::NOTHING;
+            if self.knob_menu_seed.is_some() {
+                self.knob_menu_seed = None;
+                self.knob_menu_text.clear();
+                self.knob_menu_error = false;
+                ctx.memory_mut(|m| m.surrender_focus(edit_id));
+            }
             return;
         };
-        let close = |app: &mut Self| {
-            app.knob_menu = None;
-            app.knob_menu_rect = Rect::NOTHING;
-        };
+        // When the numeric entry is focused, `handle_input` is skipped (rule 12),
+        // so catch a primary click outside the menu here and release focus cleanly.
+        let prev_rect = self.knob_menu_rect;
+        if prev_rect.is_positive()
+            && typing(ctx)
+            && ctx.input(|i| i.pointer.primary_pressed() && i.pointer.interact_pos().is_some_and(|p| !prev_rect.contains(p)))
+        {
+            return self.close_knob_menu(ctx);
+        }
         let shown = if menu.from_dock {
             self.dock == DockView::Keyboard
         } else {
@@ -28069,20 +28415,33 @@ impl DemoApp {
             stage_ok && self.stage_view == menu.stage
         };
         if !shown {
-            return close(self);
+            return self.close_knob_menu(ctx);
         }
         let (node_id, param, target) = (menu.node, menu.param, menu.target);
         // A mixer control (#75) or MidiCc control has a binding and no knob: no value to reset.
         let knob = self.knob_menu_target(&menu);
-        let Some(title) = self.cc_dest_title((node_id, param, target)) else { return close(self) };
+        let Some(title) = self.cc_dest_title((node_id, param, target)) else {
+            return self.close_knob_menu(ctx);
+        };
         let active_learn = self.cc_learn.as_ref().filter(|l| l.dest == node_id && l.param == param && l.target == target).cloned();
         let learning = active_learn.is_some();
         let capture = active_learn.as_ref().and_then(|l| l.capture.clone());
         let mapping = self.knob_cc_mapping(node_id, param, target);
         let binding = mapping.map(|(src, m)| (src, m.cc));
         if binding.is_none() && !learning {
-            return close(self);
+            return self.close_knob_menu(ctx);
         }
+        if let Some((unit, idx)) = knob {
+            if self.knob_menu_seed != Some((node_id, param, target)) {
+                self.knob_menu_text = self.knob_value_text(unit, idx);
+                self.knob_menu_seed = Some((node_id, param, target));
+                self.knob_menu_error = false;
+            }
+        }
+        let mut val_text = self.knob_menu_text.clone();
+        let mut val_err = self.knob_menu_error;
+        let mut submit_val = false;
+        let mut cancel_edit = false;
         let mut relearn = false;
         let mut finish_learn = false;
         let mut cancel_learn = false;
@@ -28097,6 +28456,8 @@ impl DemoApp {
         let has_in_range = ranged.is_some_and(|(_, m)| m.scale.has_input_range());
         let (mut in_lo_v, mut in_hi_v) = ranged.map_or((0u8, 127u8), |(_, m)| m.scale.input_bounds());
         let mut new_scale: Option<crate::matrix::CcScale> = None;
+        let enter_pressed = ctx.input(|i| i.key_pressed(Key::Enter));
+        let esc_pressed = ctx.input(|i| i.key_pressed(Key::Escape));
         let area = egui::Area::new(egui::Id::new("knob_midi_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
@@ -28123,6 +28484,31 @@ impl DemoApp {
                             (None, None) => "MIDI learn · move a controller".to_string(),
                         };
                         ui.label(egui::RichText::new(status).size(11.0).color(theme::MIDI_BLUE));
+                        if knob.is_some() {
+                            ui.add_space(6.0);
+                            theme::tracked_label(ui, "VALUE", 9.0, 0.12, theme::INK_2);
+                            ui.add_space(2.0);
+                            let before = val_text.clone();
+                            let edit = egui::TextEdit::singleline(&mut val_text)
+                                .id(edit_id)
+                                .desired_width(148.0)
+                                .font(theme::medium_font(12.0))
+                                .margin(egui::Margin::symmetric(8, 4))
+                                .hint_text("Enter value…");
+                            let resp = ui.add(edit)
+                                .on_hover_text("type an exact value (e.g. 440 Hz, 250 ms, -6 dB, 50%) and press Enter");
+                            if val_text != before {
+                                val_err = false;
+                            }
+                            if val_err {
+                                ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.0, theme::CLIP_RED), egui::StrokeKind::Inside);
+                            }
+                            if (resp.has_focus() || resp.lost_focus()) && enter_pressed {
+                                submit_val = true;
+                            } else if (resp.has_focus() || resp.lost_focus()) && esc_pressed {
+                                cancel_edit = true;
+                            }
+                        }
                         ui.add_space(6.0);
                         if learning {
                             if capture.is_some() {
@@ -28200,13 +28586,33 @@ impl DemoApp {
                     });
             });
         self.knob_menu_rect = area.response.rect;
+        self.knob_menu_text = val_text;
+        self.knob_menu_error = val_err;
         if let (Some(scale), Some((src, m))) = (new_scale, ranged) {
             self.set_cc_scaled(src, node_id, m.cc, Some(param), target, scale);
+        }
+        if cancel_edit {
+            self.close_knob_menu(ctx);
+            return;
+        }
+        if let (true, Some((unit, idx))) = (submit_val, knob) {
+            let input = self.knob_menu_text.clone();
+            if let Some(norm) = self.parse_knob_value(unit, idx, &input) {
+                self.set_unit_knob(unit, idx, norm);
+                if learning {
+                    self.cc_learn = None;
+                }
+                self.close_knob_menu(ctx);
+            } else {
+                self.knob_menu_error = true;
+                ctx.memory_mut(|m| m.request_focus(edit_id));
+            }
+            return;
         }
         if !(relearn || finish_learn || cancel_learn || clear || reset_val) {
             return;
         }
-        close(self);
+        self.close_knob_menu(ctx);
         if relearn {
             self.cc_learn = Some(CcLearn::new(
                 SourceId::Keys,
@@ -28233,8 +28639,8 @@ impl DemoApp {
         } else if clear {
             self.clear_knob_bindings(node_id, param, target);
         } else if let (true, Some((unit, idx))) = (reset_val, knob) {
-            let k = &mut self.units[unit].knobs[idx];
-            k.set_immediate(k.default);
+            let def = self.units[unit].knobs[idx].default;
+            self.set_unit_knob(unit, idx, def);
         }
     }
 
@@ -29242,6 +29648,324 @@ fn parse_pan(s: &str) -> Option<f64> {
     t.parse().ok()
 }
 
+/// Physical unit formatting and numeric parsing for rack and mixer knobs (#304).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KnobFormat {
+    /// Linear amplitude 0..1 → dB (`−∞`, `−2.5 dB`, `0 dB`).
+    LinearDb,
+    /// DSP Gain quadratic taper `amp = (2v)²`: `−∞`, `0.0 dB` at 0.5, `+12.0 dB` at 1.0.
+    GainQuadDb,
+    /// Linear dB span `lo..=hi` (EQ3 −18..+18 dB, Limiter Ceil/Drive, Saturation Drive).
+    DbRange { lo: f32, hi: f32, signed: bool },
+    /// Log frequency span in Hz (Filter cutoff 20 Hz..20.0 kHz).
+    LogHz { lo: f32, hi: f32 },
+    /// Filter resonance `Q = 0.5 * 32^v` (`Q 0.50`..`Q 16.0`).
+    FilterQ,
+    /// Log time span in seconds (Delay TIME 50 ms..2.00 s).
+    LogSecs { lo: f32, hi: f32 },
+    /// Constant-power stereo pan (`L 1.00`..`C 0.00`..`R 1.00`).
+    Pan,
+    /// Built-in MIDI transpose semitones (`−24 st`..`0 st`..`+24 st`).
+    Semitones(i8),
+    /// Percentage `lo..=hi` (optional floor clamp on normalized `v`, e.g. Arp GATE ≥ 5%).
+    Percent { lo: f32, hi: f32, clamp_min: Option<f32> },
+    /// Stepped Arp MODE (`UP`, `DOWN`, `U-D`, `CHORD`, `RAND`).
+    ArpMode,
+    /// Stepped Arp RATE (`1/4`..`1/32`).
+    ArpRate,
+    /// Stepped Arp OCT (`1 oct`..`4 oct`).
+    ArpOctaves,
+    /// Stepped Arp CHORD (`MAJ`, `MIN`, `SUS2`, `SUS4`, `7`, `MAJ7`, `MIN7`, `5`).
+    ArpChord,
+    /// Stepped Organ LESLIE (`STOP`, `SLOW`, `FAST`).
+    OrganLeslie,
+    /// Stepped Organ PERC (`OFF`, `ON`, `SOFT`).
+    OrganPerc,
+    /// Linear plain range (CLAP fallback without live voice / LV2 controls).
+    PlainRange { min: f64, max: f64 },
+}
+
+fn format_db_signed(db: f32, signed: bool) -> String {
+    if db.abs() < 0.05 {
+        "0.0 dB".into()
+    } else if db < 0.0 {
+        format!("\u{2212}{:.1} dB", -db)
+    } else if signed {
+        format!("+{db:.1} dB")
+    } else {
+        format!("{db:.1} dB")
+    }
+}
+
+fn format_plain_num(v: f64) -> String {
+    let a = v.abs();
+    if a < 1e-6 {
+        "0".into()
+    } else if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+impl KnobFormat {
+    fn format(self, v: f32) -> String {
+        let v = v.clamp(0.0, 1.0);
+        match self {
+            KnobFormat::LinearDb => db_readout(v),
+            KnobFormat::GainQuadDb => {
+                let amp = (2.0 * v) * (2.0 * v);
+                if amp < 1e-4 {
+                    "\u{2212}\u{221e}".into()
+                } else {
+                    format_db_signed(20.0 * amp.log10(), true)
+                }
+            }
+            KnobFormat::DbRange { lo, hi, signed } => format_db_signed(lo + (hi - lo) * v, signed),
+            KnobFormat::LogHz { lo, hi } => {
+                let hz = lo * (hi / lo).powf(v);
+                if hz >= 10_000.0 {
+                    format!("{:.1} kHz", hz / 1000.0)
+                } else if hz >= 1000.0 {
+                    format!("{:.2} kHz", hz / 1000.0)
+                } else {
+                    format!("{} Hz", hz.round() as i32)
+                }
+            }
+            KnobFormat::FilterQ => {
+                let q = 0.5 * 32.0f32.powf(v);
+                if q >= 10.0 {
+                    format!("Q {q:.1}")
+                } else {
+                    format!("Q {q:.2}")
+                }
+            }
+            KnobFormat::LogSecs { lo, hi } => {
+                let secs = lo * (hi / lo).powf(v);
+                if secs >= 1.0 {
+                    format!("{secs:.2} s")
+                } else {
+                    format!("{} ms", (secs * 1000.0).round() as i32)
+                }
+            }
+            KnobFormat::Pan => pan_text(v * 2.0 - 1.0),
+            KnobFormat::Semitones(max) => {
+                let semis = ((v * 2.0 - 1.0) * max as f32).round() as i8;
+                if semis == 0 {
+                    "0 st".into()
+                } else if semis > 0 {
+                    format!("+{semis} st")
+                } else {
+                    format!("\u{2212}{} st", -(semis as i16))
+                }
+            }
+            KnobFormat::Percent { lo, hi, clamp_min } => {
+                let eff = clamp_min.map_or(v, |m| v.max(m));
+                let pct = lo + (hi - lo) * eff;
+                format!("{}%", pct.round() as i32)
+            }
+            KnobFormat::ArpMode => {
+                crate::arp::ArpMode::ALL[crate::arp::step_index(v as f64, crate::arp::ArpMode::ALL.len())].label().into()
+            }
+            KnobFormat::ArpRate => {
+                crate::arp::ArpRate::ALL[crate::arp::step_index(v as f64, crate::arp::ArpRate::ALL.len())].label().into()
+            }
+            KnobFormat::ArpOctaves => {
+                let oct = crate::arp::step_index(v as f64, crate::arp::MAX_OCTAVES as usize) + 1;
+                format!("{oct} oct")
+            }
+            KnobFormat::ArpChord => {
+                crate::arp::ChordShape::ALL[crate::arp::step_index(v as f64, crate::arp::ChordShape::ALL.len())].label().into()
+            }
+            KnobFormat::OrganLeslie => crate::organ::step_name(crate::organ::P_LESLIE, v).unwrap_or("SLOW").into(),
+            KnobFormat::OrganPerc => crate::organ::step_name(crate::organ::P_PERC, v).unwrap_or("OFF").into(),
+            KnobFormat::PlainRange { min, max } => {
+                if (min - 0.0).abs() < 1e-6 && (max - 1.0).abs() < 1e-6 {
+                    format!("{}%", (v * 100.0).round() as i32)
+                } else {
+                    format_plain_num(min + v as f64 * (max - min))
+                }
+            }
+        }
+    }
+
+    fn parse(self, raw: &str) -> Option<f32> {
+        let norm_str = raw.trim().replace('\u{2212}', "-");
+        let s = norm_str.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let lower = s.to_ascii_lowercase();
+        let parse_pct = || -> Option<f32> {
+            let num = lower.strip_suffix('%')?.trim().parse::<f32>().ok()?;
+            num.is_finite().then_some((num / 100.0).clamp(0.0, 1.0))
+        };
+        let log_norm = |x: f32, lo: f32, hi: f32| -> f32 {
+            ((x.clamp(lo, hi) / lo).ln() / (hi / lo).ln()).clamp(0.0, 1.0)
+        };
+        match self {
+            KnobFormat::LinearDb => {
+                if matches!(lower.as_str(), "-inf" | "-inf db" | "-\u{221e}" | "-\u{221e} db" | "off" | "mute") {
+                    return Some(0.0);
+                }
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                if let Some(rest) = lower.strip_suffix("db") {
+                    let db = rest.trim().parse::<f32>().ok()?;
+                    if !db.is_finite() { return None; }
+                    return Some(10.0f32.powf(db.min(0.0) / 20.0).clamp(0.0, 1.0));
+                }
+                let x = s.parse::<f32>().ok()?;
+                if !x.is_finite() { return None; }
+                if x <= 0.0 {
+                    Some(10.0f32.powf(x / 20.0).clamp(0.0, 1.0))
+                } else if x <= 1.0 {
+                    Some(x.clamp(0.0, 1.0))
+                } else {
+                    Some(1.0)
+                }
+            }
+            KnobFormat::GainQuadDb => {
+                if matches!(lower.as_str(), "-inf" | "-inf db" | "-\u{221e}" | "-\u{221e} db" | "off" | "mute") {
+                    return Some(0.0);
+                }
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                let num = lower.strip_suffix("db").unwrap_or(&lower).trim().parse::<f32>().ok()?;
+                if !num.is_finite() { return None; }
+                let amp = 10.0f32.powf(num / 20.0);
+                Some((amp.sqrt() * 0.5).clamp(0.0, 1.0))
+            }
+            KnobFormat::DbRange { lo, hi, .. } => {
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                let db = lower.strip_suffix("db").unwrap_or(&lower).trim().parse::<f32>().ok()?;
+                if !db.is_finite() { return None; }
+                Some(((db - lo) / (hi - lo)).clamp(0.0, 1.0))
+            }
+            KnobFormat::LogHz { lo, hi } => {
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                let hz = if let Some(r) = lower.strip_suffix("khz").or_else(|| lower.strip_suffix('k')) {
+                    r.trim().parse::<f32>().ok()? * 1000.0
+                } else {
+                    lower.strip_suffix("hz").unwrap_or(&lower).trim().parse::<f32>().ok()?
+                };
+                if !hz.is_finite() || hz <= 0.0 { return None; }
+                Some(log_norm(hz, lo, hi))
+            }
+            KnobFormat::FilterQ => {
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                let q = lower.strip_prefix('q').unwrap_or(&lower).trim().parse::<f32>().ok()?;
+                if !q.is_finite() || q <= 0.0 { return None; }
+                Some(((q.clamp(0.5, 16.0) / 0.5).ln() / 32.0f32.ln()).clamp(0.0, 1.0))
+            }
+            KnobFormat::LogSecs { lo, hi } => {
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                let secs = if let Some(r) = lower.strip_suffix("ms") {
+                    r.trim().parse::<f32>().ok()? / 1000.0
+                } else if let Some(r) = lower.strip_suffix("sec").or_else(|| lower.strip_suffix('s')) {
+                    r.trim().parse::<f32>().ok()?
+                } else {
+                    let v = lower.parse::<f32>().ok()?;
+                    if v > hi { v / 1000.0 } else { v }
+                };
+                if !secs.is_finite() || secs <= 0.0 { return None; }
+                Some(log_norm(secs, lo, hi))
+            }
+            KnobFormat::Pan => {
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                let p = parse_pan(s)?;
+                if !p.is_finite() { return None; }
+                Some(((p.clamp(-1.0, 1.0) + 1.0) * 0.5) as f32)
+            }
+            KnobFormat::Semitones(max) => {
+                let num = lower
+                    .strip_suffix("semitones")
+                    .or_else(|| lower.strip_suffix("semis"))
+                    .or_else(|| lower.strip_suffix("semi"))
+                    .or_else(|| lower.strip_suffix("st"))
+                    .unwrap_or(&lower)
+                    .trim()
+                    .parse::<f32>()
+                    .ok()?;
+                if !num.is_finite() { return None; }
+                Some(((num / max as f32 + 1.0) * 0.5).clamp(0.0, 1.0))
+            }
+            KnobFormat::Percent { lo, hi, clamp_min } => {
+                let num = lower.strip_suffix('%').unwrap_or(&lower).trim().parse::<f32>().ok()?;
+                if !num.is_finite() { return None; }
+                let n = ((num - lo) / (hi - lo)).clamp(0.0, 1.0);
+                Some(clamp_min.map_or(n, |m| n.max(m)))
+            }
+            KnobFormat::ArpMode => {
+                let m = crate::arp::ArpMode::from_name(s)?;
+                let idx = crate::arp::ArpMode::ALL.iter().position(|&x| x == m)?;
+                Some(crate::arp::step_value(idx, crate::arp::ArpMode::ALL.len()))
+            }
+            KnobFormat::ArpRate => {
+                let r = crate::arp::ArpRate::from_name(s)?;
+                let idx = crate::arp::ArpRate::ALL.iter().position(|&x| x == r)?;
+                Some(crate::arp::step_value(idx, crate::arp::ArpRate::ALL.len()))
+            }
+            KnobFormat::ArpOctaves => {
+                let num = lower
+                    .strip_suffix("octaves")
+                    .or_else(|| lower.strip_suffix("octave"))
+                    .or_else(|| lower.strip_suffix("oct"))
+                    .unwrap_or(&lower)
+                    .trim()
+                    .parse::<f32>()
+                    .ok()?;
+                if !num.is_finite() { return None; }
+                let pos = (num.round().clamp(1.0, crate::arp::MAX_OCTAVES as f32) as usize) - 1;
+                Some(crate::arp::step_value(pos, crate::arp::MAX_OCTAVES as usize))
+            }
+            KnobFormat::ArpChord => {
+                let c = crate::arp::ChordShape::from_name(s)?;
+                let idx = crate::arp::ChordShape::ALL.iter().position(|&x| x == c)?;
+                Some(crate::arp::step_value(idx, crate::arp::ChordShape::ALL.len()))
+            }
+            KnobFormat::OrganLeslie => match lower.as_str() {
+                "stop" | "0" => Some(0.0),
+                "slow" | "1" => Some(0.5),
+                "fast" | "2" => Some(1.0),
+                _ => None,
+            },
+            KnobFormat::OrganPerc => match lower.as_str() {
+                "off" | "0" => Some(0.0),
+                "on" | "normal" | "1" => Some(0.5),
+                "soft" | "2" => Some(1.0),
+                _ => None,
+            },
+            KnobFormat::PlainRange { min, max } => {
+                if let Some(p) = parse_pct() {
+                    return Some(p);
+                }
+                let plain = s.parse::<f64>().ok()?;
+                if !plain.is_finite() { return None; }
+                if (min - 0.0).abs() < 1e-6 && (max - 1.0).abs() < 1e-6 && plain > 1.0 && plain <= 100.0 {
+                    return Some((plain / 100.0) as f32);
+                }
+                let span = (max - min).max(1e-9);
+                Some((((plain - min) / span) as f32).clamp(0.0, 1.0))
+            }
+        }
+    }
+}
+
 /// Mixer channel-strip width (sources and rig buses share it).
 const STRIP_W: f32 = 122.0;
 /// Width of a strip collapsed to its mini form (#77).
@@ -29931,6 +30655,7 @@ impl DemoApp {
 
         self.publish_patch();
         self.publish_pins();
+        self.refresh_knob_readouts();
 
         self.tessellate();
         if !(self.dock == DockView::Keyboard && self.kb_expanded) {
@@ -35383,9 +36108,10 @@ mod split_bpm_tests {
     /// Drag fields (MIN, MAX) of the knob menu, left to right.
     fn range_fields(ctx: &egui::Context) -> Vec<Rect> {
         let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
+        let edit_id = egui::Id::unique("knob_value_edit");
         ctx.viewport(|v| {
             let mut f: Vec<Rect> = v.prev_pass.widgets.get_layer(menu_layer)
-                .filter(|w| w.sense.senses_drag() && w.sense.is_focusable())
+                .filter(|w| w.id != edit_id && w.sense.senses_drag() && w.sense.is_focusable())
                 .map(|w| w.rect)
                 .collect();
             f.sort_by(|a, b| a.left().total_cmp(&b.left()));
@@ -44638,6 +45364,24 @@ mod offline_shots {
         pointer_fn: Option<&dyn Fn(&DemoApp) -> Pos2>,
         path: &std::path::Path,
     ) {
+        shot_with(app, size, path, |a, i| {
+            if i >= 2 {
+                if let Some(f) = pointer_fn {
+                    return vec![egui::Event::PointerMoved(f(a))];
+                }
+            }
+            Vec::new()
+        });
+    }
+
+    /// Run frames of `app` at `size` points, feeding `events(app, frame_idx)`
+    /// on each frame so hover/drag/popover states can be captured directly.
+    pub(super) fn shot_with(
+        app: &mut DemoApp,
+        size: Vec2,
+        path: &std::path::Path,
+        mut events: impl FnMut(&mut DemoApp, usize) -> Vec<egui::Event>,
+    ) {
         let ctx = egui::Context::default();
         // The real app's faces (Noto + symbol fallbacks), not egui's defaults.
         theme::install_fonts(&ctx);
@@ -44647,11 +45391,7 @@ mod offline_shots {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
             raw.time = Some(i as f64 * 0.05);
-            if i >= 2 {
-                if let Some(f) = pointer_fn {
-                    raw.events.push(egui::Event::PointerMoved(f(app)));
-                }
-            }
+            raw.events = events(app, i);
             eframe::App::raw_input_hook(app, &ctx, &mut raw);
             let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
             tex.apply(&out.textures_delta);
@@ -46204,5 +46944,464 @@ mod cable_ergonomics_tests {
             app.set_cable_tension(0.65, false);
             super::offline_shots::shot(&mut app, SIZE, &dir.join("settings-display-cables.png"));
         }
+    }
+}
+
+/// Precision knob controls (#304): Shift fine-tune drag (no mid-drag jump),
+/// double-click reset to default, formatted physical unit readouts (drag + hover
+/// + CLAP value_to_text), and exact numeric entry in the knob context menu
+/// without breaking quick MIDI learn or trapping rack shortcuts (rule 12).
+#[cfg(test)]
+mod precision_knob_tests {
+    use super::*;
+
+    fn run_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, time: f64, events: Vec<egui::Event>) -> Vec<String> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.time = Some(time);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        let mut texts = Vec::new();
+        for s in &out.shapes {
+            collect_texts(&s.shape, &mut texts);
+        }
+        out.textures_delta.clear(); // rule 11
+        texts
+    }
+
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.job.text.clone()),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_texts(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn knob_menu_edit_rect(ctx: &egui::Context) -> Option<Rect> {
+        let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
+        let edit_id = egui::Id::unique("knob_value_edit");
+        ctx.viewport(|v| {
+            v.prev_pass
+                .widgets
+                .get_layer(menu_layer)
+                .find(|w| w.id == edit_id)
+                .map(|w| w.rect)
+        })
+    }
+
+    #[test]
+    fn shift_drag_fine_tunes_without_mid_drag_jump_and_keeps_ctrl_unit_drag() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 1.0;
+        for _ in 0..3 {
+            t += 0.1;
+            run_at(&mut app, &ctx, size, t, vec![]);
+        }
+
+        let delay_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+        let time_ki = app.units[delay_ui].knob_index("TIME").unwrap();
+        app.units[delay_ui].knobs[time_ki].set_immediate(0.30);
+        let pos = app.xf.p(app.knob_center(delay_ui, time_ki));
+
+        // 1. Plain drag 50 px upward -> +0.300 (0.006 / px).
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+        ]);
+        let p1 = Pos2::new(pos.x, pos.y - 50.0);
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![egui::Event::PointerMoved(p1)]);
+        let after_coarse = app.units[delay_ui].knobs[time_ki].value;
+        assert!((after_coarse - 0.60).abs() < 1e-4, "coarse 50 px drag: expected 0.60, got {after_coarse}");
+
+        // 2. Press Shift mid-drag at the SAME pointer position -> ZERO jump!
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::ModifiersChanged(Modifiers::SHIFT),
+            egui::Event::PointerMoved(p1),
+        ]);
+        let after_shift_press = app.units[delay_ui].knobs[time_ki].value;
+        assert!((after_shift_press - after_coarse).abs() < 1e-6,
+            "pressing Shift mid-drag must not jump: {after_coarse} -> {after_shift_press}");
+
+        // 3. Drag 50 px further upward while holding Shift -> +0.030 (10x finer!).
+        let p2 = Pos2::new(pos.x, pos.y - 100.0);
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![egui::Event::PointerMoved(p2)]);
+        let after_fine = app.units[delay_ui].knobs[time_ki].value;
+        let fine_delta = after_fine - after_coarse;
+        assert!((fine_delta - 0.03).abs() < 1e-4, "Shift+drag 50 px should move ~0.03 (10x finer), got {fine_delta}");
+
+        // 4. Release Shift mid-drag at the SAME pointer position -> ZERO jump!
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::ModifiersChanged(Modifiers::NONE),
+            egui::Event::PointerMoved(p2),
+        ]);
+        let after_shift_release = app.units[delay_ui].knobs[time_ki].value;
+        assert!((after_shift_release - after_fine).abs() < 1e-6,
+            "releasing Shift mid-drag must not jump: {after_fine} -> {after_shift_release}");
+
+        // 5. Continue coarse drag 20 px upward -> +0.120 from after_fine.
+        let p3 = Pos2::new(pos.x, pos.y - 120.0);
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![egui::Event::PointerMoved(p3)]);
+        let after_resume = app.units[delay_ui].knobs[time_ki].value;
+        assert!((after_resume - (after_fine + 0.12)).abs() < 1e-4,
+            "resumed coarse drag should continue smoothly: expected {}, got {after_resume}", after_fine + 0.12);
+
+        // Release mouse.
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::PointerButton { pos: p3, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+        ]);
+
+        // 6. Ctrl+drag on a knob still starts Drag::Unit (unit rearranging untouched).
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::ModifiersChanged(Modifiers::CTRL),
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::CTRL },
+        ]);
+        assert!(matches!(app.drag, Drag::Unit { unit, .. } if unit == delay_ui),
+            "Ctrl+drag must still rearrange the unit, not drag the knob");
+    }
+
+    #[test]
+    fn double_click_rack_knob_resets_to_default_and_sends_to_engine() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 1.0;
+        for _ in 0..3 {
+            t += 0.1;
+            run_at(&mut app, &ctx, size, t, vec![]);
+        }
+
+        let delay_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+        let delay_node = app.units[delay_ui].node_id;
+        let time_ki = app.units[delay_ui].knob_index("TIME").unwrap();
+        let default_val = app.units[delay_ui].knobs[time_ki].default;
+        app.set_unit_knob(delay_ui, time_ki, 0.92);
+        drain.drain(|_| {});
+
+        let pos = app.xf.p(app.knob_center(delay_ui, time_ki));
+        for ev in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+        ] {
+            t += 0.05;
+            run_at(&mut app, &ctx, size, t, ev);
+        }
+
+        let k = &app.units[delay_ui].knobs[time_ki];
+        assert!((k.value - default_val).abs() < 1e-6, "double-click reset value: expected {default_val}, got {}", k.value);
+        assert!((k.display_value - default_val).abs() < 1e-6, "double-click reset display_value: {}", k.display_value);
+
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SetParam { node, param, value }
+                if *node == delay_node && *param == P_TIME && (*value - default_val as f64).abs() < 1e-5)),
+            "double-click must send SetParam with default value to engine: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn formatted_readouts_cover_builtin_dsp_arp_master_clap_and_paint_on_hover_and_drag() {
+        // 1. Pure format + parse round-trips across built-in physical units.
+        assert_eq!(KnobFormat::LogSecs { lo: crate::dsp::DELAY_MIN_S, hi: crate::dsp::DELAY_MAX_S }.format(0.0), "50 ms");
+        assert_eq!(KnobFormat::LogSecs { lo: crate::dsp::DELAY_MIN_S, hi: crate::dsp::DELAY_MAX_S }.format(0.4), "219 ms");
+        assert_eq!(KnobFormat::LogSecs { lo: crate::dsp::DELAY_MIN_S, hi: crate::dsp::DELAY_MAX_S }.format(1.0), "2.00 s");
+        let t250 = KnobFormat::LogSecs { lo: crate::dsp::DELAY_MIN_S, hi: crate::dsp::DELAY_MAX_S }.parse("250 ms").unwrap();
+        assert_eq!(KnobFormat::LogSecs { lo: crate::dsp::DELAY_MIN_S, hi: crate::dsp::DELAY_MAX_S }.format(t250), "250 ms");
+
+        assert_eq!(KnobFormat::LogHz { lo: 20.0, hi: 20000.0 }.format(0.0), "20 Hz");
+        assert_eq!(KnobFormat::LogHz { lo: 20.0, hi: 20000.0 }.format(0.45), "448 Hz");
+        assert_eq!(KnobFormat::LogHz { lo: 20.0, hi: 20000.0 }.format(1.0), "20.0 kHz");
+        let f440 = KnobFormat::LogHz { lo: 20.0, hi: 20000.0 }.parse("440 Hz").unwrap();
+        assert_eq!(KnobFormat::LogHz { lo: 20.0, hi: 20000.0 }.format(f440), "440 Hz");
+        let f2k = KnobFormat::LogHz { lo: 20.0, hi: 20000.0 }.parse("2 kHz").unwrap();
+        assert_eq!(KnobFormat::LogHz { lo: 20.0, hi: 20000.0 }.format(f2k), "2.00 kHz");
+
+        assert_eq!(KnobFormat::FilterQ.format(0.2), "Q 1.00");
+        assert_eq!(KnobFormat::LinearDb.format(0.75), "\u{2212}2.5 dB");
+        assert_eq!(KnobFormat::LinearDb.format(1.0), "0 dB");
+        assert_eq!(KnobFormat::LinearDb.format(0.0), "\u{2212}\u{221e}");
+        assert_eq!(KnobFormat::GainQuadDb.format(0.5), "0.0 dB");
+        assert_eq!(KnobFormat::GainQuadDb.format(1.0), "+12.0 dB");
+        assert_eq!(KnobFormat::DbRange { lo: -18.0, hi: 18.0, signed: true }.format(0.5), "0.0 dB");
+        assert_eq!(KnobFormat::DbRange { lo: -12.0, hi: 0.0, signed: false }.format(0.8), "\u{2212}2.4 dB");
+        assert_eq!(KnobFormat::Semitones(24).format(0.5), "0 st");
+        let st7 = KnobFormat::Semitones(24).parse("+7 st").unwrap();
+        assert_eq!(KnobFormat::Semitones(24).format(st7), "+7 st");
+        assert_eq!(KnobFormat::ArpMode.format(0.0), "UP");
+        assert_eq!(KnobFormat::ArpRate.format(0.6), "1/16");
+        assert_eq!(KnobFormat::ArpOctaves.format(1.0), "4 oct");
+        assert_eq!(KnobFormat::ArpChord.format(0.0), "MAJ");
+        assert_eq!(KnobFormat::OrganLeslie.format(1.0), "FAST");
+        assert_eq!(KnobFormat::OrganPerc.format(0.5), "ON");
+
+        // 2. Live UI paint: hover and drag both show formatted units, never raw normalized "0.40".
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 1.0;
+        for _ in 0..3 {
+            t += 0.1;
+            run_at(&mut app, &ctx, size, t, vec![]);
+        }
+
+        let delay_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+        let time_ki = app.units[delay_ui].knob_index("TIME").unwrap();
+        let pos = app.xf.p(app.knob_center(delay_ui, time_ki));
+
+        // Hover over Delay TIME (default 0.4 -> "219 ms").
+        t += 0.1;
+        let hover_texts = run_at(&mut app, &ctx, size, t, vec![egui::Event::PointerMoved(pos)]);
+        assert!(hover_texts.iter().any(|s| s == "219 ms"), "hover readout should show '219 ms': {hover_texts:?}");
+        assert!(!hover_texts.iter().any(|s| s == "0.40"), "raw normalized 0.40 must not be shown: {hover_texts:?}");
+
+        // Drag Delay TIME -> drag chip shows formatted ms/s.
+        t += 0.1;
+        let drag_texts = run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+        ]);
+        assert!(drag_texts.iter().any(|s| s == "219 ms"), "drag chip should show '219 ms': {drag_texts:?}");
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+        ]);
+
+        // 3. CLAP value_to_text cache is preferred over fallback formatting.
+        let surge_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        app.units[surge_ui].knobs.insert(0, Knob {
+            label: "CUTOFF".into(),
+            value: 0.5,
+            display_value: 0.5,
+            glide_from: 0.5,
+            glide_t: 1.0,
+            default: 0.5,
+            param: None,
+            steps: 0,
+            hidden: false,
+            sent: Some(0.5),
+            clap: Some(ClapPin { id: 42, min: 0.0, max: 1.0, sent: 0.5, hold_until: 0.0 }),
+            source: KnobSource::Main("Filter Cutoff".into()),
+            cached_text: Some((0.5, "1320.0 Hz".into())),
+            label_g: None,
+        });
+        assert_eq!(app.knob_value_text(surge_ui, 0), "1320.0 Hz");
+    }
+
+    #[test]
+    fn knob_menu_numeric_entry_updates_engine_keeps_quick_learn_and_releases_focus() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 1.0;
+        for _ in 0..3 {
+            t += 0.1;
+            run_at(&mut app, &ctx, size, t, vec![]);
+        }
+
+        let delay_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+        let delay_node = app.units[delay_ui].node_id;
+        let time_ki = app.units[delay_ui].knob_index("TIME").unwrap();
+        let pos = app.xf.p(app.knob_center(delay_ui, time_ki));
+
+        // 1. First right-click on unbound knob still arms quick MIDI learn (no menu yet).
+        for pressed in [true, false] {
+            t += 0.05;
+            run_at(&mut app, &ctx, size, t, vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE },
+            ]);
+        }
+        assert!(app.cc_learn.is_some(), "1st right-click still arms quick MIDI learn");
+        assert!(app.knob_menu.is_none(), "1st right-click on unbound knob keeps quick learn unobstructed");
+
+        // 2. Second right-click opens the knob context menu with VALUE numeric entry.
+        for pressed in [true, false] {
+            t += 0.05;
+            run_at(&mut app, &ctx, size, t, vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE },
+            ]);
+        }
+        t += 0.1;
+        run_at(&mut app, &ctx, size, t, vec![]);
+        assert!(app.knob_menu.is_some(), "2nd right-click opens knob menu");
+        let edit_rect = knob_menu_edit_rect(&ctx).expect("VALUE TextEdit rendered in knob menu");
+
+        // 3. Click into the VALUE field -> focuses it, rack shortcuts yield (rule 12).
+        for ev in [
+            vec![egui::Event::PointerMoved(edit_rect.center())],
+            vec![egui::Event::PointerButton { pos: edit_rect.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: edit_rect.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+        ] {
+            t += 0.05;
+            run_at(&mut app, &ctx, size, t, ev);
+        }
+        assert!(ctx.text_edit_focused(), "clicking VALUE field focuses the TextEdit");
+
+        // Replace text with "500 ms" and press Enter.
+        drain.drain(|_| {});
+        app.knob_menu_text = "500 ms".into();
+        t += 0.05;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        t += 0.05;
+        run_at(&mut app, &ctx, size, t, vec![]);
+
+        let want = KnobFormat::LogSecs { lo: crate::dsp::DELAY_MIN_S, hi: crate::dsp::DELAY_MAX_S }.parse("500 ms").unwrap();
+        let got = app.units[delay_ui].knobs[time_ki].value;
+        assert!((got - want).abs() < 1e-4, "numeric entry '500 ms' set knob to {got}, expected {want}");
+        assert_eq!(app.knob_value_text(delay_ui, time_ki), "500 ms");
+        assert!(app.knob_menu.is_none(), "Enter closes the knob menu");
+        assert!(app.cc_learn.is_none(), "Enter disarms pending learn");
+        assert!(!ctx.text_edit_focused(), "closing menu must release TextEdit focus (rule 12)");
+
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SetParam { node, param, value }
+                if *node == delay_node && *param == P_TIME && (*value - want as f64).abs() < 1e-4)),
+            "numeric entry sent SetParam to engine: {cmds:?}"
+        );
+
+        // 4. Rack keyboard shortcuts work immediately on the next frame (Tab flips rack).
+        assert_eq!(app.side, Side::Front);
+        t += 0.05;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Tab, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert_eq!(app.flip_to, Side::Back, "Tab rack shortcut must not be trapped after numeric entry");
+
+        // 5. Escape and clicking outside while VALUE is focused also release focus cleanly.
+        app.side = Side::Front;
+        app.flip_to = Side::Front;
+        app.flipping = false;
+        let open_and_focus = |app: &mut DemoApp, t: &mut f64| {
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    *t += 0.05;
+                    run_at(app, &ctx, size, *t, vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE },
+                    ]);
+                }
+            }
+            *t += 0.05;
+            run_at(app, &ctx, size, *t, vec![]);
+            let er = knob_menu_edit_rect(&ctx).expect("VALUE edit rect");
+            for ev in [
+                vec![egui::Event::PointerMoved(er.center())],
+                vec![egui::Event::PointerButton { pos: er.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+                vec![egui::Event::PointerButton { pos: er.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+            ] {
+                *t += 0.05;
+                run_at(app, &ctx, size, *t, ev);
+            }
+            assert!(ctx.text_edit_focused(), "VALUE field focused");
+        };
+        open_and_focus(&mut app, &mut t);
+        t += 0.05;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Escape, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        t += 0.05;
+        run_at(&mut app, &ctx, size, t, vec![]);
+        assert!(app.knob_menu.is_none(), "Escape closes knob menu");
+        assert!(!ctx.text_edit_focused(), "Escape releases VALUE focus");
+
+        app.cc_learn = None;
+        open_and_focus(&mut app, &mut t);
+        let outside = Pos2::new(10.0, 10.0);
+        t += 0.05;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::PointerMoved(outside),
+            egui::Event::PointerButton { pos: outside, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+        ]);
+        t += 0.05;
+        run_at(&mut app, &ctx, size, t, vec![
+            egui::Event::PointerButton { pos: outside, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+        ]);
+        assert!(app.knob_menu.is_none(), "click outside closes knob menu while VALUE focused");
+        assert!(!ctx.text_edit_focused(), "click outside releases VALUE focus");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat precision_knob_shots -- --ignored"]
+    fn precision_knob_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = Vec2::new(1280.0, 800.0);
+
+        // 1. Subtle hover readout on Delay TIME ("219 ms").
+        let mut app_hover = DemoApp::new_with_sink(None);
+        super::offline_shots::shot_with(&mut app_hover, size, &dir.join("precision-knob-hover.png"), |app, i| {
+            if i >= 2 {
+                let du = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+                let ki = app.units[du].knob_index("TIME").unwrap();
+                vec![egui::Event::PointerMoved(app.xf.p(app.knob_center(du, ki)))]
+            } else {
+                vec![]
+            }
+        });
+
+        // 2. Shift fine-tune drag chip on Master VOLUME ("−2.2 dB" with accent stroke).
+        let mut app_drag = DemoApp::new_with_sink(None);
+        super::offline_shots::shot_with(&mut app_drag, size, &dir.join("precision-knob-drag-fine.png"), |app, i| {
+            if i < 3 {
+                return vec![];
+            }
+            let mu = app.master_idx().unwrap();
+            let ki = app.units[mu].knob_index("VOLUME").unwrap();
+            let pos = app.xf.p(app.knob_center(mu, ki));
+            match i {
+                3 => vec![
+                    egui::Event::ModifiersChanged(Modifiers::SHIFT),
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::SHIFT },
+                ],
+                4 => vec![egui::Event::PointerMoved(Pos2::new(pos.x, pos.y - 40.0))],
+                _ => vec![],
+            }
+        });
+
+        // 3. Knob context menu open with compact VALUE numeric entry ("219 ms").
+        let mut app_menu = DemoApp::new_with_sink(None);
+        super::offline_shots::shot_with(&mut app_menu, size, &dir.join("precision-knob-menu.png"), |app, i| {
+            if i == 2 {
+                let du = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+                let ki = app.units[du].knob_index("TIME").unwrap();
+                let node = app.units[du].node_id;
+                let (param, target) = app.units[du].knobs[ki].cc_target().unwrap();
+                let pos = app.xf.p(app.knob_center(du, ki));
+                app.set_cc_binding(SourceId::Hardware(1), node, 74, Some(param), target);
+                app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack, from_dock: false });
+            }
+            vec![]
+        });
     }
 }

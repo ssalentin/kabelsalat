@@ -118,6 +118,10 @@ sync with the mixer, release held notes safely, and keep delay compensation
 intact. Agents and MCP clients have the same actions (`set_node_bypass`,
 `duplicate_node`, `reset_node_params`, `randomize_node_params`).
 
+Click the **padlock** button next to the view tabs (or press **Ctrl+L**) to **lock the rack for editing** once your patch is dialed in (saved with the session; agents/MCP: `set_rack_locked`). While locked, playing, transport, rig switching, setlist stepping, and flipping front/back to inspect cables all keep working, while patching, unplugging, reordering, adding or removing units and rigs, rack knob edits, and mutating agent calls are blocked.
+
+<p align="center"><img src="docs/shots/rack-locked.png" width="85%" alt="The rack locked for editing: the top-bar padlock button is engaged, a LOCKED · CTRL+L TO UNLOCK badge sits above the rack, and the rack stays playable and inspectable without accidental edits"/></p>
+
 <p align="center"><img src="docs/shots/back.png" width="85%" alt="The back of the rack: hovering Surge A OUT traces its audio cables while dimming unrelated routes, shows a live dBFS port tooltip, and exposes opacity and tension sliders"/></p>
 
 ### Run several rigs at once

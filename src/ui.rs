@@ -1023,6 +1023,17 @@ struct SavedRule {
     edit: RuleEdit,
 }
 
+impl SavedRule {
+    fn hw(&self) -> Option<u32> {
+        match self.source { SourceId::Hardware(d) => Some(d), _ => None }
+    }
+
+    /// A hardware device switched off for `dest`, and nothing else.
+    fn hw_off(&self) -> bool {
+        self.hw().is_some() && !self.edit.enabled && RuleEdit { enabled: true, ..self.edit.clone() }.is_default()
+    }
+}
+
 /// `s` moved onto `graph`, every node id mapped by `remap` (None drops it):
 /// knobs, plugin states, matrix routes and mixer strips follow their node.
 /// Mark every plugin a starter template needs as installed, for tests and
@@ -1072,6 +1083,8 @@ fn remap_session(
     ns.master_mute = s.master_mute;
     ns.rig_types = s.rig_types.clone(); // marks follow their rig like names (#198)
     ns.time_sig = s.time_sig; // session-level too (#87)
+    ns.rig_devices = s.rig_devices.clone(); // and devices (#227)
+    ns.set_hw_ports(s.hw_ports().clone());
     for p in s.params() {
         if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
     }
@@ -1127,6 +1140,44 @@ fn remap_session(
     // Setlist (#204): rig indices and stored part knobs follow the remap (rule 44).
     ns.setlist = setlist;
     ns
+}
+
+/// The hardware device indices a session's routing depends on (#227): a
+/// rig's device, a device with a route or binding of its own, and every
+/// device an instrument still hears while others are switched off for it
+/// (an LV2 instrument bound to one device has rules only for the others).
+fn hw_indices_in_use(rules: &[SavedRule], rig_devices: &[Option<u32>]) -> std::collections::BTreeSet<u32> {
+    let mut used: std::collections::BTreeSet<u32> = rig_devices.iter().flatten().copied().collect();
+    used.extend(rules.iter().filter(|r| !r.hw_off()).filter_map(SavedRule::hw));
+    for muted in rules.iter().filter(|r| r.hw_off()) {
+        let off: Vec<u32> = rules.iter().filter(|r| r.dest == muted.dest && r.hw_off()).filter_map(SavedRule::hw).collect();
+        used.extend((0..crate::engine::MAX_HW_DEVICES).filter(|d| !off.contains(d)));
+    }
+    used
+}
+
+/// `s` with every hardware device index it holds (matrix rule sources, rig
+/// devices) moved through `map` (#227). What is left is in this run's
+/// indices, so its table of port names goes.
+fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndexMap) {
+    let rules: Option<Vec<SavedRule>> = s.matrix().and_then(|v| serde_json::from_value(v.clone()).ok());
+    if let Some(mut rules) = rules {
+        for r in &mut rules {
+            if let SourceId::Hardware(d) = &mut r.source { *d = map.get(*d); }
+        }
+        // With the device list full, a named device went past it, and the
+        // device left over is one the session never knew: off for every
+        // instrument some devices are switched off for, like any new one.
+        let muted: std::collections::BTreeSet<u32> = rules.iter().filter(|r| r.hw_off()).map(|r| r.dest).collect();
+        for dest in muted {
+            for d in map.unclaimed() {
+                rules.push(SavedRule { source: SourceId::Hardware(d), dest, edit: RuleEdit { enabled: false, ..RuleEdit::default() } });
+            }
+        }
+        s.set_matrix(serde_json::to_value(&rules).ok());
+    }
+    for d in s.rig_devices.iter_mut().flatten() { *d = map.get(*d); }
+    s.set_hw_ports(Default::default());
 }
 
 /// A multi-rig session in the id layout the engine's LoadRigs produces
@@ -3840,6 +3891,8 @@ struct DemoApp {
     rig_presets_dir: std::path::PathBuf,
     /// Rig names of the session being applied (load path names its rigs).
     session_rig_names: Vec<String>,
+    /// Rig devices of the session being applied, in this run's indices (#227).
+    session_rig_devices: Vec<Option<u32>>,
     /// Set by edit_rigs: the next engine load is LoadRigs, not LoadGraph.
     load_as_rigs: Option<(Vec<crate::control::Rig>, usize)>,
     /// Previous frame's keyboard-focus state: losing focus drains held keys
@@ -4359,6 +4412,7 @@ impl DemoApp {
             load_rig_dialog: None,
             rig_presets_dir: Self::default_rig_presets_dir(),
             session_rig_names: Vec::new(),
+            session_rig_devices: Vec::new(),
             load_as_rigs: None,
             had_kb_focus: true,
             rig_sources: Vec::new(),
@@ -6849,9 +6903,15 @@ impl DemoApp {
         if let Some(d) = self.hw_devices.iter().position(|n| midi_port_key(n) == port) {
             return Some(d as u32);
         }
+        self.list_hw_device(port, true)
+    }
+
+    /// A place in the device list for `port`: the listed device of that
+    /// name when `reuse`, else a new, unplugged one. None = the list is full.
+    fn list_hw_device(&mut self, port: &str, reuse: bool) -> Option<u32> {
         let d = {
             let mut listed = self.hw_midi.devices.lock().ok()?;
-            match listed.iter().position(|(n, _)| midi_port_key(n) == port) {
+            match listed.iter().position(|(n, _)| reuse && midi_port_key(n) == port) {
                 Some(d) => d,
                 None if listed.len() >= crate::engine::MAX_HW_DEVICES as usize => return None,
                 None => {
@@ -6863,6 +6923,22 @@ impl DemoApp {
         self.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
         self.adopt_hw_devices();
         Some(d as u32)
+    }
+
+    /// This run's index for every device index `ports` names (#227).
+    fn hw_index_map(&mut self, ports: &std::collections::BTreeMap<u32, String>) -> crate::session::HwIndexMap {
+        self.adopt_hw_devices();
+        let listed: Vec<String> = self.hw_devices.iter().map(|n| midi_port_key(n).to_string()).collect();
+        let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
+        crate::session::HwIndexMap::new(ports, &listed, |port| self.list_hw_device(port, false))
+    }
+
+    /// The port names of the device indices `rules` and `devices` depend on
+    /// (#227, rule 58).
+    fn hw_ports_in_use(&self, rules: &[SavedRule], devices: &[Option<u32>]) -> std::collections::BTreeMap<u32, String> {
+        hw_indices_in_use(rules, devices).into_iter()
+            .filter_map(|d| Some((d, midi_port_key(self.hw_devices.get(d as usize)?).to_string())))
+            .collect()
     }
 
     /// Mirror the MIDI thread's device list when it changed (one atomic load).
@@ -7654,6 +7730,11 @@ impl DemoApp {
         if !rules.is_empty() {
             s.set_matrix(Some(serde_json::to_value(&rules)?));
         }
+        s.rig_devices = self.rig_snapshot.lock().map(|sn| sn.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
+        while s.rig_devices.last() == Some(&None) { s.rig_devices.pop(); }
+        // Rules and rig devices hold device indices, places in this run's
+        // scan only, so the session names the devices it depends on.
+        s.set_hw_ports(self.hw_ports_in_use(&rules, &s.rig_devices));
         // Each synth's input selection (#124). The device goes by its port
         // name: its index is only its place in this run's scan (rule 58).
         for row in self.voice_rows() {
@@ -7838,9 +7919,12 @@ impl DemoApp {
     /// state, and rewire the engine. Works for any topology (templates, saved
     /// sessions, the demo patch).
     fn apply_session(&mut self, s: &crate::session::Session) -> anyhow::Result<()> {
-        let canonical = canonical_rig_session(s);
+        let mut canonical = canonical_rig_session(s);
+        let map = self.hw_index_map(canonical.hw_ports());
+        map_session_hw(&mut canonical, &map);
         let s = &canonical;
         self.session_rig_names = s.rig_names.clone();
+        self.session_rig_devices = s.rig_devices.clone();
         self.build_rack(&s.graph, s.params());
         self.begin_load_fade();
         self.sync_clap_slots(&s.graph, None);
@@ -7869,6 +7953,9 @@ impl DemoApp {
         // Reset per-rig filters for the new graph (Keys splits travel IN the
         // graph — Node::split — so LoadGraph restores them).
         self.reset_rig_inputs();
+        // A synth in a rig bound to one device plays from it, as LoadRigs
+        // told the engine; the session's own rows come after.
+        self.adopt_rig_devices();
         self.restore_midi_sources(s);
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
@@ -8283,7 +8370,7 @@ impl DemoApp {
         let imported = crate::session::Session::package_path(dir, session_name)
             .and_then(|p| crate::session::Session::load(&p))
             .map_err(|e| format!("Could not load session '{session_name}': {e}"))?;
-        let imported = canonical_rig_session(&imported);
+        let mut imported = canonical_rig_session(&imported);
         let (imp_graphs, imp_bases) = crate::control::split_rigs(&imported.graph);
         if imp_graphs.is_empty() {
             return Err(format!("Session '{session_name}' has no rigs."));
@@ -8296,6 +8383,8 @@ impl DemoApp {
                 Self::MAX_RIGS
             ));
         }
+        let map = self.hw_index_map(imported.hw_ports());
+        map_session_hw(&mut imported, &map);
         let cur = self.capture_session("Import")
             .map_err(|e| format!("Could not capture current rack: {e}"))?;
         let voice_rows = self.voice_rows();
@@ -8324,7 +8413,7 @@ impl DemoApp {
                 });
             let rname: String = base_name.trim().chars().take(24).collect();
             let idx = list.len();
-            list.push(crate::control::Rig::new(rname, g, None));
+            list.push(crate::control::Rig::new(rname, g, imported.rig_devices.get(i).copied().flatten()));
             new_rig_indices.push(idx);
         }
         let new_bases = crate::control::rig_bases(&list);
@@ -8488,17 +8577,20 @@ impl DemoApp {
         // Names from the session being applied, used once (never leak into a
         // later load).
         let names = std::mem::take(&mut self.session_rig_names);
+        let devices = std::mem::take(&mut self.session_rig_devices);
         let rigs = self.load_as_rigs.take().or_else(|| {
-            // A single rig keeps LoadGraph — unless the session renamed it,
-            // which only the rig list (LoadRigs) can carry (#33).
+            // A single rig keeps LoadGraph — unless the session renamed it or
+            // bound it to a device, which only the rig list (LoadRigs) can
+            // carry (#33, #227).
             let renamed_single = names.first().is_some_and(|n| !n.trim().is_empty() && n != "Rig A");
-            if graph.nodes.iter().all(|n| n.rig == 0) && !renamed_single { return None; }
+            let bound_single = devices.first().is_some_and(Option::is_some);
+            if graph.nodes.iter().all(|n| n.rig == 0) && !renamed_single && !bound_single { return None; }
             let (graphs, _) = crate::control::split_rigs(graph);
             let rigs: Vec<crate::control::Rig> = graphs.into_iter().enumerate()
                 .map(|(i, g)| {
                     let name = names.get(i).filter(|n| !n.trim().is_empty()).cloned()
                         .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
-                    crate::control::Rig::new(name, g, None)
+                    crate::control::Rig::new(name, g, devices.get(i).copied().flatten())
                 })
                 .collect();
             Some((rigs, 0))
@@ -16454,10 +16546,13 @@ impl DemoApp {
             if node.rig as usize == rig { Some(old - base) } else { None }
         });
         rig_session.rig_names.clear();
+        rig_session.rig_devices.clear(); // the preset's own is `midi_device`
         // The preset keeps its rig's mark as its only entry (#198).
         rig_session.rig_types = trimmed_marks(vec![self.rig_mark(rig)]);
         let midi_device = self.rig_snapshot.lock().ok()
             .and_then(|sn| sn.rigs.get(rig).and_then(|m| m.midi_device));
+        let rules: Vec<SavedRule> = rig_session.matrix().and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+        rig_session.set_hw_ports(self.hw_ports_in_use(&rules, &[midi_device]));
         let mut clap_meta = Vec::new();
         for (slot, nid) in self.clap_rigs() {
             if self.units.iter().find(|u| u.node_id == nid).is_some_and(|u| u.rig as usize == rig) {
@@ -16502,15 +16597,9 @@ impl DemoApp {
             .unwrap_or_else(|| vec![None; existing_graphs.len()]);
         let existing_names: Vec<String> = (0..existing_graphs.len()).map(|i| self.rig_name(i)).collect();
         let existing_mix = self.rig_mix;
-
-        let mut old_sources_by_node = std::collections::HashMap::new();
-        let mut old_patches_by_node = std::collections::HashMap::new();
-        for (slot, nid) in self.clap_rigs() {
-            old_sources_by_node.insert(nid, self.rig_sources.get(slot).copied().unwrap_or((true, true)));
-            if let Some(Some(p)) = self.patch_names.get(slot) {
-                old_patches_by_node.insert(nid, p.clone());
-            }
-        }
+        let voice_rows = self.voice_rows();
+        // The preset's device indices are places in the scan of the run that saved it (#227).
+        let preset_hw = self.hw_index_map(preset.session.hw_ports());
 
         #[derive(Clone, Copy)]
         enum RigSlot { Existing(usize), Preset }
@@ -16534,7 +16623,7 @@ impl DemoApp {
             RigSlot::Preset => crate::control::Rig::new(
                 preset_name.clone(),
                 preset.session.graph.clone(),
-                preset.midi_device,
+                preset.midi_device.map(|d| preset_hw.get(d)),
             ),
         }).collect();
 
@@ -16561,7 +16650,8 @@ impl DemoApp {
         };
 
         let ns_existing = remap_session(&current, merged.clone(), remap_existing);
-        let ns_preset = remap_session(&preset.session, merged.clone(), remap_preset);
+        let mut ns_preset = remap_session(&preset.session, merged.clone(), remap_preset);
+        map_session_hw(&mut ns_preset, &preset_hw);
         let mut combined = crate::session::Session::new("Rigs", merged);
         combined.rig_names = list.iter().map(|r| r.name.clone()).collect();
         combined.rig_types = trimmed_marks(slots.iter().map(|slot| match *slot {
@@ -16598,18 +16688,11 @@ impl DemoApp {
                 RigSlot::Preset => preset.mix,
             };
         }
+        let voice_rows: Vec<VoiceRow> = voice_rows.into_iter()
+            .filter_map(|r| remap_existing(r.node).map(|node| VoiceRow { node, ..r }))
+            .collect();
         let mut new_sources_by_node = std::collections::HashMap::new();
         let mut new_patches_by_node = std::collections::HashMap::new();
-        for (old_nid, src) in old_sources_by_node {
-            if let Some(new_nid) = remap_existing(old_nid) {
-                new_sources_by_node.insert(new_nid, src);
-            }
-        }
-        for (old_nid, patch) in old_patches_by_node {
-            if let Some(new_nid) = remap_existing(old_nid) {
-                new_patches_by_node.insert(new_nid, patch);
-            }
-        }
         for m in &preset.clap_meta {
             if let Some(new_nid) = remap_preset(m.node) {
                 new_sources_by_node.insert(new_nid, (m.keyboard, m.hardware));
@@ -16629,7 +16712,9 @@ impl DemoApp {
             snap.active = active;
         }
         self.adopt_rig_devices();
-        // Restore per-voice source switches and patch names AFTER apply_session (rule 20/59).
+        // Restore per-voice inputs and patch names AFTER apply_session (rule
+        // 20/59): every other rig's synths keep their device too (#227).
+        self.restore_voice_rows(&voice_rows);
         for (slot, nid) in self.clap_rigs() {
             if let Some(&src) = new_sources_by_node.get(&nid) {
                 if let Some(s) = self.rig_sources.get_mut(slot) {
@@ -45711,6 +45796,8 @@ mod voice_host_tests {
 
 mod bench;
 pub use bench::run as run_ui_bench;
+#[cfg(test)]
+mod hw_ports_tests;
 
 /// Times loading saved session packages (args: package paths) on the
 /// offline-engine app with real plugins: the UI-thread `apply_session`, and

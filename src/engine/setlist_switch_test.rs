@@ -587,9 +587,9 @@ fn shared_take(block: usize, via: Via, sine: &[u8]) -> anyhow::Result<SharedTake
     anthem_part.set_fx(verb, true);
     let mut sl = Setlist {
         songs: vec![Song::new("Ballad", vec![ballad_part]), Song::new("Anthem", vec![anthem_part])],
-        next_cc: Some(FootSwitch { cc: NEXT_CC, channel: None }),
         ..Setlist::default()
     };
+    sl.learn(crate::show::ShowAction::NextPart, None, crate::show::ShowMsg::Cc(NEXT_CC));
     sl.normalize();
     let hosted = sl.show_instances(&g).hosted;
 

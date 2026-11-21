@@ -143,7 +143,7 @@ pub fn is_instrument_node(graph: &Graph, node: &Node) -> bool {
             }
             let has_midi_in = graph.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == node.id);
             let has_audio_out = graph.edges.iter().any(|e| e.kind == PortKind::Audio && e.from.node == node.id);
-            has_midi_in || (!has_audio_in && has_audio_out)
+            !has_audio_in && (has_midi_in || has_audio_out)
         }
         _ => false,
     }
@@ -689,5 +689,25 @@ mod tests {
         assert_eq!(sl.songs[0].parts[0].rigs[0].pan, Some(-0.2));
         assert_eq!(sl.songs[1].parts[1].rigs[0].level, 0.8);
         assert_eq!(sl.show_instances(&g).hosted, 1);
+    }
+
+    #[test]
+    fn midi_controlled_lv2_audio_effect_is_classified_as_effect_not_instrument() {
+        let mut g = piano_rig(&[]);
+        let k = g.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().id;
+        let p = g.nodes.iter().find(|n| matches!(n.kind, NodeKind::Clap { .. })).unwrap().id;
+        let m = g.nodes.iter().find(|n| matches!(n.kind, NodeKind::MasterOut)).unwrap().id;
+        let vocoder = g.add_node(
+            NodeKind::Lv2 { uri: crate::control::Lv2Uri::new("http://example.org/midi-vocoder") },
+            name_bytes("VOCODER"),
+        );
+        let eid = g.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        g.connect_with_id(eid, PortRef { node: k, port: 0 }, PortRef { node: vocoder, port: 0 }, PortKind::Midi);
+        g.connect_with_id(eid + 1, PortRef { node: p, port: 0 }, PortRef { node: vocoder, port: 0 }, PortKind::Audio);
+        g.connect_with_id(eid + 2, PortRef { node: vocoder, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        let vnode = g.node(vocoder).unwrap();
+        assert!(!is_instrument_node(&g, vnode), "audio-in + midi-in LV2 is an effect");
+        assert!(is_audio_effect(&g, vnode), "audio-in + midi-in LV2 is toggleable as an audio effect");
+        assert_eq!(Setlist::default().show_instances(&g).hosted, 1, "only the piano counts as a hosted instrument");
     }
 }

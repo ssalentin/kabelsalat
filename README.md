@@ -154,7 +154,7 @@ that plays across them, by up to the set number of keys.
 Switching parts never cuts held notes or reverb tails — outgoing rigs keep
 sounding until you release the keys or sustain pedal, while new notes play the
 next part from the same audio block on. A part that moves a rig's fader, pan,
-an instrument's level or a built-in effect's bypass ramps it over 5 ms, so a
+an instrument's level or an effect's bypass ramps it over 5 ms, so a
 chord held through the switch does not click.
 `kabelsalat setlist-switch-test` measures a switch under a held chord with real
 Surge XT voices (including switching between two songs that share one instance):

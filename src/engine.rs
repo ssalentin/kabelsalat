@@ -1164,6 +1164,7 @@ impl Default for GraphPub {
             zones: [RigZone::OPEN; MAX_RIGS],
             show_part: None,
             show_steps: 0,
+            show_presses: [0; crate::show::ShowAction::ALL.len()],
             strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
             sends: [NO_SEND; MAX_SENDS],
             bus_outs: [NO_BUS_OUT; MAX_BUS_OUTS],
@@ -1296,6 +1297,9 @@ pub struct GraphPub {
     /// the mix. A changed `show_steps` means the engine moved the part.
     pub show_part: Option<usize>,
     pub show_steps: u64,
+    /// Presses per show action (#277, `ShowAction as usize`), published with
+    /// the mix. The app does the tuner and recording when theirs moves.
+    pub show_presses: [u64; crate::show::ShowAction::ALL.len()],
     /// Per-node strip state (#73/#74): pan/mute/solo on sources, bypass on
     /// FX nodes — same publication discipline as `mix` (fixed-size copy).
     pub strips: [StripPub; MAX_STRIP_MIXES],
@@ -1507,6 +1511,10 @@ pub struct GraphEngine {
     show_gates: show_gates::ShowGates,
     /// Show controls and the setlist parts they step through (#261).
     show: crate::show::Show,
+    /// Tap tempo from a show control (#277), timed by `clock_frames`.
+    tap: crate::transport::TapTempo,
+    /// Frames rendered before the current block.
+    clock_frames: u64,
     /// Where the hands last played around the zones' floating edges (#276),
     /// moved by every live note-on a rig with such an edge hears.
     zone_hands: Hands,
@@ -1751,6 +1759,8 @@ impl GraphEngine {
             rig_zones: [RigZone::OPEN; MAX_RIGS],
             show_gates: show_gates::ShowGates::new(),
             show: crate::show::Show::default(),
+            tap: crate::transport::TapTempo::new(),
+            clock_frames: 0,
             zone_hands: Hands::default(),
             strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
@@ -2211,6 +2221,28 @@ impl GraphEngine {
 
     /// The bar line a synced start waits for: beat 0 (the song's own
     /// downbeat) during a count-in, else the next bar boundary.
+    /// File-player play-enable (`Command::SetPlayerEnable`); no file, no change.
+    fn set_player_enable(&mut self, on: bool) {
+        let target = self.player_target_beats();
+        let Some(p) = self.player.as_mut() else { return };
+        if on {
+            p.enabled = true;
+            if self.player_cfg.sync && self.master_clock.is_active() {
+                // AUM: while the transport rolls, the play-enable
+                // starts at the next sync-quantum (bar) boundary;
+                // during a count-in that is beat 0.
+                p.pending = true;
+                p.target_beats = target;
+            } else {
+                player_start_now(p, self.player_cfg, self.transport.beats);
+            }
+        } else {
+            p.enabled = false;
+            p.pending = false;
+        }
+        self.player_dirty = true;
+    }
+
     fn player_target_beats(&self) -> f64 {
         if self.master_clock.is_counting_in() {
             0.0
@@ -2614,6 +2646,7 @@ impl GraphEngine {
                 g.zones = self.rig_zones;
                 g.show_part = self.show.part();
                 g.show_steps = self.show.steps();
+                g.show_presses = self.show.presses();
                 g.system_gain = self.system_gain;
                 g.master_mute = self.master_mute;
                 g.mix_rev = g.mix_rev.wrapping_add(1);
@@ -3060,15 +3093,32 @@ impl GraphEngine {
     /// A show control takes the message (#261): true when it was consumed,
     /// the part it stepped to already playing.
     fn show_takes(&mut self, source: SourceId, channel: u8, msg: crate::show::ShowMsg, value: u8) -> bool {
-        match self.show.take(source, channel, msg, value) {
-            crate::show::Take::Route => false,
-            crate::show::Take::Consumed => true,
-            crate::show::Take::Part(zones) => {
-                self.set_rig_zones(zones);
-                self.mix_dirty = true;
-                true
-            }
+        use crate::show::{ShowAction, Take};
+        let take = self.show.take(source, channel, msg, value);
+        if matches!(take, Take::Part(_) | Take::Act(_)) {
+            self.mix_dirty = true;
         }
+        match take {
+            Take::Route => return false,
+            Take::Consumed => {}
+            Take::Part(zones) => self.set_rig_zones(zones),
+            Take::Act(ShowAction::Panic) => self.panic(),
+            Take::Act(ShowAction::TapTempo) => {
+                if let Some(bpm) = self.tap.tap(self.clock_frames as f64 / self.sample_rate) {
+                    self.transport.bpm = bpm as f64;
+                    self.transport_dirty = true;
+                }
+            }
+            Take::Act(ShowAction::MasterMute) => self.master_mute = !self.master_mute,
+            Take::Act(ShowAction::BackingTrack) => {
+                let on = self.player.as_ref().is_some_and(|p| !p.enabled && !p.pending);
+                self.set_player_enable(on);
+            }
+            // The app's own: done from the published presses.
+            Take::Act(ShowAction::Tuner | ShowAction::Record) => {}
+            Take::Act(ShowAction::NextSong | ShowAction::PrevSong | ShowAction::NextPart | ShowAction::PrevPart | ShowAction::SongOfProgram) => {}
+        }
+        true
     }
 
     fn pass_to_instruments(&mut self, source: SourceId, msg: MidiMsg) {
@@ -4595,6 +4645,10 @@ impl GraphEngine {
                 self.publish_rig_snapshot();
             }
             Command::NoteOn { note, velocity, source, channel } => {
+                let value = if velocity > 0.0 { 127 } else { 0 };
+                if self.show_takes(source, channel, crate::show::ShowMsg::Note(note & 0x7F), value) {
+                    return;
+                }
                 let msg = MidiMsg::note_on(channel & 0x0F, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 let mut heard = 0u64;
@@ -4618,6 +4672,9 @@ impl GraphEngine {
                 }
             }
             Command::NoteOff { note, source, channel } => {
+                if self.show_takes(source, channel, crate::show::ShowMsg::Note(note & 0x7F), 0) {
+                    return;
+                }
                 let msg = MidiMsg::note_off(channel & 0x0F, note, 0);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
@@ -5087,26 +5144,7 @@ impl GraphEngine {
                 }
                 self.player_dirty = true;
             }
-            Command::SetPlayerEnable { on } => {
-                let target = self.player_target_beats();
-                let Some(p) = self.player.as_mut() else { return };
-                if on {
-                    p.enabled = true;
-                    if self.player_cfg.sync && self.master_clock.is_active() {
-                        // AUM: while the transport rolls, the play-enable
-                        // starts at the next sync-quantum (bar) boundary;
-                        // during a count-in that is beat 0.
-                        p.pending = true;
-                        p.target_beats = target;
-                    } else {
-                        player_start_now(p, self.player_cfg, self.transport.beats);
-                    }
-                } else {
-                    p.enabled = false;
-                    p.pending = false;
-                }
-                self.player_dirty = true;
-            }
+            Command::SetPlayerEnable { on } => self.set_player_enable(on),
             // Global transport = MASTER: fan out to every transport-capable
             // node (all start together on the downbeat). Per-node
             // SetNodePlaying overrides individually afterwards and never
@@ -5415,6 +5453,7 @@ impl GraphEngine {
         // ticks right before them so its notes and breath sound on the block
         // it starts in, including through a MIDI-FX strip or arp.
         let fx_frames = data.len() / ch;
+        self.clock_frames += fx_frames as u64;
         self.tick_demo(fx_frames);
         self.pump_midi_fx(fx_frames);
         // Attach freshly-opened input captures (UI opened a device for a node):
@@ -5434,6 +5473,7 @@ impl GraphEngine {
                     g.zones = self.rig_zones;
                     g.show_part = self.show.part();
                     g.show_steps = self.show.steps();
+                    g.show_presses = self.show.presses();
                     g.strips = self.strips_pub();
                     g.sends = [NO_SEND; MAX_SENDS];
                     g.sends[..self.sends.len()].copy_from_slice(&self.sends);

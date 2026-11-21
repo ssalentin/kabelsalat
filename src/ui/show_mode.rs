@@ -190,7 +190,7 @@ impl DemoApp {
             self.mixer_knob_drag = None;
             self.mixer_strip_drag = None;
             self.cc_learn = None;
-            self.setlist_footswitch_learn = None;
+            self.show_learn = None;
             self.show_mode = Some(ShowMode::default());
         } else {
             self.show_mode = None;
@@ -202,6 +202,12 @@ impl DemoApp {
         if let Some(bus) = &self.bus {
             bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::Panic);
         }
+        self.panicked();
+    }
+
+    /// What the app shows of a Panic the engine did: the keys go dark and
+    /// Show mode says so.
+    pub(super) fn panicked(&mut self) {
         self.release_kb_drag_note();
         self.held_keys.clear();
         self.notes_down = [0; 128];
@@ -242,6 +248,7 @@ impl DemoApp {
         self.publish_patch();
         self.publish_pins();
         self.show_paint(ui);
+        self.tuner_panel(&ctx);
         // Leaving waits for the release: an Esc still held, and its key
         // repeats, would otherwise reach the editing frame and close the
         // view Show mode was opened from.
@@ -730,7 +737,7 @@ mod tests {
         let bus = Arc::new(Mutex::new(tx));
         app.bus = Some(bus.clone());
         app.graph_pub = Some(pub_);
-        app.exec_tool("set_setlist_footswitch", &serde_json::json!({"action": "next", "cc": 80}));
+        app.exec_tool("set_show_control", &serde_json::json!({"action": "next_part", "cc": 80}));
         app.select_setlist(0, 0).unwrap();
         app.set_show_mode(true);
         let mut buf = vec![0.0f32; 64 * 2];

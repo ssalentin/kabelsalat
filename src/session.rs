@@ -2655,7 +2655,8 @@ mod tests {
 
     #[test]
     fn setlist_round_trip_and_prune() {
-        use crate::setlist::{FootSwitch, Part, PartRig, SetlistPos, Song};
+        use crate::setlist::{Part, PartRig, SetlistPos, Song};
+        use crate::show::{ShowAction, ShowMsg};
         let dir = test_dir("setlist");
         let mut s = sample_session();
         let mut verse = Part::new(
@@ -2668,8 +2669,8 @@ mod tests {
         song.time_sig = Some(crate::transport::TimeSig::normalized(6, 8));
         s.setlist.songs.push(song);
         s.setlist.active = Some(SetlistPos { song: 0, part: 0 });
-        s.setlist.next_cc = Some(FootSwitch { cc: 64, channel: None });
-        s.setlist.prev_cc = Some(FootSwitch { cc: 67, channel: Some(0) });
+        s.setlist.learn(ShowAction::NextPart, None, ShowMsg::Cc(64));
+        s.setlist.learn(ShowAction::Tuner, Some(1), ShowMsg::Note(36));
 
         let pkg = Session::package_path(&dir, "Gig").unwrap();
         s.save(&pkg).unwrap();

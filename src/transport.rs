@@ -165,10 +165,12 @@ impl MasterClock {
 
 /// Pure tap-tempo estimator: averages recent tap intervals, resets after
 /// `TAP_RESET_SECS` idle, rejects outlier intervals around the median, and
-/// clamps the resulting tempo to `20..=300` BPM.
-#[derive(Clone, Debug, Default)]
+/// clamps the resulting tempo to `20..=300` BPM. Fixed size: the engine taps
+/// it on the audio thread (#277).
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TapTempo {
-    taps: Vec<f64>,
+    taps: [f64; MAX_TAP_SAMPLES],
+    len: usize,
 }
 
 impl TapTempo {
@@ -178,48 +180,54 @@ impl TapTempo {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn reset(&mut self) {
-        self.taps.clear();
+        self.len = 0;
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn tap_count(&self) -> usize {
-        self.taps.len()
+        self.len
     }
 
     /// Record a tap at `now_secs` (monotonic seconds) and return the estimated BPM
     /// once at least two taps have been recorded in the active window.
     pub fn tap(&mut self, now_secs: f64) -> Option<f32> {
         if !now_secs.is_finite() {
-            self.taps.clear();
+            self.len = 0;
             return None;
         }
-        if let Some(&prev) = self.taps.last() {
+        if let Some(&prev) = self.taps[..self.len].last() {
             let dt = now_secs - prev;
             if dt < 0.0 || dt > TAP_RESET_SECS {
-                self.taps.clear();
+                self.len = 0;
             } else if dt < 1e-6 {
                 return None;
             }
         }
-        self.taps.push(now_secs);
-        if self.taps.len() > MAX_TAP_SAMPLES {
-            let drop_n = self.taps.len() - MAX_TAP_SAMPLES;
-            self.taps.drain(..drop_n);
+        if self.len == MAX_TAP_SAMPLES {
+            self.taps.copy_within(1.., 0);
+            self.len -= 1;
         }
-        if self.taps.len() < 2 {
+        self.taps[self.len] = now_secs;
+        self.len += 1;
+        if self.len < 2 {
             return None;
         }
-        let mut intervals: Vec<f64> = self.taps.windows(2).map(|w| w[1] - w[0]).collect();
-        let avg = if intervals.len() >= 3 {
-            let mut sorted = intervals.clone();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            let median = sorted[sorted.len() / 2];
-            let lo = median * 0.65;
-            let hi = median * 1.5;
-            let kept: Vec<f64> = intervals.drain(..).filter(|dt| *dt >= lo && *dt <= hi).collect();
-            kept.iter().sum::<f64>() / kept.len().max(1) as f64
+        let mut intervals = [0.0; MAX_TAP_SAMPLES];
+        let n = self.len - 1;
+        for (i, w) in self.taps[..self.len].windows(2).enumerate() {
+            intervals[i] = w[1] - w[0];
+        }
+        let intervals = &intervals[..n];
+        let avg = if n >= 3 {
+            let mut sorted = [0.0; MAX_TAP_SAMPLES];
+            sorted[..n].copy_from_slice(intervals);
+            sorted[..n].sort_unstable_by(|a, b| a.total_cmp(b));
+            let median = sorted[n / 2];
+            let (lo, hi) = (median * 0.65, median * 1.5);
+            let (sum, kept) = intervals.iter().filter(|dt| (lo..=hi).contains(*dt)).fold((0.0, 0), |(s, k), dt| (s + dt, k + 1));
+            sum / kept.max(1) as f64
         } else {
-            intervals.iter().sum::<f64>() / intervals.len() as f64
+            intervals.iter().sum::<f64>() / n as f64
         };
         if avg <= 0.0 {
             return None;

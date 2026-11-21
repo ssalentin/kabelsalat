@@ -27,7 +27,7 @@ use super::GraphEngine;
 use crate::control::{command_bus, name_bytes, ClapId, Command, CommandBus, DspKind, Graph, NodeId, NodeKind, PortKind, PortRef};
 use crate::host::{ClapVoice, ClapVoiceMain};
 use crate::matrix::SourceId;
-use crate::setlist::{FootSwitch, Part, PartRig, Setlist, Song};
+use crate::setlist::{Part, PartRig, Setlist, Song};
 
 const SR: f64 = 48000.0;
 const CHORD: [u8; 3] = [60, 64, 67];
@@ -96,8 +96,8 @@ fn setlist(strings_rig: NodeId, piano: NodeId) -> Setlist {
     let mut piano_song = Song::new("Piano", vec![Part::new("Main", vec![rig(1, 0.5)])]);
     piano_song.bpm = Some(120.0);
     piano_song.parts[0].set_param(piano, super::P_LEVEL, 0.85);
-    let next_cc = Some(FootSwitch { cc: NEXT_CC, channel: None });
-    let mut sl = Setlist { songs: vec![strings, piano_song], next_cc, ..Setlist::default() };
+    let mut sl = Setlist { songs: vec![strings, piano_song], ..Setlist::default() };
+    sl.learn(crate::show::ShowAction::NextPart, None, crate::show::ShowMsg::Cc(NEXT_CC));
     sl.normalize();
     sl
 }

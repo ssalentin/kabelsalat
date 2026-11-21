@@ -1,14 +1,17 @@
-//! Show controls (#261): hardware MIDI messages the engine takes for a show
-//! action instead of passing them to the instruments, and the setlist parts
-//! the engine steps through itself, so a foot switch changes the zones in
-//! the block its CC arrives in, and a program change selects a song in the
+//! Show controls (#261, #277): hardware MIDI messages the engine takes for a
+//! show action instead of passing them to the instruments, and the setlist
+//! parts the engine steps through itself, so a foot switch changes the zones
+//! in the block its CC arrives in, and a program change selects a song in the
 //! block it arrives in (#208).
 //!
 //! The UI sends the table (`Command::SetShowControls`), every part
 //! (`SetShowParts`) and the active part (`SetShowPart`); the engine publishes
 //! the part it stepped to (`GraphPub::show_part`, `show_steps`) and the UI
 //! sends the rest of that part a frame later: closed buses, pinned bindings,
-//! tempo, levels and knobs.
+//! tempo, levels and knobs. The engine does Panic, tap tempo, master mute and
+//! the backing track itself; the tuner and recording belong to the app, which
+//! does them in its next frame from the presses the engine counted
+//! (`GraphPub::show_presses`).
 
 use std::sync::Arc;
 
@@ -17,14 +20,21 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::control::{Command, RigZone, MAX_RIGS};
 use crate::matrix::SourceId;
 
-/// Slots in the engine's table of show controls.
-pub const MAX_SHOW_CONTROLS: usize = 16;
+/// Devices whose program change can select the song (#208).
+pub const MAX_PROGRAM_DEVICES: usize = 14;
+
+/// Slots in the engine's table of show controls: one per learned action,
+/// then one per device whose program change selects the song.
+pub const MAX_SHOW_CONTROLS: usize = ShowAction::LEARNED.len() + MAX_PROGRAM_DEVICES;
 
 /// The message a show control listens for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShowMsg {
     /// A control change by number. It acts when it rises to 64 or above.
     Cc(u8),
+    /// A note by number. It acts on its note-on; its note-off is the release.
+    Note(u8),
     /// A program change by number. Each one acts: it has no release.
     Program(u8),
     /// Every program change. Only a control listens for this; a message is
@@ -34,21 +44,104 @@ pub enum ShowMsg {
 }
 
 /// What a show control does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ShowAction {
+    NextSong,
+    PrevSong,
     NextPart,
     PrevPart,
+    /// All notes off on every rig (`Command::Panic`).
+    Panic,
+    TapTempo,
+    /// The app opens or closes its tuner.
+    Tuner,
+    MasterMute,
+    /// Start or stop the file player.
+    BackingTrack,
+    /// The app starts or stops recording, as its REC button does.
+    Record,
     /// Program change N selects the first part of song N+1 (#208), also of
     /// a song stepping skips. A program with no song, or a CC, selects nothing.
     SongOfProgram,
+}
+
+impl ShowAction {
+    pub const ALL: [ShowAction; 11] = [
+        ShowAction::NextSong,
+        ShowAction::PrevSong,
+        ShowAction::NextPart,
+        ShowAction::PrevPart,
+        ShowAction::Panic,
+        ShowAction::TapTempo,
+        ShowAction::Tuner,
+        ShowAction::MasterMute,
+        ShowAction::BackingTrack,
+        ShowAction::Record,
+        ShowAction::SongOfProgram,
+    ];
+
+    /// The actions one control each is learned for, in the order the app
+    /// lists them. `SongOfProgram` is chosen per device instead.
+    pub const LEARNED: [ShowAction; 10] = [
+        ShowAction::NextSong,
+        ShowAction::PrevSong,
+        ShowAction::NextPart,
+        ShowAction::PrevPart,
+        ShowAction::Panic,
+        ShowAction::TapTempo,
+        ShowAction::Tuner,
+        ShowAction::MasterMute,
+        ShowAction::BackingTrack,
+        ShowAction::Record,
+    ];
+
+    /// The name tools and sessions use.
+    pub fn id(self) -> &'static str {
+        match self {
+            ShowAction::NextSong => "next_song",
+            ShowAction::PrevSong => "prev_song",
+            ShowAction::NextPart => "next_part",
+            ShowAction::PrevPart => "prev_part",
+            ShowAction::Panic => "panic",
+            ShowAction::TapTempo => "tap_tempo",
+            ShowAction::Tuner => "tuner",
+            ShowAction::MasterMute => "master_mute",
+            ShowAction::BackingTrack => "backing_track",
+            ShowAction::Record => "record",
+            ShowAction::SongOfProgram => "song_of_program",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.id() == id)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShowAction::NextSong => "Next song",
+            ShowAction::PrevSong => "Previous song",
+            ShowAction::NextPart => "Next part",
+            ShowAction::PrevPart => "Previous part",
+            ShowAction::Panic => "Panic",
+            ShowAction::TapTempo => "Tap tempo",
+            ShowAction::Tuner => "Tuner on/off",
+            ShowAction::MasterMute => "Master mute",
+            ShowAction::BackingTrack => "Backing track",
+            ShowAction::Record => "Record",
+            ShowAction::SongOfProgram => "Program change picks the song",
+        }
+    }
 }
 
 /// A MIDI message from a device, consumed by an action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShowControl {
     /// Hardware device index (`SourceId::Hardware`); `None` takes every device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<u32>,
     /// MIDI channel 0..=15; `None` takes every channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<u8>,
     pub msg: ShowMsg,
     pub action: ShowAction,
@@ -59,7 +152,8 @@ pub type ShowControls = [Option<ShowControl>; MAX_SHOW_CONTROLS];
 pub const NO_SHOW_CONTROLS: ShowControls = [None; MAX_SHOW_CONTROLS];
 
 impl ShowControl {
-    fn takes(&self, device: u32, channel: u8, msg: ShowMsg) -> bool {
+    /// Whether this control takes `msg` from hardware device `device`.
+    pub fn takes(&self, device: u32, channel: u8, msg: ShowMsg) -> bool {
         (self.msg == msg || self.msg == ShowMsg::AnyProgram && matches!(msg, ShowMsg::Program(_)))
             && self.device.is_none_or(|d| d == device)
             && self.channel.is_none_or(|c| c == channel & 0x0F)
@@ -110,6 +204,8 @@ pub enum Take {
     Consumed,
     /// A show control took it and the setlist moved to a part with these zones.
     Part([RigZone; MAX_RIGS]),
+    /// A show control took it for an action that is not a setlist step.
+    Act(ShowAction),
 }
 
 /// The engine's show state. It neither allocates nor frees: a replaced part
@@ -123,12 +219,16 @@ pub struct Show {
     /// got from hardware was 64 or above. A press heard before its control
     /// was bound (the press a learn binds) gets its release through, so a
     /// sustain pedal never stays down; one bound at rest passes nothing.
-    held: [u128; 16],
+    held_cc: [u128; 16],
+    /// The same for notes: the instruments got its note-on and no note-off.
+    held_note: [u128; 16],
     parts: Option<ShowParts>,
     /// The active part, as an index into `parts`.
     part: Option<usize>,
     /// Parts the engine stepped to itself.
     steps: u64,
+    /// Presses per action (`ShowAction as usize`).
+    presses: [u64; ShowAction::ALL.len()],
 }
 
 impl Show {
@@ -144,11 +244,15 @@ impl Show {
     }
 
     fn held_by_instruments(&self, c: ShowControl) -> bool {
-        let ShowMsg::Cc(cc) = c.msg else { return false };
-        let bit = 1u128 << (cc & 0x7F);
+        let (held, n) = match c.msg {
+            ShowMsg::Cc(n) => (&self.held_cc, n),
+            ShowMsg::Note(n) => (&self.held_note, n),
+            ShowMsg::Program(_) | ShowMsg::AnyProgram => return false,
+        };
+        let bit = 1u128 << (n & 0x7F);
         match c.channel {
-            Some(ch) => self.held[(ch & 0x0F) as usize] & bit != 0,
-            None => self.held.iter().any(|h| h & bit != 0),
+            Some(ch) => held[(ch & 0x0F) as usize] & bit != 0,
+            None => held.iter().any(|h| h & bit != 0),
         }
     }
 
@@ -168,31 +272,49 @@ impl Show {
         self.steps
     }
 
-    /// A message from `source`, `value` its data byte (a CC's value; a
-    /// program change has none).
+    pub fn presses(&self) -> [u64; ShowAction::ALL.len()] {
+        self.presses
+    }
+
+    /// What decides how the next press and release go: the table, which
+    /// controls are down and what the instruments hold.
+    #[cfg(test)]
+    pub fn edges(&self) -> String {
+        format!("{:?}|{:?}|{:?}|{:?}", self.controls, self.down, self.held_cc, self.held_note)
+    }
+
+    /// A message from `source`, `value` its data byte: a CC's value, 127 for
+    /// a note-on and 0 for a note-off; a program change has none.
     pub fn take(&mut self, source: SourceId, channel: u8, msg: ShowMsg, value: u8) -> Take {
         let SourceId::Hardware(device) = source else { return Take::Route };
         let slot = self.controls.iter().position(|c| c.is_some_and(|c| c.takes(device, channel, msg)));
-        if let ShowMsg::Cc(cc) = msg {
-            if let Some(take) = self.cc_edge(slot, channel, cc, value) {
-                return take;
-            }
+        if let Some(take) = self.edge(slot, channel, msg, value >= 64) {
+            return take;
         }
         let Some(control) = slot.and_then(|i| self.controls[i]) else { return Take::Route };
+        self.presses[control.action as usize] += 1;
         match (control.action, msg) {
             (ShowAction::NextPart, _) => self.step(true),
             (ShowAction::PrevPart, _) => self.step(false),
+            (ShowAction::NextSong, _) => self.step_song(true),
+            (ShowAction::PrevSong, _) => self.step_song(false),
             (ShowAction::SongOfProgram, ShowMsg::Program(n)) => self.select_song(n as usize),
             (ShowAction::SongOfProgram, _) => Take::Consumed,
+            (action, _) => Take::Act(action),
         }
     }
 
-    /// What a CC's value does before its control acts: `Some` when it acts
-    /// no further (no control, a release, a value held down), `None` on a
-    /// press of control `slot`.
-    fn cc_edge(&mut self, slot: Option<usize>, channel: u8, cc: u8, value: u8) -> Option<Take> {
-        let (held, bit) = (&mut self.held[(channel & 0x0F) as usize], 1u128 << (cc & 0x7F));
-        let down = value >= 64;
+    /// What a CC's value or a note's on/off does before its control acts:
+    /// `Some` when it acts no further (no control, a release, a value held
+    /// down), `None` on a press of control `slot`. A program change has no
+    /// edge: every one is a press.
+    fn edge(&mut self, slot: Option<usize>, channel: u8, msg: ShowMsg, down: bool) -> Option<Take> {
+        let (held, n) = match msg {
+            ShowMsg::Cc(n) => (&mut self.held_cc, n),
+            ShowMsg::Note(n) => (&mut self.held_note, n),
+            ShowMsg::Program(_) | ShowMsg::AnyProgram => return None,
+        };
+        let (held, bit) = (&mut held[(channel & 0x0F) as usize], 1u128 << (n & 0x7F));
         let Some(i) = slot else {
             if down { *held |= bit } else { *held &= !bit }
             return Some(Take::Route);
@@ -221,6 +343,24 @@ impl Show {
         self.part = Some(to);
         self.steps += 1;
         Take::Part(part.zones)
+    }
+
+    /// To the first part of the next (or previous) song, as
+    /// `Setlist::next_song`/`prev_song` step: past songs stepping skips, no
+    /// further than either end. With no part active, to the first part of
+    /// the first song stepping does not skip.
+    fn step_song(&mut self, forward: bool) -> Take {
+        let parts = self.parts.as_ref().map_or(&[][..], |p| &p.0[..]);
+        let starts = |q: &usize| !parts[*q].skip && (*q == 0 || parts[*q - 1].song != parts[*q].song);
+        let to = match self.part.filter(|&p| p < parts.len()) {
+            None => (0..parts.len()).find(starts),
+            Some(p) if forward => (p + 1..parts.len()).find(starts),
+            Some(p) => (0..p).rev().find(|q| starts(q) && parts[*q].song != parts[p].song),
+        };
+        match to {
+            Some(to) => self.go(to),
+            None => Take::Consumed,
+        }
     }
 
     /// One part on, as `Setlist::next_part`/`prev_part` step: inside the
@@ -389,10 +529,10 @@ mod tests {
 
     #[test]
     fn a_setlist_is_sent_once_and_a_refused_command_again() {
-        use crate::setlist::{FootSwitch, Part, PartRig, Setlist, Song};
+        use crate::setlist::{Part, PartRig, Setlist, Song};
         let mut sl = Setlist::default();
         sl.songs.push(Song::new("Opener", vec![Part::new("Verse", vec![PartRig::new(0)]), Part::new("Chorus", vec![PartRig::new(1)])]));
-        sl.next_cc = Some(FootSwitch { cc: 80, channel: None });
+        sl.learn(ShowAction::NextPart, None, ShowMsg::Cc(80));
         sl.select(0, 1);
         let mut sent = ShowSent::default();
         let mut out = Vec::new();
@@ -518,5 +658,105 @@ mod tests {
         s.set_part(Some(7));
         cc(&mut s, 80, 0);
         assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, OFF)), "a part the table no longer has counts as none");
+    }
+    fn note(s: &mut Show, n: u8, on: bool) -> Take {
+        s.take(PEDAL, 0, ShowMsg::Note(n), if on { 127 } else { 0 })
+    }
+
+    const PAD: ShowControl = ShowControl { device: Some(2), channel: None, msg: ShowMsg::Note(36), action: ShowAction::NextPart };
+
+    #[test]
+    fn a_note_steps_on_its_note_on_and_its_note_off_is_consumed() {
+        let mut s = show(&[PAD]);
+        assert_eq!(note(&mut s, 36, true), Take::Part(part(RigZone::OPEN, OFF)));
+        assert_eq!(note(&mut s, 36, false), Take::Consumed, "the release reaches no instrument");
+        assert_eq!(note(&mut s, 36, true), Take::Part(part(OFF, RigZone::OPEN)));
+        assert_eq!(note(&mut s, 37, true), Take::Route, "another key plays");
+        assert_eq!(s.take(SourceId::Hardware(1), 0, ShowMsg::Note(36), 127), Take::Route, "so does the same key on another keyboard");
+        assert_eq!(cc(&mut s, 36, 127), Take::Route, "a CC of that number is no note");
+    }
+
+    #[test]
+    fn a_note_learned_while_its_key_is_down_lets_its_note_off_through() {
+        let mut s = show(&[]);
+        assert_eq!(note(&mut s, 36, true), Take::Route, "the key a learn binds sounds first");
+        let mut t = NO_SHOW_CONTROLS;
+        t[0] = Some(PAD);
+        s.set_controls(t);
+        assert_eq!(note(&mut s, 36, false), Take::Route, "its note-off reaches the instrument that sounds it");
+        assert_eq!(note(&mut s, 36, true), Take::Part(part(RigZone::OPEN, OFF)));
+        assert_eq!(note(&mut s, 36, false), Take::Consumed);
+    }
+
+    /// Parts as `(song, skip)`, each with zones that name its place.
+    fn songs_of(parts: &[(usize, bool)]) -> ShowParts {
+        let zones = |i: usize| part(RigZone { transpose: i as i8, ..RigZone::OPEN }, OFF);
+        ShowParts::new(parts.iter().enumerate().map(|(i, &(song, skip))| ShowPart { song, skip, zones: zones(i) }).collect())
+    }
+
+    #[test]
+    fn song_steps_go_to_a_songs_first_part_past_skipped_songs() {
+        let next = ShowControl { msg: ShowMsg::Cc(82), action: ShowAction::NextSong, ..NEXT };
+        let prev = ShowControl { msg: ShowMsg::Cc(83), action: ShowAction::PrevSong, ..NEXT };
+        let mut s = show(&[next, prev]);
+        // Song 0: parts 0, 1; song 1 (skipped): 2; song 2: 3, 4.
+        s.set_parts(songs_of(&[(0, false), (0, false), (1, true), (2, false), (2, false)]));
+        let tap = |s: &mut Show, n: u8| {
+            let took = cc(s, n, 127);
+            cc(s, n, 0);
+            (took != Take::Consumed).then(|| s.part()).flatten()
+        };
+        assert_eq!(tap(&mut s, 82), Some(0), "nothing active: the first song");
+        assert_eq!(tap(&mut s, 82), Some(3), "past the skipped song");
+        assert_eq!(tap(&mut s, 82), None, "at the last song");
+        s.set_part(Some(4));
+        assert_eq!(tap(&mut s, 83), Some(0), "from a later part, back to the song before, at its first part");
+        assert_eq!(tap(&mut s, 83), None, "at the first song");
+        let mut setlist = crate::setlist::Setlist::default();
+        for (name, n) in [("A", 2), ("B", 1), ("C", 2)] {
+            let parts = (0..n).map(|i| crate::setlist::Part::new(format!("{name}{i}"), vec![crate::setlist::PartRig::new(0)])).collect();
+            setlist.songs.push(crate::setlist::Song::new(name, parts));
+        }
+        let set = setlist.add_set("Encore");
+        setlist.assign_set(1, Some(set));
+        setlist.sets[0].skip = true;
+        setlist.select(2, 1);
+        setlist.prev_song();
+        assert_eq!(setlist.active_index(), Some(0), "the setlist's own song step lands where the engine's does");
+    }
+
+    #[test]
+    fn every_other_action_is_handed_to_the_engine_once_per_press_and_counted() {
+        let others: Vec<ShowControl> = [ShowAction::Panic, ShowAction::TapTempo, ShowAction::Tuner, ShowAction::MasterMute, ShowAction::BackingTrack, ShowAction::Record]
+            .iter()
+            .enumerate()
+            .map(|(i, &action)| ShowControl { device: None, channel: None, msg: ShowMsg::Note(60 + i as u8), action })
+            .collect();
+        let mut s = show(&others);
+        for c in &others {
+            let ShowMsg::Note(n) = c.msg else { unreachable!() };
+            assert_eq!(note(&mut s, n, true), Take::Act(c.action));
+            assert_eq!(note(&mut s, n, false), Take::Consumed);
+            assert_eq!(note(&mut s, n, true), Take::Act(c.action), "the next press acts again");
+            note(&mut s, n, false);
+            assert_eq!(s.presses()[c.action as usize], 2, "{:?}", c.action);
+        }
+        assert_eq!(s.part(), None, "no action of these steps the setlist");
+        let program = ShowControl { device: None, channel: None, msg: ShowMsg::Program(9), action: ShowAction::Panic };
+        let mut s = show(&[program]);
+        assert_eq!(s.take(PEDAL, 0, ShowMsg::Program(9), 0), Take::Act(ShowAction::Panic));
+        assert_eq!(s.take(PEDAL, 0, ShowMsg::Program(9), 0), Take::Act(ShowAction::Panic), "every program change is a press");
+    }
+
+    #[test]
+    fn the_table_holds_every_action_and_every_program_device() {
+        assert_eq!(MAX_SHOW_CONTROLS, ShowAction::LEARNED.len() + MAX_PROGRAM_DEVICES);
+        assert!(ShowAction::LEARNED.iter().all(|a| ShowAction::ALL.contains(a)));
+        assert_eq!(ShowAction::ALL.len(), ShowAction::LEARNED.len() + 1, "only the program devices' action is chosen per device");
+        for (i, a) in ShowAction::ALL.into_iter().enumerate() {
+            assert_eq!(a as usize, i, "presses are indexed by the action");
+            assert_eq!(ShowAction::from_id(a.id()), Some(a));
+            assert_eq!(serde_json::to_value(a).unwrap(), serde_json::json!(a.id()), "sessions and tools use one name");
+        }
     }
 }

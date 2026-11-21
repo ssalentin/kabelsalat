@@ -707,13 +707,16 @@ fn system_prompt() -> String {
      beat clock (24 per beat, Start/Stop) for external hardware and apps.\n\
      - Sessions: save_session/load_session/list_sessions.\n\
      - Setlist (live song & part switching without cutting held notes or tails): \
-     get_setlist reads the songs, parts, active position and foot-switch CCs; \
+     get_setlist reads the songs, parts, active position and show controls; \
      set_setlist_song adds, updates, moves or removes a song and its parts (each part names \
      which rigs are live with key_lo/key_hi, transpose, level, a velocity layer vel_lo/vel_hi with \
      vel_curve, a floating split (float keys) and optional stored knobs); \
      select_setlist_part jumps to a song/part or steps next_part/prev_part/next_song/prev_song/clear; \
      add_song_from_session imports a saved session's rigs into the current gig and makes a song \
-     of them; set_setlist_footswitch binds or clears a hardware MIDI CC for next/prev part; \
+     of them; get_show_controls lists and set_show_control binds or clears the pedal, key or button \
+     (a CC, a note or a program change from a device) for each show action: next/previous song or part, \
+     panic, tap tempo, tuner, master mute, backing track and record; it also chooses the devices whose \
+     program change N picks song N+1; \
      set_show_mode opens or leaves the locked stage screen (\"go on stage\", \"show mode\"). \
      panic: all notes off on every rig when notes hang. \
      Levels: every rig, aux bus and CC binding lives at show level (no song switch touches it: \
@@ -1219,7 +1222,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"get_setlist",
-            "description":"Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.",
+            "description":"Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), buses and stored knob count), the active song/part (null = all rigs open), the show controls (as get_show_controls), the sets, and the level (show, set or song) of every rig, aux bus and CC binding.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
@@ -1253,9 +1256,14 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"session":{"type":"string"},"name":{"type":"string"}},"required":["session"]}
         }},
         {"type":"function","function":{
-            "name":"set_setlist_footswitch",
-            "description":"Bind or clear a hardware MIDI CC foot-switch to step the setlist on rising edge (value >= 64). action: 'next' | 'prev'. cc: 0..127 (omit or null to clear). channel: optional 0..15 (omit = any channel).",
-            "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["next","prev"]},"cc":{"type":["integer","null"]},"channel":{"type":["integer","null"]}},"required":["action"]}
+            "name":"get_show_controls",
+            "description":"List the show actions a pedal, key or button can trigger (next_song, prev_song, next_part, prev_part, panic, tap_tempo, tuner, master_mute, backing_track, record), the control learned for each (a CC, a note or a program change, and from which hardware device), and every hardware device with whether its program change N picks song N+1 (song_of_program). Show controls work in every song: they are at show level.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_show_control",
+            "description":"Bind a hardware control to a show action, clear it, or choose whether a device's program change picks the song. Give one of cc (0..127, acts when it rises to 64 or above), note (0..127 or a name like \"C2\", acts on its note-on) or program (0..127), and optionally device (hardware device index from get_show_controls; omitted = any device); or clear: true. A message another action had moves to this one. song_of_program takes device and on (default true): program N from that device then selects song N+1. What a control takes never reaches an instrument.",
+            "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["next_song","prev_song","next_part","prev_part","panic","tap_tempo","tuner","master_mute","backing_track","record","song_of_program"]},"cc":{"type":"integer"},"note":{"type":["integer","string"]},"program":{"type":"integer"},"device":{"type":"integer"},"clear":{"type":"boolean"},"on":{"type":"boolean"}},"required":["action"]}
         }},
         {"type":"function","function":{
             "name":"get_midi_clock",

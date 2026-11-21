@@ -12,8 +12,15 @@
 //! touches: see [`levels`] (#273).
 
 mod controls;
+mod instances;
 mod levels;
 pub use controls::msg_label;
+#[allow(unused_imports)] // #207 consumes these directly from crate::setlist
+pub use instances::{
+    find_matching_rig, is_audio_effect, is_instrument_node, merge_rig_effects_into,
+    rig_instrument_signature, FxBypass, InstrumentSig, MatchResult, RigInstances, SharingKind,
+    ShowInstances, SoundChange,
+};
 pub use levels::{part_buses, source_str, Binding, Gates, Level, Levels, Set, SetId};
 
 use anyhow::{bail, Result};
@@ -42,6 +49,10 @@ pub struct PartRig {
     pub transpose: i8,
     /// Rig mixer level (0.0..=1.0) applied when this part is recalled.
     pub level: f32,
+    /// Optional rig mixer pan (-1.0 L ..= 1.0 R) applied on switch (#275).
+    /// `None` leaves the rig's pan alone (sessions saved before #275).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pan: Option<f32>,
     /// Struck velocity range (inclusive, 0..=127) that plays this rig: a
     /// velocity layer (#276).
     pub vel_lo: u8,
@@ -60,6 +71,7 @@ impl Default for PartRig {
             key_hi: 127,
             transpose: 0,
             level: 1.0,
+            pan: None,
             vel_lo: 0,
             vel_hi: 127,
             curve: VelCurve::Linear,
@@ -137,6 +149,14 @@ pub struct Part {
     /// Keyed by node id like `Session::params` — remapped with the session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<ParamValue>,
+    /// Stored CLAP plugin parameter values recalled lock-free on switch (#275).
+    /// Kept separate from `params` so CLAP param id 0 never collides with `P_LEVEL`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_params: Vec<ParamValue>,
+    /// Per-part effect-chain bypass flags (#275): which audio effects on the
+    /// part's rigs are active (`bypass: false`) or bypassed (`bypass: true`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fx: Vec<FxBypass>,
     /// Aux buses (node ids) that take signal in this part when they are at
     /// song level (#273).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -149,6 +169,8 @@ impl Part {
             name: name.into(),
             rigs,
             params: Vec::new(),
+            plugin_params: Vec::new(),
+            fx: Vec::new(),
             buses: Vec::new(),
         }
     }
@@ -178,6 +200,31 @@ impl Part {
             self.params.push(ParamValue { node, param, value });
             self.params.sort_by_key(|p| (p.node, p.param));
         }
+    }
+
+    /// Upsert a stored CLAP plugin parameter value for this part (#275).
+    pub fn set_plugin_param(&mut self, node: NodeId, param: u32, value: f64) {
+        if let Some(p) = self.plugin_params.iter_mut().find(|p| p.node == node && p.param == param) {
+            p.value = value;
+        } else {
+            self.plugin_params.push(ParamValue { node, param, value });
+            self.plugin_params.sort_by_key(|p| (p.node, p.param));
+        }
+    }
+
+    /// Upsert one audio effect's bypass state for this part (#275).
+    pub fn set_fx(&mut self, node: NodeId, bypass: bool) {
+        if let Some(f) = self.fx.iter_mut().find(|f| f.node == node) {
+            f.bypass = bypass;
+        } else {
+            self.fx.push(FxBypass { node, bypass });
+            self.fx.sort_by_key(|f| f.node);
+        }
+    }
+
+    /// Bypass state this part chose for `node`, if any.
+    pub fn fx_bypass(&self, node: NodeId) -> Option<bool> {
+        self.fx.iter().find(|f| f.node == node).map(|f| f.bypass)
     }
 }
 
@@ -559,6 +606,27 @@ impl Setlist {
                 params.sort_by_key(|p| (p.node, p.param));
                 params.dedup_by_key(|p| (p.node, p.param));
                 part.params = params;
+
+                let mut plugin_params = Vec::with_capacity(part.plugin_params.len());
+                for p in &part.plugin_params {
+                    if let Some(new_node) = node_map(p.node) {
+                        plugin_params.push(ParamValue { node: new_node, ..*p });
+                    }
+                }
+                plugin_params.sort_by_key(|p| (p.node, p.param));
+                plugin_params.dedup_by_key(|p| (p.node, p.param));
+                part.plugin_params = plugin_params;
+
+                let mut fx = Vec::with_capacity(part.fx.len());
+                for f in &part.fx {
+                    if let Some(new_node) = node_map(f.node) {
+                        fx.push(FxBypass { node: new_node, bypass: f.bypass });
+                    }
+                }
+                fx.sort_by_key(|f| f.node);
+                fx.dedup_by_key(|f| f.node);
+                part.fx = fx;
+
                 part.buses = part.buses.iter().filter_map(|&b| node_map(b)).collect();
                 part.buses.dedup();
             }
@@ -575,6 +643,8 @@ impl Setlist {
             for part in &mut song.parts {
                 part.rigs.retain(|pr| has_rig(pr.rig));
                 part.params.retain(|p| graph.node(p.node).is_some());
+                part.plugin_params.retain(|p| graph.node(p.node).is_some());
+                part.fx.retain(|f| graph.node(f.node).is_some());
                 part.buses.retain(|&b| graph.is_bus(b));
             }
         }
@@ -606,9 +676,14 @@ impl Setlist {
                     } else {
                         pr.level = pr.level.clamp(0.0, 1.0);
                     }
+                    pr.pan = pr.pan.filter(|p| p.is_finite()).map(|p| p.clamp(-1.0, 1.0));
                 }
                 part.rigs.sort_by_key(|r| r.rig);
                 part.rigs.dedup_by_key(|r| r.rig);
+                part.plugin_params.sort_by_key(|p| (p.node, p.param));
+                part.plugin_params.dedup_by_key(|p| (p.node, p.param));
+                part.fx.sort_by_key(|f| f.node);
+                part.fx.dedup_by_key(|f| f.node);
             }
         }
         self.normalize_controls();
@@ -689,6 +764,15 @@ impl Setlist {
                             part.name
                         );
                     }
+                    if let Some(pan) = pr.pan {
+                        if !pan.is_finite() || !(-1.0..=1.0).contains(&pan) {
+                            bail!(
+                                "Setlist song '{}' part '{}' has a rig pan outside -1..1.",
+                                song.name,
+                                part.name
+                            );
+                        }
+                    }
                 }
                 for p in &part.params {
                     if graph.node(p.node).is_none() {
@@ -704,6 +788,33 @@ impl Setlist {
                             "Setlist song '{}' part '{}' has a non-finite knob value.",
                             song.name,
                             part.name
+                        );
+                    }
+                }
+                for p in &part.plugin_params {
+                    if graph.node(p.node).is_none() {
+                        bail!(
+                            "Setlist song '{}' part '{}' stores a plugin knob for node {} which is no longer in the patch.",
+                            song.name,
+                            part.name,
+                            p.node
+                        );
+                    }
+                    if !p.value.is_finite() {
+                        bail!(
+                            "Setlist song '{}' part '{}' has a non-finite plugin knob value.",
+                            song.name,
+                            part.name
+                        );
+                    }
+                }
+                for f in &part.fx {
+                    if graph.node(f.node).is_none() {
+                        bail!(
+                            "Setlist song '{}' part '{}' stores an effect bypass for node {} which is no longer in the patch.",
+                            song.name,
+                            part.name,
+                            f.node
                         );
                     }
                 }

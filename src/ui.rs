@@ -179,6 +179,7 @@ mod levels;
 mod show_controls;
 mod show_mode;
 mod preshow;
+mod shared;
 use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -8314,9 +8315,13 @@ impl DemoApp {
             let r = pr.rig as usize;
             if r < n_rigs && r < Self::MAX_RIGS {
                 self.rig_mix[r].vol = pr.level.clamp(0.0, 1.0);
+                if let Some(pan) = pr.pan {
+                    self.rig_mix[r].pan = pan.clamp(-1.0, 1.0);
+                }
                 self.send_rig_mix(r);
             }
         }
+        self.recall_part_fx_and_plugin_params(&graph);
         let rm = self.reduce_motion;
         if !part_params.is_empty() {
             for p in &part_params {
@@ -8433,17 +8438,29 @@ impl DemoApp {
                     "key_hi": r.key_hi,
                     "transpose": r.transpose,
                     "level": r.level,
+                    "pan": r.pan,
                     "vel_lo": r.vel_lo,
                     "vel_hi": r.vel_hi,
                     "vel_curve": r.curve.as_str(),
                     "float": r.float,
                 })).collect();
+                let fx: Vec<serde_json::Value> = p.fx.iter().map(|f| {
+                    let name = self.units.iter().find(|u| u.node_id == f.node)
+                        .map_or_else(String::new, |u| sentence_case(&u.name));
+                    serde_json::json!({
+                        "node": f.node,
+                        "name": name,
+                        "bypass": f.bypass,
+                    })
+                }).collect();
                 serde_json::json!({
                     "index": pi,
                     "name": p.name,
                     "rigs": rigs,
+                    "fx": fx,
                     "buses": p.buses,
                     "params_count": p.params.len(),
+                    "plugin_params_count": p.plugin_params.len(),
                 })
             }).collect();
             serde_json::json!({
@@ -8463,12 +8480,14 @@ impl DemoApp {
             "part_name": p.name,
         }));
         let show = self.show_json();
+        let instances = self.show_instances().to_json(|r| self.rig_name(r));
         serde_json::json!({
             "songs": songs,
             "active": active,
             "show_controls": self.show_controls_json(),
             "sets": show["sets"],
             "levels": show["levels"],
+            "instances": instances,
         })
     }
 
@@ -8522,14 +8541,41 @@ impl DemoApp {
                         let level = r.get("level").and_then(|v| v.as_f64())
                             .map(|v| (v as f32).clamp(0.0, 1.0))
                             .unwrap_or_else(|| self.rig_mix[rig].vol);
-                        let mut pr = PartRig { rig: rig as u8, key_lo: key_lo.min(key_hi), key_hi: key_lo.max(key_hi), transpose, level, ..PartRig::default() };
+                        let pan = match r.get("pan") {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(v) => {
+                                let p = v.as_f64().ok_or_else(|| format!("pan must be a number in -1..=1, got {v}"))? as f32;
+                                if !p.is_finite() || !(-1.0..=1.0).contains(&p) {
+                                    return Err(format!("pan must be in -1..=1, got {v}"));
+                                }
+                                Some(p)
+                            }
+                        };
+                        let mut pr = PartRig { rig: rig as u8, key_lo: key_lo.min(key_hi), key_hi: key_lo.max(key_hi), transpose, level, pan, ..PartRig::default() };
                         pr.set_layer_json(r)?;
                         part.set_rig(pr);
                     }
                 }
+                if let Some(fx_list) = item.get("fx").and_then(|v| v.as_array()) {
+                    for f in fx_list {
+                        let node = f.get("node").and_then(|v| v.as_u64()).ok_or("fx entry needs 'node' id")? as u32;
+                        let bypass = f.get("bypass").and_then(|v| v.as_bool()).ok_or("fx entry needs 'bypass' bool")?;
+                        if graph.node(node).is_none() {
+                            return Err(format!("fx node {node} is not in the patch"));
+                        }
+                        part.set_fx(node, bypass);
+                    }
+                }
                 part.buses = crate::setlist::part_buses(item, &graph)?;
                 if item.get("capture_knobs").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    part.params = self.capture_part_knobs(&part.rigs);
+                    let (params, plugin_params, fx) = self.capture_part_state(&part.rigs);
+                    part.params = params;
+                    part.plugin_params = plugin_params;
+                    for f in fx {
+                        if part.fx_bypass(f.node).is_none() {
+                            part.set_fx(f.node, f.bypass);
+                        }
+                    }
                 }
                 out.push(part);
             }
@@ -8592,7 +8638,10 @@ impl DemoApp {
                 Some(parts) => parts,
                 None => {
                     let mut p = Part::new("Main", self.default_part_rigs());
-                    p.params = self.capture_part_knobs(&p.rigs);
+                    let (params, plugin_params, fx) = self.capture_part_state(&p.rigs);
+                    p.params = params;
+                    p.plugin_params = plugin_params;
+                    p.fx = fx;
                     vec![p]
                 }
             };
@@ -8617,158 +8666,16 @@ impl DemoApp {
         }
     }
 
-    /// "Add song from session" (#204): import a saved session's rigs into the
-    /// current gig (up to `MAX_RIGS`) and create a song pointing at them.
+    /// "Add song from session" (#204, #275): delegates to `add_song_from_session_shared`
+    /// with sharing enabled so matching hosted instruments are reused.
     fn add_song_from_session_in(
         &mut self,
         dir: &std::path::Path,
         session_name: &str,
         song_name: Option<&str>,
     ) -> Result<(usize, Vec<usize>), String> {
-        let imported = crate::session::Session::package_path(dir, session_name)
-            .and_then(|p| crate::session::Session::load(&p))
-            .map_err(|e| format!("Could not load session '{session_name}': {e}"))?;
-        let mut imported = canonical_rig_session(&imported);
-        let (imp_graphs, imp_bases) = crate::control::split_rigs(&imported.graph);
-        if imp_graphs.is_empty() {
-            return Err(format!("Session '{session_name}' has no rigs."));
-        }
-        let cur_n = self.rig_count();
-        if cur_n + imp_graphs.len() > Self::MAX_RIGS {
-            return Err(format!(
-                "Cannot import {} rig(s) from '{session_name}': {cur_n} rig(s) already loaded (max {}).",
-                imp_graphs.len(),
-                Self::MAX_RIGS
-            ));
-        }
-        // The import takes the session's rigs, not its setlist: a device only
-        // its program-change choice (#208) names gets no row here.
-        let rules: Vec<SavedRule> = imported.matrix().and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
-        let used = hw_indices_in_use(&rules, &imported.rig_devices);
-        let ports = imported.hw_ports().iter().filter(|(d, _)| used.contains(d)).map(|(&d, p)| (d, p.clone())).collect();
-        let map = self.hw_index_map(&ports);
-        map_session_hw(&mut imported, &map);
-        let cur = self.capture_session("Import")
-            .map_err(|e| format!("Could not capture current rack: {e}"))?;
-        let voice_rows = self.voice_rows();
-        let (cur_graphs, cur_bases) = crate::control::split_rigs(&cur.graph);
-        let devices: Vec<Option<u32>> = {
-            let snap = self.rig_snapshot.lock().ok();
-            (0..cur_graphs.len())
-                .map(|i| snap.as_ref().and_then(|sn| sn.rigs.get(i).and_then(|m| m.midi_device)))
-                .collect()
-        };
-        let mut list: Vec<crate::control::Rig> = cur_graphs.into_iter().enumerate()
-            .map(|(i, g)| crate::control::Rig::new(self.rig_name(i), g, devices[i]))
-            .collect();
-        let first_new_rig = list.len();
-        let mut new_rig_indices = Vec::with_capacity(imp_graphs.len());
-        for (i, g) in imp_graphs.into_iter().enumerate() {
-            let base_name = imported.rig_names.get(i)
-                .filter(|n| !n.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| {
-                    if imp_bases.len() == 1 {
-                        imported.name.clone()
-                    } else {
-                        format!("{} {}", imported.name, crate::control::rig_letter(i))
-                    }
-                });
-            let rname: String = base_name.trim().chars().take(24).collect();
-            let idx = list.len();
-            list.push(crate::control::Rig::new(rname, g, imported.rig_devices.get(i).copied().flatten()));
-            new_rig_indices.push(idx);
-        }
-        let new_bases = crate::control::rig_bases(&list);
-        let merged = crate::control::merge_rigs(&list);
-        let remap_cur = |old: u32| -> Option<u32> {
-            let o = cur.graph.node(old)?.rig as usize;
-            Some(new_bases[o] + (old - cur_bases[o]))
-        };
-        let remap_imp = |old: u32| -> Option<u32> {
-            let o = imported.graph.node(old)?.rig as usize;
-            let dst = first_new_rig + o;
-            Some(new_bases[dst] + (old - imp_bases[o]))
-        };
-        let mut ns = remap_session(&cur, merged, remap_cur);
-        // Copy imported params, plugin states, matrix rules, strips, sends, bus_outs.
-        let mut imported_params = Vec::new();
-        for p in imported.params() {
-            if let Some(nid) = remap_imp(p.node) {
-                ns.set_param(nid, p.param, p.value);
-                imported_params.push(crate::session::ParamValue { node: nid, param: p.param, value: p.value });
-            }
-        }
-        for st in imported.plugin_states() {
-            if let Some(nid) = remap_imp(st.node) {
-                ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone());
-            }
-        }
-        let mut rules: Vec<SavedRule> = ns.matrix()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let imp_rules: Vec<SavedRule> = imported.matrix()
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        for mut r in imp_rules {
-            if let Some(nid) = remap_imp(r.dest) {
-                r.dest = nid;
-                rules.push(r);
-            }
-        }
-        if !rules.is_empty() {
-            ns.set_matrix(serde_json::to_value(&rules).ok());
-        }
-        for st in imported.strips() {
-            if let Some(node) = remap_imp(st.node) {
-                ns.set_strip(crate::session::StripSaved { node, ..*st });
-            }
-        }
-        for (&old, label) in imported.strip_knobs() {
-            if let Some(node) = remap_imp(old) {
-                ns.set_strip_knob(node, label.clone());
-            }
-        }
-        // Build the new song pointing at the imported rigs.
-        let title = song_name
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&imported.name)
-            .to_string();
-        let part_rigs: Vec<crate::setlist::PartRig> = new_rig_indices.iter()
-            .map(|&r| crate::setlist::PartRig::new(r as u8))
-            .collect();
-        let mut main_part = crate::setlist::Part::new("Main", part_rigs);
-        main_part.params = imported_params;
-        let mut song = crate::setlist::Song::new(title, vec![main_part]);
-        song.time_sig = imported.time_sig;
-        ns.setlist.songs.push(song);
-        let song_idx = ns.setlist.songs.len() - 1;
-
-        let saved_mix = self.rig_mix;
-        let saved_arms = self.arm_rigs;
-        let active = self.active_rig;
-        self.load_as_rigs = Some((list.clone(), active));
-        self.apply_session(&ns).map_err(|e| format!("Import failed: {e}"))?;
-        if let Ok(mut snap) = self.rig_snapshot.lock() {
-            snap.rigs = list.iter().map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
-            snap.active = active;
-        }
-        self.adopt_rig_devices();
-        let voice_rows: Vec<VoiceRow> = voice_rows.into_iter()
-            .filter_map(|r| remap_cur(r.node).map(|node| VoiceRow { node, ..r }))
-            .collect();
-        self.restore_voice_rows(&voice_rows);
-        for i in 0..first_new_rig.min(Self::MAX_RIGS) {
-            self.rig_mix[i] = saved_mix[i];
-            self.send_rig_mix(i);
-            self.set_record_arm(Some(i), saved_arms[i]);
-        }
-        self.active_rig = usize::MAX;
-        self.set_active_rig(active);
-        self.setlist_edit_song = Some(song_idx);
-        self.session_msg = format!("Added song from '{session_name}'");
-        Ok((song_idx, new_rig_indices))
+        let out = self.add_song_from_session_shared(dir, session_name, song_name, true)?;
+        Ok((out.song, out.part_rigs))
     }
 
     fn hw_queues(&self) -> HwQueues {
@@ -10516,13 +10423,18 @@ impl DemoApp {
             "add_song_from_session" => {
                 let session = args.get("session").and_then(|v| v.as_str()).unwrap_or("");
                 let song_name = args.get("name").and_then(|v| v.as_str());
+                let share = args.get("share").and_then(|v| v.as_bool()).unwrap_or(true);
                 let dir = self.effective_sessions_dir();
-                match self.add_song_from_session_in(&dir, session, song_name) {
-                    Ok((song_idx, rigs)) => {
+                match self.add_song_from_session_shared(&dir, session, song_name, share) {
+                    Ok(out) => {
                         self.agent_activity.record(origin, format!("Imported song from {session}"), Vec::new(), now);
                         serde_json::json!({
-                            "song": song_idx,
-                            "imported_rigs": rigs,
+                            "song": out.song,
+                            "imported_rigs": out.part_rigs,
+                            "shared_rigs": out.shared_rigs,
+                            "new_rigs": out.new_rigs,
+                            "reasons": out.reasons,
+                            "instances": self.show_instances().to_json(|r| self.rig_name(r)),
                             "setlist": self.setlist_json(),
                         }).to_string()
                     }
@@ -17840,6 +17752,32 @@ impl DemoApp {
         let program_rows: Vec<(u32, String, bool)> = (0..self.hw_devices.len() as u32)
             .map(|d| (d, self.hw_device_label(d), self.hw_live.get(d as usize).copied().unwrap_or(true)))
             .collect();
+        // Hosted instrument accounting (#275): real instance count, per-rig sharing
+        // status, and each rig's audio effects for per-part effect-chain chips.
+        let show_instances = self.show_instances();
+        let instances_badge = show_instances.summary_label(self.setlist.songs.len());
+        let instances_tip = if show_instances.rigs.is_empty() {
+            "No plugin instruments hosted yet.".to_string()
+        } else {
+            let mut lines = vec![format!("{} hosted instrument instance(s):", show_instances.hosted)];
+            for r in &show_instances.rigs {
+                let rname = self.rig_name(r.rig as usize);
+                let how = match r.sharing {
+                    crate::setlist::SharingKind::Shared => format!("shared across {} song(s) — level/pan/split/FX/knobs apply at switch", r.songs.len()),
+                    crate::setlist::SharingKind::SeparatePreset => "separate instance (own preset)".into(),
+                    crate::setlist::SharingKind::Single => format!("{} song(s)", r.songs.len()),
+                };
+                lines.push(format!("• Rig {} ({rname}): {} inst · {how}", r.rig + 1, r.nodes.len()));
+            }
+            lines.join("\n")
+        };
+        let rig_sharing: Vec<Option<(crate::setlist::SharingKind, usize)>> = (0..n_rigs as u8)
+            .map(|r| show_instances.rigs.iter().find(|ri| ri.rig == r).map(|ri| (ri.sharing, ri.songs.len())))
+            .collect();
+        let rig_fx: Vec<Vec<(u32, String, bool)>> = (0..n_rigs as u8)
+            .map(|r| self.rig_audio_effects(r))
+            .collect();
+        let can_split_rig = n_rigs < Self::MAX_RIGS;
 
         // Keep selected song index valid.
         if self.setlist.songs.is_empty() {
@@ -17857,6 +17795,8 @@ impl DemoApp {
         let mut add_part_for: Option<usize> = None;
         let mut remove_part: Option<(usize, usize)> = None;
         let mut capture_knobs_for: Option<(usize, usize)> = None;
+        let mut vary_rig: Option<u8> = None;
+        let mut split_rig: Option<(usize, usize, u8)> = None;
         let mut active_part_dirty = false;
         let mut enter_show = false;
         let mut toggle_check = false;
@@ -17916,11 +17856,16 @@ impl DemoApp {
                             ).truncate());
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let subtitle = if show_instances.hosted > 0 {
+                                format!("{instances_badge} · PageUp/Dn step · F12: rack")
+                            } else {
+                                "songs & parts over loaded rigs · PageUp/Dn step · F12: rack".to_string()
+                            };
                             ui.add(egui::Label::new(
-                                egui::RichText::new("songs & parts over loaded rigs · PageUp / PageDown step · F12 / Esc: rack")
+                                egui::RichText::new(subtitle)
                                     .size(12.5)
                                     .color(theme::INK_2),
-                            ).truncate());
+                            ).truncate()).on_hover_text(&instances_tip);
                         });
                     });
                 });
@@ -18087,6 +18032,8 @@ impl DemoApp {
                                   add_part_for: &mut Option<usize>,
                                   remove_part: &mut Option<(usize, usize)>,
                                   capture_knobs_for: &mut Option<(usize, usize)>,
+                                  vary_rig: &mut Option<u8>,
+                                  split_rig: &mut Option<(usize, usize, u8)>,
                                   jump_to: &mut Option<(usize, usize)>,
                                   active_part_dirty: &mut bool| {
                     let Some(si) = edit_song.filter(|&i| i < setlist.songs.len()) else {
@@ -18195,13 +18142,14 @@ impl DemoApp {
                                                 if part_count > 1 && theme::chip_button(ui, "×", false).on_hover_text("Remove part").clicked() {
                                                     *remove_part = Some((si, pi));
                                                 }
-                                                let knob_lbl = if part.params.is_empty() {
+                                                let knob_count = part.params.len() + part.plugin_params.len();
+                                                let knob_lbl = if knob_count == 0 {
                                                     "Save knobs".to_string()
                                                 } else {
-                                                    format!("Save knobs ({})", part.params.len())
+                                                    format!("Save knobs ({knob_count})")
                                                 };
-                                                if theme::chip_button(ui, &knob_lbl, !part.params.is_empty())
-                                                    .on_hover_text("Snapshot current rack knobs of this part's live rigs")
+                                                if theme::chip_button(ui, &knob_lbl, knob_count > 0)
+                                                    .on_hover_text("Snapshot current rack knobs, pinned plugin knobs and effect bypasses of this part's live rigs")
                                                     .clicked()
                                                 {
                                                     *capture_knobs_for = Some((si, pi));
@@ -18213,6 +18161,7 @@ impl DemoApp {
                                             let r_u8 = ri as u8;
                                             let existing_idx = part.rigs.iter().position(|r| r.rig == r_u8);
                                             let mut on = existing_idx.is_some();
+                                            let mut show_fx_row = false;
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 6.0;
                                                 if theme::chip_button(ui, &format!("{} · {rname}", ri + 1), on).clicked() {
@@ -18227,7 +18176,14 @@ impl DemoApp {
                                                 if let Some(Some(tag)) = rig_level_tags.get(ri) {
                                                     ui.label(egui::RichText::new(tag).size(11.0).color(theme::INK_2))
                                                         .on_hover_text("Setlist → Sets & levels sets where this rig lives");
+                                                    if theme::wrapped_chip_button(ui, "Vary per song", false)
+                                                        .on_hover_text("Keep this 1 hosted instance in every song, and give each song its own level, pan, split and effect chain")
+                                                        .clicked()
+                                                    {
+                                                        *vary_rig = Some(r_u8);
+                                                    }
                                                 } else if let Some(pr) = part.rigs.iter_mut().find(|r| r.rig == r_u8) {
+                                                    show_fx_row = true;
                                                     ui.label(egui::RichText::new("Keys").size(11.0).color(theme::INK_2));
                                                     let lo_lbl = crate::setlist::note_label(pr.key_lo);
                                                     if ui.add(
@@ -18265,6 +18221,17 @@ impl DemoApp {
                                                         pr.level = (pct as f32 / 100.0).clamp(0.0, 1.0);
                                                         if is_live { *active_part_dirty = true; }
                                                     }
+                                                    ui.label(egui::RichText::new("Pan").size(11.0).color(theme::INK_2));
+                                                    let mut pan_v = pr.pan.unwrap_or(0.0);
+                                                    if ui.add(
+                                                        egui::DragValue::new(&mut pan_v)
+                                                            .range(-1.0..=1.0)
+                                                            .speed(0.02)
+                                                            .custom_formatter(|v, _| pan_text(v as f32)),
+                                                    ).on_hover_text("Rig pan recalled on switch (smooth 5 ms ramp)").changed() {
+                                                        pr.pan = Some(pan_v.clamp(-1.0, 1.0));
+                                                        if is_live { *active_part_dirty = true; }
+                                                    }
                                                     ui.label(egui::RichText::new("Vel").size(11.0).color(theme::INK_2));
                                                     let mut moved = ui.add(egui::DragValue::new(&mut pr.vel_lo).range(0..=127).speed(0.25))
                                                         .on_hover_text("Softest velocity this rig plays").changed();
@@ -18291,6 +18258,60 @@ impl DemoApp {
                                                     if moved && is_live { *active_part_dirty = true; }
                                                 }
                                             });
+                                            if show_fx_row {
+                                                let fxs = rig_fx.get(ri).map(Vec::as_slice).unwrap_or(&[]);
+                                                let sharing_info = rig_sharing.get(ri).copied().flatten();
+                                                let has_sharing_badge = matches!(
+                                                    sharing_info,
+                                                    Some((crate::setlist::SharingKind::Shared | crate::setlist::SharingKind::SeparatePreset, _))
+                                                );
+                                                if !fxs.is_empty() || has_sharing_badge {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.add_space(18.0);
+                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                        if !fxs.is_empty() {
+                                                            ui.label(egui::RichText::new("FX").size(10.5).color(theme::INK_2));
+                                                            for (fx_node, fx_name, current_bypass) in fxs {
+                                                                let bypassed = part.fx_bypass(*fx_node).unwrap_or(*current_bypass);
+                                                                let active = !bypassed;
+                                                                if theme::wrapped_chip_button(ui, fx_name, active)
+                                                                    .on_hover_text(if active { "Active in this part — click to bypass" } else { "Bypassed in this part — click to enable" })
+                                                                    .clicked()
+                                                                {
+                                                                    part.set_fx(*fx_node, !bypassed);
+                                                                    if is_live { *active_part_dirty = true; }
+                                                                }
+                                                            }
+                                                        }
+                                                        if !fxs.is_empty() && has_sharing_badge {
+                                                            ui.label(egui::RichText::new("·").size(10.5).color(theme::INK_2));
+                                                        }
+                                                        match sharing_info {
+                                                            Some((crate::setlist::SharingKind::Shared, count)) => {
+                                                                ui.label(
+                                                                    egui::RichText::new(format!("Shared · {count} songs (knobs at switch)"))
+                                                                        .size(10.5)
+                                                                        .color(theme::LIVE_TEAL),
+                                                                ).on_hover_text("One hosted instance shared across songs. Level, pan, split, effect chain and knobs apply at the switch without cutting held notes.");
+                                                                if can_split_rig && theme::wrapped_chip_button(ui, "Own instance", false)
+                                                                    .on_hover_text("Make a separate hosted instance for this part so it can load a different preset")
+                                                                    .clicked()
+                                                                {
+                                                                    *split_rig = Some((si, pi, r_u8));
+                                                                }
+                                                            }
+                                                            Some((crate::setlist::SharingKind::SeparatePreset, _)) => {
+                                                                ui.label(
+                                                                    egui::RichText::new("Separate instance (own preset)")
+                                                                        .size(10.5)
+                                                                        .color(theme::INK_2),
+                                                                ).on_hover_text("Hosted separately from another rig of the same plugin so each keeps its own preset.");
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    });
+                                                }
+                                            }
                                         }
                                         if !part_buses.is_empty() {
                                             ui.horizontal_wrapped(|ui| {
@@ -18351,6 +18372,8 @@ impl DemoApp {
                                 &mut add_part_for,
                                 &mut remove_part,
                                 &mut capture_knobs_for,
+                                &mut vary_rig,
+                                &mut split_rig,
                                 &mut jump_to,
                                 &mut active_part_dirty,
                             );
@@ -18386,6 +18409,8 @@ impl DemoApp {
                             &mut add_part_for,
                             &mut remove_part,
                             &mut capture_knobs_for,
+                            &mut vary_rig,
+                            &mut split_rig,
                             &mut jump_to,
                             &mut active_part_dirty,
                         );
@@ -18407,7 +18432,7 @@ impl DemoApp {
             };
             self.setlist_new_song_name.clear();
             let mut part = Part::new("Main", self.default_part_rigs());
-            part.params = self.capture_part_knobs(&part.rigs);
+            (part.params, part.plugin_params, part.fx) = self.capture_part_state(&part.rigs);
             self.setlist.songs.push(Song::new(title, vec![part]));
             self.setlist_edit_song = Some(self.setlist.songs.len() - 1);
         }
@@ -18439,7 +18464,7 @@ impl DemoApp {
                 };
                 self.setlist_new_part_name.clear();
                 let mut part = Part::new(pname, self.default_part_rigs());
-                part.params = self.capture_part_knobs(&part.rigs);
+                (part.params, part.plugin_params, part.fx) = self.capture_part_state(&part.rigs);
                 if let Some(song) = self.setlist.songs.get_mut(si) {
                     song.parts.push(part);
                 }
@@ -18456,10 +18481,24 @@ impl DemoApp {
         }
         if let Some((si, pi)) = capture_knobs_for {
             if let Some(rigs) = self.setlist.songs.get(si).and_then(|s| s.parts.get(pi)).map(|p| p.rigs.clone()) {
-                let knobs = self.capture_part_knobs(&rigs);
+                let (knobs, plugin_knobs, fx) = self.capture_part_state(&rigs);
                 if let Some(part) = self.setlist.songs.get_mut(si).and_then(|s| s.parts.get_mut(pi)) {
                     part.params = knobs;
+                    part.plugin_params = plugin_knobs;
+                    part.fx = fx;
                 }
+            }
+        }
+        if let Some(r) = vary_rig {
+            let m = self.rig_mix[(r as usize).min(Self::MAX_RIGS - 1)];
+            self.setlist.share_rig_across_songs(r, m.vol, Some(m.pan));
+            if self.setlist.active.is_some() {
+                self.apply_setlist_part();
+            }
+        }
+        if let Some((si, pi, r)) = split_rig {
+            if let Err(e) = self.split_part_rig_to_own_instance(si, pi, r) {
+                self.session_msg = e;
             }
         }
         if enter_show {
@@ -48738,17 +48777,21 @@ mod navigator_tests {
         assert_eq!(chorus.rigs[0].rig, 0);
         assert_eq!(chorus.rigs[0].transpose, 12);
 
-        // 6. Add song from saved session imports its rigs and appends a song.
+        // 6. Add song from saved session shares matching hosted instruments by
+        // default (#275), and creates a new rig when sharing is disabled.
         let single_pkg = crate::session::Session::package_path(&dir, "PianoSong").unwrap();
         let mut s_one = crate::session::Template::SynthLead.session();
         s_one.name = "PianoSong".into();
         s_one.save(&single_pkg).unwrap();
         let before_rigs = app.rig_count();
-        let (song_idx, new_rigs) = app.add_song_from_session_in(&dir, "PianoSong", Some("Encore")).unwrap();
-        assert_eq!(app.rig_count(), before_rigs + 1);
-        assert_eq!(new_rigs.len(), 1);
+        let (song_idx, part_rigs) = app.add_song_from_session_in(&dir, "PianoSong", Some("Encore")).unwrap();
+        assert_eq!(app.rig_count(), before_rigs, "matching Surge XT rig is shared (1 instance)");
+        assert_eq!(part_rigs, vec![0]);
         assert_eq!(app.setlist.songs[song_idx].name, "Encore");
-        assert_eq!(app.setlist.songs[song_idx].parts[0].rigs[0].rig as usize, new_rigs[0]);
+        assert_eq!(app.setlist.songs[song_idx].parts[0].rigs[0].rig as usize, part_rigs[0]);
+        let sep = app.add_song_from_session_shared(&dir, "PianoSong", Some("Encore Separate"), false).unwrap();
+        assert_eq!(app.rig_count(), before_rigs + 1, "share=false adds a separate instance");
+        assert_eq!(sep.new_rigs.len(), 1);
 
         // 7. Undo/redo restores setlist edits.
         app.undo_job = None;
@@ -48839,16 +48882,19 @@ mod navigator_tests {
             let (mut app, _) = two_rigs_with_inserts(true);
             let _ = app.rename_rig(0, "Piano");
             let _ = app.rename_rig(1, "Warm Pad");
+            let piano_delay = app.rig_audio_effects(0).first().map(|(n, _, _)| *n);
+            let verse_fx = piano_delay.map(|n| serde_json::json!([{"node": n, "bypass": true}]));
+            let chorus_fx = piano_delay.map(|n| serde_json::json!([{"node": n, "bypass": false}]));
             let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
                 "name": "Opening Night",
                 "bpm": 118.0,
                 "time_signature": {"numerator": 4, "denominator": 4},
                 "parts": [
-                    {"name": "Verse", "rigs": [{"rig": 0, "key_lo": 36, "key_hi": 96, "transpose": 0, "level": 0.9}], "capture_knobs": true},
+                    {"name": "Verse", "rigs": [{"rig": 0, "key_lo": 36, "key_hi": 96, "transpose": 0, "level": 0.9, "pan": -0.2}], "fx": verse_fx, "capture_knobs": true},
                     {"name": "Chorus", "rigs": [
-                        {"rig": 0, "key_lo": 36, "key_hi": 59, "transpose": 0, "level": 0.85, "float": 3},
-                        {"rig": 1, "key_lo": 60, "key_hi": 96, "transpose": 12, "level": 0.8, "vel_lo": 40, "vel_curve": "soft", "float": 3}
-                    ], "capture_knobs": true}
+                        {"rig": 0, "key_lo": 36, "key_hi": 59, "transpose": 0, "level": 0.85, "pan": -0.35, "float": 3},
+                        {"rig": 1, "key_lo": 60, "key_hi": 96, "transpose": 12, "level": 0.8, "pan": 0.35, "vel_lo": 40, "vel_curve": "soft", "float": 3}
+                    ], "fx": chorus_fx, "capture_knobs": true}
                 ]
             }));
             let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
@@ -48856,7 +48902,10 @@ mod navigator_tests {
                 "bpm": 76.0,
                 "time_signature": {"numerator": 3, "denominator": 4},
                 "parts": [
-                    {"name": "Theme", "rigs": [{"rig": 1, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.85}]}
+                    {"name": "Theme", "rigs": [
+                        {"rig": 0, "key_lo": 24, "key_hi": 108, "transpose": 0, "level": 0.75, "pan": 0.15},
+                        {"rig": 1, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.85, "pan": -0.15}
+                    ]}
                 ]
             }));
             let _ = app.exec_tool("set_show_control", &serde_json::json!({"action": "next_part", "cc": 64}));

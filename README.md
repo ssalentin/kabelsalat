@@ -136,18 +136,29 @@ away without a MIDI keyboard (`play_demo` / `stop_demo` for agents).
 ### Play a setlist without a gap
 Press **F12** (or click **Setlist**) to organize a gig into songs and parts
 (Verse, Chorus, Solo) over the loaded rigs. Every rig stays loaded; each part
-says which rigs take new notes, with per-rig key range, transpose, level and
-stored knob values, and each song can set its own tempo and time signature.
+says which rigs take new notes, with per-rig key range, transpose, level, pan,
+effect-chain bypasses and stored knob values (including pinned plugin knobs),
+and each song can set its own tempo and time signature.
+One hosted instrument can be shared across as many songs as you like (a piano in
+twenty songs hosts one plugin instance, with each song's own level, pan, split,
+effect chain and knobs applied at the switch without cutting held notes);
+**Add song from session** shares matching hosted instruments (same plugin and
+saved preset) automatically, while a different preset or **Own instance** hosts
+a separate instance so switching never reloads plugin state mid-show. The
+Setlist header shows how many instrument instances the show really hosts, and a
+show-level rig has **Vary per song** to keep that one instance in every song
+while customizing it per song.
 Each rig also takes a velocity range and curve, so a soft pad can sit under a
 hard-struck piano, and a floating split: its key range's edges follow the hand
 that plays across them, by up to the set number of keys.
 Switching parts never cuts held notes or reverb tails — outgoing rigs keep
 sounding until you release the keys or sustain pedal, while new notes play the
-next part from the same audio block on. A part that moves a rig's fader or an
-instrument's level moves it over 5 ms, so a chord held through the switch does
-not click.
+next part from the same audio block on. A part that moves a rig's fader, pan,
+an instrument's level or an effect's bypass ramps it over 5 ms, so a
+chord held through the switch does not click.
 `kabelsalat setlist-switch-test` measures a switch under a held chord with real
-Surge XT voices: no gap, no click, the reverb and delay tails ring on, and the
+Surge XT voices (including switching between two songs that share one instance):
+no gap, no click, the reverb and delay tails ring on, and the
 first note of the next song starts in the block that switched (at most one
 buffer later, 5.3 ms at the default 256 frames, plus the sound card's own
 output latency). Step parts from the top bar, with
@@ -157,7 +168,8 @@ from a pedal"). Under **Program change picks the song**, turn a keyboard or
 foot controller on, and its preset buttons pick songs: program change N jumps
 to song N+1 in the next audio block, and that device's program changes no
 longer reach its instruments (other devices' still do). **Add song from
-session** pulls a saved session's rigs into the gig as a new song, and the
+session** pulls a saved session into the gig as a new song (reusing matching
+hosted instruments by default), and the
 assistant and MCP agents can read, build and step the setlist.
 
 <p align="center"><img src="docs/shots/setlist.png" width="85%" alt="The Setlist view: songs with tempo and time signature on the left, parts with per-rig key ranges, transpose, level, velocity range and curve, floating split and knob capture on the right, and the song/part stepper in the top bar"/></p>

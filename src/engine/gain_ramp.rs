@@ -39,6 +39,11 @@ impl GainRamp {
         self.now == (0.0, 0.0) && self.to == (0.0, 0.0)
     }
 
+    /// At unity and staying there.
+    pub fn is_unity(&self) -> bool {
+        self.now == (1.0, 1.0) && self.to == (1.0, 1.0) && self.left == 0
+    }
+
     /// Scale one interleaved stereo block, moving the gain on.
     pub fn apply(&mut self, buf: &mut [f32]) {
         if self.left == 0 {
@@ -58,6 +63,30 @@ impl GainRamp {
             }
             f[0] *= self.now.0;
             f[1] *= self.now.1;
+        }
+    }
+
+    /// Crossfade `dry` and `wet` in place inside `wet` (`0 = dry`, `1 = wet`)
+    /// so toggling an effect's bypass on a part switch does not click (#275).
+    pub fn mix_dry_wet(&mut self, dry: &[f32], wet: &mut [f32]) {
+        if self.left == 0 {
+            let (l, r) = self.now;
+            if (l, r) == (1.0, 1.0) {
+                return;
+            }
+            for (d, w) in dry.chunks_exact(2).zip(wet.chunks_exact_mut(2)) {
+                w[0] = d[0] + (w[0] - d[0]) * l;
+                w[1] = d[1] + (w[1] - d[1]) * r;
+            }
+            return;
+        }
+        for (d, w) in dry.chunks_exact(2).zip(wet.chunks_exact_mut(2)) {
+            if self.left > 0 {
+                self.left -= 1;
+                self.now = if self.left == 0 { self.to } else { (self.now.0 + self.step.0, self.now.1 + self.step.1) };
+            }
+            w[0] = d[0] + (w[0] - d[0]) * self.now.0;
+            w[1] = d[1] + (w[1] - d[1]) * self.now.1;
         }
     }
 }
@@ -109,5 +138,18 @@ mod tests {
         g.apply(&mut buf);
         g.apply(&mut buf);
         assert_eq!(buf, vec![0.25, 0.0, 0.25, 0.0, 0.25, 0.0, 0.25, 0.0]);
+    }
+
+    #[test]
+    fn mix_dry_wet_crossfades_cleanly_between_dry_and_wet() {
+        let mut g = GainRamp::UNITY;
+        assert!(g.is_unity());
+        g.set((0.0, 0.0), 4);
+        assert!(!g.is_unity());
+        let dry = vec![1.0f32; 8];
+        let mut wet = vec![0.0f32; 8];
+        g.mix_dry_wet(&dry, &mut wet);
+        assert_eq!(wet, vec![0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0]);
+        assert!(g.is_silent());
     }
 }

@@ -380,6 +380,10 @@ pub struct VoiceSlot {
     rig_device: Option<u32>,
     /// The latency the CLAP voice last reported, in frames.
     latency: u32,
+    /// Dry/wet bypass crossfade when this CLAP node runs as an audio effect (#275).
+    wet: gain_ramp::GainRamp,
+    /// True once `wet` has snapped to the slot's initial bypass state on its first block.
+    wet_init: bool,
 }
 
 impl VoiceSlot {
@@ -395,6 +399,8 @@ impl VoiceSlot {
             src_hw: true,
             rig_device: None,
             latency,
+            wet: gain_ramp::GainRamp::UNITY,
+            wet_init: false,
         }
     }
 
@@ -417,6 +423,8 @@ impl VoiceSlot {
         self.src_keys = true;
         self.src_hw = true;
         self.rig_device = None;
+        self.wet = gain_ramp::GainRamp::UNITY;
+        self.wet_init = false;
     }
 }
 
@@ -475,6 +483,10 @@ struct DspSlot {
     kind: DspKind,
     proc: Box<dyn Processor>,
     buf: Vec<f32>,
+    /// Dry/wet bypass crossfade (1 = active, 0 = bypassed, 5 ms ramp, #275).
+    wet: gain_ramp::GainRamp,
+    /// True once `wet` has snapped to the slot's initial bypass state on its first block.
+    wet_init: bool,
     /// Per-instrument transport (metronome; the file-player node joins via
     /// `NodeKind::supports_transport`). Engine-owned plain state, set only by
     /// commands drained at block boundaries — the render path reads it with
@@ -544,7 +556,23 @@ fn dsp_slot(node: &crate::control::Node, kind: &DspKind, sample_rate: f64) -> Ds
         kind: kind.clone(),
         proc: build_processor(kind, sample_rate),
         buf: vec![0.0; 8192 * 2],
+        wet: gain_ramp::GainRamp::UNITY,
+        wet_init: false,
         transport,
+    }
+}
+
+/// Snap an effect slot's dry/wet ramp to its initial bypass state on its first
+/// rendered block (so sessions loaded with bypassed effects never leak 5 ms of
+/// wet audio on block 0), then crossfade over `ramp` frames on every live toggle.
+#[inline]
+fn sync_wet(wet: &mut gain_ramp::GainRamp, init: &mut bool, bypassed: bool, ramp: u32) {
+    let target = if bypassed { 0.0 } else { 1.0 };
+    if !*init {
+        *wet = gain_ramp::GainRamp::at(target);
+        *init = true;
+    } else {
+        wet.set((target, target), ramp);
     }
 }
 
@@ -555,6 +583,10 @@ struct Lv2Slot {
     /// The latency the plugin last reported, in frames: what the delay
     /// plan counts for this unit.
     latency: u32,
+    /// Dry/wet bypass crossfade (1 = active, 0 = bypassed, 5 ms ramp, #275).
+    wet: gain_ramp::GainRamp,
+    /// True once `wet` has snapped to the slot's initial bypass state on its first block.
+    wet_init: bool,
 }
 
 /// Input events a MIDI-FX unit may hold between blocks (a full queue drops,
@@ -750,7 +782,7 @@ const LV2_RING: usize = 2 * LV2_SLOT_CAP;
 
 fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
     match crate::lv2::Lv2Plugin::load(uri, sample_rate, 8192) {
-        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2], latency: 0 }),
+        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false }),
         Err(e) => {
             eprintln!("lv2 node {node}: {e}");
             None
@@ -835,7 +867,7 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
         .iter()
         .filter_map(|n| match &n.kind {
             NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sample_rate, 8192) {
-                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2], latency: 0 }),
+                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false }),
                 Err(e) => {
                     eprintln!("lv2 node {}: {e}", n.id);
                     None
@@ -2919,6 +2951,7 @@ impl GraphEngine {
     /// taps of this pass (None for a bus's own chain, which cannot send).
     fn run_effects(&mut self, bus: &mut [f32], frames: usize, solo_rigs: &[bool; MAX_RIGS], mut taps: Option<&mut BusTaps>) {
         let n2 = frames * 2;
+        let ramp = (gain_ramp::RAMP_S * self.sample_rate) as u32;
         let n_dsp = self.dsp.len();
         let n_lv2 = self.lv2.len();
         let n_fx = n_dsp + n_lv2 + self.voices.len();
@@ -2929,37 +2962,84 @@ impl GraphEngine {
             self.sum_audio_into(node, &mut bus[..n2]);
             // Bypass (#74): the slot passes its summed input through
             // unchanged; its knobs keep their values for when it returns.
+            // Zero-latency effect slots crossfade dry↔wet over 5 ms (#275) so
+            // a per-part effect-chain switch never clicks under a held note.
             let bypassed = strip_bypassed(&self.strips, node);
+            let mut pdc_bypass = bypassed;
             if f < n_dsp {
                 let d = &mut self.dsp[f];
+                sync_wet(&mut d.wet, &mut d.wet_init, bypassed, ramp);
                 d.buf[..n2].copy_from_slice(&bus[..n2]);
-                if !bypassed {
+                if !d.wet.is_silent() {
                     d.proc.process(&mut d.buf[..n2], frames);
+                    if !d.wet.is_unity() {
+                        d.wet.mix_dry_wet(&bus[..n2], &mut d.buf[..n2]);
+                    }
                 }
+                pdc_bypass = d.wet.is_silent();
             } else if f < n_dsp + n_lv2 {
                 let slot = &mut self.lv2[f - n_dsp];
-                if bypassed {
-                    slot.buf[..n2].copy_from_slice(&bus[..n2]);
-                } else {
-                    slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
-                    // LV2 writes its latency in every run.
-                    let latency = slot.plugin.latency_frames();
-                    if latency != slot.latency {
-                        slot.latency = latency;
-                        self.latency_dirty = true;
+                if slot.latency > 0 {
+                    slot.wet = if bypassed { gain_ramp::GainRamp::at(0.0) } else { gain_ramp::GainRamp::UNITY };
+                    slot.wet_init = true;
+                    if bypassed {
+                        slot.buf[..n2].copy_from_slice(&bus[..n2]);
+                    } else {
+                        slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                        let latency = slot.plugin.latency_frames();
+                        if latency != slot.latency {
+                            slot.latency = latency;
+                            self.latency_dirty = true;
+                        }
                     }
+                } else {
+                    sync_wet(&mut slot.wet, &mut slot.wet_init, bypassed, ramp);
+                    if slot.wet.is_silent() {
+                        slot.buf[..n2].copy_from_slice(&bus[..n2]);
+                    } else {
+                        slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                        let latency = slot.plugin.latency_frames();
+                        if latency != slot.latency {
+                            slot.latency = latency;
+                            self.latency_dirty = true;
+                        }
+                        if !slot.wet.is_unity() {
+                            slot.wet.mix_dry_wet(&bus[..n2], &mut slot.buf[..n2]);
+                        }
+                    }
+                    pdc_bypass = slot.wet.is_silent();
                 }
             } else {
                 let slot = &mut self.voices[f - n_dsp - n_lv2];
-                if bypassed {
-                    slot.scratch[..n2].copy_from_slice(&bus[..n2]);
-                } else {
-                    slot.voice.process(&bus[..n2], &mut slot.scratch[..n2], self.transport);
-                    let latency = slot.voice.latency();
-                    if latency != slot.latency {
-                        slot.latency = latency;
-                        self.latency_dirty = true;
+                if slot.latency > 0 {
+                    slot.wet = if bypassed { gain_ramp::GainRamp::at(0.0) } else { gain_ramp::GainRamp::UNITY };
+                    slot.wet_init = true;
+                    if bypassed {
+                        slot.scratch[..n2].copy_from_slice(&bus[..n2]);
+                    } else {
+                        slot.voice.process(&bus[..n2], &mut slot.scratch[..n2], self.transport);
+                        let latency = slot.voice.latency();
+                        if latency != slot.latency {
+                            slot.latency = latency;
+                            self.latency_dirty = true;
+                        }
                     }
+                } else {
+                    sync_wet(&mut slot.wet, &mut slot.wet_init, bypassed, ramp);
+                    if slot.wet.is_silent() {
+                        slot.scratch[..n2].copy_from_slice(&bus[..n2]);
+                    } else {
+                        slot.voice.process(&bus[..n2], &mut slot.scratch[..n2], self.transport);
+                        let latency = slot.voice.latency();
+                        if latency != slot.latency {
+                            slot.latency = latency;
+                            self.latency_dirty = true;
+                        }
+                        if !slot.wet.is_unity() {
+                            slot.wet.mix_dry_wet(&bus[..n2], &mut slot.scratch[..n2]);
+                        }
+                    }
+                    pdc_bypass = slot.wet.is_silent();
                 }
             }
             // A bypassed unit with a lookahead still delays by it, so the
@@ -2972,7 +3052,7 @@ impl GraphEngine {
             } else {
                 &mut self.voices[f - n_dsp - n_lv2].scratch
             };
-            self.pdc.bypass(node, &bus[..n2], &mut buf[..n2], bypassed);
+            self.pdc.bypass(node, &bus[..n2], &mut buf[..n2], pdc_bypass);
             // Another source's solo silences sources, never effects: it took
             // the soloed source's own chain with it. An LV2 instrument is a
             // source; an effect keeps only what its own strip entry says.
@@ -5947,6 +6027,7 @@ impl GraphEngine {
             // order, BEFORE the fixed limiter + warmth. The cables stay the
             // truth — an insert is exactly an audio edge out of a master.
             // Allocation-free: a fixed stack table, linear scans.
+            let insert_ramp = (gain_ramp::RAMP_S * self.sample_rate) as u32;
             for &f in &inserts[..n_ins] {
                 let node_t0 = std::time::Instant::now();
                 let node = self.fx_node(f);
@@ -5955,22 +6036,31 @@ impl GraphEngine {
                 let bypassed = strip_bypassed(&self.strips, node);
                 if f < n_dsp {
                     let d = &mut self.dsp[f];
+                    sync_wet(&mut d.wet, &mut d.wet_init, bypassed, insert_ramp);
                     d.buf[..n2].copy_from_slice(&acc[..n2]);
-                    if !bypassed {
+                    if !d.wet.is_silent() {
                         d.proc.process(&mut d.buf[..n2], frames);
+                        if !d.wet.is_unity() {
+                            d.wet.mix_dry_wet(&acc[..n2], &mut d.buf[..n2]);
+                        }
                         acc.copy_from_slice(&d.buf[..n2]);
                     }
                 } else if f < n_dsp + n_lv2 {
                     let slot = &mut self.lv2[f - n_dsp];
-                    if bypassed {
+                    sync_wet(&mut slot.wet, &mut slot.wet_init, bypassed, insert_ramp);
+                    if slot.wet.is_silent() {
                         slot.buf[..n2].copy_from_slice(&acc[..n2]);
                     } else {
                         slot.plugin.process(&acc[..n2], &mut slot.buf[..n2], frames);
+                        if !slot.wet.is_unity() {
+                            slot.wet.mix_dry_wet(&acc[..n2], &mut slot.buf[..n2]);
+                        }
                         acc.copy_from_slice(&slot.buf[..n2]);
                     }
                 } else {
                     let slot = &mut self.voices[f - n_dsp - n_lv2];
-                    if bypassed {
+                    sync_wet(&mut slot.wet, &mut slot.wet_init, bypassed, insert_ramp);
+                    if slot.wet.is_silent() {
                         slot.scratch[..n2].copy_from_slice(&acc[..n2]);
                     } else {
                         slot.voice.process(&acc[..n2], &mut slot.scratch[..n2], self.transport);
@@ -5978,6 +6068,9 @@ impl GraphEngine {
                         if latency != slot.latency {
                             slot.latency = latency;
                             self.latency_dirty = true;
+                        }
+                        if !slot.wet.is_unity() {
+                            slot.wet.mix_dry_wet(&acc[..n2], &mut slot.scratch[..n2]);
                         }
                         acc.copy_from_slice(&slot.scratch[..n2]);
                     }

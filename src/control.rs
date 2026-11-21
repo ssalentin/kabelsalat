@@ -1113,6 +1113,16 @@ pub enum Command {
     /// control back to rest). Without an entry a mixer binding always works
     /// and any other works while its rig is live. Cleared on graph loads.
     SetBindingLive { source: SourceId, dest: NodeId, cc: u8, live: bool },
+    /// The show controls (#261): hardware messages the engine takes for a
+    /// show action before the matrix, so no instrument sees them. Replaces
+    /// the whole table; kept across graph loads.
+    SetShowControls { controls: crate::show::ShowControls },
+    /// Every setlist part's zones in setlist order, the table a
+    /// `ShowAction::NextPart`/`PrevPart` steps through. Kept across graph
+    /// loads. The replaced table goes back to the host to be freed.
+    SetShowParts { parts: Vec<[RigZone; 8]> },
+    /// The active part as an index into `SetShowParts` (`None`: no part).
+    SetShowPart { part: Option<usize> },
     /// Per-SOURCE strip mix (#73): pan and mute/solo on one instrument /
     /// audio-in / generator node, applied to the node's own output (post its
     /// LEVEL knob — the strip fader) before anything downstream hears it, so
@@ -1413,6 +1423,9 @@ impl Command {
             | Command::ClearShowGates
             | Command::SetBusLive { .. }
             | Command::SetBindingLive { .. }
+            | Command::SetShowControls { .. }
+            | Command::SetShowParts { .. }
+            | Command::SetShowPart { .. }
             | Command::SetStripMix { .. }
             | Command::SetSend { .. }
             | Command::SetBusOutput { .. }
@@ -1599,6 +1612,13 @@ mod tests {
             Command::SetTimeSignature { num: 6, den: 8 },
             Command::SetRigZones { zones: [RigZone { live: false, key_lo: 36, key_hi: 59, transpose: -2 }, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN] },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
+            Command::SetShowControls { controls: {
+                let mut t = crate::show::NO_SHOW_CONTROLS;
+                t[0] = Some(crate::show::ShowControl { device: Some(1), channel: None, msg: crate::show::ShowMsg::Cc(64), action: crate::show::ShowAction::PrevPart });
+                t
+            } },
+            Command::SetShowParts { parts: vec![[RigZone::OPEN; 8], [RigZone { live: false, key_lo: 0, key_hi: 59, transpose: 12 }; 8]] },
+            Command::SetShowPart { part: Some(1) },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 7, param: Some(0), target: crate::matrix::CcTarget::Knob, scale: Default::default() },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None, target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },

@@ -1649,3 +1649,15 @@ Learned so far (2026-11-15, UI polish pass):
     subtitle, worse once "Sets & levels" joined the buttons (#273). Draw the
     buttons in `right_to_left`, then the subtitle as a truncating label in a
     nested `left_to_right`; check a shot with a long live song name.
+195. **A hardware message an app action takes is consumed in the engine,
+    before the matrix:** the setlist foot switch was handled in the UI frame,
+    which reported the CC "consumed" after `HwDirect` (rule 31) had already
+    routed it to every instrument, so a switch on CC 64 stepped the setlist
+    and held the sustain pedal (#261). A learned control is a `ShowControl`
+    in the engine's table (`Command::SetShowControls`), its action runs
+    there (the part step switches zones in the block the CC arrives in), and
+    a newly bound control lets one release through, so a press heard before
+    the binding never stays held
+    (`a_learned_foot_switch_reaches_no_instrument_and_a_sustain_pedal_on_another_cc_still_does`).
+    In a held-notes fingerprint, hash only state that can repeat: `Show`'s
+    step counter only grows, and with it no search reached a fixpoint.

@@ -431,6 +431,8 @@ pub enum VoiceMsg {
 pub enum VoiceBack {
     Voice(VoiceSlot),
     Table(Vec<VoiceSlot>),
+    /// A setlist part table `SetShowParts` replaced.
+    Parts(Vec<[RigZone; 8]>),
 }
 
 /// Voices the engine holds before the host has to send a larger table.
@@ -1149,6 +1151,8 @@ impl Default for GraphPub {
             rules: Vec::new(),
             mix: [RigMix::DEFAULT; 8],
             zones: [RigZone::OPEN; 8],
+            show_part: None,
+            show_steps: 0,
             strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
             sends: [NO_SEND; MAX_SENDS],
             bus_outs: [NO_BUS_OUT; MAX_BUS_OUTS],
@@ -1276,6 +1280,11 @@ pub struct GraphPub {
     pub mix: [RigMix; 8],
     /// Per-rig zones (#204), published with the mix (same `mix_rev`).
     pub zones: [RigZone; 8],
+    /// The active setlist part (index into `SetShowParts`) and how many
+    /// parts the engine stepped to on a show control (#261), published with
+    /// the mix. A changed `show_steps` means the engine moved the part.
+    pub show_part: Option<usize>,
+    pub show_steps: u64,
     /// Per-node strip state (#73/#74): pan/mute/solo on sources, bypass on
     /// FX nodes — same publication discipline as `mix` (fixed-size copy).
     pub strips: [StripPub; MAX_STRIP_MIXES],
@@ -1474,6 +1483,8 @@ pub struct GraphEngine {
     rig_zones: [RigZone; 8],
     /// Show levels (#273): closed aux buses and pinned bindings.
     show_gates: show_gates::ShowGates,
+    /// Show controls and the setlist parts they step through (#261).
+    show: crate::show::Show,
     /// Per-node strip state (SetStripMix/SetStripBypass): pan/mute/solo on
     /// sources, bypass on FX nodes. Capacity is fixed (MAX_STRIP_MIXES): a
     /// node past it keeps playing at unity. Linear scans, like the rest.
@@ -1708,6 +1719,7 @@ impl GraphEngine {
             rig_mix: [RigMix::DEFAULT; 8],
             rig_zones: [RigZone::OPEN; 8],
             show_gates: show_gates::ShowGates::new(),
+            show: crate::show::Show::default(),
             strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
             latency_dirty: false,
@@ -2562,6 +2574,8 @@ impl GraphEngine {
                 g.rules = self.matrix.rules.clone();
                 g.mix = self.rig_mix;
                 g.zones = self.rig_zones;
+                g.show_part = self.show.part();
+                g.show_steps = self.show.steps();
                 g.system_gain = self.system_gain;
                 g.master_mute = self.master_mute;
                 g.mix_rev = g.mix_rev.wrapping_add(1);
@@ -4488,6 +4502,12 @@ impl GraphEngine {
             Command::ClearShowGates => self.show_gates.clear(),
             Command::SetBusLive { bus, live } => self.show_gates.set_bus(bus, live),
             Command::SetBindingLive { source, dest, cc, live } => self.show_gates.set_binding(source, dest, cc, live),
+            Command::SetShowControls { controls } => self.show.set_controls(controls),
+            Command::SetShowParts { parts } => {
+                let old = self.show.set_parts(parts);
+                self.send_back(VoiceBack::Parts(old));
+            }
+            Command::SetShowPart { part } => self.show.set_part(part),
             Command::SetStripMix { node, pan, mute, solo } => {
                 self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo, send: None });
             }
@@ -4629,6 +4649,15 @@ impl GraphEngine {
                 self.publish_graph();
             }
             Command::Cc { source, channel, cc, value } => {
+                match self.show.take(source, channel, crate::show::ShowMsg::Cc(cc), value) {
+                    crate::show::Take::Route => {}
+                    crate::show::Take::Consumed => return,
+                    crate::show::Take::Part(zones) => {
+                        self.set_rig_zones(zones);
+                        self.mix_dirty = true;
+                        return;
+                    }
+                }
                 let msg = MidiMsg::cc(channel, cc, value);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
@@ -5249,6 +5278,8 @@ impl GraphEngine {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     g.mix = self.rig_mix;
                     g.zones = self.rig_zones;
+                    g.show_part = self.show.part();
+                    g.show_steps = self.show.steps();
                     g.strips = self.strips_pub();
                     g.sends = [NO_SEND; MAX_SENDS];
                     g.sends[..self.sends.len()].copy_from_slice(&self.sends);
@@ -8209,6 +8240,79 @@ mod tests {
         assert_eq!(pub_.lock().unwrap().zones, [RigZone::OPEN; 8], "and publishes it");
         let a_after = synth_of(&e, 0);
         assert_eq!(play(&mut e, &mut bus, on(80)), vec![(a_after, 80, true)], "the old range and transpose are gone (was node {a})");
+    }
+
+    // ---- #261: show controls (setlist foot switch) ---------------------
+
+    const PEDAL: SourceId = SourceId::Hardware(1);
+
+    /// A foot switch on the pedal's CC `cc` that steps to the next part, and
+    /// the setlist's two parts: rig A alone, then rig B alone. Part 0 plays.
+    fn foot_switch(e: &mut super::GraphEngine, bus: &mut crate::control::CommandBus, cc: u8) {
+        use crate::control::RigZone;
+        use crate::show::{ShowAction, ShowControl, ShowMsg};
+        let mut controls = crate::show::NO_SHOW_CONTROLS;
+        controls[0] = Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action: ShowAction::NextPart });
+        let part = |a: RigZone, b: RigZone| {
+            let mut z = [RigZone::OPEN; 8];
+            z[0] = a;
+            z[1] = b;
+            z
+        };
+        bus.send(Command::SetShowControls { controls });
+        bus.send(Command::SetShowParts { parts: vec![part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN)] });
+        bus.send(Command::SetShowPart { part: Some(0) });
+        play(e, bus, zones(RigZone::OPEN, OFF));
+    }
+
+    fn passed(e: &mut super::GraphEngine, bus: &mut crate::control::CommandBus, cmd: Command) -> Vec<(u32, u8, u8)> {
+        e.cc_passthrough_log.clear();
+        play(e, bus, cmd);
+        let mut log = e.cc_passthrough_log.clone();
+        log.sort_unstable();
+        log
+    }
+
+    #[test]
+    fn a_learned_foot_switch_reaches_no_instrument_and_a_sustain_pedal_on_another_cc_still_does() {
+        use crate::control::RigZone;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let (a, b) = (synth_of(&e, 0), synth_of(&e, 1));
+        let cc = |source: SourceId, cc: u8, value: u8| Command::Cc { source, channel: 0, cc, value };
+        // Part 0 plays; the press a learn hears reaches its rig, as nothing knows the switch yet.
+        play(&mut e, &mut bus, zones(RigZone::OPEN, OFF));
+        assert_eq!(passed(&mut e, &mut bus, cc(PEDAL, 80, 127)), vec![(a, 80, 127)]);
+        foot_switch(&mut e, &mut bus, 80);
+        assert_eq!(passed(&mut e, &mut bus, cc(PEDAL, 80, 0)), vec![(a, 80, 0)], "its release follows, so nothing stays held");
+        assert!(passed(&mut e, &mut bus, cc(PEDAL, 80, 127)).is_empty(), "a press reaches no instrument");
+        assert_eq!(e.rig_zones[..2], [OFF, RigZone::OPEN], "and steps to the next part");
+        assert!(passed(&mut e, &mut bus, cc(PEDAL, 80, 0)).is_empty(), "nor does its release");
+        assert!(passed(&mut e, &mut bus, cc(PEDAL, 80, 127)).is_empty(), "nor a press at the last part");
+        assert_eq!(passed(&mut e, &mut bus, cc(SourceId::Hardware(0), 64, 127)), vec![(b, 64, 127)], "the keyboard's sustain pedal plays the new part");
+        assert_eq!(passed(&mut e, &mut bus, cc(SourceId::Hardware(0), 64, 0)), vec![(a, 64, 0), (b, 64, 0)]);
+    }
+
+    #[test]
+    fn a_foot_switch_on_the_sustain_cc_steps_without_holding_the_sustain() {
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        foot_switch(&mut e, &mut bus, 64);
+        let cc = |value: u8| Command::Cc { source: PEDAL, channel: 0, cc: 64, value };
+        assert!(passed(&mut e, &mut bus, cc(127)).is_empty(), "the press holds no sustain");
+        assert!(!e.rig_zones[0].live && e.rig_zones[1].live, "it stepped");
+    }
+
+    #[test]
+    fn a_foot_switch_press_switches_the_zones_in_the_block_it_arrives_in() {
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let b = synth_of(&e, 1);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        e.set_graph_pub(pub_.clone());
+        foot_switch(&mut e, &mut bus, 80);
+        // The press and the next note land in one block: no UI frame runs between them.
+        bus.send(Command::Cc { source: PEDAL, channel: 0, cc: 80, value: 127 });
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(b, 60, true)], "the first note after the press plays the new part");
+        let p = pub_.lock().unwrap();
+        assert_eq!((p.show_part, p.show_steps, p.zones[1].live), (Some(1), 1, true), "the step is published with the zones");
     }
 
     #[test]

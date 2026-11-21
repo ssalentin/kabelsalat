@@ -31,6 +31,12 @@
 //! `SetRigZones` sets both rigs (live or not, key range, transpose), next to
 //! the routing edits whose transforms the zone transpose stacks on.
 //!
+//! The foot-switch scenario (#261) has the same rigs and `SONGS` as the
+//! setlist's parts; two foot switches step through them in the engine, next
+//! to songs picked with `SetRigZones` and the routing edits the zone
+//! transpose stacks on. A step taps a switch (press, then release): only the
+//! press moves the zones, the release moves nothing.
+//!
 //! Run + interpret: `.claude/skills/verify-held-notes/SKILL.md`.
 
 use super::GraphEngine;
@@ -128,6 +134,8 @@ enum Edit {
     Zones(u8),
     /// SetStripBypass on a node (#305).
     Bypass(u32, bool),
+    /// A tap on a foot switch: hardware CC `NEXT_CC` or `PREV_CC` down, then up.
+    Switch(u8),
 }
 
 /// Which scenario a search runs: the plain rack, the arp (#90), the rack
@@ -141,6 +149,7 @@ enum Scenario {
     Demo,
     Zones,
     Bypass,
+    FootSwitch,
 }
 
 /// C# major pentatonic: B (59) snaps down to A#, C (60) up to C#. Two keys
@@ -192,6 +201,10 @@ const FX_EDITS: [Edit; 18] = [
 
 const OFF: RigZone = RigZone { live: false, ..RigZone::OPEN };
 
+/// The foot-switch scenario's switches (#261): next and previous part.
+const NEXT_CC: u8 = 80;
+const PREV_CC: u8 = 81;
+
 /// The songs of the zones scenario, as (rig 0, rig 1): live flips both ways,
 /// a key range per rig, and transposes that move while notes are held. The
 /// last one sends rig 1 a transpose while taking it out of the song: the
@@ -222,6 +235,19 @@ const ZONE_EDITS: [Edit; 11] = [
     Edit::Split(None),
     Edit::Unplug(6),
     Edit::Plug { id: 6, port: 0, dest: SURGE_B },
+];
+
+/// Edits of the foot-switch scenario: both switches, a song picked in the UI
+/// meanwhile, and the matrix transpose and split the zone transpose stacks on.
+const SWITCH_EDITS: [Edit; 8] = [
+    Edit::Switch(NEXT_CC),
+    Edit::Switch(PREV_CC),
+    Edit::Zones(3),
+    Edit::Zones(4),
+    Edit::Rule { dest: SURGE_A, transpose: 12, enabled: true },
+    Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
+    Edit::Split(Some(60)),
+    Edit::Split(None),
 ];
 
 /// Edits of the arp scenario. Knob percents land on the stepped knobs'
@@ -293,7 +319,7 @@ impl Edit {
             Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
             Edit::Source { .. } => Kind::Source,
             Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
-            Edit::Zones(_) => Kind::Zone,
+            Edit::Zones(_) | Edit::Switch(_) => Kind::Zone,
             Edit::Bypass(..) => Kind::Bypass,
         }
     }
@@ -380,8 +406,30 @@ impl Edit {
                 Command::SetRigZones { zones }
             }
             Edit::Bypass(node, bypass) => Command::SetStripBypass { node, bypass },
+            Edit::Switch(cc) => switch(cc, 127),
         }
     }
+}
+
+fn switch(cc: u8, value: u8) -> Command {
+    Command::Cc { source: SourceId::Hardware(0), channel: 0, cc, value }
+}
+
+/// The foot-switch scenario's setlist in the engine: `SONGS` as parts, and
+/// `NEXT_CC` / `PREV_CC` as the foot switches that step through them. The
+/// last two commands pay the release each new switch owes the instruments.
+fn show_commands() -> [Command; 4] {
+    use crate::show::{ShowAction, ShowControl, ShowMsg};
+    let control = |cc, action| Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action });
+    let mut controls = crate::show::NO_SHOW_CONTROLS;
+    controls[0] = control(NEXT_CC, ShowAction::NextPart);
+    controls[1] = control(PREV_CC, ShowAction::PrevPart);
+    let parts = SONGS.iter().map(|song| {
+        let mut zones = [RigZone::OPEN; 8];
+        zones[..2].copy_from_slice(song);
+        zones
+    });
+    [Command::SetShowControls { controls }, Command::SetShowParts { parts: parts.collect() }, switch(NEXT_CC, 0), switch(PREV_CC, 0)]
 }
 
 /// Keys(0) → Surge A(1) and Surge B(3) over MIDI cables 1 and 6, both into
@@ -436,7 +484,7 @@ fn start_graph_for(scn: Scenario) -> Graph {
     match scn {
         Scenario::RoutingWithStrip | Scenario::Fx | Scenario::Bypass => start_graph_with_strip(),
         Scenario::Routing | Scenario::Arp | Scenario::Demo => start_graph(),
-        Scenario::Zones => start_graph_two_rigs(),
+        Scenario::Zones | Scenario::FootSwitch => start_graph_two_rigs(),
     }
 }
 
@@ -479,6 +527,11 @@ impl Run {
         let (_bus, drain) = command_bus();
         let mut engine = GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
         engine.apply(Command::LoadGraph { graph: start_graph_for(scn) });
+        if scn == Scenario::FootSwitch {
+            for cmd in show_commands() {
+                engine.apply(cmd);
+            }
+        }
         engine.note_log.clear();
         Run { engine, held: BTreeMap::new(), sounding: BTreeSet::new(), arp_scenario: scn == Scenario::Arp, scn, arp_added: false }
     }
@@ -505,6 +558,9 @@ impl Run {
         match cmd {
             Some(cmd) => self.engine.apply(cmd),
             None => self.engine.arp_test_step(),
+        }
+        if let Step::Edit(Edit::Switch(cc)) = step {
+            self.engine.apply(switch(cc, 0));
         }
         // A MIDI-FX unit's queue is processed at the next block: pump it, like
         // `render` does, so what the unit emits reaches the log.
@@ -588,9 +644,10 @@ impl Run {
         let bypassed: Vec<u32> = self.engine.strips.iter().filter(|(_, m)| m.bypass).map(|(n, _)| *n).collect();
         let demo = self.engine.demo.as_ref().map(|d| d.fingerprint());
         // Hashed: 100k states of a kilobyte of JSON each is memory the check
-        // does not need to keep.
+        // does not need to keep. Of the show state only the part counts: the
+        // switches are tapped (never left down) and the step counter only grows.
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{routing}|{fx:?}|{bypassed:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}", self.held, self.sounding, self.arp_added, self.engine.rig_zones).hash(&mut h);
+        format!("{routing}|{fx:?}|{bypassed:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}|{:?}", self.held, self.sounding, self.arp_added, self.engine.rig_zones, self.engine.show.part()).hash(&mut h);
         h.finish()
     }
 }
@@ -635,6 +692,7 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::DemoStop) => "DemoStop".to_string(),
         Step::Edit(Edit::Zones(n)) => format!("SetRigZones (rig 0, rig 1) = {:?}", SONGS[n as usize]),
         Step::Edit(Edit::Bypass(node, on)) => format!("SetStripBypass node {node} = {on}"),
+        Step::Edit(Edit::Switch(cc)) => format!("Tap foot switch CC {cc}"),
         Step::Tick => "Tick (time passes)".to_string(),
     }
 }
@@ -718,6 +776,14 @@ pub(super) fn explore_arp_bypass(max_states: usize) -> Report {
     explore_with(&alphabet, max_states, Scenario::Arp)
 }
 
+/// Foot switches that step the setlist's parts in the engine (#261).
+pub(super) fn explore_foot_switch(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.extend(SWITCH_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::FootSwitch)
+}
+
 fn explore_with(alphabet: &[Step], max_states: usize, scn: Scenario) -> Report {
     let start = Run::new(scn);
     let mut seen: HashSet<u64> = HashSet::from([start.fingerprint()]);
@@ -791,6 +857,21 @@ fn held_notes_are_released_across_song_switches() {
     }
     assert!(report.stuck.is_empty(), "stuck notes across song switches (traces above)");
     assert!(report.complete, "state bound hit before fixpoint: the zones alphabet's state space grew");
+}
+
+#[test]
+fn held_notes_are_released_across_foot_switch_steps() {
+    let report = explore_foot_switch(100_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (foot switch): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes across foot-switch steps (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the foot-switch alphabet's state space grew");
 }
 
 #[test]

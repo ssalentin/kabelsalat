@@ -30,6 +30,13 @@ agents are in [AGENTS.md](../AGENTS.md).
   `SetRigZones` + `ClearShowGates` + `SetBusLive` (closed buses take no new
   signal, fading over one block) + `SetBindingLive` (pinned bindings); the app,
   headless MCP and `levels-test` all send that same list.
+- `show.rs` — show controls (#261): `ShowControl` (a MIDI message from a
+  device, consumed by a `ShowAction`) in one fixed table the engine checks
+  before the matrix, so a foot switch's CC never reaches an instrument. The
+  engine also holds every part's zones (`SetShowParts`) and the active part
+  (`SetShowPart`), steps the part itself in the block the CC arrives in, and
+  publishes `GraphPub::show_part`/`show_steps`; the UI then recalls the
+  part's tempo, levels and knobs. `ShowSent` sends a setlist's changes.
 - `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
   atomics, read once), `NodeTimes` (lock-free render time per unit) and the
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`

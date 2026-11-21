@@ -23,6 +23,10 @@ use crate::session::ParamValue;
 use crate::show::{ShowAction, ShowControl, ShowControls, ShowMsg, ShowPart, NO_SHOW_CONTROLS};
 use crate::transport::TimeSig;
 
+/// Devices whose program change can select the song (#208): the show
+/// table's slots after the two foot switches.
+pub const MAX_PROGRAM_DEVICES: usize = crate::show::MAX_SHOW_CONTROLS - 2;
+
 pub use crate::control::MAX_RIGS;
 
 /// Which rig is played in a [`Part`], and how.
@@ -333,9 +337,10 @@ impl Setlist {
         self.program_devices.contains(&d)
     }
 
+    /// Past `MAX_PROGRAM_DEVICES`, turning one on does nothing.
     pub fn set_program_selects_song(&mut self, d: u32, on: bool) {
         self.program_devices.retain(|&x| x != d);
-        if on {
+        if on && self.program_devices.len() < MAX_PROGRAM_DEVICES {
             self.program_devices.push(d);
             self.program_devices.sort_unstable();
         }
@@ -588,6 +593,7 @@ impl Setlist {
         }
         self.program_devices.sort_unstable();
         self.program_devices.dedup();
+        self.program_devices.truncate(MAX_PROGRAM_DEVICES);
         self.normalize_levels();
         self.clamp_active();
     }
@@ -760,6 +766,13 @@ mod tests {
         assert!(!serde_json::to_string(&sl).unwrap().contains("program_devices"), "nothing chosen, nothing saved");
         let only = Setlist { program_devices: vec![0], ..Setlist::default() };
         assert!(!only.is_empty(), "a setlist that only chose a device is saved");
+
+        for d in 0..16 {
+            sl.set_program_selects_song(d, true);
+        }
+        assert_eq!(sl.program_devices.len(), MAX_PROGRAM_DEVICES, "no more devices than the table has slots");
+        let t = sl.show_controls();
+        assert!(sl.program_devices.iter().all(|&d| t.contains(&song_select(d))), "every device that shows On selects songs");
     }
 
     #[test]

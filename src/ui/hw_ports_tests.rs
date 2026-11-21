@@ -227,6 +227,21 @@ fn a_program_change_device_follows_its_port_into_another_scan_order() {
     assert_eq!(app.setlist.program_devices, [u6], "unplugged, never the FM-1");
 }
 
+/// "Add song from session" takes a session's rigs, not its setlist: a
+/// device only its program-change choice names is not listed in the gig.
+#[test]
+fn an_imported_song_lists_no_device_only_its_sessions_program_change_named() {
+    let (mut app, _) = opened(&session_of(&[rig("Synth", surge(), "SURGE")]), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+    app.setlist.set_program_selects_song(1, true);
+    saved_and_loaded(&mut app, "hw-ports-program-import");
+
+    let (mut gig, _) = opened(&session_of(&[rig("Organ", organ(), "ORGAN")]), &[(FM1_PORT, "24:0")]);
+    gig.add_song_from_session_in(&DemoApp::sessions_dir(), "hw-ports-program-import", None).unwrap();
+    let listed: Vec<&str> = gig.hw_devices.iter().map(|n| midi_port_key(n)).collect();
+    assert_eq!(listed, [FM1_PORT], "no unplugged U6MIDI Pro row");
+    assert!(gig.setlist.program_devices.is_empty());
+}
+
 /// A file from before #227 names no ports: its indices load as they are.
 #[test]
 fn a_session_without_port_names_loads_its_indices_as_saved() {

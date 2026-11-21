@@ -8448,7 +8448,12 @@ impl DemoApp {
                 Self::MAX_RIGS
             ));
         }
-        let map = self.hw_index_map(imported.hw_ports());
+        // The import takes the session's rigs, not its setlist: a device only
+        // its program-change choice (#208) names gets no row here.
+        let rules: Vec<SavedRule> = imported.matrix().and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+        let used = hw_indices_in_use(&rules, &imported.rig_devices);
+        let ports = imported.hw_ports().iter().filter(|(d, _)| used.contains(d)).map(|(&d, p)| (d, p.clone())).collect();
+        let map = self.hw_index_map(&ports);
         map_session_hw(&mut imported, &map);
         let cur = self.capture_session("Import")
             .map_err(|e| format!("Could not capture current rack: {e}"))?;
@@ -17723,6 +17728,7 @@ impl DemoApp {
                                  remove_song: &mut Option<usize>,
                                  jump_to: &mut Option<(usize, usize)>| {
                     const PROGRAM_ROW_H: f32 = 28.0;
+                    // Device rows the songs list leaves room for; more scroll.
                     const PROGRAM_ROWS_SHOWN: usize = 3;
                     theme::section_label(ui, "Songs");
                     ui.add_space(6.0);
@@ -17841,62 +17847,72 @@ impl DemoApp {
                             }
                         });
 
+                    // Foot switches and program change scroll together in
+                    // what the column has left, so a short window never cuts
+                    // them off (rule 27).
                     ui.add_space(10.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(8.0);
-                    theme::section_label(ui, "Foot-switch CC");
-                    ui.add_space(6.0);
-                    for (label, action, binding) in [
-                        ("Next part", FootSwitchAction::Next, setlist.next_cc),
-                        ("Prev part", FootSwitchAction::Prev, setlist.prev_cc),
-                    ] {
-                        let learning = *learn == Some(action);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
-                            let txt = if learning {
-                                "Press pedal…".to_string()
-                            } else if let Some(fs) = binding {
-                                format!("CC {}", fs.cc)
-                            } else {
-                                "Unbound".to_string()
-                            };
-                            ui.label(egui::RichText::new(txt).size(11.5).monospace().color(if learning { theme::ACCENT } else { theme::INK_2 }));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                if binding.is_some() && theme::chip_button(ui, "Clear", false).clicked() {
-                                    match action {
-                                        FootSwitchAction::Next => setlist.next_cc = None,
-                                        FootSwitchAction::Prev => setlist.prev_cc = None,
-                                    }
-                                }
-                                if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
-                                    *learn = if learning { None } else { Some(action) };
-                                }
-                            });
-                        });
-                        ui.add_space(4.0);
-                    }
-
-                    ui.add_space(6.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(8.0);
-                    theme::section_label(ui, "Program change picks the song");
-                    ui.add_space(6.0);
-                    if program_rows.is_empty() {
-                        ui.label(egui::RichText::new("Plug in a MIDI device to pick songs with its program buttons.").size(11.5).color(theme::INK_2));
-                    }
+                    let rest = ui.available_height().max(0.0);
                     egui::ScrollArea::vertical()
-                        .id_salt("setlist_program_devices")
-                        .min_scrolled_height(0.0)
-                        .max_height(PROGRAM_ROW_H * PROGRAM_ROWS_SHOWN as f32)
+                        .id_salt("setlist_controls_scroll")
+                        .min_scrolled_height(rest)
+                        .max_height(rest)
                         .show(ui, |ui| {
+                            Self::stage_hairline(ui);
+                            ui.add_space(8.0);
+                            theme::section_label(ui, "Foot-switch CC");
+                            ui.add_space(6.0);
+                            for (label, action, binding) in [
+                                ("Next part", FootSwitchAction::Next, setlist.next_cc),
+                                ("Prev part", FootSwitchAction::Prev, setlist.prev_cc),
+                            ] {
+                                let learning = *learn == Some(action);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
+                                    let txt = if learning {
+                                        "Press pedal…".to_string()
+                                    } else if let Some(fs) = binding {
+                                        format!("CC {}", fs.cc)
+                                    } else {
+                                        "Unbound".to_string()
+                                    };
+                                    ui.label(egui::RichText::new(txt).size(11.5).monospace().color(if learning { theme::ACCENT } else { theme::INK_2 }));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        if binding.is_some() && theme::chip_button(ui, "Clear", false).clicked() {
+                                            match action {
+                                                FootSwitchAction::Next => setlist.next_cc = None,
+                                                FootSwitchAction::Prev => setlist.prev_cc = None,
+                                            }
+                                        }
+                                        if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
+                                            *learn = if learning { None } else { Some(action) };
+                                        }
+                                    });
+                                });
+                                ui.add_space(4.0);
+                            }
+
+                            ui.add_space(6.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(8.0);
+                            theme::section_label(ui, "Program change picks the song");
+                            ui.add_space(6.0);
+                            if program_rows.is_empty() {
+                                ui.label(egui::RichText::new("Plug in a MIDI device to pick songs with its program buttons.").size(11.5).color(theme::INK_2));
+                            }
                             for (d, name, live) in &program_rows {
                                 let on = setlist.program_selects_song(*d);
+                                let full = !on && setlist.program_devices.len() >= crate::setlist::MAX_PROGRAM_DEVICES;
                                 ui.horizontal(|ui| {
                                     ui.set_min_height(PROGRAM_ROW_H - 4.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let hint = "Program N selects song N+1; this device's program changes no longer reach its instruments";
-                                        if theme::chip_button(ui, if on { "On" } else { "Off" }, on).on_hover_text(hint).clicked() {
+                                        let hint = if full {
+                                            format!("At most {} devices pick songs", crate::setlist::MAX_PROGRAM_DEVICES)
+                                        } else {
+                                            "Program N selects song N+1; this device's program changes no longer reach its instruments".to_string()
+                                        };
+                                        let chip = ui.add_enabled_ui(!full, |ui| theme::chip_button(ui, if on { "On" } else { "Off" }, on)).inner;
+                                        if chip.on_hover_text(hint).clicked() {
                                             setlist.set_program_selects_song(*d, !on);
                                         }
                                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -47991,55 +48007,86 @@ mod navigator_tests {
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "neither another device's program nor one with no song moves it");
     }
 
-    fn texts_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<(String, Rect)> {
-        fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+    /// The texts a frame paints where they can be seen: inside their clip.
+    fn visible_texts(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(s: &egui::Shape, clip: Rect, acc: &mut Vec<(String, Rect)>) {
             match s {
-                egui::Shape::Text(t) => acc.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
-                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, acc)),
+                egui::Shape::Text(t) => {
+                    let rect = t.galley.rect.translate(t.pos.to_vec2());
+                    if clip.expand(0.5).contains_rect(rect) {
+                        acc.push((t.galley.text().to_string(), rect));
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, clip, acc)),
                 _ => {}
             }
         }
         let mut acc = Vec::new();
-        for cs in run_frame_at(app, ctx, size, vec![]) {
-            walk(&cs.shape, &mut acc);
+        for cs in run_frame_at(app, ctx, size, events) {
+            walk(&cs.shape, cs.clip_rect, &mut acc);
         }
         acc
     }
 
-    /// The device's row in the Setlist sheet and the chip that turns its
-    /// program change into a song select (#208).
-    fn program_row(texts: &[(String, Rect)], device: &str) -> (Rect, Option<(String, Rect)>) {
-        let name = texts.iter().find(|(t, _)| t == device).unwrap_or_else(|| panic!("{device} is listed: {texts:?}")).1;
-        let chip = texts.iter().find(|(t, r)| (t == "On" || t == "Off") && (r.center().y - name.center().y).abs() < 6.0);
-        (name, chip.cloned())
+    /// A device's name in the Setlist sheet and the chip beside it that
+    /// turns its program change into a song select (#208), where visible.
+    fn program_row(texts: &[(String, Rect)], device: &str) -> Option<(Rect, String, Rect)> {
+        let name = texts.iter().find(|(t, _)| t == device)?.1;
+        let (label, chip) = texts.iter().find(|(t, r)| (t == "On" || t == "Off") && (r.center().y - name.center().y).abs() < 6.0)?;
+        Some((name, label.clone(), *chip))
     }
 
     #[test]
-    fn a_click_in_the_setlist_sheet_makes_a_devices_program_change_select_the_song() {
+    fn every_devices_program_change_chip_in_the_setlist_sheet_can_be_reached_and_clicked() {
         use super::rig_switch_tests::{list_midi_ports, FM1_PORT, U6_PORT};
-        for size in [Vec2::new(1280.0, 800.0), Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0)] {
-            let (mut app, _) = two_rigs_with_inserts(false);
-            list_midi_ports(&mut app, &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
-            app.stage_view = StageView::Setlist;
-            let ctx = egui::Context::default();
-            for _ in 0..3 {
-                run_frame_at(&mut app, &ctx, size, vec![]);
+        // More devices than the songs list leaves room for: the rest scroll.
+        let devices = [
+            ("M-Wave FM-1", FM1_PORT),
+            ("U6MIDI Pro", U6_PORT),
+            ("nanoPAD2", "nanoPAD2:nanoPAD2 MIDI 1"),
+            ("FCB1010", "FCB1010:FCB1010 MIDI 1"),
+            ("Nord Stage 4", "Nord Stage 4:Nord Stage 4 MIDI 1"),
+            ("TC-Helicon", "TC-Helicon:TC-Helicon MIDI 1"),
+        ];
+        for dock in [DockView::None, DockView::Keyboard, DockView::Assistant] {
+            for size in super::window_size_layout_tests::SIZES.map(|(w, h)| Vec2::new(w, h)) {
+                let (mut app, _) = two_rigs_with_inserts(false);
+                list_midi_ports(&mut app, &devices.map(|(_, port)| (port, "24:0")));
+                app.dock = dock;
+                app.stage_view = StageView::Setlist;
+                let ctx = egui::Context::default();
+                for _ in 0..3 {
+                    run_frame_at(&mut app, &ctx, size, vec![]);
+                }
+                let texts = visible_texts(&mut app, &ctx, size, vec![]);
+                // A dock in a short window leaves the column no room below the
+                // songs list; the foot switches above these rows go first.
+                let Some(over) = texts.iter().find(|(t, _)| t == "Next part").map(|t| t.1.center()) else {
+                    assert_ne!(dock, DockView::None, "{size:?}: the foot switches show");
+                    continue;
+                };
+                for (d, (name, _)) in devices.iter().enumerate() {
+                    let mut row = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name);
+                    for _ in 0..10 {
+                        if row.is_some() {
+                            break;
+                        }
+                        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -40.0),
+                            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown, modifiers: Modifiers::NONE };
+                        run_frame_at(&mut app, &ctx, size, vec![egui::Event::PointerMoved(over), wheel]);
+                        row = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name);
+                    }
+                    let (name_rect, label, chip) = row.unwrap_or_else(|| panic!("{dock:?} {size:?}: {name}'s row scrolls into view"));
+                    assert_eq!(label, "Off");
+                    assert!(chip.left() > name_rect.right() && chip.right() <= size.x, "{dock:?} {size:?}: the chip {chip:?} beside {name_rect:?}");
+                    click_at(&mut app, &ctx, size, chip.center());
+                    assert!(app.setlist.program_selects_song(d as u32), "{dock:?} {size:?}: a click turns {name} on");
+                    let shown = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name).map(|r| r.1);
+                    assert_eq!(shown.as_deref(), Some("On"), "{dock:?} {size:?}");
+                }
+                let controls = app.setlist.show_controls();
+                assert!((0..devices.len() as u32).all(|d| controls.iter().flatten().any(|c| c.device == Some(d) && c.action == crate::show::ShowAction::SongOfProgram)));
             }
-            let texts = texts_at(&mut app, &ctx, size);
-            let (fm1, fm1_chip) = program_row(&texts, "M-Wave FM-1");
-            let (u6, u6_chip) = program_row(&texts, "U6MIDI Pro");
-            for (name, chip) in [(fm1, &fm1_chip), (u6, &u6_chip)] {
-                let (label, chip) = chip.clone().unwrap_or_else(|| panic!("{size:?}: a chip beside {name:?}: {texts:?}"));
-                assert_eq!(label, "Off");
-                assert!(chip.left() > name.right() && chip.right() <= size.x, "{size:?}: the chip {chip:?} beside the name {name:?}, inside the window");
-            }
-            click_at(&mut app, &ctx, size, u6_chip.unwrap().1.center());
-            assert_eq!(app.setlist.program_devices, [1], "{size:?}: the U6MIDI Pro's program change selects the song");
-            let texts = texts_at(&mut app, &ctx, size);
-            assert_eq!(program_row(&texts, "U6MIDI Pro").1.map(|c| c.0).as_deref(), Some("On"));
-            assert_eq!(program_row(&texts, "M-Wave FM-1").1.map(|c| c.0).as_deref(), Some("Off"));
-            let controls = app.setlist.show_controls();
-            assert!(controls.iter().flatten().any(|c| c.device == Some(1) && c.action == crate::show::ShowAction::SongOfProgram));
         }
     }
 

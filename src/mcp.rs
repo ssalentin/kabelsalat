@@ -301,8 +301,8 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
             }
             if let Some(rigs) = &p.rigs {
                 for r in rigs {
-                    if (r.rig as usize) >= crate::setlist::MAX_RIGS {
-                        return Err(format!("rig {} is out of range (0..{})", r.rig, crate::setlist::MAX_RIGS));
+                    if (r.rig as usize) >= crate::control::MAX_RIGS {
+                        return Err(format!("rig {} is out of range (0..{})", r.rig, crate::control::MAX_RIGS));
                     }
                     let mut pr = PartRig {
                         rig: r.rig,
@@ -1358,7 +1358,7 @@ fn headless_rig_type(st: &State, rig: usize) -> Value {
         .map(|n| crate::keyboard::classify_instrument(&n.kind, None, Some(crate::control::name_str(&n.name)), &[]));
     let mark = st.rig_types.get(rig).copied().flatten();
     let name = st.rigs.lock().ok().and_then(|s| s.rigs.get(rig).map(|m| m.name.clone())).filter(|n| !n.is_empty())
-        .unwrap_or_else(|| format!("Rig {}", (b'A' + rig.min(25) as u8) as char));
+        .unwrap_or_else(|| format!("Rig {}", control::rig_letter(rig)));
     json!({
         "rig": rig,
         "name": name,
@@ -1806,7 +1806,7 @@ impl McpServer {
         let mut rigs: Vec<Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
             let m = meta.get(i);
             let name = m.map(|m| m.name.clone()).filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+                .unwrap_or_else(|| format!("Rig {}", control::rig_letter(i)));
             Rig::new(name, g, m.and_then(|m| m.midi_device))
         }).collect();
         let active = match delete {
@@ -1819,10 +1819,10 @@ impl McpServer {
                 0
             }
             None => {
-                if rigs.len() >= 8 { return tool_err("at most 8 rigs"); }
+                if rigs.len() >= control::MAX_RIGS { return tool_err(format!("at most {} rigs", control::MAX_RIGS)); }
                 let used: Vec<String> = rigs.iter().map(|r| r.name.clone()).collect();
                 let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
-                    (b'A'..=b'Z').map(|c| format!("Rig {}", c as char)).find(|n| !used.contains(n)).unwrap_or_else(|| "Rig".into())
+                    (0..control::MAX_RIGS).map(|i| format!("Rig {}", control::rig_letter(i))).find(|n| !used.contains(n)).unwrap_or_else(|| "Rig".into())
                 });
                 rigs.push(Rig::new(name, control::standard_rig_graph(true), None));
                 rigs.len() - 1
@@ -3630,13 +3630,13 @@ impl McpServer {
         if src >= graphs.len() {
             return tool_err(format!("no rig {src}: there are {}", graphs.len()));
         }
-        if graphs.len() >= 8 {
-            return tool_err("at most 8 rigs");
+        if graphs.len() >= control::MAX_RIGS {
+            return tool_err(format!("at most {} rigs", control::MAX_RIGS));
         }
         let mut rigs: Vec<Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
             let m = meta.get(i);
             let name = m.map(|m| m.name.clone()).filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+                .unwrap_or_else(|| format!("Rig {}", control::rig_letter(i)));
             Rig::new(name, g, m.and_then(|m| m.midi_device))
         }).collect();
         let used: Vec<String> = rigs.iter().map(|r| r.name.clone()).collect();
@@ -3647,11 +3647,11 @@ impl McpServer {
         let cloned = Rig::new(clone_name, rigs[src].graph.clone(), rigs[src].midi_device);
         rigs.push(cloned);
         let target = rigs.len() - 1;
-        let mut mixes = [crate::engine::RigMix::DEFAULT; 8];
+        let mut mixes = [crate::engine::RigMix::DEFAULT; control::MAX_RIGS];
         if let Some(gp) = &st.graph_pub {
             if let Ok(g) = gp.lock() { mixes = g.mix; }
         }
-        mixes[target.min(7)] = mixes[src.min(7)];
+        mixes[target.min(control::MAX_RIGS - 1)] = mixes[src.min(control::MAX_RIGS - 1)];
         if let Err(e) = send_cmd(&mut st, Command::LoadRigs { rigs: rigs.clone(), active: target }) {
             return tool_err(e);
         }
@@ -4189,13 +4189,13 @@ impl McpServer {
             return tool_err(format!("no rig {rig}: there are {}", graphs.len()));
         }
         let rig_name = meta.get(rig).map(|m| m.name.clone()).filter(|n| !n.is_empty())
-            .unwrap_or_else(|| format!("Rig {}", (b'A' + rig.min(25) as u8) as char));
+            .unwrap_or_else(|| format!("Rig {}", control::rig_letter(rig)));
         let sess = crate::session::Session::new(args.name.trim(), graphs[rig].clone());
         let mut preset = crate::session::RigPreset::new(args.name.trim(), rig_name.clone(), sess);
         preset.midi_device = meta.get(rig).and_then(|m| m.midi_device);
         if let Some(gp) = &st.graph_pub {
             if let Ok(g) = gp.lock() {
-                preset.mix = g.mix[rig.min(7)];
+                preset.mix = g.mix[rig.min(control::MAX_RIGS - 1)];
             }
         }
         let path = match crate::session::RigPreset::package_path(&st.rig_presets_dir, &args.name) {
@@ -4230,10 +4230,10 @@ impl McpServer {
         let mut rigs: Vec<Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
             let m = meta.get(i);
             let name = m.map(|m| m.name.clone()).filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+                .unwrap_or_else(|| format!("Rig {}", control::rig_letter(i)));
             Rig::new(name, g, m.and_then(|m| m.midi_device))
         }).collect();
-        let mut mixes = [crate::engine::RigMix::DEFAULT; 8];
+        let mut mixes = [crate::engine::RigMix::DEFAULT; control::MAX_RIGS];
         if let Some(gp) = &st.graph_pub {
             if let Ok(g) = gp.lock() { mixes = g.mix; }
         }
@@ -4241,7 +4241,7 @@ impl McpServer {
         let loaded_rig = Rig::new(preset_rig_name.clone(), preset.session.graph.clone(), preset.midi_device);
         let target = match args.rig {
             None => {
-                if rigs.len() >= 8 { return tool_err("at most 8 rigs"); }
+                if rigs.len() >= control::MAX_RIGS { return tool_err(format!("at most {} rigs", control::MAX_RIGS)); }
                 rigs.push(loaded_rig);
                 rigs.len() - 1
             }
@@ -4251,7 +4251,7 @@ impl McpServer {
                 r
             }
         };
-        mixes[target.min(7)] = preset.mix;
+        mixes[target.min(control::MAX_RIGS - 1)] = preset.mix;
         let bases = control::rig_bases(&rigs);
         if let Err(e) = send_cmd(&mut st, Command::LoadRigs { rigs: rigs.clone(), active: target }) {
             return tool_err(e);
@@ -4607,7 +4607,7 @@ impl McpServer {
             return tool_err(format!("no rig {rig} ({n_rigs} rig(s), 0..{})", n_rigs.saturating_sub(1)));
         }
         let rig_name = rigs.get(rig).map(|m| m.name.clone())
-            .unwrap_or_else(|| format!("Rig {}", (b'A' + (rig as u8).min(25)) as char));
+            .unwrap_or_else(|| format!("Rig {}", control::rig_letter(rig)));
         let inst = st.graph.nodes.iter().find(|n| {
             n.rig as usize == rig && (matches!(n.kind, NodeKind::Clap { .. })
                 || crate::organ::is_organ(&n.kind)
@@ -4761,7 +4761,7 @@ impl McpServer {
     }
 
     /// Import a saved session's rigs into the current gig as a new setlist song (#204).
-    #[tool(name = "add_song_from_session", description = "Import a saved session's rigs into the current gig (up to 8 rigs total) and append a new song in the setlist pointing at those imported rigs. session = saved session name from list_sessions; optional name overrides the song title.")]
+    #[tool(name = "add_song_from_session", description = "Import a saved session's rigs into the current gig (up to the gig's rig limit) and append a new song in the setlist pointing at those imported rigs. session = saved session name from list_sessions; optional name overrides the song title.")]
     fn add_song_from_session(&self, Parameters(args): Parameters<AddSongFromSessionArgs>) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {

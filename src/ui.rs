@@ -155,7 +155,10 @@ fn edge_display_level(peak: f32) -> f32 {
     if !(peak > 0.0) { return 0.0; }
     ((20.0 * peak.log10() + 48.0) / 48.0).clamp(0.0, 1.0)
 }
-const MAX_CABLES: usize = 64;
+/// Cables of the whole rack, every rig's: eight per rig (Keys → synth →
+/// two effects → master), each with its own published edge level.
+const MAX_CABLES: usize = 8 * crate::control::MAX_RIGS;
+const _: () = assert!(MAX_CABLES <= crate::engine::EDGE_LEVEL_SLOTS);
 const FLIP_SECS: f32 = 0.35;
 
 const WHITE_SEMI: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
@@ -3111,9 +3114,9 @@ const AGENT_FADE_SECS: f32 = 1.2;
 struct UndoSnap {
     session: crate::session::Session,
     rigs: Vec<crate::control::RigMeta>,
-    mix: [crate::engine::RigMix; 8],
+    mix: [crate::engine::RigMix; crate::control::MAX_RIGS],
     arm_master: bool,
-    arm_rigs: [bool; 8],
+    arm_rigs: [bool; crate::control::MAX_RIGS],
     active: usize,
     /// Per-voice source switches, device and patch name (not in the session).
     voices: Vec<VoiceRow>,
@@ -3611,7 +3614,7 @@ struct DemoApp {
     agent_activity: AgentActivity,
     /// Grace deadlines (`ui_time`) so echoes of direct UI edits never light
     /// up agent highlights.
-    ui_mix_grace: [f32; 8],
+    ui_mix_grace: [f32; crate::control::MAX_RIGS],
     ui_master_mute_grace: f32,
     /// Last frame's dt (peak-hold decay and strip animations read it).
     ui_dt: f32,
@@ -3746,9 +3749,9 @@ struct DemoApp {
     rule_param_filter: String,
     rule_param_cache: Option<(u32, Vec<(u32, String)>)>,
     /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
-    rig_mix: [crate::engine::RigMix; 8],
+    rig_mix: [crate::engine::RigMix; crate::control::MAX_RIGS],
     /// Per-rig setlist zone mirror (#204): what each rig takes from its sources.
-    rig_zones: [crate::control::RigZone; 8],
+    rig_zones: [crate::control::RigZone; crate::control::MAX_RIGS],
     /// Grace deadline (`ui_time`) so our own SetRigZones echo does not clobber local state.
     ui_zone_grace: f32,
     /// Session setlist (#204): songs, parts, active cursor, and foot-switch CCs.
@@ -4076,7 +4079,7 @@ struct DemoApp {
     record_sync: bool,
     /// Record-arm mirror: master + per-rig stem arms (authoritative on engine).
     arm_master: bool,
-    arm_rigs: [bool; 8],
+    arm_rigs: [bool; crate::control::MAX_RIGS],
     ui_arm_grace: f32,
     /// Signature of the living cable set behind `shared_graph` (change detect).
     graph_sig: Vec<(u32, u32, u8, u32, u8, CPortKind)>,
@@ -4266,7 +4269,7 @@ impl DemoApp {
             assistant_input_h: 34.0,
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
-            ui_mix_grace: [-1.0; 8],
+            ui_mix_grace: [-1.0; crate::control::MAX_RIGS],
             ui_master_mute_grace: -1.0,
             ui_dt: 1.0 / 60.0,
             ui_transport_grace: -1.0,
@@ -4348,8 +4351,8 @@ impl DemoApp {
             rule_param_id: 0,
             rule_param_filter: String::new(),
             rule_param_cache: None,
-            rig_mix: [crate::engine::RigMix::DEFAULT; 8],
-            rig_zones: [crate::control::RigZone::OPEN; 8],
+            rig_mix: [crate::engine::RigMix::DEFAULT; crate::control::MAX_RIGS],
+            rig_zones: [crate::control::RigZone::OPEN; crate::control::MAX_RIGS],
             ui_zone_grace: -1.0,
             setlist: crate::setlist::Setlist::default(),
             setlist_footswitch_learn: None,
@@ -4518,7 +4521,7 @@ impl DemoApp {
             recorder: None,
             record_sync: false,
             arm_master: true,
-            arm_rigs: [false; 8],
+            arm_rigs: [false; crate::control::MAX_RIGS],
             ui_arm_grace: 0.0,
             graph_sig: Vec::new(),
             editor_open: false,
@@ -4648,7 +4651,7 @@ impl DemoApp {
         self.rule_editor = None;
         self.cc_learn = None;
         self.rule_param_cache = None;
-        self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
+        self.rig_mix = [crate::engine::RigMix::DEFAULT; crate::control::MAX_RIGS];
         // Strip meters hold per-node transients: a rebuilt rack means new
         // ids, so peak holds and clip lights start over (#72). The strip
         // rows themselves are session state, restored by apply_session.
@@ -4799,8 +4802,7 @@ impl DemoApp {
                 if !m.name.is_empty() { return m.name.clone(); }
             }
         }
-        let letter = (b'A' + (rig.min(25)) as u8) as char;
-        format!("Rig {letter}")
+        format!("Rig {}", crate::control::rig_letter(rig))
     }
 
     /// Overview device line: the rig's bound hardware MIDI device, or ALL.
@@ -5771,7 +5773,7 @@ impl DemoApp {
         let mut mix_diff_rigs: Vec<usize> = Vec::new();
         if g.mix_rev != self.last_mix_rev {
             self.last_mix_rev = g.mix_rev;
-            for r in 0..8 {
+            for r in 0..Self::MAX_RIGS {
                 if g.mix[r] != self.rig_mix[r] && now >= self.ui_mix_grace[r] {
                     mix_diff_rigs.push(r);
                 }
@@ -5891,7 +5893,7 @@ impl DemoApp {
                 if rec.is_live() {
                     let s = rec.snapshot();
                     self.arm_master = s.armed_master;
-                    for (i, a) in s.armed_rigs.iter().enumerate().take(8) {
+                    for (i, a) in s.armed_rigs.iter().enumerate().take(Self::MAX_RIGS) {
                         self.arm_rigs[i] = *a;
                     }
                 }
@@ -7254,7 +7256,7 @@ impl DemoApp {
         self.restore_voice_rows(&new_voice_rows);
         self.rig_mix = keep_mix;
         self.set_record_arm(None, keep_arm_master);
-        for i in 0..self.rig_count().min(8) {
+        for i in 0..self.rig_count().min(Self::MAX_RIGS) {
             self.set_record_arm(Some(i), keep_arms[i]);
             self.send_rig_mix(i);
         }
@@ -7590,7 +7592,7 @@ impl DemoApp {
         let list: Vec<crate::control::Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
             let meta = snap.rigs.get(i);
             let name = meta.map(|m| m.name.clone()).filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+                .unwrap_or_else(|| format!("Rig {}", crate::control::rig_letter(i)));
             crate::control::Rig::new(name, g, meta.and_then(|m| m.midi_device))
         }).collect();
         let active = snap.active.min(list.len().saturating_sub(1));
@@ -7604,7 +7606,7 @@ impl DemoApp {
         self.restore_voice_rows(&snap.voices);
         self.rig_mix = snap.mix;
         self.set_record_arm(None, snap.arm_master);
-        for i in 0..list.len().min(8) {
+        for i in 0..list.len().min(Self::MAX_RIGS) {
             self.set_record_arm(Some(i), snap.arm_rigs[i]);
         }
         self.sync_recorder_rig_names();
@@ -8462,7 +8464,7 @@ impl DemoApp {
                     if imp_bases.len() == 1 {
                         imported.name.clone()
                     } else {
-                        format!("{} {}", imported.name, (b'A' + i.min(25) as u8) as char)
+                        format!("{} {}", imported.name, crate::control::rig_letter(i))
                     }
                 });
             let rname: String = base_name.trim().chars().take(24).collect();
@@ -8550,7 +8552,7 @@ impl DemoApp {
             .filter_map(|r| remap_cur(r.node).map(|node| VoiceRow { node, ..r }))
             .collect();
         self.restore_voice_rows(&voice_rows);
-        for i in 0..first_new_rig.min(8) {
+        for i in 0..first_new_rig.min(Self::MAX_RIGS) {
             self.rig_mix[i] = saved_mix[i];
             self.send_rig_mix(i);
             self.set_record_arm(Some(i), saved_arms[i]);
@@ -8658,7 +8660,7 @@ impl DemoApp {
             let rigs: Vec<crate::control::Rig> = graphs.into_iter().enumerate()
                 .map(|(i, g)| {
                     let name = names.get(i).filter(|n| !n.trim().is_empty()).cloned()
-                        .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+                        .unwrap_or_else(|| format!("Rig {}", crate::control::rig_letter(i)));
                     crate::control::Rig::new(name, g, devices.get(i).copied().flatten())
                 })
                 .collect();
@@ -8773,7 +8775,7 @@ impl DemoApp {
         self.master_mute = false;
         self.mixer_knob_drag = None;
         self.setlist = crate::setlist::Setlist::default();
-        self.rig_zones = [crate::control::RigZone::OPEN; 8];
+        self.rig_zones = [crate::control::RigZone::OPEN; crate::control::MAX_RIGS];
         self.setlist_footswitch_learn = None;
         self.setlist_edit_song = None;
         self.begin_load_fade();
@@ -9641,15 +9643,15 @@ impl DemoApp {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let n_rigs = self.rig_count();
                 if rig >= n_rigs { return format!("rig {rig} out of range ({n_rigs} rigs)"); }
-                let m = &mut self.rig_mix[rig.min(7)];
+                let m = &mut self.rig_mix[rig.min(Self::MAX_RIGS - 1)];
                 if let Some(v) = args.get("vol").and_then(|v| v.as_f64()) { m.vol = v.clamp(0.0, 1.0) as f32; }
                 if let Some(v) = args.get("pan").and_then(|v| v.as_f64()) { m.pan = v.clamp(-1.0, 1.0) as f32; }
                 if let Some(v) = args.get("mute").and_then(|v| v.as_bool()) { m.mute = v; }
                 if let Some(v) = args.get("solo").and_then(|v| v.as_bool()) { m.solo = v; }
-                if m.solo { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(7)); }
+                if m.solo { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(Self::MAX_RIGS - 1)); }
                 self.send_rig_mix(rig);
                 if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
-                let m = self.rig_mix[rig.min(7)];
+                let m = self.rig_mix[rig.min(Self::MAX_RIGS - 1)];
                 let nodes: Vec<u32> = self.units.iter()
                     .filter(|u| n_rigs <= 1 || u.rig as usize == rig)
                     .map(|u| u.node_id)
@@ -10187,7 +10189,7 @@ impl DemoApp {
                     "rig": which,
                     "armed": armed,
                     "armed_master": self.arm_master,
-                    "armed_rigs": self.arm_rigs[..self.rig_count().min(8)],
+                    "armed_rigs": self.arm_rigs[..self.rig_count().min(Self::MAX_RIGS)],
                 }).to_string()
             }
             "set_record_sync" => {
@@ -13473,12 +13475,12 @@ impl DemoApp {
             return;
         }
         if let Some(rig) = self.rig_of_bus_node(node) {
-            let m = &mut self.rig_mix[rig.min(7)];
+            let m = &mut self.rig_mix[rig.min(Self::MAX_RIGS - 1)];
             if let Some(v) = e.vol { m.vol = v; }
             if let Some(p) = e.pan { m.pan = p; }
             if let Some(b) = e.mute { m.mute = b; }
             if let Some(b) = e.solo { m.solo = b; }
-            if e.solo == Some(true) { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(7)); }
+            if e.solo == Some(true) { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(Self::MAX_RIGS - 1)); }
             if resend { self.send_rig_mix(rig); }
         } else if ctl.fits(false).is_ok() && self.units.iter().any(|u| u.node_id == node) {
             self.with_strip_row(node, |row| {
@@ -14179,7 +14181,7 @@ impl DemoApp {
 
     /// Publish the full per-rig mixer state to the engine (idempotent).
     fn send_rig_mix(&self, rig: usize) {
-        let m = self.rig_mix[rig.min(7)];
+        let m = self.rig_mix[rig.min(Self::MAX_RIGS - 1)];
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap().send(Command::SetRigMix {
                 rig: rig as u8,
@@ -14198,7 +14200,7 @@ impl DemoApp {
                 }
             }
             Some(r) => {
-                let r = r.min(7);
+                let r = r.min(Self::MAX_RIGS - 1);
                 self.arm_rigs[r] = armed;
                 if armed {
                     if let Some(rec) = &self.recorder {
@@ -16249,7 +16251,7 @@ impl DemoApp {
 
     fn rigs_json(&self) -> serde_json::Value {
         let rigs: Vec<serde_json::Value> = (0..self.rig_count()).map(|r| {
-            let m = self.rig_mix[r.min(7)];
+            let m = self.rig_mix[r.min(Self::MAX_RIGS - 1)];
             let units: Vec<serde_json::Value> = self.units.iter().filter(|u| u.rig as usize == r)
                 .map(|u| serde_json::json!({"node": u.node_id, "name": u.name})).collect();
             serde_json::json!({
@@ -16261,8 +16263,8 @@ impl DemoApp {
         serde_json::json!({"rigs": rigs, "active": self.active_rig, "max_rigs": Self::MAX_RIGS})
     }
 
-    /// Most rigs the UI manages (the per-rig mixer mirror is `[RigMix; 8]`).
-    const MAX_RIGS: usize = 8;
+    /// Most rigs the UI manages: the one limit of `control.rs` (#205).
+    const MAX_RIGS: usize = crate::control::MAX_RIGS;
 
     /// Add a rig (`None`) or delete rig `Some(r)`, keeping every surviving
     /// rig's patch, knob values, synth state, device binding and mixer.
@@ -16318,7 +16320,7 @@ impl DemoApp {
             None => {
                 let used: Vec<String> = rigs.iter().map(|(_, r)| r.name.clone()).collect();
                 let name = add_name.map(|s| s.trim().chars().take(24).collect::<String>()).filter(|s| !s.is_empty())
-                    .or_else(|| (b'A'..=b'Z').map(|c| format!("Rig {}", c as char)).find(|n| !used.contains(n)))
+                    .or_else(|| (0..Self::MAX_RIGS).map(|i| format!("Rig {}", crate::control::rig_letter(i))).find(|n| !used.contains(n)))
                     .unwrap_or_else(|| format!("Rig {}", n + 1));
                 let graph = add_graph.unwrap_or_else(|| crate::control::standard_rig_graph(true));
                 rigs.push((None, crate::control::Rig::new(name.clone(), graph, None)));
@@ -16339,11 +16341,11 @@ impl DemoApp {
         ns.rig_types = trimmed_marks(rigs.iter().map(|(k, _)| k.and_then(|o| self.rig_mark(o))).collect());
         // Mixer follows its rig; the new rig starts at unity (applied after
         // the reload — build_rack resets the mixer).
-        let mut mix = [crate::engine::RigMix::DEFAULT; 8];
-        let mut arms = [false; 8];
+        let mut mix = [crate::engine::RigMix::DEFAULT; crate::control::MAX_RIGS];
+        let mut arms = [false; crate::control::MAX_RIGS];
         for (i, (k, _)) in rigs.iter().enumerate() {
-            mix[i] = k.map_or(crate::engine::RigMix::DEFAULT, |o| self.rig_mix[o.min(7)]);
-            arms[i] = k.map_or(false, |o| self.arm_rigs[o.min(7)]);
+            mix[i] = k.map_or(crate::engine::RigMix::DEFAULT, |o| self.rig_mix[o.min(Self::MAX_RIGS - 1)]);
+            arms[i] = k.map_or(false, |o| self.arm_rigs[o.min(Self::MAX_RIGS - 1)]);
         }
         let active = match delete {
             None => rigs.len() - 1,
@@ -16372,7 +16374,7 @@ impl DemoApp {
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
         for i in 0..list.len() { self.send_rig_mix(i); }
-        for i in 0..8 { self.set_record_arm(Some(i), if i < list.len() { arms[i] } else { false }); }
+        for i in 0..Self::MAX_RIGS { self.set_record_arm(Some(i), if i < list.len() { arms[i] } else { false }); }
         self.session_msg = msg;
         self.editor_status.clear(); // not "rack reloaded" noise for a rig edit
     }
@@ -16498,9 +16500,9 @@ impl DemoApp {
         ns.set_bus_outs(outs);
 
         let mut mix = self.rig_mix;
-        mix[new_rig.min(7)] = self.rig_mix[rig.min(7)];
+        mix[new_rig.min(Self::MAX_RIGS - 1)] = self.rig_mix[rig.min(Self::MAX_RIGS - 1)];
         let mut arms = self.arm_rigs;
-        arms[new_rig.min(7)] = false;
+        arms[new_rig.min(Self::MAX_RIGS - 1)] = false;
 
         self.load_as_rigs = Some((list.clone(), new_rig));
         self.apply_session(&ns)?;
@@ -16526,10 +16528,10 @@ impl DemoApp {
         self.active_rig = usize::MAX;
         self.set_active_rig(new_rig);
         for i in 0..list.len() {
-            self.ui_mix_grace[i.min(7)] = self.ui_time + 0.6;
+            self.ui_mix_grace[i.min(Self::MAX_RIGS - 1)] = self.ui_time + 0.6;
             self.send_rig_mix(i);
         }
-        for i in 0..8 {
+        for i in 0..Self::MAX_RIGS {
             self.set_record_arm(Some(i), if i < list.len() { arms[i] } else { false });
         }
         self.session_msg = format!("Cloned {} → {clone_name}", names[rig]);
@@ -16581,7 +16583,7 @@ impl DemoApp {
         if let Ok(mut snap) = self.rig_snapshot.lock() {
             while snap.rigs.len() < n {
                 let i = snap.rigs.len();
-                snap.rigs.push(crate::control::RigMeta { name: format!("Rig {}", (b'A' + i.min(25) as u8) as char), midi_device: None });
+                snap.rigs.push(crate::control::RigMeta { name: format!("Rig {}", crate::control::rig_letter(i)), midi_device: None });
             }
             snap.rigs[rig].name = name.clone();
         }
@@ -16670,7 +16672,7 @@ impl DemoApp {
             }
         }
         let mut preset = crate::session::RigPreset::new(preset_name.trim(), self.rig_name(rig), rig_session);
-        preset.mix = self.rig_mix[rig.min(7)];
+        preset.mix = self.rig_mix[rig.min(Self::MAX_RIGS - 1)];
         preset.midi_device = midi_device;
         preset.clap_meta = clap_meta;
         preset.validate()?;
@@ -16784,10 +16786,10 @@ impl DemoApp {
             combined.set_matrix(serde_json::to_value(&rules).ok());
         }
 
-        let mut mix = [crate::engine::RigMix::DEFAULT; 8];
+        let mut mix = [crate::engine::RigMix::DEFAULT; crate::control::MAX_RIGS];
         for (i, slot) in slots.iter().enumerate() {
             mix[i] = match *slot {
-                RigSlot::Existing(o) => existing_mix[o.min(7)],
+                RigSlot::Existing(o) => existing_mix[o.min(Self::MAX_RIGS - 1)],
                 RigSlot::Preset => preset.mix,
             };
         }
@@ -16835,7 +16837,7 @@ impl DemoApp {
         self.active_rig = usize::MAX;
         self.set_active_rig(active);
         for i in 0..list.len() {
-            self.ui_mix_grace[i.min(7)] = self.ui_time + 0.6;
+            self.ui_mix_grace[i.min(Self::MAX_RIGS - 1)] = self.ui_time + 0.6;
             self.send_rig_mix(i);
         }
         self.editor_status.clear();
@@ -17136,13 +17138,13 @@ impl DemoApp {
                             let bar_right = ui.max_rect().right();
                             let rig_budget = (bar_right - left_used - right_w - view_w - gap * 3.0 - 8.0).max(if narrow { 56.0 } else { 86.0 });
                             let active_max_w = if narrow { 56.0 } else if compact { 84.0 } else { 116.0 };
-                            let est_pills_w = active_max_w + (n.min(9).saturating_sub(1) as f32) * 30.0 + 30.0;
+                            let est_pills_w = active_max_w + (n.saturating_sub(1) as f32) * 30.0 + 30.0;
                             let needs_scroll = est_pills_w > rig_budget;
 
                             let mut draw_pills = |ui: &mut egui::Ui| -> Rect {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 let mut active_rect = Rect::NOTHING;
-                                for rig in 0..n.min(9) {
+                                for rig in 0..n {
                                     let active = rig == self.active_rig;
                                     let name = self.rig_name(rig);
                                     let dev = self.rig_device_label(rig);
@@ -24705,7 +24707,7 @@ impl DemoApp {
         // silenced path as live).
         let any_solo = self.rig_mix.iter().take(n_rigs).any(|m| m.solo);
         for r in 0..n_rigs {
-            let m = self.rig_mix[r.min(7)];
+            let m = self.rig_mix[r.min(Self::MAX_RIGS - 1)];
             let bus_gain = if m.mute || (any_solo && !m.solo) { 0.0 } else { m.vol };
             let target = bus_gain * if let Some(l) = &heard {
                 self.cables.iter()
@@ -26664,10 +26666,10 @@ impl DemoApp {
     /// the same dB fader, peak hold and clip as the sources (#72).
     fn rig_bus_strip_ui(&mut self, ui: &mut egui::Ui, rig: usize, fader_h: f32) {
         let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
-        let mut m = self.rig_mix[rig.min(7)];
+        let mut m = self.rig_mix[rig.min(Self::MAX_RIGS - 1)];
         let mut vol = m.vol;
         let old = (m.vol, m.pan, m.mute, m.solo);
-        let armed = self.arm_rigs[rig.min(7)];
+        let armed = self.arm_rigs[rig.min(Self::MAX_RIGS - 1)];
         let mut arm_toggle = false;
         // What MIDI learn binds on this bus (#75), keyed by the rig's Master node.
         let dest = |app: &Self, c: MixControl| app.rig_bus_node(rig).map(|n| (n, c.param(), CcTarget::Mix));
@@ -26733,9 +26735,9 @@ impl DemoApp {
         let changed = (m.vol, m.pan, m.mute, m.solo) != old || vol != old.0;
         if changed {
             m.vol = vol;
-            self.ui_mix_grace[rig.min(7)] = self.ui_time + 0.6;
-            self.rig_mix[rig.min(7)] = m;
-            if m.solo { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(7)); }
+            self.ui_mix_grace[rig.min(Self::MAX_RIGS - 1)] = self.ui_time + 0.6;
+            self.rig_mix[rig.min(Self::MAX_RIGS - 1)] = m;
+            if m.solo { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(Self::MAX_RIGS - 1)); }
             self.send_rig_mix(rig);
         }
     }
@@ -31609,9 +31611,10 @@ fn peak_hold_update(ph: &mut PeakHold, level: f32, now: f32, dt: f32) {
 /// master out get their own key space at the top of the u32 range (merge-safe:
 /// node ids come from a graph's small counters).
 fn rig_strip_key(rig: usize) -> u32 {
-    u32::MAX - rig.min(7) as u32
+    u32::MAX - rig.min(crate::control::MAX_RIGS - 1) as u32
 }
-const MASTER_STRIP_KEY: u32 = u32::MAX - 8;
+const MASTER_STRIP_KEY: u32 = u32::MAX - crate::control::MAX_RIGS as u32;
+const _: () = assert!(crate::control::MAX_RIGS < 40, "rig and master keys stay above the app-stream keys");
 
 /// ---- per-node strip mirror (#73/#77) ------------------------------------
 
@@ -43918,7 +43921,7 @@ mod mixer_parity_tests {
             app.stage_view = view;
             app.meter = level;
             app.meter_peak = level;
-            app.rig_levels = vec![level; 8];
+            app.rig_levels = vec![level; crate::control::MAX_RIGS];
             for u in app.units.iter_mut() { u.led = level; }
             super::offline_shots::shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join(format!("{view:?}-minus12dbfs.png").to_lowercase()));
         }
@@ -46240,6 +46243,8 @@ mod window_size_layout_tests {
                 a.node_times = Some(timer.handle());
             }),
             ("two rigs", &|a| a.load_multi_rig_demo()),
+            ("twenty rigs", &|a| while a.rig_count() < 20 { a.edit_rigs(None) }),
+            ("twenty-rig mixer", &|a| { while a.rig_count() < 20 { a.edit_rigs(None) } a.stage_view = StageView::Mixer }),
             ("mixer", &|a| a.stage_view = StageView::Mixer),
             ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
             ("mixer with a loudness target", &|a| {
@@ -47319,6 +47324,73 @@ mod navigator_tests {
         assert!(tool_is_read_only("list_channels"));
         let json: serde_json::Value = serde_json::from_str(&app.exec_tool("list_channels", &serde_json::json!({"filter": "plugins"}))).unwrap();
         assert_eq!(json["rows"].as_array().unwrap().len(), app.nav_rows(NavFilter::Plugins).len());
+    }
+
+    #[test]
+    fn twenty_rigs_select_by_number_reach_from_the_rail_and_survive_a_save() {
+        // #205: past the old 8-slot tables. A session saved with 8 rigs loads
+        // and grows to 20; keys 1-9 pick the first nine, the rail scrolls to
+        // the last one, and the mix and arm of rig 20 are its own.
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let dir = std::env::temp_dir().join(format!("ksalat-twenty-rigs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let round_trip = |app: &mut DemoApp, name: &str| {
+            let path = crate::session::Session::package_path(&dir, name).unwrap();
+            app.capture_session(name).unwrap().save(&path).unwrap();
+            app.load_demo_patch();
+            assert_eq!(app.rig_count(), 1);
+            app.apply_session(&crate::session::Session::load(&path).unwrap()).unwrap();
+        };
+        while app.rig_count() < 8 { app.edit_rigs(None); }
+        round_trip(&mut app, "eight");
+        assert_eq!(app.rig_count(), 8, "a session saved with 8 rigs loads");
+        while app.rig_count() < 20 { app.edit_rigs(None); }
+        assert_eq!(app.rig_count(), 20);
+        assert_eq!(app.rig_name(19), "Rig T");
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 19, "name": "Encore pad"}));
+        round_trip(&mut app, "twenty");
+        assert_eq!(app.rig_count(), 20, "every rig comes back");
+        assert_eq!(app.rig_name(19), "Encore pad");
+        let names: std::collections::BTreeSet<String> = (0..20).map(|r| app.rig_name(r)).collect();
+        assert_eq!(names.len(), 20, "every rig keeps its own name: {names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 19, "vol": 0.4, "pan": 0.5}));
+        let r = app.exec_tool("set_record_arm", &serde_json::json!({"rig": 19, "armed": true}));
+        assert!(r.contains("\"armed\":true"), "{r}");
+        assert_eq!((app.rig_mix[19].vol, app.rig_mix[19].pan), (0.4, 0.5));
+        assert_eq!(app.rig_mix[7], crate::engine::RigMix::DEFAULT, "rig 8 keeps its own fader");
+        assert!(app.arm_rigs[19] && !app.arm_rigs[7], "rig 20 arms its own stem");
+
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+        assert_eq!(app.rig_chip_rects.len(), 20, "the top bar's rig strip holds every rig, not the first nine");
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Num9));
+        assert_eq!(app.active_rig, 8, "9 selects the ninth rig");
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Num1));
+        assert_eq!(app.active_rig, 0);
+
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Q));
+        assert!(app.nav_open);
+        run_frame_at(&mut app, &ctx, size, vec![]);
+        let last_row = |app: &DemoApp| app.nav_row_rects.iter()
+            .find_map(|(r, rect)| matches!(r, NavRow::Rig { rig: 19, .. }).then_some(*rect))
+            .expect("rig 20 has a rail row");
+        for _ in 0..60 {
+            if app.nav_panel_rect.contains_rect(last_row(&app)) { break; }
+            let over = app.nav_panel_rect.center();
+            run_frame_at(&mut app, &ctx, size, vec![
+                egui::Event::PointerMoved(over),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -240.0),
+                    phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown, modifiers: Modifiers::NONE },
+            ]);
+        }
+        let row = last_row(&app);
+        assert!(app.nav_panel_rect.contains_rect(row), "the rail scrolls to rig 20: {row:?} in {:?}", app.nav_panel_rect);
+        click_at(&mut app, &ctx, size, row.center());
+        assert_eq!(app.active_rig, 19, "rig 20 is reachable from the rail");
     }
 
     #[test]

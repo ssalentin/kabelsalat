@@ -23,8 +23,7 @@ use crate::session::ParamValue;
 use crate::show::{ShowAction, ShowControl, ShowControls, ShowMsg, ShowPart, NO_SHOW_CONTROLS};
 use crate::transport::TimeSig;
 
-/// Maximum number of rigs the engine's zone table serves right now (#205 raises this).
-pub const MAX_RIGS: usize = 8;
+pub use crate::control::MAX_RIGS;
 
 /// Which rig is played in a [`Part`], and how.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

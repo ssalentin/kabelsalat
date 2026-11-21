@@ -442,7 +442,7 @@ impl Edit {
             Edit::DemoPlay(phrase) => Command::DemoPlay { rig: 0, phrase },
             Edit::DemoStop => Command::DemoStop,
             Edit::Zones(n) => {
-                let mut zones = [RigZone::OPEN; 8];
+                let mut zones = [RigZone::OPEN; crate::control::MAX_RIGS];
                 zones[..2].copy_from_slice(&SONGS[n as usize]);
                 Command::SetRigZones { zones }
             }

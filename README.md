@@ -107,6 +107,17 @@ cable on that jack. Dial **Cable opacity** and **Cable tension** from the
 bottom-right controls on the back panel or under **Settings → Display** to tame
 dense racks without losing cable physics.
 
+Right-click any unit plate on the front or back to open its context menu:
+**Bypass / Enable** (**Ctrl+E**), **Duplicate unit** (**Ctrl+D**, copying its
+parameters and plugin state into the rig), **Initialize parameters**,
+**Randomize parameters** (**Ctrl+R**, within sensible musical bounds as one
+undo step), **Copy / Paste settings** between compatible units, **Unplug all
+cables**, **Open plugin GUI**, or **Remove unit**. Bypassed units dim on both
+front and back faces with a `BYPASSED` chip (click it to re-enable), stay in
+sync with the mixer, release held notes safely, and keep delay compensation
+intact. Agents and MCP clients have the same actions (`set_node_bypass`,
+`duplicate_node`, `reset_node_params`, `randomize_node_params`).
+
 <p align="center"><img src="docs/shots/back.png" width="85%" alt="The back of the rack: hovering Surge A OUT traces its audio cables while dimming unrelated routes, shows a live dBFS port tooltip, and exposes opacity and tension sliders"/></p>
 
 ### Run several rigs at once

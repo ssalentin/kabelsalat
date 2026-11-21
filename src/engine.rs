@@ -262,6 +262,102 @@ pub fn find_knob_spec(kind: &NodeKind, name: &str) -> Option<&'static KnobSpec> 
         .find(|k| k.label.eq_ignore_ascii_case(q) || k.aliases.iter().any(|a| a.eq_ignore_ascii_case(q)))
 }
 
+/// Deterministic splitmix64 step returning a uniform `f32` in `[0.0, 1.0)`.
+/// Shared by UI and headless MCP parameter randomization.
+pub fn next_rand_f32(state: &mut u64) -> f32 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    ((z >> 40) as f32) / ((1u32 << 24) as f32)
+}
+
+/// Sensible musical bounds `(lo, hi)` in `0..=1` for randomizing a rack knob.
+/// Returns `None` for controls that must never be randomized (e.g. Master
+/// VOLUME, AudioIn MON, SystemAudio GAIN, Keys controls). `has_other_knobs`
+/// lets CLAP instruments keep their `LEVEL` knob steady when plugin main/pinned
+/// controls are present to randomize instead.
+pub fn knob_random_bounds(
+    kind: &NodeKind,
+    label: &str,
+    param: Option<ParamId>,
+    has_other_knobs: bool,
+) -> Option<(f32, f32)> {
+    match kind {
+        NodeKind::Keys | NodeKind::SystemAudio => None,
+        NodeKind::MasterOut => match param {
+            Some(P_WARM) => Some((0.0, 0.75)),
+            _ => None, // Never randomize Master VOLUME
+        },
+        NodeKind::AudioIn { .. } => match param {
+            Some(P_AUDIO_IN_GAIN) => Some((0.35, 0.80)),
+            _ => None, // Never toggle MON randomly
+        },
+        NodeKind::Clap { .. } => {
+            if param == Some(P_LEVEL) {
+                if has_other_knobs { None } else { Some((0.55, 0.95)) }
+            } else {
+                Some((0.15, 0.85))
+            }
+        }
+        NodeKind::Dsp(dk) => match dk {
+            DspKind::Delay => match param {
+                Some(P_TIME) => Some((0.15, 0.85)),
+                Some(P_MIX) => Some((0.15, 0.70)),
+                _ => Some((0.15, 0.85)),
+            },
+            DspKind::Reverb => match param {
+                Some(0) => Some((0.15, 0.70)), // MIX
+                Some(1) => Some((0.20, 0.90)), // SIZE
+                _ => Some((0.15, 0.85)),
+            },
+            DspKind::Gain => Some((0.45, 0.95)),
+            DspKind::Filter => match param {
+                Some(0) => Some((0.20, 0.90)), // CUTOFF
+                Some(1) => Some((0.0, 0.65)),  // RESO
+                _ => Some((0.15, 0.85)),
+            },
+            DspKind::Eq3 => Some((0.20, 0.80)),
+            DspKind::Limiter => match param {
+                Some(0) => Some((0.55, 0.95)), // CEIL
+                Some(1) => Some((0.0, 0.65)),  // DRIVE
+                _ => Some((0.20, 0.80)),
+            },
+            DspKind::Saturation => match param {
+                Some(0) => Some((0.10, 0.80)), // DRIVE
+                Some(1) => Some((0.20, 0.80)), // MIX
+                _ => Some((0.15, 0.85)),
+            },
+            DspKind::Pan => Some((0.15, 0.85)),
+            DspKind::Bus => Some((0.50, 1.0)),
+            DspKind::Metronome => None,
+        },
+        NodeKind::Lv2 { .. } => {
+            if crate::organ::is_organ(kind) {
+                match param {
+                    Some(crate::organ::P_DRIVE) => Some((0.0, 0.70)),
+                    Some(crate::organ::P_REVERB) => Some((0.0, 0.65)),
+                    _ => Some((0.0, 1.0)),
+                }
+            } else if label.eq_ignore_ascii_case("LEVEL") && has_other_knobs {
+                None
+            } else {
+                Some((0.15, 0.85))
+            }
+        }
+        NodeKind::MidiFx { plugin } => match plugin {
+            MidiFxPlugin::Builtin { .. } => Some((0.25, 0.75)), // ±12 semitones
+            MidiFxPlugin::Lv2 { .. } => Some((0.15, 0.85)),
+        },
+        NodeKind::Arp => match param {
+            Some(crate::arp::P_ARP_GATE) => Some((0.25, 0.95)),
+            Some(crate::arp::P_ARP_SWING) => Some((0.0, 0.65)),
+            _ => Some((0.0, 1.0)), // stepped MODE/RATE/OCT/CHORD
+        },
+    }
+}
+
 /// A hosted CLAP voice inside the engine: the audio half of the plugin plus
 /// the per-instrument state of the Clap node it plays. Built off the audio
 /// thread (it owns its render buffer) and handed over with [`VoiceMsg::Add`].
@@ -2875,6 +2971,9 @@ impl GraphEngine {
         }
         let mut arps = std::mem::take(&mut self.arp);
         for a in &mut arps {
+            if strip_bypassed(&self.strips, a.node) {
+                continue;
+            }
             let (node, vel) = (a.node, a.velocity());
             let mut emit = |note: u8, on: bool| self.deliver_arp_note(node, note, on, vel);
             a.test_step(&mut emit);
@@ -3103,7 +3202,22 @@ impl GraphEngine {
                     }
                 }
             }
+            let bypassed = strip_bypassed(&self.strips, node);
             let slot = &mut self.midi_fx[i];
+            if bypassed {
+                for &d in self.fx_in.iter() {
+                    if self.fx_out.len() >= self.fx_out.capacity() {
+                        break;
+                    }
+                    let status = d[0] & 0xF0;
+                    let ch = d[0] & 0x0F;
+                    self.fx_out.push(match status {
+                        0x90 if d[2] > 0 => FxOutEvent::NoteOn { channel: ch, note: d[1], velocity: d[2] },
+                        0x80 | 0x90 => FxOutEvent::NoteOff { channel: ch, note: d[1] },
+                        _ => FxOutEvent::Midi(d),
+                    });
+                }
+            } else {
             match &mut slot.proc {
                 Some(MidiFxProc::Lv2(s)) => {
                     for &ev in self.fx_in.iter() {
@@ -3137,6 +3251,7 @@ impl GraphEngine {
                     }
                 }
             }
+            }
             for j in 0..self.fx_out.len() {
                 let ev = self.fx_out[j];
                 self.deliver_fx_event(node, ev);
@@ -3168,6 +3283,9 @@ impl GraphEngine {
                 continue;
             }
             if is_on || is_off {
+                if is_on && strip_bypassed(&self.strips, dest) {
+                    continue;
+                }
                 #[cfg(test)]
                 self.note_log.push((dest, m.data[0], is_on));
                 let note = m.data[0];
@@ -3620,6 +3738,10 @@ impl GraphEngine {
         let Some(route) = self.keys_route_in_rig(rig, dest, played) else { return };
         let Some(out) = Self::routed_note(&m, &route).and_then(|n| shifted(n, zone.transpose.into())) else { return };
         if self.arp.iter().any(|a| a.node == dest) {
+            if strip_bypassed(&self.strips, dest) {
+                self.deliver_arp_note(dest, out, on, vel as f32);
+                return;
+            }
             if on {
                 let now = self.arp_clock(dest);
                 let v = vel as f32;
@@ -3637,14 +3759,21 @@ impl GraphEngine {
             }
             return;
         }
-        #[cfg(test)]
-        self.note_log.push((dest, out, on));
         if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+            #[cfg(test)]
+            self.note_log.push((dest, out, on));
             if !on || source.is_none_or(|src| self.fx_accepts(dest, src)) {
                 self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
             }
             return;
         }
+        // A bypassed instrument takes no new note-ons (note-offs always pass,
+        // and toggling bypass releases everything held first — rule 41).
+        if on && strip_bypassed(&self.strips, dest) {
+            return;
+        }
+        #[cfg(test)]
+        self.note_log.push((dest, out, on));
         if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
             if source.is_none_or(|src| source_accepted(s, src)) {
                 if on {
@@ -3865,15 +3994,20 @@ impl GraphEngine {
             let e = &self.graph.edges[i];
             if e.kind != PortKind::Midi || e.from.node != arp_node { continue; }
             let dest = e.to.node;
-            #[cfg(test)]
-            self.note_log.push((dest, note, on));
             // An arp wired into a MIDI strip (arp → unit → synth): the unit
             // takes the note into its queue like one from the keys.
             if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                #[cfg(test)]
+                self.note_log.push((dest, note, on));
                 let v7 = (vel.clamp(0.0, 1.0) * 127.0) as u8;
                 self.midi_fx[j].queue(if on { MidiMsg::note_on(0, note, v7) } else { MidiMsg::note_off(0, note, 0) });
                 continue;
             }
+            if on && strip_bypassed(&self.strips, dest) {
+                continue;
+            }
+            #[cfg(test)]
+            self.note_log.push((dest, note, on));
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                 if on {
                     s.voice.note_on(note as u16, vel as f64);
@@ -4015,6 +4149,9 @@ impl GraphEngine {
                     }
                 }
                 self.dsp.retain(|s| s.node != id);
+                let strips_before = self.strips.len();
+                self.strips.retain(|(n, _)| *n != id);
+                if self.strips.len() != strips_before { self.mix_dirty = true; }
                 let before = self.sends.len();
                 self.sends.retain(|s| s.bus != id && s.from != SendSource::Node(id));
                 if self.sends.len() != before { self.mix_dirty = true; }
@@ -4348,6 +4485,18 @@ impl GraphEngine {
                 self.set_bus_output(bus, sink);
             }
             Command::SetStripBypass { node, bypass } => {
+                // Toggling bypass on an instrument, MIDI-FX or arp changes
+                // whether/how notes reach it, so release held notes first
+                // (rule 41). Audio-only effects need no note release.
+                if strip_bypassed(&self.strips, node) != bypass {
+                    let needs_release = self.arp.iter().any(|a| a.node == node)
+                        || self.is_midi_fx(node)
+                        || matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Clap { .. }))
+                        || self.lv2.iter().any(|s| s.node == node && s.plugin.is_instrument());
+                    if needs_release {
+                        self.release_all(node);
+                    }
+                }
                 if bypass {
                     match self.strips.iter_mut().find(|(n, _)| *n == node) {
                         Some((_, m)) => m.bypass = true,
@@ -5128,16 +5277,22 @@ impl GraphEngine {
                 continue;
             }
             let s = &mut self.voices[i];
-            s.voice.render(&mut s.scratch[..n2], self.transport);
-            let latency = s.voice.latency();
-            if latency != s.latency {
-                s.latency = latency;
-                self.latency_dirty = true;
+            let bypassed = strip_bypassed(&self.strips, s.node);
+            if bypassed {
+                s.scratch[..n2].fill(0.0);
+            } else {
+                s.voice.render(&mut s.scratch[..n2], self.transport);
+                let latency = s.voice.latency();
+                if latency != s.latency {
+                    s.latency = latency;
+                    self.latency_dirty = true;
+                }
             }
             // Level and strip mix (mute/solo/pan) at the source's own output:
             // the edge levels published from this buffer stay post-fader
-            // (rule 53). Sends tap on either side of it.
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, s.level, false, &mut s.scratch[..n2]);
+            // (rule 53). Sends tap on either side of it; PDC keeps running
+            // while bypassed so parallel paths stay aligned.
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, s.level, bypassed, &mut s.scratch[..n2]);
             // One clock read per voice: each ends where the next begins.
             let now = std::time::Instant::now();
             self.node_timer.record(s.node, now - node_t0);
@@ -5150,7 +5305,8 @@ impl GraphEngine {
         // A generator plays no notes, so a rig that is not live (#204) mutes
         // it here, at its own output: its effects ring out.
         for a in &mut self.audio_in {
-            let muted = !zone_of(&self.rig_zones, &self.graph, a.node).live;
+            let muted = !zone_of(&self.rig_zones, &self.graph, a.node).live
+                || strip_bypassed(&self.strips, a.node);
             source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, a.node, 1.0, muted, &mut a.buf[..n2]);
         }
 
@@ -5188,7 +5344,8 @@ impl GraphEngine {
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, sig, suppress_wrap_click);
-                let muted = !zone_of(&self.rig_zones, &self.graph, d.node).live;
+                let muted = !zone_of(&self.rig_zones, &self.graph, d.node).live
+                    || strip_bypassed(&self.strips, d.node);
                 source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, 1.0, muted, &mut d.buf[..n2]);
             }
         }
@@ -5209,9 +5366,11 @@ impl GraphEngine {
                     a.phase = self.transport.beats;
                 }
                 let (t0, t1) = (a.phase, a.phase + block_beats);
-                let (node, vel) = (a.node, a.velocity());
-                let mut emit = |note: u8, on: bool| self.deliver_arp_note(node, note, on, vel);
-                a.tick(t0, t1, &mut emit);
+                if !strip_bypassed(&self.strips, a.node) {
+                    let (node, vel) = (a.node, a.velocity());
+                    let mut emit = |note: u8, on: bool| self.deliver_arp_note(node, note, on, vel);
+                    a.tick(t0, t1, &mut emit);
+                }
                 if !self.transport.playing {
                     a.phase = t1;
                 }
@@ -11430,5 +11589,62 @@ mod send_tests {
             "DemoStop resets both CC 2 and channel pressure to 0: {:?}",
             engine.cc_passthrough_log
         );
+    }
+
+    #[test]
+    fn unit_bypass_passes_midifx_and_arp_through_and_keeps_random_bounds_safe() {
+        use crate::control::{command_bus, name_bytes, Command, DspKind, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef};
+        use crate::matrix::SourceId;
+
+        // 1. MIDI-FX transposer (+12) bypass: active shifts +12, bypassed passes raw pitch,
+        //    and toggling bypass mid-note releases held notes first (rule 41).
+        let mut g = Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let fx = g.add_node(NodeKind::MidiFx { plugin: MidiFxPlugin::Builtin { semis: 12 } }, name_bytes("TRANSPOSE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: fx, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+        g.connect_with_id(3, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
+        let mut buf = vec![0.0f32; 64 * 2];
+        bus.send(Command::LoadGraph { graph: g });
+        engine.render(&mut buf, 2);
+
+        engine.note_log.clear();
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.contains(&(surge, 72, true)), "active MIDI-FX transposes +12: {:?}", engine.note_log);
+
+        engine.note_log.clear();
+        bus.send(Command::SetStripBypass { node: fx, bypass: true });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.contains(&(surge, 255, false)), "bypassing MIDI-FX releases downstream held notes: {:?}", engine.note_log);
+
+        engine.note_log.clear();
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.contains(&(surge, 60, true)), "bypassed MIDI-FX passes note unmodified: {:?}", engine.note_log);
+
+        // 2. Instrument bypass gates new note-ons and releases held notes on toggle.
+        engine.note_log.clear();
+        bus.send(Command::SetStripBypass { node: surge, bypass: true });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.contains(&(surge, 255, false)), "bypassing instrument releases held notes");
+        engine.note_log.clear();
+        bus.send(Command::NoteOn { note: 64, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+        engine.render(&mut buf, 2);
+        assert!(!engine.note_log.iter().any(|&(d, _, on)| d == surge && on), "bypassed instrument ignores new note-ons: {:?}", engine.note_log);
+
+        // 3. Random bounds exclude safety-critical controls and stay bounded.
+        assert_eq!(knob_random_bounds(&NodeKind::MasterOut, "VOLUME", Some(P_VOL), true), None);
+        assert!(knob_random_bounds(&NodeKind::MasterOut, "WARM", Some(P_WARM), true).is_some());
+        assert_eq!(knob_random_bounds(&NodeKind::AudioIn { device: None, channels: Default::default() }, "MON", Some(P_AUDIO_IN_MONITOR), true), None);
+        assert_eq!(knob_random_bounds(&NodeKind::SystemAudio, "GAIN", Some(P_SYSTEM_GAIN), false), None);
+        assert_eq!(knob_random_bounds(&NodeKind::Keys, "VEL", None, true), None);
+        let (lo, hi) = knob_random_bounds(&NodeKind::Dsp(DspKind::Delay), "MIX", Some(P_MIX), true).unwrap();
+        assert!(lo >= 0.0 && hi <= 0.8 && lo < hi);
     }
 }

@@ -1019,13 +1019,42 @@ struct GetBusOutputsArgs {}
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetSendsArgs {}
 
-/// Arguments for `set_node_bypass` (#74).
+/// Arguments for `set_node_bypass` (#74, #305).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetNodeBypassArgs {
-    /// FX node id (get_graph).
+    /// Unit node id (get_graph).
     node: NodeId,
     /// True = bypass (default), false = enable.
     bypass: Option<bool>,
+}
+
+/// Arguments for `duplicate_node` (#305).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DuplicateNodeArgs {
+    /// Source unit node id (get_graph).
+    node: NodeId,
+    /// Optional target 0-based rig index (default: source node's rig).
+    rig: Option<u8>,
+    /// Optional custom name for the duplicate (up to 24 characters).
+    name: Option<String>,
+}
+
+/// Arguments for `reset_node_params` (#305).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ResetNodeParamsArgs {
+    /// Unit node id (get_graph).
+    node: NodeId,
+}
+
+/// Arguments for `randomize_node_params` (#305).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RandomizeNodeParamsArgs {
+    /// Unit node id (get_graph).
+    node: NodeId,
+    /// Randomization strength in 0..=1 (default 1.0).
+    amount: Option<f64>,
+    /// Optional deterministic RNG seed.
+    seed: Option<u64>,
 }
 
 /// Arguments for `list_plugins`.
@@ -3730,8 +3759,8 @@ impl McpServer {
         ok_json(json!({"removed": args.bus}))
     }
 
-    /// Bypass one effect node (#74).
-    #[tool(name = "set_node_bypass", description = "Bypass one effect node (#74): a bypassed FX passes its input through unchanged (its knobs are kept). True = bypass, false = enable. Resets on graph loads.")]
+    /// Bypass one rack unit (#74, #305).
+    #[tool(name = "set_node_bypass", description = "Bypass or enable one rack unit (#74, #305): a bypassed audio effect passes its input through unchanged (preserving PDC latency), a bypassed MIDI-FX/arp passes MIDI through unmodified, and a bypassed instrument is muted with held notes released (its knobs are kept). True = bypass, false = enable. Resets on graph loads.")]
     fn set_node_bypass(&self, Parameters(args): Parameters<SetNodeBypassArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -3746,6 +3775,182 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"node": args.node, "bypass": bypass}))
+    }
+
+    /// Duplicate one rack unit (#305).
+    #[tool(name = "duplicate_node", description = "Duplicate one rack unit (#305): copies its node kind, knob/parameter values, and hosted plugin state (CLAP/LV2) into its rig (or optional target 0-based rig index). Duplicated instruments are wired into the rig; effects/MIDI-FX/arps are added ready to patch without disturbing existing cables. One undo step in the app. Cannot duplicate Keys or Master out.")]
+    fn duplicate_node(&self, Parameters(args): Parameters<DuplicateNodeArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            let mut a = json!({"node": args.node});
+            if let Some(r) = args.rig { a["rig"] = json!(r); }
+            if let Some(n) = &args.name { a["name"] = json!(n); }
+            return Self::ui_bridge_tool("duplicate_node", a);
+        }
+        let Some(src) = st.graph.node(args.node).cloned() else {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        };
+        if matches!(src.kind, NodeKind::Keys | NodeKind::MasterOut) {
+            return tool_err(format!("node {} ({}) cannot be duplicated", args.node, name_str(&src.name)));
+        }
+        let rig = args.rig.unwrap_or(src.rig);
+        let base_name = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| {
+                let raw = name_str(&src.name).trim();
+                let mut n = 2usize;
+                loop {
+                    let cand = format!("{raw} {n}");
+                    let short: String = cand.chars().take(24).collect();
+                    if !st.graph.nodes.iter().any(|x| name_str(&x.name).eq_ignore_ascii_case(&short)) {
+                        break short;
+                    }
+                    n += 1;
+                }
+            });
+        let name = name_bytes(&base_name);
+        let wire = match &src.kind {
+            NodeKind::Clap { plugin_id } => {
+                !crate::plugins::clap_id_is_effect(plugin_id.as_str(), &crate::host::list_clap_plugins())
+            }
+            NodeKind::Lv2 { uri } => {
+                crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
+            }
+            NodeKind::Dsp(DspKind::Bus) => true,
+            _ => false,
+        };
+        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: src.kind.clone(), name, rig, wire }) {
+            return tool_err(e);
+        }
+        let id = st.graph.add_node(src.kind.clone(), name);
+        st.graph.set_rig(id, rig);
+        let before = st.graph.edges.len();
+        if wire {
+            if matches!(src.kind, NodeKind::Dsp(DspKind::Bus)) {
+                st.graph.wire_bus(id);
+            } else {
+                let _ = st.graph.wire_instrument(id);
+            }
+        }
+        let cables: Vec<u32> = st.graph.edges[before..].iter().map(|e| e.id).collect();
+        let mut result = json!({
+            "node": id,
+            "source": args.node,
+            "name": name_str(&name),
+            "rig": rig,
+            "cables": cables,
+        });
+        note_silent_claps(&st, &mut result);
+        ok_json(result)
+    }
+
+    /// Initialize (reset) a unit's parameters to defaults (#305).
+    #[tool(name = "reset_node_params", description = "Initialize (reset) a rack unit's parameters and knobs back to their default values (#305). One undo step in the running app.")]
+    fn reset_node_params(&self, Parameters(args): Parameters<ResetNodeParamsArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("reset_node_params", json!({"node": args.node}));
+        }
+        let Some(node) = st.graph.node(args.node).cloned() else {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        };
+        let specs = crate::engine::knob_specs(&node.kind);
+        let mut reset: Vec<Value> = Vec::new();
+        for k in specs {
+            if let Some(param) = k.param {
+                let val = k.default as f64;
+                if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param, value: val }) {
+                    return tool_err(e);
+                }
+                reset.push(json!({"label": k.label, "param": param, "value": k.default}));
+            }
+        }
+        if reset.is_empty() {
+            if let NodeKind::Lv2 { uri } = &node.kind {
+                for c in crate::lv2::control_descs_for_uri(uri.as_str()) {
+                    let span = (c.max - c.min).abs();
+                    let norm = if span > 1e-9 { ((c.default - c.min) / (c.max - c.min)).clamp(0.0, 1.0) } else { 0.0 };
+                    if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: c.index as u32, value: norm as f64 }) {
+                        return tool_err(e);
+                    }
+                    reset.push(json!({"label": c.name, "param": c.index, "value": norm}));
+                }
+            }
+        }
+        ok_json(json!({
+            "node": args.node,
+            "name": name_str(&node.name),
+            "reset_count": reset.len(),
+            "knobs": reset,
+        }))
+    }
+
+    /// Randomize a unit's parameters within sensible musical bounds (#305).
+    #[tool(name = "randomize_node_params", description = "Randomize a rack unit's parameters within sensible musical bounds (#305). Leaves safety-critical controls like Master VOLUME and AudioIn MON untouched. One undo step in the running app.")]
+    fn randomize_node_params(&self, Parameters(args): Parameters<RandomizeNodeParamsArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            let mut a = json!({"node": args.node});
+            if let Some(amt) = args.amount { a["amount"] = json!(amt); }
+            if let Some(seed) = args.seed { a["seed"] = json!(seed); }
+            return Self::ui_bridge_tool("randomize_node_params", a);
+        }
+        let Some(node) = st.graph.node(args.node).cloned() else {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        };
+        let amount = args.amount.unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+        let mut rng = args.seed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x5eed_cafe)
+                ^ ((args.node as u64).wrapping_mul(0x9e37_79b9))
+        });
+        let specs = crate::engine::knob_specs(&node.kind);
+        let has_other = specs.len() > 1;
+        let mut changed: Vec<Value> = Vec::new();
+        for k in specs {
+            if k.hidden { continue; }
+            let Some((lo, hi)) = crate::engine::knob_random_bounds(&node.kind, k.label, k.param, has_other) else { continue };
+            let Some(param) = k.param else { continue };
+            let r = crate::engine::next_rand_f32(&mut rng);
+            let target = lo + r * (hi - lo);
+            let mut val = k.default + (target - k.default) * amount;
+            if k.steps >= 2 {
+                let n = (k.steps - 1) as f32;
+                val = (val.clamp(0.0, 1.0) * n).round() / n;
+            } else {
+                val = val.clamp(0.0, 1.0);
+            }
+            if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param, value: val as f64 }) {
+                return tool_err(e);
+            }
+            changed.push(json!({"label": k.label, "param": param, "value": val}));
+        }
+        if changed.is_empty() {
+            if let NodeKind::Lv2 { uri } = &node.kind {
+                for c in crate::lv2::control_descs_for_uri(uri.as_str()).into_iter().take(12) {
+                    let r = crate::engine::next_rand_f32(&mut rng);
+                    let target = 0.15 + r * 0.70;
+                    let span = (c.max - c.min).abs();
+                    let def_norm = if span > 1e-9 { ((c.default - c.min) / (c.max - c.min)).clamp(0.0, 1.0) } else { 0.5 };
+                    let val = (def_norm + (target - def_norm) * amount).clamp(0.0, 1.0);
+                    if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: c.index as u32, value: val as f64 }) {
+                        return tool_err(e);
+                    }
+                    changed.push(json!({"label": c.name, "param": c.index, "value": val}));
+                }
+            }
+        }
+        ok_json(json!({
+            "node": args.node,
+            "name": name_str(&node.name),
+            "randomized_count": changed.len(),
+            "knobs": changed,
+        }))
     }
 
     /// Add an insert to a strip's chain (#74).
@@ -5851,6 +6056,67 @@ mod tests {
         })));
         assert_eq!(reset["ok"], json!(true));
         assert_eq!(reset["reset_count"], json!(5));
+        engine.render(&mut buf, 2);
+    }
+
+    #[test]
+    fn unit_actions_duplicate_reset_and_randomize_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+
+        // Demo patch has Delay A (node 2), Keys (node 0), MasterOut (node 3).
+        let graph = tool_json(&server.get_graph());
+        let delay = graph["nodes"].as_array().unwrap().iter()
+            .find(|n| n["kind"] == json!({"type": "dsp", "dsp": "delay"}))
+            .expect("delay node")["id"].as_u64().unwrap() as u32;
+        let keys = graph["nodes"].as_array().unwrap().iter()
+            .find(|n| n["kind"] == json!({"type": "keys"}))
+            .expect("keys node")["id"].as_u64().unwrap() as u32;
+        let master = graph["nodes"].as_array().unwrap().iter()
+            .find(|n| n["kind"] == json!({"type": "master_out"}))
+            .expect("master node")["id"].as_u64().unwrap() as u32;
+
+        // Keys and Master cannot be duplicated; unknown nodes fail cleanly.
+        assert!(is_err(server.duplicate_node(Parameters(DuplicateNodeArgs { node: keys, rig: None, name: None }))));
+        assert!(is_err(server.duplicate_node(Parameters(DuplicateNodeArgs { node: master, rig: None, name: None }))));
+        assert!(is_err(server.duplicate_node(Parameters(DuplicateNodeArgs { node: 999, rig: None, name: None }))));
+
+        // Duplicate Delay into rig 0.
+        let dup = tool_json(&server.duplicate_node(Parameters(DuplicateNodeArgs {
+            node: delay, rig: None, name: Some("Delay Copy".into()),
+        })));
+        let dup_id = dup["node"].as_u64().unwrap() as u32;
+        assert_ne!(dup_id, delay);
+        assert_eq!(dup["source"], json!(delay));
+        assert_eq!(dup["name"], json!("Delay Copy"));
+        engine.render(&mut buf, 2);
+
+        // Randomize with a deterministic seed returns bounded values.
+        let rnd = tool_json(&server.randomize_node_params(Parameters(RandomizeNodeParamsArgs {
+            node: dup_id, amount: Some(1.0), seed: Some(42),
+        })));
+        assert_eq!(rnd["randomized_count"], json!(2));
+        for k in rnd["knobs"].as_array().unwrap() {
+            let v = k["value"].as_f64().unwrap();
+            assert!((0.15..=0.85).contains(&v), "bounded delay knob: {k}");
+        }
+        engine.render(&mut buf, 2);
+
+        // Reset restores factory defaults (TIME 0.4, MIX 0.5).
+        let rst = tool_json(&server.reset_node_params(Parameters(ResetNodeParamsArgs { node: dup_id })));
+        assert_eq!(rst["reset_count"], json!(2));
+        let knobs = rst["knobs"].as_array().unwrap();
+        assert!((knobs[0]["value"].as_f64().unwrap() - 0.4).abs() < 1e-5);
+        assert!((knobs[1]["value"].as_f64().unwrap() - 0.5).abs() < 1e-5);
+        engine.render(&mut buf, 2);
+
+        // Bypass works on the duplicated unit.
+        let byp = tool_json(&server.set_node_bypass(Parameters(SetNodeBypassArgs { node: dup_id, bypass: Some(true) })));
+        assert_eq!(byp, json!({"node": dup_id, "bypass": true}));
         engine.render(&mut buf, 2);
     }
 }

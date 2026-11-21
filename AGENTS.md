@@ -1710,3 +1710,12 @@ Learned so far (2026-11-15, UI polish pass):
     (`retro::Window::read`), so it needs neither a second copy of the history
     nor a margin that grows with its length
     (`a_chunk_the_feed_reached_is_refused_and_one_frame_short_of_it_is_saved`).
+
+195. **A crash handler holds no lock and resets nothing process-wide while
+    it writes:** `SA_RESETHAND` resets a signal for every thread, so a
+    second thread's crash killed the process in the middle of the first
+    one's report, and glibc's unwinder before 2.35 takes the loader lock that
+    a crash inside `dlopen` holds. `crash::on_fatal` keeps its handler until
+    the report is written, then sets `SIG_DFL` and re-raises, and it unwinds
+    only where `_dl_find_object` exists. Check a change there with
+    `kabelsalat crash-test` (#279).

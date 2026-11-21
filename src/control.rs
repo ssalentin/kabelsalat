@@ -1120,7 +1120,7 @@ pub enum Command {
     /// Every setlist part's zones in setlist order, the table a
     /// `ShowAction::NextPart`/`PrevPart` steps through. Kept across graph
     /// loads. Sent as JSON, it is a list of 8-zone lists.
-    SetShowParts { parts: crate::show::PartZones },
+    SetShowParts { parts: crate::show::ShowParts },
     /// The active part as an index into `SetShowParts` (`None`: no part).
     SetShowPart { part: Option<usize> },
     /// Per-SOURCE strip mix (#73): pan and mute/solo on one instrument /
@@ -1617,7 +1617,10 @@ mod tests {
                 t[0] = Some(crate::show::ShowControl { device: Some(1), channel: None, msg: crate::show::ShowMsg::Cc(64), action: crate::show::ShowAction::PrevPart });
                 t
             } },
-            Command::SetShowParts { parts: crate::show::PartZones::new(vec![[RigZone::OPEN; 8], [RigZone { live: false, key_lo: 0, key_hi: 59, transpose: 12 }; 8]]) },
+            Command::SetShowParts { parts: crate::show::ShowParts::new(vec![
+                crate::show::ShowPart { song: 0, skip: false, zones: [RigZone::OPEN; 8] },
+                crate::show::ShowPart { song: 2, skip: true, zones: [RigZone { live: false, key_lo: 0, key_hi: 59, transpose: 12 }; 8] },
+            ]) },
             Command::SetShowPart { part: Some(1) },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 7, param: Some(0), target: crate::matrix::CcTarget::Knob, scale: Default::default() },

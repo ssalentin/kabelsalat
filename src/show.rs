@@ -3,10 +3,11 @@
 //! the engine steps through itself, so a foot switch changes the zones in
 //! the block its CC arrives in.
 //!
-//! The UI sends the table (`Command::SetShowControls`), every part's zones
+//! The UI sends the table (`Command::SetShowControls`), every part
 //! (`SetShowParts`) and the active part (`SetShowPart`); the engine publishes
 //! the part it stepped to (`GraphPub::show_part`, `show_steps`) and the UI
-//! recalls the rest of that part (tempo, levels, knobs).
+//! sends the rest of that part a frame later: closed buses, pinned bindings,
+//! tempo, levels and knobs.
 
 use std::sync::Arc;
 
@@ -55,25 +56,36 @@ impl ShowControl {
     }
 }
 
-/// Every setlist part's zones, in setlist order (`Command::SetShowParts`).
-/// Shared, not copied: the app keeps each table it sent until the engine has
-/// let go of it (`ShowSent`), so the audio thread never frees one.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PartZones(Arc<[[RigZone; 8]]>);
+/// One setlist part as the engine steps through it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShowPart {
+    /// Its song's index: stepping stays inside a song before it moves on.
+    pub song: usize,
+    /// Its song's set is skipped: a step from another song passes over it.
+    pub skip: bool,
+    /// What every rig takes in this part, levels applied (`Setlist::zones_of`).
+    pub zones: [RigZone; 8],
+}
 
-impl PartZones {
-    pub fn new(parts: Vec<[RigZone; 8]>) -> Self {
+/// Every setlist part in setlist order (`Command::SetShowParts`). Shared,
+/// not copied: the app keeps each table it sent until the engine has let go
+/// of it (`ShowSent`), so the audio thread never frees one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShowParts(Arc<[ShowPart]>);
+
+impl ShowParts {
+    pub fn new(parts: Vec<ShowPart>) -> Self {
         Self(parts.into())
     }
 }
 
-impl Serialize for PartZones {
+impl Serialize for ShowParts {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(s)
     }
 }
 
-impl<'de> Deserialize<'de> for PartZones {
+impl<'de> Deserialize<'de> for ShowParts {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Vec::deserialize(d).map(Self::new)
     }
@@ -102,7 +114,7 @@ pub struct Show {
     /// was bound (the press a learn binds) gets its release through, so a
     /// sustain pedal never stays down; one bound at rest passes nothing.
     held: [u128; 16],
-    parts: Option<PartZones>,
+    parts: Option<ShowParts>,
     /// The active part, as an index into `parts`.
     part: Option<usize>,
     /// Parts the engine stepped to itself.
@@ -130,7 +142,7 @@ impl Show {
         }
     }
 
-    pub fn set_parts(&mut self, parts: PartZones) {
+    pub fn set_parts(&mut self, parts: ShowParts) {
         self.parts = Some(parts);
     }
 
@@ -166,28 +178,34 @@ impl Show {
             return Take::Consumed;
         }
         match self.controls[i].map(|c| c.action) {
-            Some(ShowAction::NextPart) => self.step(1),
-            Some(ShowAction::PrevPart) => self.step(-1),
+            Some(ShowAction::NextPart) => self.step(true),
+            Some(ShowAction::PrevPart) => self.step(false),
             None => Take::Consumed,
         }
     }
 
-    /// Move by `by` parts and stop at either end. With no part active, any
-    /// step goes to the first part (as `Setlist::next_part` does).
-    fn step(&mut self, by: isize) -> Take {
+    /// One part on, as `Setlist::next_part`/`prev_part` step: inside the
+    /// song first, then to the next (or previous) song stepping does not
+    /// skip, and no further than either end. With no part active, to the
+    /// first part of the first such song.
+    fn step(&mut self, forward: bool) -> Take {
         let parts = self.parts.as_ref().map_or(&[][..], |p| &p.0[..]);
-        let Some(last) = parts.len().checked_sub(1) else { return Take::Consumed };
-        let to = match self.part {
-            None => 0,
-            Some(p) => p.min(last).saturating_add_signed(by).min(last),
+        let playable = |q: &usize| !parts[*q].skip;
+        let to = match self.part.filter(|&p| p < parts.len()) {
+            None => (0..parts.len()).find(playable),
+            Some(p) if forward => match parts.get(p + 1) {
+                Some(next) if next.song == parts[p].song => Some(p + 1),
+                _ => (p + 1..parts.len()).find(playable),
+            },
+            Some(p) => match p.checked_sub(1) {
+                Some(q) if parts[q].song == parts[p].song => Some(q),
+                _ => (0..p).rev().find(playable),
+            },
         };
-        if self.part == Some(to) {
-            return Take::Consumed;
-        }
-        let zones = parts[to];
+        let Some(to) = to else { return Take::Consumed };
         self.part = Some(to);
         self.steps += 1;
-        Take::Part(zones)
+        Take::Part(parts[to].zones)
     }
 }
 
@@ -197,7 +215,7 @@ impl Show {
 pub struct ShowSent {
     controls: ShowControls,
     /// Every part table the engine may still hold, the one sent last at the end.
-    parts: Vec<PartZones>,
+    parts: Vec<ShowParts>,
     /// The active part as the engine knows it. Set it when the engine moved
     /// the part itself, so the frontend does not send that move back.
     pub part: Option<usize>,
@@ -212,9 +230,9 @@ impl ShowSent {
             self.controls = controls;
         }
         self.parts.retain(|p| Arc::strong_count(&p.0) > 1);
-        let zones = setlist.part_zones();
-        if self.parts.last().map_or(&[][..], |p| &p.0[..]) != &zones[..] {
-            let parts = PartZones::new(zones);
+        let now = setlist.show_parts();
+        if self.parts.last().map_or(&[][..], |p| &p.0[..]) != &now[..] {
+            let parts = ShowParts::new(now);
             if send(Command::SetShowParts { parts: parts.clone() }) {
                 self.parts.push(parts);
             }
@@ -239,6 +257,11 @@ mod tests {
         z
     }
 
+    /// Each zone table as a one-part song.
+    fn songs(zones: &[[RigZone; 8]]) -> ShowParts {
+        ShowParts::new(zones.iter().enumerate().map(|(song, &zones)| ShowPart { song, skip: false, zones }).collect())
+    }
+
     fn show(controls: &[ShowControl]) -> Show {
         let mut s = Show::default();
         let mut t = NO_SHOW_CONTROLS;
@@ -246,7 +269,7 @@ mod tests {
             *slot = Some(*c);
         }
         s.set_controls(t);
-        s.set_parts(PartZones::new(vec![part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN), part(RigZone::OPEN, RigZone::OPEN)]));
+        s.set_parts(songs(&[part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN), part(RigZone::OPEN, RigZone::OPEN)]));
         s
     }
 
@@ -292,7 +315,7 @@ mod tests {
     #[test]
     fn a_press_with_no_parts_is_still_consumed() {
         let mut s = show(&[NEXT]);
-        s.set_parts(PartZones::new(Vec::new()));
+        s.set_parts(songs(&[]));
         assert_eq!(cc(&mut s, 80, 127), Take::Consumed);
         assert_eq!(s.part(), None);
     }
@@ -383,12 +406,43 @@ mod tests {
     }
 
     #[test]
+    fn the_engine_steps_as_the_setlist_does_past_a_skipped_set() {
+        use crate::setlist::{Part, PartRig, Setlist, Song};
+        let mut sl = Setlist::default();
+        for (name, n) in [("A", 2), ("B", 1), ("C", 2), ("D", 1)] {
+            let parts = (0..n).map(|i| Part::new(format!("{name}{i}"), vec![PartRig::new(0)])).collect();
+            sl.songs.push(Song::new(name, parts));
+        }
+        let encore = sl.add_set("Encore");
+        sl.assign_set(2, Some(encore));
+        sl.sets.iter_mut().for_each(|set| set.skip = true);
+        let mut engine = show(&[NEXT, PREV]);
+        engine.set_parts(ShowParts::new(sl.show_parts()));
+        let tap = |engine: &mut Show, sl: &mut Setlist, forward: bool| {
+            let moved = if forward { sl.next_part() } else { sl.prev_part() };
+            let cc_no = if forward { 80 } else { 81 };
+            let took = cc(engine, cc_no, 127);
+            cc(engine, cc_no, 0);
+            assert_eq!(matches!(took, Take::Part(_)), moved.is_some(), "a step where the setlist steps, at {:?}", sl.active);
+            assert_eq!(engine.part(), sl.active_index(), "the same part as the setlist");
+        };
+        for forward in [true, true, true, true, true, false, false, false, false, false] {
+            tap(&mut engine, &mut sl, forward);
+        }
+        sl.select(2, 0);
+        engine.set_part(sl.active_index());
+        for forward in [true, true, false, false] {
+            tap(&mut engine, &mut sl, forward);
+        }
+    }
+
+    #[test]
     fn the_ui_moving_the_part_moves_where_the_next_press_goes() {
         let mut s = show(&[NEXT]);
         s.set_part(Some(1));
         assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, RigZone::OPEN)));
         s.set_part(Some(7));
         cc(&mut s, 80, 0);
-        assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, RigZone::OPEN)), "a stale part past the end clamps");
+        assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, OFF)), "a part the table no longer has counts as none");
     }
 }

@@ -423,12 +423,12 @@ fn show_commands() -> [Command; 2] {
     let mut controls = crate::show::NO_SHOW_CONTROLS;
     controls[0] = control(NEXT_CC, ShowAction::NextPart);
     controls[1] = control(PREV_CC, ShowAction::PrevPart);
-    let parts = SONGS.iter().map(|song| {
+    let parts = SONGS.iter().enumerate().map(|(song, rigs)| {
         let mut zones = [RigZone::OPEN; 8];
-        zones[..2].copy_from_slice(song);
-        zones
+        zones[..2].copy_from_slice(rigs);
+        crate::show::ShowPart { song, skip: false, zones }
     });
-    [Command::SetShowControls { controls }, Command::SetShowParts { parts: crate::show::PartZones::new(parts.collect()) }]
+    [Command::SetShowControls { controls }, Command::SetShowParts { parts: crate::show::ShowParts::new(parts.collect()) }]
 }
 
 /// Keys(0) → Surge A(1) and Surge B(3) over MIDI cables 1 and 6, both into

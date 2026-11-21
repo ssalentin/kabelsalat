@@ -1663,6 +1663,6 @@ Learned so far (2026-11-15, UI polish pass):
     press can land before they would, and they would undo it. Spent data
     never goes back through `VoiceBack` (drained only when voices change; the
     part tables filled it in two seconds of slider drag): the sender keeps an
-    `Arc` until the engine let go (`show::PartZones`). In a held-notes
+    `Arc` until the engine let go (`show::ShowParts`). In a held-notes
     fingerprint, hash only state that can repeat: `Show`'s step counter only
     grows, and with it no search reached a fixpoint.

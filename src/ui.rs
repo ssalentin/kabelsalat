@@ -8576,8 +8576,8 @@ impl DemoApp {
     }
 
     /// Recall the part the engine stepped to on a show control (#261). The
-    /// engine switched the zones already, and sending them again could undo
-    /// a second step it took meanwhile; tempo, levels and knobs follow.
+    /// engine switched the zones already; buses, bindings, tempo, levels and
+    /// knobs follow here.
     fn follow_show(&mut self) {
         let Some(p) = &self.graph_pub else { return };
         let Ok(g) = p.lock() else { return };
@@ -8592,7 +8592,7 @@ impl DemoApp {
         if self.setlist.active != Some(pos) {
             self.setlist.active = Some(pos);
             self.setlist_edit_song = Some(pos.song);
-            self.rig_zones = self.setlist.active_zones();
+            self.send_show_gates_after_engine_step();
             self.recall_setlist_part();
         }
     }
@@ -47646,6 +47646,31 @@ mod navigator_tests {
     }
 
     #[test]
+    fn after_an_engine_step_the_app_sends_the_parts_gates_but_not_its_zones() {
+        let (mut app, _) = two_rigs_with_inserts(false);
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Opener",
+            "parts": [{"name": "Verse", "rigs": [{"rig": 0}]}, {"name": "Chorus", "rigs": [{"rig": 1}]}]
+        }));
+        app.select_setlist(0, 0).unwrap();
+        drain.drain(|_| {});
+        let stepped = crate::engine::GraphPub { show_part: Some(1), show_steps: 1, ..Default::default() };
+        app.graph_pub = Some(Arc::new(Mutex::new(stepped)));
+        app.follow_show();
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
+        assert!(sent.iter().any(|c| matches!(c, Command::ClearShowGates)), "the chorus's buses and bindings go out: {sent:?}");
+        assert!(
+            !sent.iter().any(|c| matches!(c, Command::SetRigZones { .. })),
+            "its zones do not: the engine set them, and may be past them already"
+        );
+        assert_eq!(app.rig_zones, app.setlist.active_zones());
+    }
+
+    #[test]
     fn a_foot_switch_steps_the_part_in_the_engine_and_the_app_recalls_the_rest() {
         let (mut app, _) = two_rigs_with_inserts(false);
         let (tx, drain) = crate::control::command_bus();
@@ -47664,17 +47689,21 @@ mod navigator_tests {
             ]
         }));
         let _ = app.exec_tool("set_setlist_footswitch", &serde_json::json!({"action": "next", "cc": 80}));
+        // Rig A plays through the whole show (#273), whatever the part names.
+        app.setlist.pin_rig(0, crate::setlist::Level::Show);
         app.select_setlist(0, 0).unwrap();
         app.publish_show();
         let mut buf = vec![0.0f32; 64 * 2];
         engine.render(&mut buf, 2);
+        let zones_of = |app: &DemoApp, part: usize| app.setlist.zones_of(&app.setlist.songs[0], &app.setlist.songs[0].parts[part]);
 
         let pedal = |value: u8| Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 80, value };
         assert!(bus.lock().unwrap().send(pedal(127)));
         engine.render(&mut buf, 2);
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }), "no frame ran yet");
-        let chorus = app.setlist.songs[0].parts[1].zones();
-        assert_eq!(pub_.lock().unwrap().zones, chorus, "the engine plays the chorus already");
+        let chorus = zones_of(&app, 1);
+        assert!(chorus[0].live && chorus[1].live && chorus[1].transpose == 12, "{chorus:?}");
+        assert_eq!(pub_.lock().unwrap().zones, chorus, "the engine plays the chorus already, the show-level rig A too");
 
         // The second press reaches the bus before the app follows the first.
         assert!(bus.lock().unwrap().send(pedal(0)));
@@ -47685,7 +47714,7 @@ mod navigator_tests {
         assert_eq!(app.rig_zones, chorus);
         assert!((app.rig_mix[1].vol - 0.6).abs() < 1e-6, "and recalls the chorus level: {:?}", app.rig_mix[1]);
         engine.render(&mut buf, 2);
-        let bridge = app.setlist.songs[0].parts[2].zones();
+        let bridge = zones_of(&app, 2);
         assert_eq!(pub_.lock().unwrap().zones, bridge, "following the chorus did not undo the step to the bridge");
         app.follow_show();
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 2 }));

@@ -8255,7 +8255,9 @@ mod tests {
             z
         };
         bus.send(Command::SetShowControls { controls });
-        bus.send(Command::SetShowParts { parts: crate::show::PartZones::new(vec![part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN)]) });
+        let parts = [part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN)].into_iter().enumerate();
+        let parts = parts.map(|(song, zones)| crate::show::ShowPart { song, skip: false, zones }).collect();
+        bus.send(Command::SetShowParts { parts: crate::show::ShowParts::new(parts) });
         bus.send(Command::SetShowPart { part: Some(0) });
         play(e, bus, zones(RigZone::OPEN, OFF));
     }

@@ -431,7 +431,10 @@ pub static CATALOG: &[CatalogEntry] = &[
         clap_id: Some("fr.mgth.unsampled-piano"),
         lv2_uris: &[],
         bundles: &["Unsampled Piano.clap"],
-        data: None,
+        // Shipped TOML presets read by the plugin editor from
+        // `$XDG_DATA_HOME/unsampled-piano/presets` (same path as upstream's
+        // `installer/linux/install.sh` and `tools/install-app.sh`).
+        data: Some(RepoData { path: "presets", dest: ".local/share/unsampled-piano" }),
     },
     CatalogEntry {
         id: "ot-keys",
@@ -1169,7 +1172,11 @@ fn fetch_and_play(entry: &CatalogEntry, route: &InstallRoute, dir: &Path) -> any
             .iter()
             .filter_map(|f| crate::juce::value_tree_to_state(&std::fs::read(f).ok()?).err().map(|e| format!("{}: {e}", f.display())))
             .collect();
-        println!("  {}: {} data files under ~/{}, {} .odin patches convert to plugin state", entry.name, files.len(), data.dest, patches.len() - unreadable.len());
+        if patches.is_empty() {
+            println!("  {}: {} data files under ~/{}/{}", entry.name, files.len(), data.dest, folder.display());
+        } else {
+            println!("  {}: {} data files under ~/{}, {} .odin patches convert to plugin state", entry.name, files.len(), data.dest, patches.len() - unreadable.len());
+        }
         anyhow::ensure!(!files.is_empty() && unreadable.is_empty(), "data: {unreadable:?}");
     }
     match entry.format {
@@ -1717,9 +1724,13 @@ mod tests {
         assert_eq!(route_for(piano, "aarch64").unwrap().kind(), "source");
         let x86 = plan(piano, route_for(piano, "x86_64").unwrap(), Path::new("/c"), Path::new("/home/u"));
         assert_eq!(x86[6].argv, ["cp", "-r", "/c/unsampled-piano/unpacked/Unsampled Piano.clap", "/home/u/.clap/"]);
+        assert_eq!(x86[9].argv, ["git", "-C", "/c/unsampled-piano-data", "sparse-checkout", "set", "presets"]);
+        assert_eq!(x86[11].argv, ["cp", "-r", "/c/unsampled-piano-data/presets", "/home/u/.local/share/unsampled-piano/"]);
         let arm = plan(piano, route_for(piano, "aarch64").unwrap(), Path::new("/c"), Path::new("/home/u"));
         assert_eq!(arm[2].argv, ["env", "-u", "CARGO_TARGET_DIR", "cargo", "xtask", "bundle", "piano-plugin", "--release"]);
         assert_eq!(arm[4].argv, ["cp", "-r", "/c/unsampled-piano/target/bundled/Unsampled Piano.clap", "/home/u/.clap/"]);
+        assert_eq!(arm[7].argv, ["git", "-C", "/c/unsampled-piano-data", "sparse-checkout", "set", "presets"]);
+        assert_eq!(arm[9].argv, ["cp", "-r", "/c/unsampled-piano-data/presets", "/home/u/.local/share/unsampled-piano/"]);
     }
 
     #[test]

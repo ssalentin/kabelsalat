@@ -1,0 +1,2 @@
+### Fixed
+- **Top-bar collapsed rig pills:** inactive numbered rig pills now show live audio output as a bottom horizontal teal meter bar instead of a middle teal dot, so they never show two identical green dots when a setlist is active (the single top-right dot belongs exclusively to setlist live/out-of-song status, and out-of-song inactive pills also dim). Collapsed pill widths no longer jump while a rig sounds.

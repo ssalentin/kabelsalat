@@ -1519,6 +1519,7 @@ impl Command {
 impl CommandBus {
     /// Non-blocking; returns false if the ring is full (command dropped).
     pub fn send(&mut self, cmd: Command) -> bool {
+        crate::crash::note_command(&cmd);
         self.tx.push(cmd).is_ok()
     }
 }

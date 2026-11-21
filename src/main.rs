@@ -22,6 +22,7 @@ mod capture;
 mod catalog;
 mod clocksend;
 mod control;
+mod crash;
 mod demo;
 mod dsp;
 mod engine;
@@ -63,7 +64,10 @@ const MODES: &str = "app, preview, analysis-test [--save <dir>], audio-test, aud
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
     match mode.as_str() {
-        "app" => ui::run_app(),
+        "app" => {
+            crash::install();
+            ui::run_app()
+        }
         "preview" => preview::run(),
         "audio-test" => audio::run_test(),
         "midi-test" => midi::run_test(),

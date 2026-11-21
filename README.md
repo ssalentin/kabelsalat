@@ -145,7 +145,11 @@ Switching parts never cuts held notes or reverb tails — outgoing rigs keep
 sounding until you release the keys or sustain pedal, while new notes play the
 next part from the same audio block on. Step parts from the top bar, with
 **PageUp / PageDown** (**Shift+PageUp / Shift+PageDown** for songs — works with
-page-turner pedals), or bind a hardware MIDI foot-switch CC. **Add song from
+page-turner pedals), or bind a hardware MIDI foot-switch CC. Under **Program
+change picks the song**, turn a keyboard or foot controller on, and its preset
+buttons pick songs: program change N jumps to song N+1 in the next audio block,
+and that device's program changes no longer reach its instruments (other
+devices' still do). **Add song from
 session** pulls a saved session's rigs into the gig as a new song, and the
 assistant and MCP agents can read, build and step the setlist.
 

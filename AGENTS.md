@@ -1687,3 +1687,11 @@ Learned so far (2026-11-15, UI polish pass):
     (`twenty_rigs_each_mix_and_record_their_own_stem`,
     `plus_rig_grows_a_single_rig_rack`,
     `a_rig_past_the_eighth_sends_and_plays_to_its_own_output`).
+199. **Every channel message type the hardware sends has a decode arm, or it
+    is lost without a trace:** `hw_expression` knew bend and aftertouch, and
+    the note/CC path wanted 3 bytes, so a program change (0xC0, 2 bytes) from
+    any device reached neither an instrument nor the setlist, though #208
+    assumed setBfree took it. `hw_expression` turns it into
+    `Command::Program`, which a show control may take before the matrix
+    (`a_wind_controllers_breath_and_bend_become_engine_commands` checks the
+    raw bytes); a new message type gets an arm there and a raw-bytes test.

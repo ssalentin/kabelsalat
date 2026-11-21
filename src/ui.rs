@@ -47991,6 +47991,79 @@ mod navigator_tests {
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "neither another device's program nor one with no song moves it");
     }
 
+    fn texts_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<(String, Rect)> {
+        fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => acc.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, acc)),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        for cs in run_frame_at(app, ctx, size, vec![]) {
+            walk(&cs.shape, &mut acc);
+        }
+        acc
+    }
+
+    /// The device's row in the Setlist sheet and the chip that turns its
+    /// program change into a song select (#208).
+    fn program_row(texts: &[(String, Rect)], device: &str) -> (Rect, Option<(String, Rect)>) {
+        let name = texts.iter().find(|(t, _)| t == device).unwrap_or_else(|| panic!("{device} is listed: {texts:?}")).1;
+        let chip = texts.iter().find(|(t, r)| (t == "On" || t == "Off") && (r.center().y - name.center().y).abs() < 6.0);
+        (name, chip.cloned())
+    }
+
+    #[test]
+    fn a_click_in_the_setlist_sheet_makes_a_devices_program_change_select_the_song() {
+        use super::rig_switch_tests::{list_midi_ports, FM1_PORT, U6_PORT};
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0)] {
+            let (mut app, _) = two_rigs_with_inserts(false);
+            list_midi_ports(&mut app, &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+            app.stage_view = StageView::Setlist;
+            let ctx = egui::Context::default();
+            for _ in 0..3 {
+                run_frame_at(&mut app, &ctx, size, vec![]);
+            }
+            let texts = texts_at(&mut app, &ctx, size);
+            let (fm1, fm1_chip) = program_row(&texts, "M-Wave FM-1");
+            let (u6, u6_chip) = program_row(&texts, "U6MIDI Pro");
+            for (name, chip) in [(fm1, &fm1_chip), (u6, &u6_chip)] {
+                let (label, chip) = chip.clone().unwrap_or_else(|| panic!("{size:?}: a chip beside {name:?}: {texts:?}"));
+                assert_eq!(label, "Off");
+                assert!(chip.left() > name.right() && chip.right() <= size.x, "{size:?}: the chip {chip:?} beside the name {name:?}, inside the window");
+            }
+            click_at(&mut app, &ctx, size, u6_chip.unwrap().1.center());
+            assert_eq!(app.setlist.program_devices, [1], "{size:?}: the U6MIDI Pro's program change selects the song");
+            let texts = texts_at(&mut app, &ctx, size);
+            assert_eq!(program_row(&texts, "U6MIDI Pro").1.map(|c| c.0).as_deref(), Some("On"));
+            assert_eq!(program_row(&texts, "M-Wave FM-1").1.map(|c| c.0).as_deref(), Some("Off"));
+            let controls = app.setlist.show_controls();
+            assert!(controls.iter().flatten().any(|c| c.device == Some(1) && c.action == crate::show::ShowAction::SongOfProgram));
+        }
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat program_change_shots -- --ignored"]
+    fn program_change_shots() {
+        use super::rig_switch_tests::{list_midi_ports, FM1_PORT, U6_PORT};
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Rule 148: a fresh app per image.
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(781.0, 950.0)] {
+            let (mut app, _) = two_rigs_with_inserts(false);
+            list_midi_ports(&mut app, &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+            for (name, rig) in [("Opener", 0), ("Ballad", 1), ("Closer", 0)] {
+                let _ = app.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "parts": [{"name": "Main", "rigs": [{"rig": rig}]}]}));
+            }
+            app.setlist.next_cc = Some(crate::setlist::FootSwitch { cc: 64, channel: None });
+            app.setlist.set_program_selects_song(1, true);
+            app.select_setlist(1, 0).unwrap();
+            app.stage_view = StageView::Setlist;
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("setlist-program-{}x{}.png", size.x, size.y)));
+        }
+    }
+
     #[test]
     fn a_foot_switch_steps_the_part_in_the_engine_and_the_app_recalls_the_rest() {
         let (mut app, _) = two_rigs_with_inserts(false);

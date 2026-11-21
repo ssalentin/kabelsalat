@@ -36,7 +36,10 @@ agents are in [AGENTS.md](../AGENTS.md).
   engine also holds every part (`SetShowParts`: its song, whether stepping
   skips that song's set, its level-aware zones from `Setlist::zones_of`) and
   the active part (`SetShowPart`), steps the part itself in the block the CC
-  arrives in, as `next_part`/`prev_part` would, and publishes
+  arrives in, as `next_part`/`prev_part` would, or jumps to song N+1's first
+  part on program change N from a device in `Setlist::program_devices` (#208:
+  `ShowMsg::AnyProgram` + `ShowAction::SongOfProgram`; a control naming one
+  program, `ShowMsg::Program(n)`, goes before it in the table), and publishes
   `GraphPub::show_part`/`show_steps`. The UI follows one frame later with
   the part's closed buses and pinned bindings (never its zones again) and
   its tempo, levels and knobs. `ShowSent` sends a setlist's changes and

@@ -19,6 +19,21 @@ const DAMPING: f32 = 0.985;
 const SLACK: f32 = 1.18;
 const SLACK_EXTRA: f32 = 50.0;
 
+/// Cable tension setting bounds (0.0 = loose sag, 0.5 = default, 1.0 = taut).
+pub const MIN_TENSION: f32 = 0.0;
+pub const MAX_TENSION: f32 = 1.0;
+pub const DEFAULT_TENSION: f32 = 0.5;
+
+/// Map `tension` in `0.0..=1.0` to a slack scale factor around the original
+/// `SLACK` / `SLACK_EXTRA` constants:
+/// - `0.0` (loose) → `1.5` (deeper hang)
+/// - `0.5` (default) → `1.0` (exact original slack)
+/// - `1.0` (taut) → `0.15` (tight run that still swings under Verlet)
+pub fn slack_scale(tension: f32) -> f32 {
+    let t = tension.clamp(MIN_TENSION, MAX_TENSION);
+    if t <= 0.5 { 1.5 - t } else { 1.0 - (t - 0.5) * 1.7 }
+}
+
 /// Smoothed polyline samples per rope segment (see [`Rope::sample`]).
 pub const SAMPLES_PER_SEG: usize = 4;
 pub const MAX_SAMPLES: usize = (POINTS - 2) * SAMPLES_PER_SEG + 2;
@@ -43,17 +58,27 @@ impl Rope {
     /// buckle on the first steps. `side` (±1) leans the belly sideways, which
     /// breaks the symmetry of vertical runs so their slack swings out.
     pub fn new(a: Vec2, b: Vec2, side: f32) -> Self {
+        Self::new_with_tension(a, b, side, DEFAULT_TENSION)
+    }
+
+    /// Lay the rope out between `a` and `b` with an initial sag matching `tension`.
+    pub fn new_with_tension(a: Vec2, b: Vec2, side: f32, tension: f32) -> Self {
+        let s = slack_scale(tension);
         let mut p = [Vec2::ZERO; POINTS];
         for (i, q) in p.iter_mut().enumerate() {
             let t = i as f32 / (POINTS - 1) as f32;
             let belly = (t * std::f32::consts::PI).sin();
-            *q = a + (b - a) * t + Vec2::new(side * 24.0, 70.0) * belly;
+            *q = a + (b - a) * t + Vec2::new(side * 24.0 * s, 70.0 * s) * belly;
         }
-        Self { p, prev: p, rest: Self::rest_for(a, b) }
+        Self { p, prev: p, rest: Self::rest_for_tension(a, b, tension) }
     }
 
-    fn rest_for(a: Vec2, b: Vec2) -> f32 {
-        ((b - a).length() * SLACK + SLACK_EXTRA) / (POINTS - 1) as f32
+    /// Segment rest length between `a` and `b` for a given `tension` (`0.0..=1.0`).
+    pub fn rest_for_tension(a: Vec2, b: Vec2, tension: f32) -> f32 {
+        let s = slack_scale(tension);
+        let slack = 1.0 + (SLACK - 1.0) * s;
+        let extra = SLACK_EXTRA * s;
+        ((b - a).length() * slack + extra) / (POINTS - 1) as f32
     }
 
     /// False once any point went NaN/infinite (an unlaid jack, rule 32);
@@ -65,13 +90,19 @@ impl Rope {
     pub fn start(&self) -> Vec2 { self.p[0] }
     pub fn end(&self) -> Vec2 { self.p[POINTS - 1] }
 
+    /// One fixed step at default tension. See [`Rope::step_with_tension`].
+    pub fn step(&mut self, a: Option<Vec2>, b: Option<Vec2>, slack_mul: f32, bounds: Bounds) {
+        self.step_with_tension(a, b, slack_mul, DEFAULT_TENSION, bounds);
+    }
+
     /// One fixed step. `None` leaves that end free. While both ends are
     /// pinned the rope length follows their distance, so stretching a patch
     /// never snaps it taut; a free end keeps the last length. `slack_mul`
-    /// scales the length (audio cables breathe with their level).
-    pub fn step(&mut self, a: Option<Vec2>, b: Option<Vec2>, slack_mul: f32, bounds: Bounds) {
+    /// scales the length (audio cables breathe with their level), and `tension`
+    /// (`0.0..=1.0`, default `0.5`) scales `SLACK` / `SLACK_EXTRA`.
+    pub fn step_with_tension(&mut self, a: Option<Vec2>, b: Option<Vec2>, slack_mul: f32, tension: f32, bounds: Bounds) {
         if let (Some(a), Some(b)) = (a, b) {
-            self.rest = Self::rest_for(a, b) * slack_mul;
+            self.rest = Self::rest_for_tension(a, b, tension) * slack_mul;
         }
         let keep = DAMPING.powf(STEP * 60.0);
         let fall = Vec2::new(0.0, GRAVITY * STEP * STEP);
@@ -206,5 +237,44 @@ mod tests {
         assert_eq!(n, MAX_SAMPLES);
         assert_eq!(out[0], Pos2::new(10.0, 5.0));
         assert_eq!(out[n - 1], Pos2::new(200.0, 40.0));
+    }
+
+    #[test]
+    fn default_tension_matches_original_slack() {
+        let (a, b) = (Vec2::new(0.0, 0.0), Vec2::new(300.0, 0.0));
+        let orig = ((b - a).length() * SLACK + SLACK_EXTRA) / (POINTS - 1) as f32;
+        assert!((Rope::rest_for_tension(a, b, DEFAULT_TENSION) - orig).abs() < 1e-6);
+    }
+
+    #[test]
+    fn higher_tension_reduces_sag_while_preserving_swing_and_bounds() {
+        let (a, b) = (Vec2::new(0.0, 0.0), Vec2::new(300.0, 0.0));
+        let settle_at = |tension: f32, bounds: Bounds| {
+            let mut r = Rope::new(a, b, 1.0);
+            for _ in 0..(6.0 / STEP) as usize {
+                r.step_with_tension(Some(a), Some(b), 1.0, tension, bounds);
+            }
+            r
+        };
+        let lowest = |r: &Rope| r.p.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+
+        let loose = settle_at(0.0, OPEN);
+        let default = settle_at(DEFAULT_TENSION, OPEN);
+        let mut taut = settle_at(1.0, OPEN);
+        assert!(loose.is_finite() && default.is_finite() && taut.is_finite());
+        assert!(lowest(&loose) > lowest(&default) + 15.0, "loose sags more: {} vs {}", lowest(&loose), lowest(&default));
+        assert!(lowest(&default) > lowest(&taut) + 30.0, "taut sags less: {} vs {}", lowest(&default), lowest(&taut));
+        assert!(lowest(&taut) > 10.0, "taut cable still has gentle physical sag: {}", lowest(&taut));
+        assert!(speed(&taut) < 5.0, "taut cable settles cleanly: {}", speed(&taut));
+
+        // Taut cable still responds to a kick and stays inside bounds.
+        let before = taut.p[POINTS / 2];
+        taut.kick(POINTS / 2, Vec2::new(0.0, -400.0));
+        let floor = Bounds { min_x: -1e4, max_x: 1e4, floor: 20.0 };
+        for _ in 0..6 {
+            taut.step_with_tension(Some(a), Some(b), 1.0, 1.0, floor);
+        }
+        assert!((taut.p[POINTS / 2] - before).length() > 1.0, "taut cable still swings");
+        assert!(taut.p.iter().all(|p| p.y <= 20.0), "taut cable obeys floor bounds");
     }
 }

@@ -1792,3 +1792,13 @@ Learned so far (2026-11-15, UI polish pass):
     dialog to the edge of the active screen. `PluginWindow::open` queries RandR
     `GetMonitors` and picks the focused Hyprland monitor (or pointer/primary
     monitor) before centring (`plugin_window::tests`).
+204. **A request that names an instrument plugin is not a `load_sound` preset
+    search:** Jev's `load_sound` shortcut matched "Load Unsampled Piano" as
+    `sound=keys` and fell back to loading a Surge XT Keys patch, and the system
+    prompt told the chat model to use `load_sound` for instruments. Both Jev's
+    criteria and `assistant::load_sound` (`names_catalog_instrument`) hand any
+    catalog instrument name to the chat model (while keeping rig names like
+    "on the YANES rig" stripped by `sound_words`), and the system prompt directs
+    the model to `list_plugins(type="instrument")` + `add_node`/`add_rig`
+    instead of substituting Surge (`a_sound_is_searched_in_the_library_of_the_rigs_own_instrument`,
+    `agent-eval --task unsampled_piano`).

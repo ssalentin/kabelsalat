@@ -659,7 +659,8 @@ fn system_prompt() -> String {
     "You are the built-in assistant of kabelsalat, a live audio/MIDI wiring app for Linux \
      (AUM-style routing, Reason-style rack flip, written in Rust). You help with setup, \
      routing, sound design, and troubleshooting (PipeWire, ALSA MIDI, latency, xruns).\n\n\
-     The app is a graph of nodes — Keys, Surge XT synth, built-in DSP (delay/reverb/EQ/\
+     The app is a graph of nodes — Keys, CLAP/LV2 instruments (Surge XT, Unsampled Piano, \
+     Dexed, setBfree, …), built-in DSP (delay/reverb/EQ/\
      filter/limiter/etc.), LV2 effects, an Audio In unit (live mic/guitar/interface with \
      a tuner), system-audio capture, file player, Master — wired \
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
@@ -763,7 +764,9 @@ fn system_prompt() -> String {
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
      sound once wired.\n\
      - Rigs (you operate on ALL of them, not only the one in view): get_rigs lists every \
-     rig; add_rig creates a new playable rig (Keys -> Surge -> Master); clone_rig duplicates \
+     rig; add_rig creates a new playable rig (Keys -> Surge -> Master, or pass plugin_id \
+     from list_plugins for another CLAP instrument such as Unsampled Piano, Dexed or \
+     YANES); clone_rig duplicates \
      an existing rig (units, cables, knobs, synth state, matrix routes, mix) as a new rig; \
      delete_rig removes one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
@@ -816,7 +819,16 @@ fn system_prompt() -> String {
      preamble, no recap. Name rigs and units EXACTLY as the app shows them \
      (e.g. Rig A, Surge B, Delay, Reverb, Master) so the UI can highlight them; \
      do not use markdown headings.\n\
-     SOUNDS: every instrument has its OWN sound library, and load_sound / list_sounds \
+     INSTRUMENTS VS SOUNDS: when the user asks for a specific instrument plugin by name \
+     (e.g. Unsampled Piano, Dexed, Odin 2, Six Sines, Starbreath, OneTrick KEYS, setBfree, \
+     Aeolus, Vitalium, YANES), NEVER substitute a Surge patch — check \
+     list_plugins(type=\"instrument\") for its plugin_id (CLAP) or uri (LV2) (or \
+     list_instruments if not installed, and offer install_instrument). Put it on a new rig \
+     with add_rig(plugin_id=…), or switch the rig in view to it with \
+     add_node(kind=\"clap\", plugin_id=…, name=…) (or kind=\"lv2\", uri=…) — which \
+     auto-wires Keys -> it -> Master — and remove_node on the old synth it replaces unless \
+     the user asked to layer them. \
+     Every instrument has its OWN sound library, and load_sound / list_sounds \
      work in the library of the rig's instrument: Surge has ~3000 patches (a new Surge \
      plays its init patch), Dexed its DX7 cartridge voices (Dexed's factory default \
      'Say Again.' is an octave-bouncing echo FX patch — whenever you add a Dexed / DX7 \
@@ -824,12 +836,12 @@ fn system_prompt() -> String {
      'rhodes', 'e.piano', 'brass' or whatever character fits, never leave it on the \
      default), setBfree its organ \
      registrations (MIDI programmes), Vitalium its LV2 presets, YANES its chip presets. \
-     When the user asks for an instrument or character (flute, warm pad, 808 bass, jazz \
-     organ…), call load_sound(query, rig) (or add_rig with sound=…); list_sounds(query, \
-     rig) browses that library and names the instrument and library it searched. A sound \
-     of one instrument cannot be loaded into another: if a library has nothing that fits, \
-     say so and offer what it has. A rig with several different instruments needs \
-     node=<the instrument's node id>.\n\
+     When the user asks for a sound character (flute, warm pad, 808 bass, jazz \
+     organ…) on the rig's current instrument, call load_sound(query, rig) (or add_rig with \
+     sound=…); list_sounds(query, rig) browses that library and names the instrument and \
+     library it searched. A sound of one instrument cannot be loaded into another: if a \
+     library has nothing that fits, say so and offer what it has. A rig with several \
+     different instruments needs node=<the instrument's node id>.\n\
      Be concise and practical. When something is broken, diagnose step by step starting \
      with get_status. Notes: loading a template or adding a plugin rebuilds the current \
      patch; system-audio capture records other playing apps, never kabelsalat's own output."
@@ -1922,6 +1934,26 @@ fn metronome(f: &Facts, done: &[String]) -> Option<Step> {
     }
 }
 
+/// Does `words` (the user's sound words, with rig names already stripped)
+/// name an instrument plugin from the catalog (e.g. "unsampled piano",
+/// "dexed", "odin 2", "six sines", "setbfree")? Naming a plugin asks for
+/// that instrument, not a preset in the rig's current synth.
+fn names_catalog_instrument(words: &[String]) -> bool {
+    let split = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let contains_all = |needle: &[String]| {
+        !needle.is_empty() && needle.iter().all(|w| words.iter().any(|x| x == w))
+    };
+    crate::catalog::CATALOG.iter()
+        .filter(|e| e.plugin_type == crate::plugins::PluginType::Instrument)
+        .any(|e| contains_all(&split(e.name)) || contains_all(&split(e.id)))
+}
+
 /// Load a sound of the kind Jev picked from the library of the rig's own
 /// instrument. That library is asked for the user's words with the kind
 /// ("jazz drawbar organ"), then for the words, then for the kind alone; an
@@ -1930,9 +1962,13 @@ fn metronome(f: &Facts, done: &[String]) -> Option<Step> {
 fn load_sound(f: &Facts, done: &[String]) -> Option<Step> {
     // "Pads/Dreamscape" names one sound, not a kind: no other pad will do.
     if f.request.contains('/') { return None; }
+    let words = f.sound_words();
+    // "Load Unsampled Piano" / "Use Dexed" names an instrument plugin, not a
+    // preset in the rig's current synth: leave it to the chat model.
+    if names_catalog_instrument(&words) { return None; }
     let kind = f.pick(&SOUND)?;
     let rig = f.rig_or_view()?;
-    let described = f.sound_words().join(" ");
+    let described = words.join(" ");
     let mut queries: Vec<String> = Vec::new();
     for q in [if described.contains(kind) { described.clone() } else { format!("{described} {kind}") }, described.clone(), kind.to_string()] {
         let q = q.trim().to_string();
@@ -1974,7 +2010,7 @@ const SHORTCUTS: &[Shortcut] = &[
         plan: add_effect },
     Shortcut { key: "remove_effect", means: "Remove ONE effect unit (e.g. the delay) from a rig, and nothing more.",
         plan: remove_effect },
-    Shortcut { key: "load_sound", means: "Load a kind of sound or preset (e.g. a warm pad, a bass, a piano, a jazz organ registration) into an existing rig's instrument, and nothing more (no new rig, no level).",
+    Shortcut { key: "load_sound", means: "Load a kind of sound or preset (e.g. a warm pad, a bass, a piano, a jazz organ registration) into an existing rig's CURRENT instrument, and nothing more (no new rig, no level, no named plugin such as Unsampled Piano, Dexed, Odin 2 or setBfree).",
         plan: load_sound },
     Shortcut { key: "add_rig", means: "Add a new, plain rig (no sound, name or level asked for).",
         // The tool appends the rig list as JSON for a model to read.
@@ -2024,8 +2060,9 @@ fn decision_questions() -> Value {
     let mut actions = serde_json::Map::new();
     for s in SHORTCUTS { actions.insert(s.key.to_string(), json!(s.means)); }
     actions.insert(NOT_A_SHORTCUT.to_string(), json!(
-        "Anything else: a question, a request for more than one change, wiring or rewiring units, a new rig with a sound \
-         or a level, an effect with settings or placed between two other units, or anything unclear."));
+        "Anything else: a question, a request for more than one change, wiring or rewiring units, adding or switching to a \
+         named instrument plugin (e.g. Unsampled Piano, Dexed, Odin 2, setBfree, Aeolus), a new rig with a sound or a level, \
+         an effect with settings or placed between two other units, or anything unclear."));
     let mut rigs = serde_json::Map::new();
     for n in 1..=crate::control::MAX_RIGS { rigs.insert(format!("rig_{n}"), json!(format!("The request names rig {n} (by number, letter or name; see 'all rigs' in the context)."))); }
     rigs.insert(NO_PICK.to_string(), json!("The request names no rig, or says 'this rig' / 'the current rig'."));
@@ -2092,6 +2129,7 @@ const JEV_SAMPLES: &[&str] = &[
     "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.", "Load a warm pad.",
     "Load a bass sound into rig 2.", "give me a rhodes", "load a flute", "Load the patch Pads/Dreamscape.",
     "Load a bass sound on the YANES rig.", "Give the organ rig a jazz drawbar preset.",
+    "Load Unsampled Piano.", "Use Dexed on rig 1.",
     "Add a reverb to rig 1 and wire it in.", "Add a reverb to this rig", "Insert a reverb into rig 2.",
     "Put a delay after the synth.", "Put a filter between the synth and the delay.", "Add a reverb with a long tail to rig 1.",
     "Add a chorus to rig 1.", "Add a reverb to rig 1 and set the tempo to 120 BPM.", "Remove the delay from rig 1.",
@@ -3101,6 +3139,31 @@ mod tests {
             vec![asked("Load the patch Pads/Dreamscape.")],
         );
         assert!(ran(&events).is_empty() && requests.len() == 2, "the chat model looks for that one patch");
+
+        // A request that names a catalog instrument plugin (like Unsampled Piano
+        // or Dexed) is not a preset search in the rig's current synth.
+        for (req, slot) in [
+            ("Load Unsampled Piano.", "keys"),
+            ("Use Unsampled Piano on rig 1.", "keys"),
+            ("Give me Dexed.", "keys"),
+            ("Switch to Odin 2.", "lead"),
+        ] {
+            let (events, requests) = drive_with_jev(
+                vec![decision_with("load_sound", 0.99, ("none", 0.9), &[("sound", slot)]), text("m", "from the chat model")],
+                vec![asked(req)],
+            );
+            assert!(ran(&events).is_empty() && requests.len() == 2, "{req}: must hand off to the chat model, not load a Surge patch");
+        }
+        // Naming the rig after a catalog instrument ("on the YANES rig") still
+        // runs the sound shortcut for the sound asked for.
+        let (events, requests) = drive_with_jev(
+            vec![decision_with("load_sound", 0.99, ("rig_2", 0.99), &[("sound", "bass")])],
+            vec![asked("Load a bass sound on the YANES rig."),
+                results(&[r#"{"instrument":"YANES","node":4,"rig":1,"library":"Preset","total":146,"sounds":["Bass 1"]}"#]),
+                results(&["loaded 'Bass 1' into YANES (node 4), rig 1 'YANES'"])],
+        );
+        assert_eq!(requests.len(), 1, "a rig named YANES still uses the shortcut for 'bass'");
+        assert_eq!(said(&events), vec!["Rig 2 now plays Bass 1."]);
 
         // A name with an apostrophe is said whole.
         let (events, _) = drive_with_jev(

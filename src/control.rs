@@ -1362,6 +1362,10 @@ pub enum Command {
     /// second `DemoPlay` releases the first one's notes, then starts.
     DemoPlay { rig: u8, phrase: crate::demo::PhraseKind },
     DemoStop,
+    /// Silence every rig (#210): a demo phrase stops, and every instrument,
+    /// arp and MIDI-FX unit lets go of its pedals and releases every note.
+    /// Routing, the mix and the setlist stay as they are.
+    Panic,
 }
 
 /// What a command does to a running demo phrase. A demo note's note-off
@@ -1436,7 +1440,8 @@ impl Command {
             | Command::SetNodeSplit { .. }
             | Command::SetKeysScale { .. }
             | Command::SetZoneOctave { .. }
-            | Command::MatrixRule { .. } => Ends,
+            | Command::MatrixRule { .. }
+            | Command::Panic => Ends,
             Command::Connect { .. }
             | Command::SetParam { .. }
             | Command::NoteOn { .. }
@@ -1666,6 +1671,7 @@ mod tests {
             Command::SetAudioIn { node: 9, device: Some("USB Audio".into()), channels: None },
             Command::DemoPlay { rig: 1, phrase: crate::demo::PhraseKind::Bass },
             Command::DemoStop,
+            Command::Panic,
         ];
         for cmd in cmds {
             let s = serde_json::to_string(&cmd).unwrap();

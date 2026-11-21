@@ -2072,7 +2072,12 @@ impl Lv2Plugin {
 
     /// Queue a MIDI control change (channel 1) for the next run().
     pub fn control_change(&mut self, cc: u8, value: u8) {
-        self.queue_midi([0xB0, cc & 0x7F, value & 0x7F]);
+        self.control_change_ch(cc, value, 0);
+    }
+
+    /// Control change on a 0-based MIDI channel.
+    pub fn control_change_ch(&mut self, cc: u8, value: u8, channel: u8) {
+        self.queue_midi([0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F]);
     }
 
     /// Queue a channel-pressure (aftertouch) message: how wind patches read

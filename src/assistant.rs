@@ -713,7 +713,9 @@ fn system_prompt() -> String {
      vel_curve, a floating split (float keys) and optional stored knobs); \
      select_setlist_part jumps to a song/part or steps next_part/prev_part/next_song/prev_song/clear; \
      add_song_from_session imports a saved session's rigs into the current gig and makes a song \
-     of them; set_setlist_footswitch binds or clears a hardware MIDI CC for next/prev part. \
+     of them; set_setlist_footswitch binds or clears a hardware MIDI CC for next/prev part; \
+     set_show_mode opens or leaves the locked stage screen (\"go on stage\", \"show mode\"). \
+     panic: all notes off on every rig when notes hang. \
      Levels: every rig, aux bus and CC binding lives at show level (no song switch touches it: \
      a vocal mic, a master reverb, a volume pedal), at the level of a set (a named group of songs, \
      set_setlist_set makes, fills, skips or moves one) or at song level (only where the parts use \
@@ -861,6 +863,16 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"stop_demo",
             "description":"Stop the running rig demo phrase and release any notes it holds.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_show_mode",
+            "description":"Open (on=true) or leave (on=false) Show mode: the locked full-window stage screen with the current song and part in large type, the next song, tempo, the master meter, one meter per live rig, a clock and a Panic button. While it is open no click or key edits the patch, the mix or the setlist; PageUp/PageDown and foot switches still step parts, and the user leaves by holding Esc for a second and letting go. Returns what the screen shows.",
+            "parameters":{"type":"object","properties":{"on":{"type":"boolean"}},"required":["on"]}
+        }},
+        {"type":"function","function":{
+            "name":"panic",
+            "description":"All notes off on every rig: every instrument, arp and MIDI effect releases its notes and pedals, and a demo phrase stops. Routing, the mix and the setlist stay as they are. Use it when notes hang.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{

@@ -47,6 +47,17 @@ agents are in [AGENTS.md](../AGENTS.md).
   played around each key-range edge. The engine moves it once per live
   note-on; releases are never gated, so a layer or a floated split cannot
   strand a note.
+- `ui/show_mode.rs` — Show mode (#210), the locked stage screen. The lock is
+  one gate at the top of `frame_ui`: while it is open the frame runs
+  `show_frame` instead of the editing frame, so no panel, view, shortcut or
+  rack handler reads input. Both frames share `frame_feeds` (agents, the
+  engine's publications with `follow_show`, plugins, hardware MIDI) and
+  `frame_end` (`publish_show`, repaint pacing), so a foot switch, an agent
+  or a remote edit keeps working and the screen shows its result. Its own
+  input is PageUp/PageDown, the Panic button (`Command::Panic`: pedals up and
+  all notes off on every channel, each node released once) and Esc held
+  for a second, which leaves when it is let go (so its key repeats never
+  reach the editing frame).
 - `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
   atomics, read once), `NodeTimes` (lock-free render time per unit) and the
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`

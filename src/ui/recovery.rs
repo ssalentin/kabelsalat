@@ -13,6 +13,8 @@ pub(super) struct Recovery {
     pub(super) autosaved: Option<String>,
     written: Option<Marker>,
     notice: Option<Notice>,
+    /// Where the notice was drawn last frame; the rack takes no click there.
+    notice_rect: Option<Rect>,
 }
 
 struct Notice {
@@ -53,14 +55,15 @@ impl DemoApp {
         let Some(name) = &m.session else { return Ok(None) };
         let dir = self.effective_sessions_dir();
         self.open_saved_session(&dir, name)?;
-        match m.pos {
-            Some(pos) => {
-                self.select_setlist(pos.song, pos.part)?;
-            }
-            None if self.setlist.active.is_some() => {
-                self.step_setlist("clear")?;
-            }
-            None => {}
+        // A part added after the last save is not in the file: the session
+        // stays open at the part it saved.
+        let moved = match m.pos {
+            Some(pos) => self.select_setlist(pos.song, pos.part).map(|_| ()),
+            None if self.setlist.active.is_some() => self.step_setlist("clear").map(|_| ()),
+            None => Ok(()),
+        };
+        if let Err(e) = moved {
+            eprintln!("recovery: {e}");
         }
         let at = self.setlist.current().map(|(s, p, _)| format!(" at {} · {}", s.name, p.name)).unwrap_or_default();
         Ok(Some(format!("'{name}'{at}")))
@@ -69,11 +72,16 @@ impl DemoApp {
     /// Per frame: write the marker when what it should say changed.
     pub(super) fn track_recovery(&mut self) {
         let Some(path) = &self.recovery.marker else { return };
+        // While a saved session is open, an older autosave of an unsaved
+        // rack no longer holds it (a delete of the open one falls to nothing).
+        if self.open_session.is_some() {
+            self.recovery.autosaved = None;
+        }
         let session = self.open_session.as_deref().or(self.recovery.autosaved.as_deref());
         if self.recovery.written.as_ref().is_some_and(|w| w.session.as_deref() == session && w.pos == self.setlist.active) {
             return;
         }
-        let now = Marker { session: session.map(str::to_string), pos: self.setlist.active };
+        let now = Marker { pid: std::process::id(), session: session.map(str::to_string), pos: self.setlist.active };
         match now.write(path) {
             Ok(()) => self.recovery.written = Some(now),
             Err(e) => {
@@ -82,6 +90,11 @@ impl DemoApp {
                 self.recovery.written = Some(now);
             }
         }
+    }
+
+    /// Whether `p` lies on the crash notice (`handle_input` leaves it alone).
+    pub(super) fn crash_notice_covers(&self, p: Pos2) -> bool {
+        self.recovery.notice.is_some() && self.recovery.notice_rect.is_some_and(|r| r.contains(p))
     }
 
     /// The note a restarted app shows until it is dismissed.
@@ -100,7 +113,7 @@ impl DemoApp {
         let screen = ctx.content_rect();
         let width = (screen.width() - 32.0).clamp(240.0, 560.0);
         let mut dismiss = false;
-        egui::Area::new(egui::Id::unique("crash_notice"))
+        let area = egui::Area::new(egui::Id::unique("crash_notice"))
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::CENTER_TOP)
             .fixed_pos(screen.center_top() + egui::vec2(0.0, 56.0))
@@ -131,6 +144,7 @@ impl DemoApp {
                     });
                 });
             });
+        self.recovery.notice_rect = Some(area.response.rect);
         if dismiss {
             self.recovery.notice = None;
         }
@@ -211,13 +225,19 @@ mod tests {
         before.select_setlist(1, 1).unwrap();
         before.track_recovery();
         let marker = Marker::read(&dir.join("recover.json")).unwrap();
-        assert_eq!(marker, Marker { session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 1 }) });
+        assert_eq!(marker, Marker { pid: std::process::id(), session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 1 }) });
 
         // The file still holds part (0, 0): the switch was never autosaved.
         let mut after = supervised_app(&dir);
         assert_eq!(after.restore(&marker).unwrap().as_deref(), Some("'Gig' at Encore · Outro"));
         assert_eq!(after.open_session.as_deref(), Some("Gig"));
         assert_eq!(after.setlist.active, Some(SetlistPos { song: 1, part: 1 }));
+
+        // A song added after the last save: the session still opens.
+        let mut later = supervised_app(&dir);
+        let gone = Marker { pos: Some(SetlistPos { song: 2, part: 0 }), ..marker };
+        assert_eq!(later.restore(&gone).unwrap().as_deref(), Some("'Gig' at Opener · Intro"));
+        assert_eq!(later.open_session.as_deref(), Some("Gig"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -234,6 +254,15 @@ mod tests {
         app.autosave_rebase();
         app.track_recovery();
         assert_eq!(Marker::read(&dir.join("recover.json")).unwrap().session, None, "a template load is not on disk");
+
+        // Autosave wrote the open session; deleting that session leaves nothing to reopen.
+        app.open_session = Some("Gig".into());
+        app.recovery.autosaved = Some("Gig".into());
+        app.track_recovery();
+        assert_eq!(Marker::read(&dir.join("recover.json")).unwrap().session.as_deref(), Some("Gig"));
+        app.open_session = None;
+        app.track_recovery();
+        assert_eq!(Marker::read(&dir.join("recover.json")).unwrap().session, None, "the deleted session is not reopened");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -289,6 +318,7 @@ mod tests {
             }
             let at = shown.iter().find(|(s, _)| s == "Dismiss").unwrap().1.center();
             frame(&mut app, &ctx, size, 4.0, vec![egui::Event::PointerMoved(at)]);
+            assert!(app.crash_notice_covers(at) && matches!(app.hover, Some(Hit::Background)), "{size:?}: the rack under the notice takes the pointer");
             frame(&mut app, &ctx, size, 4.1, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
             frame(&mut app, &ctx, size, 4.2, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
             assert!(app.recovery.notice.is_none(), "{size:?}: Dismiss left the notice up");

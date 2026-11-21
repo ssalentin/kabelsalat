@@ -5,7 +5,8 @@
 //! drive it; it answers on stdout with lines that start with `headless:`.
 //!
 //! - `ready pid=… recovered=0|1 report=<path>|-` and a `state` line, once up
-//! - `open <session>` / `select <song> <part>` / `state` → `state session=… song=… part=… bpm=…`
+//! - `open <session>` / `select <song> <part>` / `autosave` (one autosave
+//!   check now) / `state` → `state session=… song=… part=… bpm=…`
 //! - `play` → transport on, then `sound peak=…` once the master is not silent; `stop`
 //! - `panic` / `segv` → a panic or a segfault on the UI thread; `quit` → exit 0
 
@@ -97,6 +98,7 @@ impl Headless {
                 let (song, part) = (n.next().ok_or("select <song> <part>")??, n.next().ok_or("select <song> <part>")??);
                 self.app.select_setlist(song, part)?;
             }
+            "autosave" => self.app.autosave_now(&DemoApp::sessions_dir()),
             "state" => {}
             "play" => {
                 self.app.master_transport(true);
@@ -107,7 +109,13 @@ impl Headless {
                 self.app.master_transport(false);
                 self.listening = false;
             }
-            "panic" => panic!("crash-test: a panic on the UI thread"),
+            // Formatted with what a report must not show: the session's name
+            // and the user's folder.
+            "panic" => panic!(
+                "crash-test: a panic on the UI thread in '{}' under {}",
+                self.app.open_session.as_deref().unwrap_or("-"),
+                DemoApp::sessions_dir().display()
+            ),
             // Non-null, so the debug precondition check does not abort first.
             "segv" => unsafe { (16 as *mut u8).write_volatile(1) },
             "quit" => return Ok(false),

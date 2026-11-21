@@ -5,10 +5,10 @@
 //! the crashed one was on, from the marker the app keeps up to date
 //! (`Marker`), and `KABELSALAT_CRASH_REPORT` with the report it left.
 //!
-//! A child is only recovered when it wrote the marker itself, after its
-//! own start: a crash before the first frame (or while a recovered child
-//! loads the session again) starts the next child fresh, so a session that
-//! crashes on load cannot loop. Five crashes within a minute end the watch.
+//! A child is only recovered when the marker carries its own pid: a crash
+//! before the first frame (or while a recovered child loads the session
+//! again) starts the next child fresh, so a session that crashes on load
+//! cannot loop. Five crashes within a minute end the watch.
 //!
 //! `KABELSALAT_WATCHDOG=0` runs the app without one. SIGINT, SIGTERM and
 //! SIGHUP to the watchdog go on to the app.
@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,8 @@ pub use selftest::run as run_test;
 pub const SUPERVISED: &str = "KABELSALAT_SUPERVISED";
 /// Set for a child after a crash: open what the marker names.
 pub const RECOVER: &str = "KABELSALAT_RECOVER";
-/// Set for a child after a crash: the report the crashed one wrote.
+/// Set for a child after a crash: the report the crashed one wrote (empty
+/// when it wrote none).
 pub const CRASH_REPORT: &str = "KABELSALAT_CRASH_REPORT";
 /// `0` runs the app without a watchdog.
 pub const WATCHDOG: &str = "KABELSALAT_WATCHDOG";
@@ -40,9 +41,11 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 
 /// What the app was on, so a restart can go back to it: the saved session
 /// whose file holds the rack (the open session, or the one autosave wrote)
-/// and the setlist position.
+/// and the setlist position, from the process `pid`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Marker {
+    #[serde(default)]
+    pub pid: u32,
     pub session: Option<String>,
     pub pos: Option<SetlistPos>,
 }
@@ -51,6 +54,9 @@ impl Marker {
     /// `$XDG_STATE_HOME/kabelsalat/recover.json`, else under
     /// `~/.local/state`. Tests use a folder of their own (rule 37).
     pub fn path() -> PathBuf {
+        #[cfg(test)]
+        return crate::crash::crash_dir().join("recover.json");
+        #[cfg(not(test))]
         crate::crash::crash_dir().parent().map(|p| p.join("recover.json")).unwrap_or_else(|| "recover.json".into())
     }
 
@@ -107,8 +113,11 @@ pub fn run_app(headless: bool) -> anyhow::Result<()> {
 }
 
 static CHILD: AtomicI32 = AtomicI32::new(0);
+/// A stop signal the watchdog got: no child is started after it.
+static STOP: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn forward(sig: libc::c_int) {
+    STOP.store(sig, Ordering::Relaxed);
     let pid = CHILD.load(Ordering::Relaxed);
     if pid > 0 {
         unsafe { libc::kill(pid, sig) };
@@ -130,8 +139,13 @@ fn supervise() -> anyhow::Result<i32> {
     let marker = Marker::path();
     let mut crashes: Vec<Instant> = Vec::new();
     let mut recover = false;
-    let mut report: Option<PathBuf> = None;
+    // After a crash: Some(the report it wrote, if any).
+    let mut report: Option<Option<PathBuf>> = None;
     loop {
+        let stop = STOP.load(Ordering::Relaxed);
+        if stop != 0 {
+            return Ok(128 + stop);
+        }
         let command = |exe: &Path| {
             let mut cmd = std::process::Command::new(exe);
             cmd.args(&args).env(SUPERVISED, "1").env_remove(RECOVER).env_remove(CRASH_REPORT);
@@ -139,11 +153,10 @@ fn supervise() -> anyhow::Result<i32> {
                 cmd.env(RECOVER, "1");
             }
             if let Some(r) = &report {
-                cmd.env(CRASH_REPORT, r);
+                cmd.env(CRASH_REPORT, r.as_deref().unwrap_or(Path::new("")));
             }
             cmd
         };
-        let started = SystemTime::now();
         // An upgrade may have replaced the file since the start; the kernel
         // still runs the image this watchdog came from.
         let mut child = command(&exe).spawn().or_else(|_| command(Path::new("/proc/self/exe")).spawn())?;
@@ -158,23 +171,19 @@ fn supervise() -> anyhow::Result<i32> {
         let now = Instant::now();
         crashes.retain(|t| now.duration_since(*t) < CRASH_WINDOW);
         crashes.push(now);
-        report = crate::crash::report_of(&crate::crash::crash_dir(), pid);
-        let shown = report.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into());
+        let written = crate::crash::report_of(&crate::crash::crash_dir(), pid);
+        let shown = written.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into());
+        report = Some(written);
         if crashes.len() >= MAX_CRASHES {
             eprintln!("watchdog: the app crashed {} times within a minute ({why}); not starting it again. Last report: {shown}", crashes.len());
             return Ok(1);
         }
-        recover = wrote_since(&marker, started);
+        recover = Marker::read(&marker).is_some_and(|m| m.pid == pid);
         eprintln!(
             "watchdog: the app crashed ({why}), report: {shown}; starting it again{}",
             if recover { " where it was" } else { " fresh (it crashed before it was up)" }
         );
     }
-}
-
-/// Whether the marker was written at or after `t`.
-fn wrote_since(marker: &Path, t: SystemTime) -> bool {
-    std::fs::metadata(marker).and_then(|m| m.modified()).is_ok_and(|m| m >= t)
 }
 
 #[cfg(test)]
@@ -197,16 +206,12 @@ mod tests {
     }
 
     #[test]
-    fn the_marker_round_trips_and_says_when_it_was_written() {
-        let dir = std::env::temp_dir().join(format!("kabelsalat-test-marker-{}", std::process::id()));
-        let path = dir.join("recover.json");
-        let before = SystemTime::now() - Duration::from_secs(1);
-        assert!(!wrote_since(&path, before));
-        let m = Marker { session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 2 }) };
+    fn the_marker_round_trips_in_a_folder_of_the_test_process() {
+        let path = Marker::path();
+        assert!(path.starts_with(crate::crash::crash_dir()), "{}", path.display());
+        let m = Marker { pid: 42, session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 2 }) };
         m.write(&path).unwrap();
         assert_eq!(Marker::read(&path), Some(m));
-        assert!(wrote_since(&path, before));
-        assert!(!wrote_since(&path, SystemTime::now() + Duration::from_secs(5)));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
     }
 }

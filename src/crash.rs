@@ -17,7 +17,7 @@ use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use libc::c_int;
@@ -51,8 +51,12 @@ static SETUP: OnceLock<Setup> = OnceLock::new();
 static COMMANDS: Ring = Ring::new();
 /// Held while a report is written: the scratch buffers are one static.
 static WRITING: AtomicBool = AtomicBool::new(false);
-/// A panic was reported; the abort that may follow writes no second report.
-static PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
+/// The thread that holds `WRITING`, and whether it holds it in `on_fatal`.
+static WRITER: AtomicI32 = AtomicI32::new(0);
+static WRITER_FATAL: AtomicBool = AtomicBool::new(false);
+/// The thread whose panic was reported: the abort that panic may end in
+/// writes no second report. Another thread's abort still does.
+static PANIC_TID: AtomicI32 = AtomicI32::new(0);
 /// glibc has `_dl_find_object` (2.35+), which libgcc's unwinder uses instead
 /// of `dl_iterate_phdr` and its loader lock. Without it the signal handler
 /// takes no frames: a crash inside dlopen would hold that lock.
@@ -156,7 +160,7 @@ pub fn install() {
         for sig in SIGNALS {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_fatal as extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) as libc::sighandler_t;
-            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESETHAND;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
@@ -445,10 +449,11 @@ fn file_name(path: &[u8]) -> &[u8] {
     }
 }
 
-/// The plugin bundle a mapped file belongs to: the path component that ends
-/// in `.clap`, `.lv2` or `.vst3`.
+/// The plugin bundle a mapped file belongs to: the last path component
+/// that ends in `.clap`, `.lv2` or `.vst3`.
 fn plugin_bundle(path: &[u8]) -> Option<&[u8]> {
-    path.split(|&b| b == b'/').find(|c| [&b".clap"[..], b".lv2", b".vst3"].iter().any(|ext| c.len() > ext.len() && c.ends_with(ext)))
+    let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+    path.split(|&b| b == b'/').rfind(|c| [&b".clap"[..], b".lv2", b".vst3"].iter().any(|ext| c.len() > ext.len() && c.ends_with(ext)))
 }
 
 fn fnv(bytes: &[u8]) -> u64 {
@@ -532,7 +537,7 @@ fn write_frames<O: Out>(t: &mut Text<O>, frames: &[*mut c_void], maps: impl FnMu
                 let n = name.len().min(MODULE);
                 s.module[i][..n].copy_from_slice(&name[..n]);
                 s.module_len[i] = n;
-                s.offset[i] = pc - base;
+                s.offset[i] = pc.wrapping_sub(base);
             }
         }
     });
@@ -656,7 +661,7 @@ fn write_head<O: Out>(t: &mut Text<O>, setup: &Setup, now: i64) {
 
 fn write_thread_and_uptime<O: Out>(t: &mut Text<O>, setup: &Setup) {
     let mut name = [0u8; 17];
-    unsafe { libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr()) };
+    unsafe { libc::prctl(libc::PR_GET_NAME, name.as_mut_ptr(), 0, 0, 0) };
     let len = name.iter().position(|&b| b == 0).unwrap_or(16);
     let main = unsafe { libc::syscall(libc::SYS_gettid) as i32 == libc::getpid() };
     t.str("thread: ").bytes(&name[..len]).str(if main { " (main)" } else { "" }).str("\n");
@@ -688,19 +693,34 @@ fn write_tail<O: Out>(t: &mut Text<O>, s: &mut Scratch, unwind: bool) {
     t.flush();
 }
 
+fn gettid() -> i32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
+
 extern "C" fn on_fatal(sig: c_int, info: *mut libc::siginfo_t, _ctx: *mut c_void) {
-    // SA_RESETHAND made the action the default again: once this returns, the
-    // raised (or re-executed) signal ends the process as it would have.
+    // With the default action back, the raised (or re-executed) signal ends
+    // the process as it would have once this returns. Only now: another
+    // thread's crash meanwhile waits for this report instead of killing it.
     let reraise = || unsafe {
+        libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     };
     let Some(setup) = SETUP.get() else { return reraise() };
-    if sig == libc::SIGABRT && PANIC_REPORTED.load(Ordering::Acquire) {
+    let tid = gettid();
+    if sig == libc::SIGABRT && PANIC_TID.load(Ordering::Acquire) == tid {
         return reraise();
+    }
+    let mut ours = !WRITING.swap(true, Ordering::Acquire);
+    if !ours && WRITER.load(Ordering::Acquire) == tid {
+        if WRITER_FATAL.load(Ordering::Acquire) {
+            // A fault inside this handler.
+            return reraise();
+        }
+        // A fault inside this thread's panic hook, which will not resume.
+        ours = true;
     }
     // Another thread may be writing a report: a crash ends the process when
     // it is done, a panic hook lets go of the buffers.
-    let mut ours = !WRITING.swap(true, Ordering::Acquire);
     for _ in 0..200 {
         if ours {
             break;
@@ -712,6 +732,8 @@ extern "C" fn on_fatal(sig: c_int, info: *mut libc::siginfo_t, _ctx: *mut c_void
     if !ours {
         return reraise();
     }
+    WRITER.store(tid, Ordering::Release);
+    WRITER_FATAL.store(true, Ordering::Release);
     // An unwinder stuck on a broken stack must not keep the show down.
     unsafe { libc::alarm(5) };
     // SAFETY: WRITING is ours.
@@ -752,12 +774,9 @@ fn on_panic(info: &std::panic::PanicHookInfo) {
     if WRITING.swap(true, Ordering::Acquire) {
         return;
     }
-    let message = info
-        .payload()
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| info.payload().downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "(no message)".into());
+    let tid = gettid();
+    WRITER.store(tid, Ordering::Release);
+    let message = panic_message(info.payload());
     let at = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
     let backtrace = short_backtrace(&std::backtrace::Backtrace::force_capture().to_string());
     let home = std::env::var("HOME").ok();
@@ -779,7 +798,8 @@ fn on_panic(info: &std::panic::PanicHookInfo) {
         let len = s.path.iter().position(|&b| b == 0).unwrap_or(0);
         eprintln!("kabelsalat: panic report: {}", String::from_utf8_lossy(&s.path[..len]));
     }
-    PANIC_REPORTED.store(true, Ordering::Release);
+    PANIC_TID.store(tid, Ordering::Release);
+    WRITER.store(0, Ordering::Release);
     WRITING.store(false, Ordering::Release);
 }
 
@@ -805,44 +825,108 @@ fn short_backtrace(full: &str) -> String {
 
 // -- scrubbing ---------------------------------------------------------------
 
-/// Text with every path cut to what is the app's or a library's own:
-/// a source file keeps `src/…` (behind its crate and version when it comes
+/// A panic's message. A literal one is code and stays; a formatted one may
+/// carry names (sessions, rigs, devices), so what it quotes becomes `…`.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return s.to_string();
+    }
+    let Some(s) = payload.downcast_ref::<String>() else { return "(no message)".into() };
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(i) = rest.find(['"', '\'']) {
+        let q = rest[i..].chars().next().unwrap_or('"');
+        out.push_str(&rest[..=i]);
+        match rest[i + 1..].find(q) {
+            Some(j) => {
+                out.push('…');
+                out.push(q);
+                rest = &rest[i + 1 + j + 1..];
+            }
+            None => rest = &rest[i + 1..],
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Text with every path cut to what is the app's or a library's own: a Rust
+/// source file keeps `src/…` (behind its crate and version when it comes
 /// from crates.io or the standard library), any other path becomes
-/// `<path>`. What is left of `home` after that becomes `~`.
+/// `<path>`. An absolute path runs to its closing quote or, unquoted, to
+/// the end of its line, since a folder name may hold spaces.
 pub fn scrub(text: &str, home: Option<&str>) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+    let mut out: Vec<String> = text.split('\n').map(|l| scrub_line(l, home)).collect();
+    if text.ends_with('\n') {
+        out.pop();
+        out.push(String::new());
+    }
+    out.join("\n")
+}
+
+fn scrub_line(line: &str, home: Option<&str>) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
     while let Some(i) = rest.find(['/', '~']) {
-        let starts_path = rest[..i].chars().next_back().is_none_or(|c| c.is_whitespace() || "'\"([<=,:".contains(c));
-        let is_path = starts_path && (rest[i..].starts_with('/') || rest[i..].starts_with("~/"));
-        if !is_path {
+        let before = rest[..i].chars().next_back();
+        let starts = before.is_none_or(|c| c.is_whitespace() || "'\"`([{<=,:".contains(c));
+        if !(starts && (rest[i..].starts_with('/') || rest[i..].starts_with("~/"))) {
             out.push_str(&rest[..i + 1]);
             rest = &rest[i + 1..];
             continue;
         }
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
-        // A quoted path (Debug of a path or string) may hold spaces.
-        let end = match rest[..i].chars().next_back().filter(|&c| c == '"' || c == '\'') {
-            Some(q) => tail.find([q, '\n']),
-            None => tail.find(|c: char| c.is_whitespace() || "'\"()<>,;".contains(c)),
-        }
-        .unwrap_or(tail.len());
+        let word = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let end = match before.filter(|c| "'\"`".contains(*c)) {
+            Some(q) => tail.find(q).unwrap_or(tail.len()),
+            None if source_path(&tail[..word]).is_some() => word,
+            None => tail.len(),
+        };
         out.push_str(&source_path(&tail[..end]).unwrap_or_else(|| "<path>".into()));
         rest = &tail[end..];
     }
     out.push_str(rest);
-    match home.filter(|h| h.len() > 1) {
-        Some(h) => out.replace(h, "~"),
-        None => out,
+    if let Some(h) = home.filter(|h| h.len() > 1) {
+        out = out.replace(h, "~");
     }
+    // Relative paths are the user's too, unless they name a source file.
+    out.split(' ')
+        .map(|w| if w.contains('/') && !is_source(w.trim_matches(|c: char| "'\"`()[]{}<>,;".contains(c))) { "<path>" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// `…/<crate>/src/<file>` → `src/<file>`, keeping `<crate>` when it is a
-/// published crate (`name-1.2.3`) or part of the standard library.
+/// `src/<file>.rs`, optionally behind one crate folder and with `:line:col`.
+fn is_source(word: &str) -> bool {
+    let (krate, file) = match word.find("src/") {
+        Some(0) => ("", word),
+        Some(i) => (&word[..i - 1], &word[i..]),
+        None => return false,
+    };
+    !krate.contains('/') && !file.contains(char::is_whitespace) && is_rs(file)
+}
+
+/// Ends in `.rs`, `.rs:line` or `.rs:line:col`.
+fn is_rs(file: &str) -> bool {
+    let mut f = file;
+    for _ in 0..2 {
+        match f.rsplit_once(':') {
+            Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => f = head,
+            _ => break,
+        }
+    }
+    f.ends_with(".rs")
+}
+
+/// `…/<crate>/src/<file>.rs` → `src/<file>.rs`, keeping `<crate>` when it
+/// is a published crate (`name-1.2.3`) or part of the standard library.
 fn source_path(path: &str) -> Option<String> {
     let i = path.rfind("/src/")?;
     let file = &path[i + 1..];
+    if file.contains(char::is_whitespace) || !is_rs(file) {
+        return None;
+    }
     let krate = path[..i].rsplit('/').next().unwrap_or("");
     let semver = |v: &str| v.split('.').count() >= 3 && v.split('.').take(2).all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
     let published = krate.rsplit_once('-').is_some_and(|(n, v)| !n.is_empty() && semver(v));
@@ -931,14 +1015,22 @@ called `Result::unwrap()` on an `Err` value: \"/home/ada/kabelsalat-sessions/Sec
    2: kabelsalat::ui::DemoApp::frame_ui
              at /home/ada/code/my-band/kabelsalat/src/ui.rs:31760:5
    3: plugin at ~/.clap/Surge.clap, opened (/opt/ada-tools/lib.so)
-home is /home/ada, a/b stays";
+   4: at /home/ada/My Projects/kabelsalat/src/main.rs:10:5
+   5: Load failed: /home/ada/kabelsalat-sessions/Secret Band.ksalat/session.json: bad
+   6: wav /home/ada/src/secret-band/vocals.wav, `/home/ada/Secret.wav` and Band/Secret.ksalat
+   7: at ./csu/../sysdeps/nptl/libc_start_call_main.h:59:16
+home is /home/ada, a/b goes";
         let out = scrub(text, Some(home));
         assert!(out.contains("std/src/panicking.rs:12:5"), "{out}");
         assert!(out.contains("egui-0.37.0/src/context.rs:800:9"), "{out}");
         assert!(out.contains("at src/ui.rs:31760:5"), "{out}");
-        assert!(out.contains("plugin at <path>, opened (<path>)"), "{out}");
-        assert!(out.contains("home is <path>, a/b stays"), "{out}");
-        for gone in ["ada", "Secret", "Gig", "my-band", "rustc", "registry", "index.crates"] {
+        assert!(out.contains("plugin at <path>"), "{out}");
+        assert!(out.contains("4: at src/main.rs:10:5"), "{out}");
+        assert!(out.contains("5: Load failed: <path>"), "{out}");
+        assert!(out.contains("6: wav <path>"), "{out}");
+        assert!(out.contains("7: at <path>"), "{out}");
+        assert!(out.contains("home is <path>"), "{out}");
+        for gone in ["ada", "Secret", "Gig", "Band", "Projects", "secret-band", "vocals", "my-band", "rustc", "registry", "index.crates", "a/b"] {
             assert!(!out.contains(gone), "{gone} left in: {out}");
         }
     }
@@ -995,6 +1087,21 @@ f2cccb600000-f2cccb601000 r-xp 00000000 08:01 133179                     /home/a
         let (mut chunk, mut line) = ([0u8; 1024], [0u8; LINE]);
         scan_maps(reader(&long), &mut chunk, &mut line, |l| names.push((l.start, String::from_utf8_lossy(file_name(l.path)).into_owned())));
         assert_eq!(names, [(0xf2cccb600000, "libdeep.so".to_string())]);
+    }
+
+    #[test]
+    fn a_formatted_panic_message_loses_what_it_quotes() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("index 'out' of bounds");
+        assert_eq!(panic_message(literal.as_ref()), "index 'out' of bounds", "a literal is code");
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(String::from("rig 'Secret Gig' failed: Os { message: \"No such file\" } on 'x"));
+        assert_eq!(panic_message(formatted.as_ref()), "rig '…' failed: Os { message: \"…\" } on 'x");
+    }
+
+    #[test]
+    fn a_plugin_is_named_by_its_own_bundle_not_a_folder_above_it() {
+        assert_eq!(plugin_bundle(b"/home/ada/my-band.lv2/b_synth.lv2/b_synth.so"), Some(&b"b_synth.lv2"[..]));
+        assert_eq!(plugin_bundle(b"/home/ada/.clap/Surge XT.clap (deleted)"), Some(&b"Surge XT.clap"[..]));
+        assert_eq!(plugin_bundle(b"/usr/lib/libc.so.6"), None);
     }
 
     #[test]

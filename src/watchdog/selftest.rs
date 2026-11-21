@@ -165,7 +165,7 @@ struct Round {
 
 const ROUNDS: [Round; 3] = [
     Round { how: "kill -SEGV", goto: SetlistPos { song: 1, part: 1 }, crash: Crash::Kill(libc::SIGSEGV), cause: "cause: SIGSEGV (signal 11), sent by process" },
-    Round { how: "panic on the UI thread", goto: SetlistPos { song: 0, part: 1 }, crash: Crash::Say("panic"), cause: "cause: panic: crash-test: a panic on the UI thread" },
+    Round { how: "panic on the UI thread", goto: SetlistPos { song: 0, part: 1 }, crash: Crash::Say("panic"), cause: "cause: panic: crash-test: a panic on the UI thread in '…' under <path>\n" },
     Round { how: "segfault on the UI thread", goto: SetlistPos { song: 1, part: 0 }, crash: Crash::Say("segv"), cause: "cause: SIGSEGV (signal 11), fault address 0x10" },
 ];
 
@@ -204,10 +204,19 @@ fn drive(app: &mut App, home: &Path, forbidden: &[String]) -> anyhow::Result<()>
     let opened = app.ask(&format!("open {SESSION}"), "state")?;
     ensure!(opened.get("session").as_deref() == Some(SESSION), "open: {}", opened.0);
     let crashes = home.join(".local/state/kabelsalat/crashes");
+    let package = Session::package_path(&home.join("kabelsalat-sessions"), SESSION)?;
+    // The first part switch is autosaved: the restart reads it from the
+    // file. The later ones are not: they come from the watchdog's marker.
+    app.ask("autosave", "state")?;
     let mut times = Vec::new();
-    for round in &ROUNDS {
+    for (i, round) in ROUNDS.iter().enumerate() {
         let at = app.ask(&format!("select {} {}", round.goto.song, round.goto.part), "state")?;
         ensure!(at.pos() == Some(round.goto), "select: {}", at.0);
+        if i == 0 {
+            app.ask("autosave", "state")?;
+        }
+        let saved = Session::load(&package)?.setlist.active;
+        ensure!((saved == Some(round.goto)) == (i == 0), "{}: the session file is at {saved:?}", round.how);
         let t0 = Instant::now();
         match round.crash {
             Crash::Kill(sig) => unsafe {

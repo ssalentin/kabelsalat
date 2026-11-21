@@ -25526,6 +25526,7 @@ impl DemoApp {
         if (self.engine_info_open && self.engine_info_rect.contains(s))
             || (self.session_popover_open && self.session_popover_rect.contains(s))
             || (self.nav_rig_menu.is_some() && self.nav_rig_menu_rect.contains(s))
+            || self.crash_notice_covers(s)
             || (self.stage_view == StageView::Rack && self.side == Side::Back && self.back_controls_rect.contains(s))
         {
             self.hover = Some(Hit::Background);

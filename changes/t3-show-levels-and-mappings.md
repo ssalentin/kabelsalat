@@ -1,0 +1,5 @@
+### Added
+- **Show, set and song levels (#273):** a vocal mic, a master reverb or a volume pedal can now stay through the whole show. Every rig, aux bus and MIDI controller binding lives at show level (no song switch touches it: it keeps the whole keyboard, its fader and its knobs), at the level of a set, or at song level (only where the setlist's parts use it). Songs can be grouped into named sets, which move or are skipped as a whole. Choose levels and build sets under **Setlist → Sets & levels**, or on the mixer's bus strips; a part can now also name the buses it uses. Older sessions load with everything at show level, except the rigs their setlist's parts already use, which keep playing only in those parts. Agents use `get_setlist`, `set_level` and `set_setlist_set`; `kabelsalat levels-test` renders ten song switches under a show-level vocal and reverb.
+
+### Fixed
+- **Setlist header at narrow windows:** the subtitle no longer runs under the step buttons and the live song; it is shortened instead.

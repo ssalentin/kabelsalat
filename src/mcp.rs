@@ -212,7 +212,28 @@ fn template_ids() -> String {
     crate::session::Template::ALL.iter().map(|t| t.id()).collect::<Vec<_>>().join(", ")
 }
 
-fn setlist_json(sl: &crate::setlist::Setlist) -> Value {
+/// Every controller binding of the headless matrix, with its target.
+fn headless_bindings(st: &State) -> Vec<(crate::setlist::Binding, crate::matrix::CcTarget)> {
+    let mut out: Vec<_> = st
+        .cc_maps
+        .iter()
+        .flat_map(|(&(source, dest), maps)| maps.iter().map(move |m| (crate::setlist::Binding { source, dest, cc: m.cc }, m.target)))
+        .collect();
+    out.sort_by_key(|(b, _)| (b.dest, b.cc, crate::setlist::source_str(b.source)));
+    out
+}
+
+/// Send the active part's zones, closed buses and pinned bindings.
+fn send_show_gates(st: &mut State) -> Result<(), String> {
+    let cmds = st.setlist.gates(&st.graph).commands();
+    for c in cmds {
+        send_cmd(st, c)?;
+    }
+    Ok(())
+}
+
+fn setlist_json(st: &State) -> Value {
+    let sl = &st.setlist;
     let songs: Vec<Value> = sl.songs.iter().enumerate().map(|(si, s)| {
         let parts: Vec<Value> = s.parts.iter().enumerate().map(|(pi, p)| {
             let rigs: Vec<Value> = p.rigs.iter().map(|r| json!({
@@ -222,13 +243,14 @@ fn setlist_json(sl: &crate::setlist::Setlist) -> Value {
                 "transpose": r.transpose,
                 "level": r.level,
             })).collect();
-            json!({ "index": pi, "name": p.name, "rigs": rigs, "params_count": p.params.len() })
+            json!({ "index": pi, "name": p.name, "rigs": rigs, "buses": p.buses, "params_count": p.params.len() })
         }).collect();
         json!({
             "index": si,
             "name": s.name,
             "bpm": s.bpm,
             "time_signature": s.time_sig.map(|t| t.to_json()),
+            "set": sl.set_of(si).map(|x| x.name.as_str()),
             "parts": parts,
         })
     }).collect();
@@ -239,15 +261,20 @@ fn setlist_json(sl: &crate::setlist::Setlist) -> Value {
         "part_name": p.name,
     }));
     let fs = |f: Option<crate::setlist::FootSwitch>| f.map(|x| json!({"cc": x.cc, "channel": x.channel}));
+    let bus_name = |n: NodeId| st.graph.node(n).map_or_else(String::new, |x| name_str(&x.name).to_string());
+    let show = sl.show_json(&st.graph, &headless_bindings(st), bus_name);
     json!({
         "songs": songs,
         "active": active,
         "foot_switch": { "next_cc": fs(sl.next_cc), "prev_cc": fs(sl.prev_cc) },
+        "sets": show["sets"],
+        "levels": show["levels"],
     })
 }
 
 fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Result<(), String> {
     use crate::setlist::{Part, PartRig, Song};
+    let graph = st.graph.clone();
     let parse_sig = |v: &Value| -> Result<crate::transport::TimeSig, String> {
         let num = v.get("numerator").and_then(Value::as_u64).ok_or("time_signature.numerator required")?;
         let den = v.get("denominator").and_then(Value::as_u64).ok_or("time_signature.denominator required")?;
@@ -260,6 +287,14 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
             let name = p.name.trim();
             if name.is_empty() { return Err("part name cannot be empty".into()); }
             let mut part = Part::new(name, Vec::new());
+            for &b in p.buses.iter().flatten() {
+                if !graph.is_bus(b) {
+                    return Err(format!("node {b} is not an aux bus (get_sends lists them)"));
+                }
+                if !part.buses.contains(&b) {
+                    part.buses.push(b);
+                }
+            }
             if let Some(rigs) = &p.rigs {
                 for r in rigs {
                     if (r.rig as usize) >= crate::setlist::MAX_RIGS {
@@ -639,6 +674,8 @@ struct SetlistPartArg {
     name: String,
     /// Live rigs in this part.
     rigs: Option<Vec<SetlistPartRigArg>>,
+    /// Aux bus node ids that take signal in this part while at song level.
+    buses: Option<Vec<NodeId>>,
     /// Snapshot the current knob values of those rigs into this part.
     capture_knobs: Option<bool>,
 }
@@ -680,6 +717,54 @@ struct AddSongFromSessionArgs {
     session: String,
     /// Optional song name (defaults to the session name).
     name: Option<String>,
+}
+
+/// Arguments for `set_level`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetLevelArgs {
+    /// "show" | "set" | "song".
+    level: String,
+    /// With level "set": the set's name or 0-based index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    set: Option<String>,
+    /// A rig (0-based).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rig: Option<u8>,
+    /// An aux bus (its node id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bus: Option<NodeId>,
+    /// A binding: the node it is bound on (with cc and source).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<NodeId>,
+    /// A binding's controller number (0..=127).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cc: Option<u8>,
+    /// A binding's source: "keys" (default) | "hw:<device>".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+}
+
+/// Arguments for `set_setlist_set`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetSetlistSetArgs {
+    /// The set to change (its name or 0-based index); omit to make a new set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    set: Option<String>,
+    /// The new set's name, or a new name for `set`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// 0-based song indices that make up the set, e.g. "0,1,2".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    songs: Option<String>,
+    /// Stepping jumps over the set's songs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip: Option<bool>,
+    /// "up" | "down": move the whole set past its neighbour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    r#move: Option<String>,
+    /// Remove the set (its songs stay).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remove: Option<bool>,
 }
 
 /// Arguments for `set_setlist_footswitch`.
@@ -4558,7 +4643,7 @@ impl McpServer {
             drop(st);
             return Self::ui_bridge_tool("get_setlist", json!({}));
         }
-        ok_json(setlist_json(&st.setlist))
+        ok_json(setlist_json(&st))
     }
 
     /// Add, update, reorder, or remove a song in the setlist (#204).
@@ -4572,7 +4657,7 @@ impl McpServer {
         if let Err(e) = apply_setlist_song_headless(&mut st, &args) {
             return tool_err(e);
         }
-        ok_json(setlist_json(&st.setlist))
+        ok_json(setlist_json(&st))
     }
 
     /// Select or step the active setlist song/part without a gap (#204).
@@ -4600,22 +4685,22 @@ impl McpServer {
                 }
             }
         }
-        let zones = st.setlist.active_zones();
-        if let Err(e) = send_cmd(&mut st, Command::SetRigZones { zones }) {
+        if let Err(e) = send_show_gates(&mut st) {
             return tool_err(e);
         }
-        if let Some((song, part, _)) = st.setlist.current().map(|(s, p, pos)| (s.clone(), p.clone(), pos)) {
+        if let Some(song) = st.setlist.current().map(|(s, _, _)| s.clone()) {
             if let Some(bpm) = song.bpm {
                 let _ = send_cmd(&mut st, Command::SetBpm { bpm });
             }
             if let Some(sig) = song.time_sig {
                 let _ = send_cmd(&mut st, Command::SetTimeSignature { num: sig.num, den: sig.den });
             }
-            for pr in &part.rigs {
+            // Only song-level rigs are recalled (#273).
+            for pr in st.setlist.recalled_rigs() {
                 let _ = send_cmd(&mut st, Command::SetRigMix { rig: pr.rig, vol: Some(pr.level), pan: None, mute: None, solo: None });
             }
         }
-        ok_json(setlist_json(&st.setlist))
+        ok_json(setlist_json(&st))
     }
 
     /// Import a saved session's rigs into the current gig as a new setlist song (#204).
@@ -4646,7 +4731,54 @@ impl McpServer {
             "prev" => st.setlist.prev_cc = fs,
             other => return tool_err(format!("unknown action '{other}' (use 'next' or 'prev')")),
         }
-        ok_json(setlist_json(&st.setlist))
+        ok_json(setlist_json(&st))
+    }
+
+    /// Choose the level of one rig, aux bus or CC binding (#273).
+    #[tool(name = "set_level", description = "Choose where one rig, aux bus or CC binding lives in the show. level 'show' = every song, never touched by a song or part switch (a vocal mic, a master reverb, a volume pedal); 'set' = through the songs of one set (set = its name or 0-based index); 'song' = only where the setlist's parts use it (a part's rigs and buses; a binding works while its node's rig plays). Give rig (0-based), OR bus (aux bus node id), OR a binding's node and cc (with source 'keys' | 'hw:<device>', default keys). Without a choice a rig or bus a part uses is at song level and any other at show level; a binding follows its rig, a mixer binding is at show level.")]
+    fn set_level(&self, Parameters(args): Parameters<SetLevelArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_level", v);
+        }
+        let (graph, bindings) = (st.graph.clone(), headless_bindings(&st));
+        let msg = match st.setlist.apply_set_level(&graph, &bindings, &v) {
+            Ok(m) => m,
+            Err(e) => return tool_err(e),
+        };
+        if st.setlist.active.is_some() {
+            if let Err(e) = send_show_gates(&mut st) {
+                return tool_err(e);
+            }
+        }
+        let mut out = setlist_json(&st);
+        out["result"] = json!(msg);
+        ok_json(out)
+    }
+
+    /// Make, fill, skip, move or remove a set of songs (#273).
+    #[tool(name = "set_setlist_set", description = "Make or change a set: a named group of consecutive songs that moves or is skipped as a whole. Omit set to make a new one (name required); pass set (its name or 0-based index) to change it. songs: the 0-based song indices that make up the set, e.g. '0,1,2' (others leave it; the set's songs are kept together). skip=true makes next/prev stepping jump over its songs. move 'up' | 'down' moves the whole set past its neighbour. remove=true removes the set (its songs stay). name renames it.")]
+    fn set_setlist_set(&self, Parameters(args): Parameters<SetSetlistSetArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_setlist_set", v);
+        }
+        let msg = match st.setlist.apply_setlist_set(&v) {
+            Ok(m) => m,
+            Err(e) => return tool_err(e),
+        };
+        if st.setlist.active.is_some() {
+            if let Err(e) = send_show_gates(&mut st) {
+                return tool_err(e);
+            }
+        }
+        let mut out = setlist_json(&st);
+        out["result"] = json!(msg);
+        ok_json(out)
     }
 
     /// Configure master transport count-in.
@@ -5827,11 +5959,13 @@ mod tests {
                 SetlistPartArg {
                     name: "Verse".into(),
                     rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9) }]),
+                    buses: None,
                     capture_knobs: None,
                 },
                 SetlistPartArg {
                     name: "Chorus".into(),
                     rigs: Some(vec![SetlistPartRigArg { rig: 1, key_lo: Some(48), key_hi: Some(96), transpose: Some(12), level: Some(0.8) }]),
+                    buses: None,
                     capture_knobs: None,
                 },
             ]),
@@ -5861,6 +5995,34 @@ mod tests {
         assert_eq!(fs["foot_switch"]["next_cc"]["cc"], json!(64));
         let got = tool_json(&server.get_setlist());
         assert_eq!(got["active"]["part"], json!(1));
+    }
+
+    #[test]
+    fn set_and_level_tools_work_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 480 * 2];
+        for name in ["Opener", "Encore"] {
+            tool_json(&server.set_setlist_song(Parameters(SetSetlistSongArgs {
+                song: None, name: Some(name.into()), bpm: None, time_signature: None, parts: None, move_to: None, remove: None,
+            })));
+        }
+        let set = tool_json(&server.set_setlist_set(Parameters(SetSetlistSetArgs {
+            set: None, name: Some("Encores".into()), songs: Some("1".into()), skip: Some(true), r#move: None, remove: None,
+        })));
+        assert_eq!((set["sets"][0]["name"].as_str(), set["sets"][0]["skip"].as_bool()), (Some("Encores"), Some(true)), "{set}");
+        assert_eq!(set["songs"][1]["set"], json!("Encores"));
+        let level = |rig: u8, level: &str, set: Option<&str>| server.set_level(Parameters(SetLevelArgs {
+            level: level.into(), set: set.map(Into::into), rig: Some(rig), bus: None, node: None, cc: None, source: None,
+        }));
+        let lv = tool_json(&level(0, "set", Some("Encores")));
+        assert_eq!((lv["levels"]["rigs"][0]["level"].as_str(), lv["levels"]["rigs"][0]["pinned"].as_bool()), (Some("set"), Some(true)), "{lv}");
+        assert_eq!(level(9, "show", None).unwrap().is_error, Some(true), "a rig that is not there is refused");
+        assert_eq!(level(0, "set", Some("Nope")).unwrap().is_error, Some(true), "a set that is not there is refused");
+        let sel = tool_json(&server.select_setlist_part(Parameters(SelectSetlistPartArgs { action: None, song: Some(0), part: None })));
+        assert_eq!(sel["active"]["song"], json!(0));
+        engine.render(&mut buf, 2);
+        let stepped = tool_json(&server.select_setlist_part(Parameters(SelectSetlistPartArgs { action: Some("next_song".into()), song: None, part: None })));
+        assert_eq!(stepped["active"]["song"], json!(0), "stepping skips the skipped set: {stepped}");
     }
 
     #[test]

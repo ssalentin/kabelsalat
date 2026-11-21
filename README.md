@@ -146,6 +146,20 @@ assistant and MCP agents can read, build and step the setlist.
 
 <p align="center"><img src="docs/shots/setlist.png" width="85%" alt="The Setlist view: songs with tempo and time signature on the left, parts with per-rig key ranges, transpose, level and knob capture on the right, and the song/part stepper in the top bar"/></p>
 
+### Keep what stays through the whole show
+A vocal mic, a master reverb or a volume pedal is set up once and stays through
+every song. Each rig, aux bus and MIDI controller binding lives at **show**
+level (no song switch touches it: it keeps the whole keyboard, its fader and
+its knobs), at the level of a **set** (a named group of songs) or at **song**
+level (only where the setlist's parts use it). A rig or bus a part uses is at
+song level by itself; everything else is at show level, which is also how
+older sessions load. Group songs into sets under **Setlist → Sets & levels**,
+move a set or skip it as a whole, and choose each level there or on the
+mixer's bus strips. Agents read and set them with `get_setlist`, `set_level`
+and `set_setlist_set`.
+
+<p align="center"><img src="docs/shots/setlist-levels.png" width="85%" alt="Setlist → Sets & levels: two sets of songs (one skipped) and a level dropdown for each rig, the Hall bus and a CC 11 pedal binding"/></p>
+
 ### Browse and install plugins by type
 Press **F9** (or **B**) to open **Plugins**, organized by what each unit does
 rather than by plugin format: **Instruments**, **Effects**, **MIDI FX**,

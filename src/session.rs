@@ -2666,4 +2666,33 @@ mod tests {
         assert!(orphaned.setlist.songs[0].parts[0].params.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// #273: a package written before levels existed. Its manifest is the
+    /// one this code writes for a session without sets or pins, so it is
+    /// edited into the old shape (no `levels`, no `sets`) and checked for it.
+    #[test]
+    fn a_session_saved_before_levels_loads_with_everything_at_show_level() {
+        use crate::setlist::{Level, Part, PartRig, Song};
+        let dir = test_dir("levels-v0.2");
+        let mut s = sample_session();
+        let bus = s.graph.add_node(crate::control::NodeKind::Dsp(crate::control::DspKind::Bus), crate::control::name_bytes("HALL"));
+        let plain = Session::package_path(&dir, "Plain").unwrap();
+        s.save(&plain).unwrap();
+        let loaded = Session::load(&plain).unwrap();
+        assert!(loaded.setlist.levels.is_empty() && loaded.setlist.sets.is_empty());
+        assert_eq!(loaded.setlist.rig_level(0), Level::Show);
+        assert_eq!(loaded.setlist.bus_level(bus), Level::Show);
+
+        s.setlist.songs.push(Song::new("Opener", vec![Part::new("Verse", vec![PartRig::new(0)])]));
+        let gig = Session::package_path(&dir, "Gig").unwrap();
+        s.save(&gig).unwrap();
+        let manifest = fs::read_to_string(gig.join(SESSION_FILE)).unwrap();
+        for key in ["\"levels\"", "\"sets\"", "\"buses\"", "\"set\""] {
+            assert!(!manifest.contains(key), "the setlist is in the old shape ({key} is new)");
+        }
+        let loaded = Session::load(&gig).unwrap();
+        assert_eq!(loaded.setlist.rig_level(0), Level::Song, "the rig its song plays stays song by song, as it played");
+        assert_eq!(loaded.setlist.bus_level(bus), Level::Show);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

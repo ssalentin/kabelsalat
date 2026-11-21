@@ -6,6 +6,13 @@
 //! [`crate::control::Command::SetRigZones`] (plus tempo, time signature, rig
 //! levels, and knob values) without changing routing — held notes keep
 //! sounding until released and reverb/delay tails ring out.
+//!
+//! Songs can be grouped into sets, and every rig, send bus and controller
+//! binding has a level (show, set or song) that decides what a switch
+//! touches: see [`levels`] (#273).
+
+mod levels;
+pub use levels::{part_buses, source_str, Binding, Level, Levels, Set, SetId};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -75,6 +82,10 @@ pub struct Part {
     /// Keyed by node id like `Session::params` — remapped with the session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<ParamValue>,
+    /// Aux buses (node ids) that take signal in this part when they are at
+    /// song level (#273).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buses: Vec<NodeId>,
 }
 
 impl Part {
@@ -83,18 +94,8 @@ impl Part {
             name: name.into(),
             rigs,
             params: Vec::new(),
+            buses: Vec::new(),
         }
-    }
-
-    /// Build the 8-slot zone table for `Command::SetRigZones`.
-    pub fn zones(&self) -> [RigZone; MAX_RIGS] {
-        let mut zones = [RigZone { live: false, ..RigZone::OPEN }; MAX_RIGS];
-        for pr in &self.rigs {
-            if (pr.rig as usize) < MAX_RIGS {
-                zones[pr.rig as usize] = pr.to_zone();
-            }
-        }
-        zones
     }
 
     /// Upsert a rig entry in this part (one entry per rig index).
@@ -138,6 +139,9 @@ pub struct Song {
     /// Ordered sections of the song (at least one).
     #[serde(default)]
     pub parts: Vec<Part>,
+    /// The [`Set`] this song belongs to (#273); a set's songs are consecutive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set: Option<SetId>,
 }
 
 impl Song {
@@ -147,6 +151,7 @@ impl Song {
             bpm: None,
             time_sig: None,
             parts,
+            set: None,
         }
     }
 }
@@ -180,8 +185,9 @@ pub enum FootSwitchAction {
     Prev,
 }
 
-/// The session's setlist: ordered songs, active position, and optional
-/// foot-switch CC bindings.
+/// The session's setlist: ordered songs, active position, optional
+/// foot-switch CC bindings, the sets that group songs, and the chosen
+/// levels of rigs, buses and bindings (#273).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Setlist {
@@ -192,13 +198,18 @@ pub struct Setlist {
     pub next_cc: Option<FootSwitch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_cc: Option<FootSwitch>,
+    /// Sets in song order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sets: Vec<Set>,
+    #[serde(skip_serializing_if = "Levels::is_empty")]
+    pub levels: Levels,
 }
 
 impl Setlist {
-    /// True when the setlist has no songs and no foot-switch bindings
-    /// (so older/plain sessions omit the `"setlist"` field in `session.json`).
+    /// True when the setlist holds nothing at all (so older/plain sessions
+    /// omit the `"setlist"` field in `session.json`).
     pub fn is_empty(&self) -> bool {
-        self.songs.is_empty() && self.next_cc.is_none() && self.prev_cc.is_none()
+        self.songs.is_empty() && self.next_cc.is_none() && self.prev_cc.is_none() && self.sets.is_empty() && self.levels.is_empty()
     }
 
     /// The currently active `(song, part)` if any.
@@ -207,15 +218,6 @@ impl Setlist {
         let song = self.songs.get(pos.song)?;
         let part = song.parts.get(pos.part)?;
         Some((song, part, pos))
-    }
-
-    /// The 8-slot zone table for the engine right now.
-    /// When no song/part is active, every rig is [`RigZone::OPEN`].
-    pub fn active_zones(&self) -> [RigZone; MAX_RIGS] {
-        match self.current() {
-            Some((_, part, _)) => part.zones(),
-            None => [RigZone::OPEN; MAX_RIGS],
-        }
     }
 
     /// Select `(song, part)` if it exists.
@@ -244,13 +246,18 @@ impl Setlist {
             }
         }
         for si in (pos.song + 1)..self.songs.len() {
-            if !self.songs[si].parts.is_empty() {
+            if self.playable(si) {
                 let next = SetlistPos { song: si, part: 0 };
                 self.active = Some(next);
                 return Some(next);
             }
         }
         None
+    }
+
+    /// A song stepping can land on: it has parts and its set is not skipped.
+    fn playable(&self, song: usize) -> bool {
+        self.songs.get(song).is_some_and(|s| !s.parts.is_empty()) && !self.song_skipped(song)
     }
 
     /// Step to the previous part (crossing into the previous song's last part).
@@ -267,7 +274,7 @@ impl Setlist {
         }
         for si in (0..pos.song).rev() {
             let n = self.songs[si].parts.len();
-            if n > 0 {
+            if self.playable(si) {
                 let prev = SetlistPos { song: si, part: n - 1 };
                 self.active = Some(prev);
                 return Some(prev);
@@ -282,7 +289,7 @@ impl Setlist {
             return self.first_non_empty_pos().inspect(|&p| self.active = Some(p));
         };
         for si in (pos.song + 1)..self.songs.len() {
-            if !self.songs[si].parts.is_empty() {
+            if self.playable(si) {
                 let next = SetlistPos { song: si, part: 0 };
                 self.active = Some(next);
                 return Some(next);
@@ -297,7 +304,7 @@ impl Setlist {
             return self.first_non_empty_pos().inspect(|&p| self.active = Some(p));
         };
         for si in (0..pos.song).rev() {
-            if !self.songs[si].parts.is_empty() {
+            if self.playable(si) {
                 let prev = SetlistPos { song: si, part: 0 };
                 self.active = Some(prev);
                 return Some(prev);
@@ -307,11 +314,7 @@ impl Setlist {
     }
 
     fn first_non_empty_pos(&self) -> Option<SetlistPos> {
-        self.songs
-            .iter()
-            .enumerate()
-            .find(|(_, s)| !s.parts.is_empty())
-            .map(|(song, _)| SetlistPos { song, part: 0 })
+        (0..self.songs.len()).find(|&si| self.playable(si)).map(|song| SetlistPos { song, part: 0 })
     }
 
     /// Clamp or clear `active` so it always points to a valid `(song, part)`.
@@ -402,8 +405,11 @@ impl Setlist {
                 params.sort_by_key(|p| (p.node, p.param));
                 params.dedup_by_key(|p| (p.node, p.param));
                 part.params = params;
+                part.buses = part.buses.iter().filter_map(|&b| node_map(b)).collect();
+                part.buses.dedup();
             }
         }
+        out.remap_levels(&rig_map, &node_map);
         out.clamp_active();
         out
     }
@@ -415,8 +421,10 @@ impl Setlist {
             for part in &mut song.parts {
                 part.rigs.retain(|pr| has_rig(pr.rig));
                 part.params.retain(|p| graph.node(p.node).is_some());
+                part.buses.retain(|&b| graph.is_bus(b));
             }
         }
+        self.prune_levels(graph);
         self.clamp_active();
     }
 
@@ -454,6 +462,7 @@ impl Setlist {
             fs.cc &= 0x7F;
             fs.channel = fs.channel.map(|c| c & 0x0F);
         }
+        self.normalize_levels();
         self.clamp_active();
     }
 
@@ -516,6 +525,21 @@ impl Setlist {
             match self.songs.get(pos.song) {
                 Some(s) if pos.part < s.parts.len() => {}
                 _ => bail!("Setlist active position ({}, {}) is out of range.", pos.song, pos.part),
+            }
+        }
+        for song in &self.songs {
+            if song.set.is_some_and(|id| self.set(id).is_none()) {
+                bail!("Setlist song '{}' is in a set that does not exist.", song.name);
+            }
+        }
+        let levels = self.levels.rigs.iter().map(|p| p.level)
+            .chain(self.levels.buses.iter().map(|p| p.level))
+            .chain(self.levels.bindings.iter().map(|p| p.level));
+        for level in levels {
+            if let Level::Set(id) = level {
+                if self.set(id).is_none() {
+                    bail!("A rig, bus or binding is at the level of a set that does not exist.");
+                }
             }
         }
         Ok(())
@@ -583,7 +607,7 @@ mod tests {
         let mut s2 = Song::new("Ballad", vec![Part::new("Main", vec![PartRig::new(1)])]);
         s2.bpm = Some(74.0);
         s2.time_sig = Some(TimeSig::normalized(3, 4));
-        Setlist { songs: vec![s1, s2], active: None, next_cc: None, prev_cc: None }
+        Setlist { songs: vec![s1, s2], ..Setlist::default() }
     }
 
     #[test]
@@ -595,7 +619,7 @@ mod tests {
         let z = sl.active_zones();
         assert!(z[0].live && z[0].key_lo == 0 && z[0].key_hi == 59);
         assert!(z[1].live && z[1].key_lo == 60 && z[1].key_hi == 127 && z[1].transpose == 12);
-        assert!(!z[2].live);
+        assert_eq!(z[2], RigZone::OPEN, "rig 2, which no part names, is at show level (#273)");
         assert_eq!(sl.next_part(), Some(SetlistPos { song: 1, part: 0 }));
         assert_eq!(sl.next_part(), None, "stops at the end");
         assert_eq!(sl.prev_part(), Some(SetlistPos { song: 0, part: 1 }));

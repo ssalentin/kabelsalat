@@ -255,6 +255,7 @@ fn setlist_json(st: &State) -> Value {
             "bpm": s.bpm,
             "time_signature": s.time_sig.map(|t| t.to_json()),
             "set": sl.set_of(si).map(|x| x.name.as_str()),
+            "backing": s.backing,
             "parts": parts,
         })
     }).collect();
@@ -349,6 +350,9 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
         if let Some(ps) = &args.parts {
             st.setlist.songs[idx].parts = parse_parts(ps)?;
         }
+        if let Some(b) = &args.backing {
+            st.setlist.songs[idx].backing = crate::setlist::backing_path(b.as_deref())?;
+        }
         if let Some(to) = args.move_to {
             if to >= st.setlist.songs.len() {
                 return Err(format!("move_to {to} is out of range"));
@@ -374,6 +378,9 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
         }
         if let Some(Some(v)) = &args.time_signature {
             song.time_sig = Some(parse_sig(v)?);
+        }
+        if let Some(b) = &args.backing {
+            song.backing = crate::setlist::backing_path(b.as_deref())?;
         }
         st.setlist.songs.push(song);
         Ok(())
@@ -710,12 +717,23 @@ struct SetSetlistSongArgs {
     bpm: Option<Option<f32>>,
     /// Optional time signature `{numerator, denominator}` (null clears).
     time_signature: Option<Option<Value>>,
+    /// Absolute path of a WAV backing track the file player starts when the
+    /// song is selected (null clears).
+    backing: Option<Option<String>>,
     /// Ordered parts of the song.
     parts: Option<Vec<SetlistPartArg>>,
     /// Reorder `song` to this 0-based index.
     move_to: Option<usize>,
     /// Set true with `song` to delete that song.
     remove: Option<bool>,
+}
+
+/// Arguments for `preshow_check`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct PreshowCheckArgs {
+    /// A saved session to check (its package path; the running app also
+    /// takes a name from `list_sessions`). Omit to check the loaded show.
+    session: Option<String>,
 }
 
 /// Arguments for `select_setlist_part`.
@@ -4698,7 +4716,7 @@ impl McpServer {
     }
 
     /// Add, update, reorder, or remove a song in the setlist (#204).
-    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?, vel_lo?, vel_hi?, vel_curve?, float?}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs. vel_lo/vel_hi make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60), vel_curve is linear | soft | hard, float (0..12 keys) lets the key range's edges follow the hand that plays across them (a floating split).")]
+    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional backing: absolute path of a WAV backing track the file player starts when the song is selected (null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?, vel_lo?, vel_hi?, vel_curve?, float?}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs. vel_lo/vel_hi make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60), vel_curve is linear | soft | hard, float (0..12 keys) lets the key range's edges follow the hand that plays across them (a floating split).")]
     fn set_setlist_song(&self, Parameters(args): Parameters<SetSetlistSongArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4715,6 +4733,39 @@ impl McpServer {
             }
         }
         ok_json(setlist_json(&st))
+    }
+
+    /// The pre-show check (#278): the same table the app's Check show panel
+    /// and `kabelsalat preshow-check` run, on the check thread.
+    #[tool(name = "preshow_check", description = "Check everything that could go wrong before the first song, and change nothing: every MIDI device the show binds is plugged in, the chosen audio output and the Audio In devices are connected, every plugin is installed and loads, every rig makes sound when played (an offline probe plays each rig's demo phrase in an engine of its own), every song's backing-track file is there, disk space for recording, buffer size and render headroom, battery and power. Takes a few seconds. Returns summary and checks: [{id, title, status: ok | warning | problem, text}], where text says what to do. Without session it checks the show loaded now; session = a saved session's package path (or, attached to the app, its name from list_sessions).")]
+    fn preshow_check(&self, Parameters(args): Parameters<PreshowCheckArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("preshow_check", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        let path = args.session.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+        let mut session = crate::session::Session::new("Headless rack", st.graph.clone());
+        session.setlist = st.setlist.clone();
+        session.rig_types = st.rig_types.clone();
+        drop(st);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = crate::preshow::gather::submit(move || {
+            let report = match path {
+                Some(p) => crate::preshow::gather::check_package(&p).map_err(|e| format!("{e:#}")),
+                None => {
+                    let t = std::time::Instant::now();
+                    let facts = crate::preshow::gather::machine_facts(&session);
+                    Ok(crate::preshow::Report::of(&session, &facts, t.elapsed()))
+                }
+            };
+            let _ = tx.send(report);
+        });
+        match rx.recv() {
+            Ok(Ok(report)) if started => ok_json(report.json()),
+            Ok(Err(e)) => tool_err(format!("the pre-show check failed: {e}")),
+            _ => tool_err("the pre-show check could not run"),
+        }
     }
 
     /// Select or step the active setlist song/part without a gap (#204).
@@ -6022,6 +6073,7 @@ mod tests {
             name: Some("Opener".into()),
             bpm: Some(Some(114.0)),
             time_signature: Some(Some(json!({"numerator": 3, "denominator": 4}))),
+            backing: Some(Some("/gig/opener.wav".into())),
             parts: Some(vec![
                 SetlistPartArg {
                     name: "Verse".into(),
@@ -6043,6 +6095,7 @@ mod tests {
             remove: None,
         })));
         assert_eq!(added["songs"].as_array().unwrap().len(), 1);
+        assert_eq!(added["songs"][0]["backing"], json!("/gig/opener.wav"), "a song names its backing track (#278)");
         let sel = tool_json(&server.select_setlist_part(Parameters(SelectSetlistPartArgs {
             action: None,
             song: Some(0),
@@ -6086,7 +6139,7 @@ mod tests {
         let mut buf = vec![0.0f32; 480 * 2];
         for name in ["Opener", "Encore"] {
             tool_json(&server.set_setlist_song(Parameters(SetSetlistSongArgs {
-                song: None, name: Some(name.into()), bpm: None, time_signature: None, parts: None, move_to: None, remove: None,
+                song: None, name: Some(name.into()), bpm: None, time_signature: None, backing: None, parts: None, move_to: None, remove: None,
             })));
         }
         let set = tool_json(&server.set_setlist_set(Parameters(SetSetlistSetArgs {

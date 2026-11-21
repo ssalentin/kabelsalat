@@ -178,6 +178,7 @@ use crate::theme::{alpha, mix};
 mod console;
 mod levels;
 mod show_mode;
+mod preshow;
 use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -1497,6 +1498,8 @@ enum Waiting {
     SoundScan { call: crate::assistant::ToolCall, deadline: std::time::Instant },
     /// listen: recording the master and asking the listening model.
     Listen(std::sync::mpsc::Receiver<String>),
+    /// preshow_check: the check thread probing the show.
+    Check(std::sync::mpsc::Receiver<String>),
 }
 
 /// The tools that read an instrument's sound library.
@@ -3173,7 +3176,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo", "set_show_mode", "panic",
-    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch",
+    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch", "preshow_check",
     "set_level", "set_setlist_set",
     "inspect_plugin", "set_param", "reset_params",
 ];
@@ -3186,7 +3189,7 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_") || name.starts_with("inspect_")
-        || matches!(name, "record_status" | "measure_mix" | "listen" | "undo" | "redo")
+        || matches!(name, "record_status" | "measure_mix" | "listen" | "preshow_check" | "undo" | "redo")
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
@@ -3780,6 +3783,10 @@ struct DemoApp {
     setlist_levels_open: bool,
     /// The locked stage screen (#210), open over every view.
     show_mode: Option<show_mode::ShowMode>,
+    /// The pre-show check (#278): its panel, last report and running check.
+    preshow: preshow::PreshowState,
+    /// The song whose backing track was started last (#278).
+    setlist_backing_song: Option<usize>,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
     /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
     /// node id like the session's strips (`remap_session` carries them).
@@ -4371,6 +4378,8 @@ impl DemoApp {
             setlist_import_open: false,
             setlist_levels_open: false,
             show_mode: None,
+            preshow: Default::default(),
+            setlist_backing_song: None,
             strips: Vec::new(),
             sends: Vec::new(),
             bus_outs: Vec::new(),
@@ -6533,6 +6542,7 @@ impl DemoApp {
                 args.get("denominator").and_then(|v| v.as_u64()).unwrap_or(4),
             ),
             "get_setlist" => "Read setlist".into(),
+            "preshow_check" => "Check the show".into(),
             "set_setlist_song" => match args.get("name").and_then(|v| v.as_str()) {
                 Some(n) if !n.trim().is_empty() => format!("Setlist · {n}"),
                 _ if args.get("remove").and_then(|v| v.as_bool()) == Some(true) => "Remove setlist song".into(),
@@ -6605,6 +6615,7 @@ impl DemoApp {
                 ),
                 Waiting::Engine(_) => LiveStatus::new(doing, &["waiting for the engine"]),
                 Waiting::SoundScan { .. } => LiveStatus::new(doing, &["reading the sound library"]),
+                Waiting::Check(_) => LiveStatus::new(doing, &["checking devices, plugins and every rig"]),
             });
         }
         let after = self.active_run_user_idx
@@ -6697,6 +6708,11 @@ impl DemoApp {
                         Err(std::sync::mpsc::TryRecvError::Empty) => None,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("listen: the listening thread ended without an answer".into()),
                     },
+                    Waiting::Check(answer) => match answer.try_recv() {
+                        Ok(text) => Some(text),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("error: the pre-show check ended without an answer".into()),
+                    },
                 };
                 match outcome {
                     Some(result) => {
@@ -6724,6 +6740,11 @@ impl DemoApp {
                 let result = self.run_assistant_tool(&call.name, &call.args);
                 if let Some(answer) = self.listening.take().filter(|_| call.name == "listen") {
                     batch.waiting = Some((Waiting::Listen(answer), chip_idx));
+                    self.tool_batch = Some(batch);
+                    return;
+                }
+                if let Some(answer) = self.preshow.answer.take().filter(|_| call.name == "preshow_check") {
+                    batch.waiting = Some((Waiting::Check(answer), chip_idx));
                     self.tool_batch = Some(batch);
                     return;
                 }
@@ -8125,6 +8146,7 @@ impl DemoApp {
     /// song-level rigs' levels and stored knobs, and switch the rack view to
     /// the first live rig if needed.
     fn recall_setlist_part(&mut self) {
+        self.follow_song_backing();
         // Only song-level rigs are recalled: show- and set-level rigs keep
         // their fader and knobs through every switch (#273).
         let graph = self.mirror_graph();
@@ -8180,6 +8202,31 @@ impl DemoApp {
             }
         }
         self.session_msg = format!("{song_name} · {part_name}");
+    }
+
+    /// A switch into a song that names a backing track starts it in the file
+    /// player (at its gain, or 0.8 when it is off); a switch to a song
+    /// without one stops the track a song started (#278). Parts of the same
+    /// song leave it playing.
+    fn follow_song_backing(&mut self) {
+        let song = self.setlist.active.map(|p| p.song);
+        let track = song.and_then(|i| self.setlist.songs.get(i)).and_then(|s| s.backing.clone());
+        let cmd = match track {
+            Some(path) if self.setlist_backing_song != song => {
+                let Some(pc) = &self.player_ctrl else { return };
+                pc.play(path);
+                self.setlist_backing_song = song;
+                Command::SetPlayer { gain: if self.player.gain > 0.0 { self.player.gain } else { 0.8 } }
+            }
+            None if self.setlist_backing_song.is_some() => {
+                self.setlist_backing_song = None;
+                Command::SetPlayerEnable { on: false }
+            }
+            _ => return,
+        };
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(cmd);
+        }
     }
 
     /// Snapshot current knob values for every unit belonging to any rig in `rigs`.
@@ -8264,6 +8311,7 @@ impl DemoApp {
                 "bpm": s.bpm,
                 "time_signature": s.time_sig.map(|t| t.to_json()),
                 "set": self.setlist.set_of(si).map(|x| x.name.as_str()),
+                "backing": s.backing,
                 "parts": parts,
             })
         }).collect();
@@ -8313,6 +8361,12 @@ impl DemoApp {
             let num = v.get("numerator").and_then(|x| x.as_u64()).ok_or("time_signature.numerator required")?;
             let den = v.get("denominator").and_then(|x| x.as_u64()).ok_or("time_signature.denominator required")?;
             crate::transport::TimeSig::checked(num, den)
+        };
+        let parse_backing = |v: &serde_json::Value| -> Result<Option<String>, String> {
+            if !v.is_null() && !v.is_string() {
+                return Err("backing must be the path of a WAV file, or null".into());
+            }
+            crate::setlist::backing_path(v.as_str())
         };
         let parse_parts = |arr: &[serde_json::Value]| -> Result<Vec<Part>, String> {
             if arr.is_empty() { return Err("a song needs at least one part".into()); }
@@ -8381,6 +8435,9 @@ impl DemoApp {
             if let Some(sig_v) = args.get("time_signature") {
                 self.setlist.songs[idx].time_sig = if sig_v.is_null() { None } else { Some(parse_sig(sig_v)?) };
             }
+            if let Some(v) = args.get("backing") {
+                self.setlist.songs[idx].backing = parse_backing(v)?;
+            }
             if let Some(parts) = parsed_parts {
                 self.setlist.songs[idx].parts = parts;
             }
@@ -8414,6 +8471,9 @@ impl DemoApp {
                 if !sig_v.is_null() {
                     song.time_sig = Some(parse_sig(sig_v)?);
                 }
+            }
+            if let Some(v) = args.get("backing") {
+                song.backing = parse_backing(v)?;
             }
             self.setlist.songs.push(song);
             let idx = self.setlist.songs.len() - 1;
@@ -10260,6 +10320,7 @@ impl DemoApp {
                 }
             }
             "get_setlist" => self.setlist_json().to_string(),
+            "preshow_check" => self.preshow_tool(args),
             "set_level" => match self.exec_set_level(args) {
                 Ok(val) => {
                     self.agent_activity.record(origin, "Level set", Vec::new(), now);
@@ -16044,6 +16105,11 @@ impl DemoApp {
                 self.pending_ui_requests.push(((tool, args, reply), deadline));
                 continue;
             }
+            // Answered by the check thread, seconds later (#278).
+            if tool == "preshow_check" {
+                self.preshow_request(&args, reply);
+                continue;
+            }
             let out = match tool.as_str() {
                 t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
@@ -17638,6 +17704,7 @@ impl DemoApp {
         let mut capture_knobs_for: Option<(usize, usize)> = None;
         let mut active_part_dirty = false;
         let mut enter_show = false;
+        let mut toggle_check = false;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
@@ -17661,6 +17728,13 @@ impl DemoApp {
                             .clicked()
                         {
                             self.setlist_levels_open = !self.setlist_levels_open;
+                            self.preshow.open = false;
+                        }
+                        if theme::chip_button(ui, "Check show", self.preshow.open)
+                            .on_hover_text("what could go wrong before the first song: devices, plugins, every rig, backing tracks, disk, power")
+                            .clicked()
+                        {
+                            toggle_check = true;
                         }
                         if self.setlist.active.is_some() {
                             if theme::chip_button(ui, "All rigs", false)
@@ -18124,6 +18198,10 @@ impl DemoApp {
                         });
                         ui.add_space(10.0);
                         ui.allocate_ui_with_layout(egui::vec2(right_w, avail_h), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            if self.preshow.open {
+                                self.preshow_panel(ui, avail_h - 8.0);
+                                return;
+                            }
                             if self.setlist_levels_open {
                                 self.setlist_levels_panel(ui, avail_h - 8.0);
                                 return;
@@ -18158,7 +18236,9 @@ impl DemoApp {
                     ui.add_space(12.0);
                     Self::stage_hairline(ui);
                     ui.add_space(10.0);
-                    if self.setlist_levels_open {
+                    if self.preshow.open {
+                        self.preshow_panel(ui, avail_h - 8.0);
+                    } else if self.setlist_levels_open {
                         self.setlist_levels_panel(ui, avail_h - 8.0);
                     } else {
                         draw_right(
@@ -18178,6 +18258,9 @@ impl DemoApp {
         });
 
         // Apply deferred actions outside the UI borrows.
+        if toggle_check {
+            self.toggle_preshow_panel();
+        }
         if add_song {
             let name = self.setlist_new_song_name.trim().to_string();
             let title = if name.is_empty() {
@@ -32022,6 +32105,7 @@ impl DemoApp {
         self.follow_show();
         self.poll_assistant();
         self.serve_ui_inbox();
+        self.poll_preshow();
         self.sync_from_engine();
         for main in &mut self._surge_main {
             main.pump();
@@ -46236,7 +46320,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 40] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 41] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {
@@ -46333,6 +46417,11 @@ mod window_size_layout_tests {
                 a.exec_tool("set_setlist_set", &serde_json::json!({"name": "The second set of the evening", "songs": "0,1"}));
                 a.exec_tool("select_setlist_part", &serde_json::json!({"song": 1}));
                 a.set_show_mode(true);
+            }),
+            ("setlist pre-show check", &|a| {
+                a.stage_view = StageView::Setlist;
+                a.preshow.open = true;
+                a.preshow.report = Some(super::preshow::tests::a_report());
             }),
         ];
 }

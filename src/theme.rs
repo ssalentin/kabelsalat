@@ -1217,6 +1217,8 @@ mod font_coverage_tests {
             ("theme.rs", include_str!("theme.rs")),
             ("preview.rs", include_str!("preview.rs")),
             ("rope.rs", include_str!("rope.rs")),
+            ("preshow.rs", include_str!("preshow.rs")),
+            ("ui/preshow.rs", include_str!("ui/preshow.rs")),
         ] {
             for (c, line) in literal_symbols(src) {
                 for font in [FontId::proportional(12.0), medium_font(12.0), FontId::monospace(12.0)] {

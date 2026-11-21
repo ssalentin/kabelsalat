@@ -50,10 +50,6 @@ pub static UI_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// and surface live agent activity in the rack.
 pub static REMOTE_CMDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 
-fn ui_call(tool: String, args: Value) -> Result<String, String> {
-    ui_call_within(tool, args, Duration::from_secs(5))
-}
-
 fn ui_call_within(tool: String, args: Value, wait: Duration) -> Result<String, String> {
     if !UI_ATTACHED.load(Ordering::Relaxed) { return Err("no app UI attached".into()); }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -89,7 +85,7 @@ pub fn now_ms() -> u64 {
 fn refused_while_paused(req: &Value) -> bool {
     let op = req.get("op").and_then(Value::as_str);
     let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
-    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_");
+    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_") || tool == "preshow_check";
     op == Some("cmd") || (op == Some("ui") && !reads)
 }
 
@@ -396,11 +392,13 @@ fn handle_line_with_pub(
             json!({"ok": true})
         }
         // UI-owned tools (synth patches live on the app's main thread):
-        // queued for the app frame, answered within 5 s.
+        // queued for the app frame, answered within 5 s (the pre-show check: 60 s).
         Some("ui") => {
             let tool = req.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
             let args = req.get("args").cloned().unwrap_or(json!({}));
-            match ui_call(tool, args) {
+            // The pre-show check probes every rig: seconds, not a frame.
+            let wait = Duration::from_secs(if tool == "preshow_check" { 60 } else { 5 });
+            match ui_call_within(tool, args, wait) {
                 Ok(text) => json!({"ok": true, "data": text}),
                 Err(e) => err_reply(e),
             }

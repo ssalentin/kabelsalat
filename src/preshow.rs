@@ -539,11 +539,20 @@ fn render(_: &Session, f: &Facts) -> Outcome {
     let worst = r.max_us / (buffer_ms * 10.0);
     let setup = format!("{} frames at {} kHz ({buffer_ms:.1} ms)", r.buffer_frames, r.sample_rate as f64 / 1000.0);
     let took = format!("rendering takes {load:.0} % of a buffer, {worst:.0} % at worst");
-    if LoadLevel::of(load) == LoadLevel::Critical || worst > 100.0 {
-        return Outcome::problem(format!("{setup}: {took}, so expect dropouts. Raise the buffer in Settings ▸ Audio, or take out a heavy plugin."));
+    match LoadLevel::of(load) {
+        LoadLevel::Critical => {
+            return Outcome::problem(format!("{setup}: {took}, so expect dropouts. Raise the buffer in Settings ▸ Audio, or take out a heavy plugin."));
+        }
+        LoadLevel::High => {
+            return Outcome::warning(format!("{setup}: {took}, little headroom for a busy song. A larger buffer in Settings ▸ Audio gives more."));
+        }
+        LoadLevel::Normal => {}
     }
-    if LoadLevel::of(load) == LoadLevel::High || worst > 80.0 {
-        return Outcome::warning(format!("{setup}: {took}, little headroom for a busy song. A larger buffer in Settings ▸ Audio gives more."));
+    // One slow buffer (a patch load, say) is a late block, not a full load.
+    if worst > 100.0 {
+        return Outcome::warning(format!(
+            "{setup}: {took}: one buffer ran late. Reset the peaks in Engine Info and watch them while you play; a larger buffer gives more room."
+        ));
     }
     if let Some(x) = r.xruns.filter(|&x| x > 0) {
         return Outcome::warning(format!(
@@ -839,7 +848,7 @@ mod tests {
         assert_eq!(at(&mut f, 1000.0, 2000.0, 0), Status::Ok);
         assert_eq!(at(&mut f, 4000.0, 4200.0, 0), Status::Warning, "75 % of a 5.3 ms buffer");
         assert_eq!(at(&mut f, 5000.0, 5200.0, 0), Status::Problem, "94 %");
-        assert_eq!(at(&mut f, 1000.0, 6000.0, 0), Status::Problem, "a block longer than its buffer drops out");
+        assert_eq!(at(&mut f, 1000.0, 6000.0, 0), Status::Warning, "one late block at a light load");
         assert_eq!(at(&mut f, 1000.0, 2000.0, 3), Status::Warning, "dropouts already happened");
         f.render = Some(Render { sample_rate: 48_000, buffer_frames: 2048, avg_us: 1000.0, max_us: 2000.0, xruns: None });
         assert_eq!(row(&run(&s, &f), "render").status, Status::Warning, "43 ms of latency");

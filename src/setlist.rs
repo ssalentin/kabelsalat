@@ -648,6 +648,17 @@ impl Setlist {
     }
 }
 
+/// A song's backing track as a tool gives it: an absolute path, or
+/// nothing (None or empty clears it). The file need not exist yet: the
+/// pre-show check says when it is missing (#278).
+pub fn backing_path(path: Option<&str>) -> Result<Option<String>, String> {
+    match path.map(str::trim).filter(|p| !p.is_empty()) {
+        None => Ok(None),
+        Some(p) if std::path::Path::new(p).is_absolute() => Ok(Some(p.to_string())),
+        Some(p) => Err(format!("backing must be the absolute path of a WAV file, not '{p}'")),
+    }
+}
+
 /// Format a MIDI note number (0..=127) as a short name like `"C3"`, `"F#4"`.
 pub fn note_label(note: u8) -> String {
     const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];

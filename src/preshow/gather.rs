@@ -160,6 +160,40 @@ pub fn machine_facts(s: &Session) -> Facts {
     facts
 }
 
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Run `job` on the one thread of the process that runs checks: it is the
+/// main thread of the probe's plugin instances, so a never-free plugin it
+/// parks stays in its pool for the next check (rules 56, 133), and it waits
+/// on its channel in between (rule 47). False when no thread could start.
+pub fn submit(job: impl FnOnce() + Send + 'static) -> bool {
+    static JOBS: std::sync::Mutex<Option<std::sync::mpsc::Sender<Job>>> = std::sync::Mutex::new(None);
+    let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut job: Job = Box::new(job);
+    for _ in 0..2 {
+        if jobs.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let spawned = std::thread::Builder::new().name("kabelsalat-preshow".into()).spawn(move || {
+                for job in rx {
+                    job();
+                }
+            });
+            if spawned.is_err() {
+                return false;
+            }
+            *jobs = Some(tx);
+        }
+        // A probe that panicked took the thread with it: start another.
+        match jobs.as_ref().map(|tx| tx.send(job)) {
+            Some(Ok(())) => return true,
+            Some(Err(std::sync::mpsc::SendError(j))) => job = j,
+            None => return false,
+        }
+        *jobs = None;
+    }
+    false
+}
+
 pub fn check_package(path: &Path) -> anyhow::Result<Report> {
     let t = Instant::now();
     let session = Session::load(path)?;

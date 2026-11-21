@@ -17660,12 +17660,12 @@ impl DemoApp {
                             }
                         }
                         if let Some((s, p, pos)) = self.setlist.current() {
-                            ui.label(
+                            ui.add(egui::Label::new(
                                 egui::RichText::new(format!("LIVE  {}. {} · {}", pos.song + 1, s.name, p.name))
                                     .size(12.5)
                                     .strong()
                                     .color(theme::LIVE_TEAL),
-                            );
+                            ).truncate());
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.add(egui::Label::new(
@@ -46199,7 +46199,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 34] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 36] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {
@@ -46283,6 +46283,16 @@ mod window_size_layout_tests {
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
             ("settings-keys", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Keys }),
+            ("show mode", &|a| a.set_show_mode(true)),
+            ("show mode in a set", &|a| {
+                for name in ["Opener", "A song with a title long enough to fill the stage screen twice"] {
+                    let parts = r#"[{"name": "Second chorus after the long bridge", "rigs": [{"rig": 0}]}]"#;
+                    a.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "bpm": 132, "parts": parts}));
+                }
+                a.exec_tool("set_setlist_set", &serde_json::json!({"name": "The second set of the evening", "songs": "0,1"}));
+                a.exec_tool("select_setlist_part", &serde_json::json!({"song": 1}));
+                a.set_show_mode(true);
+            }),
         ];
 }
 

@@ -3977,17 +3977,22 @@ impl GraphEngine {
                     }
                 }
             }
-            self.with_arp_slot(dest, |a, eng| {
-                let (node, vel) = (a.node, a.velocity());
-                let mut emit = |note: u8, on: bool| eng.deliver_arp_note(node, note, on, vel);
-                a.release_all(&mut emit);
-            });
+            self.release_arp(dest);
             for i in 0..n_fed {
                 self.release_instrument(fed[i]);
             }
             return;
         }
         self.release_instrument(dest);
+    }
+
+    /// The arp lets go of its held keys and the notes it sounds.
+    fn release_arp(&mut self, dest: NodeId) {
+        self.with_arp_slot(dest, |a, eng| {
+            let (node, vel) = (a.node, a.velocity());
+            let mut emit = |note: u8, on: bool| eng.deliver_arp_note(node, note, on, vel);
+            a.release_all(&mut emit);
+        });
     }
 
     /// Note-off for all 128 notes on one instrument (voice or LV2).
@@ -4033,7 +4038,10 @@ impl GraphEngine {
 
     /// All notes off on every rig (#210), on every MIDI channel: pedals up
     /// first, so a held sustain cannot keep a released note sounding, then
-    /// every note of each instrument, arp and MIDI-FX unit. Allocation-free.
+    /// every note. Each node is released once: an arp or a MIDI-FX unit lets
+    /// go of its own state only, the instruments behind it are released in
+    /// their own turn, so no event queue takes the same 128 note-offs twice.
+    /// Allocation-free.
     fn panic(&mut self) {
         for s in self.voices.iter_mut().filter(|s| s.node != NodeId::MAX) {
             for ch in 0..16 {
@@ -4047,11 +4055,23 @@ impl GraphEngine {
                 s.plugin.control_change_ch(123, 0, ch);
             }
         }
+        for fx in self.midi_fx.iter_mut() {
+            fx.in_q.clear();
+            for ch in 0..16 {
+                fx.queue(MidiMsg::cc(ch, 64, 0));
+                fx.queue(MidiMsg::cc(ch, 123, 0));
+            }
+            for note in 0..128u8 {
+                fx.queue(MidiMsg::note_off(0, note, 0));
+            }
+        }
         for i in 0..self.graph.nodes.len() {
             let n = &self.graph.nodes[i];
-            if matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. } | NodeKind::Arp | NodeKind::MidiFx { .. }) {
-                let id = n.id;
-                self.release_all(id);
+            let id = n.id;
+            match n.kind {
+                NodeKind::Clap { .. } | NodeKind::Lv2 { .. } => self.release_instrument(id),
+                NodeKind::Arp => self.release_arp(id),
+                _ => {}
             }
         }
     }
@@ -11224,6 +11244,20 @@ mod midifx_cc_tests {
             engine.render(&mut buf, 2);
             assert_eq!(semis(&engine, fx), -MIDIFX_SEMI_MAX, "{target:?}: zero CC = bottom");
         }
+    }
+
+    /// #210: Panic lifts the pedals a MIDI effect may hold and releases its
+    /// notes, on every channel.
+    #[test]
+    fn panic_lifts_a_midi_effects_pedals_and_releases_its_notes() {
+        let (mut engine, _bus, fx) = engine_with_strip();
+        engine.apply(Command::Panic);
+        let q = &engine.midi_fx.iter().find(|s| s.node == fx).expect("unit").in_q;
+        for ch in 0..16 {
+            assert!(q.contains(&crate::matrix::MidiMsg::cc(ch, 64, 0)), "sustain up on channel {}", ch + 1);
+            assert!(q.contains(&crate::matrix::MidiMsg::cc(ch, 123, 0)), "all notes off on channel {}", ch + 1);
+        }
+        assert_eq!(q.iter().filter(|m| m.is_note_off()).count(), 128, "each note released once");
     }
 }
 

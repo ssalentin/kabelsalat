@@ -4,13 +4,17 @@
 //! [`DemoApp::show_frame`] in place of the editing frame, so no key, click or
 //! dropped file reaches the patch, the mix or the setlist. Its own input is
 //! PageUp / PageDown (a page-turner pedal; Shift for songs), the Panic button
-//! and a held Esc, which leaves. Hardware MIDI, the engine and agents keep
+//! and Esc, held until its line fills and then let go, which leaves. Hardware MIDI, the engine and agents keep
 //! running: a foot switch still steps the part, and the screen follows.
 
 use super::*;
 
-/// How long Esc is held to leave.
+/// How long Esc is held before letting go of it leaves.
 pub(super) const LEAVE_HOLD_SECS: f32 = 1.0;
+/// The floors of the master meter (`meter_db_pos`) and of a rig meter
+/// (`edge_display_level`), in dBFS.
+const MASTER_FLOOR_DB: f32 = -60.0;
+const RIG_FLOOR_DB: f32 = -48.0;
 /// How long the screen says "All notes off" after a Panic.
 const PANIC_NOTE_SECS: f32 = 2.0;
 /// One meter row: a rig or the master.
@@ -34,10 +38,23 @@ struct Board {
     part: Option<String>,
     next: Option<String>,
     tempo: String,
-    /// Live rigs: name and meter position on the −60…0 dBFS scale.
+    /// Live rigs: name and level (`rig_levels`, −48…0 dBFS).
     rigs: Vec<(String, f32)>,
     master: f32,
     master_peak: f32,
+}
+
+/// The hero's text laid out at one scale, and the height it takes.
+struct HeroBlock {
+    inner: Rect,
+    height: f32,
+    gap: f32,
+    caption: theme::TrackedLabel,
+    song: Arc<egui::Galley>,
+    part: Option<Arc<egui::Galley>>,
+    tempo: Arc<egui::Galley>,
+    /// The tempo goes under the part: both do not fit on one line.
+    stacked: bool,
 }
 
 /// The screen's bands, top to bottom.
@@ -63,11 +80,6 @@ fn regions(screen: Rect, meter_rows: usize) -> Regions {
     Regions { top, hero, next, meters, bottom }
 }
 
-/// A rig level (`edge_display_level`, −48…0 dB) on the master's −60…0 dB scale.
-fn rig_meter_pos(level: f32) -> f32 {
-    if level > 0.0 { (level * 48.0 + 12.0) / 60.0 } else { 0.0 }
-}
-
 /// The local wall-clock time, "21:47" (rule 54).
 fn clock_now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
@@ -90,6 +102,25 @@ fn tracked(p: &egui::Painter, text: &str, size: f32) -> theme::TrackedLabel {
     p.fonts_mut(|f| theme::layout_tracked(f, &text.to_uppercase(), FontId::proportional(size), 0.14))
 }
 
+/// [`tracked`] no wider than `width`: smaller down to `min` points, then cut
+/// short with an ellipsis.
+fn tracked_fit(p: &egui::Painter, text: &str, max: f32, min: f32, width: f32) -> theme::TrackedLabel {
+    let label = tracked(p, text, max);
+    if label.size.x <= width {
+        return label;
+    }
+    let size = (((max * width / label.size.x) * 2.0).floor() / 2.0).max(min);
+    let mut chars: Vec<char> = text.chars().collect();
+    loop {
+        let shown: String = if chars.len() < text.chars().count() { chars.iter().collect::<String>() + "…" } else { text.to_owned() };
+        let label = tracked(p, &shown, size);
+        if label.size.x <= width || chars.is_empty() {
+            return label;
+        }
+        chars.pop();
+    }
+}
+
 /// [`tracked`] painted at `pos`; returns its size.
 fn caption(p: &egui::Painter, pos: Pos2, text: &str, size: f32, color: Color32) -> Vec2 {
     let label = tracked(p, text, size);
@@ -97,18 +128,40 @@ fn caption(p: &egui::Painter, pos: Pos2, text: &str, size: f32, color: Color32) 
     label.size
 }
 
-/// A horizontal stepped meter (flat segments, cream → tomato → clip).
-fn paint_bar(p: &egui::Painter, r: Rect, pos: f32, peak: Option<f32>) {
+/// A horizontal stepped meter (flat segments, cream → tomato → clip) from
+/// `floor_db` to 0 dBFS; `pos` and `peak` are positions on that scale.
+fn paint_bar(p: &egui::Painter, r: Rect, pos: f32, peak: Option<f32>, floor_db: f32) {
     let segs = ((r.width() / 12.0) as usize).max(8);
     let seg_w = r.width() / segs as f32;
     let lit = lit_segments(pos, segs);
     let peak_i = peak.map(|v| ((v.clamp(0.0, 1.0) * segs as f32).ceil() as usize).min(segs));
     for i in 0..segs {
         let sr = Rect::from_min_size(Pos2::new(r.left() + i as f32 * seg_w + 1.0, r.top()), Vec2::new(seg_w - 2.0, r.height()));
-        let t = (i as f32 + 0.5) / segs as f32;
+        let db = floor_db * (1.0 - (i as f32 + 0.5) / segs as f32);
         let on = i < lit || peak_i.is_some_and(|k| k > 0 && i + 1 == k);
-        p.rect_filled(sr, 1.0, if on { theme::meter_color(t) } else { theme::METER_TRACK });
+        p.rect_filled(sr, 1.0, if on { theme::meter_color((db - MASTER_FLOOR_DB) / -MASTER_FLOOR_DB) } else { theme::METER_TRACK });
     }
+}
+
+/// The hero's text at `scale`.
+fn hero_block(p: &egui::Painter, board: &Board, hero: Rect, scale: f32) -> HeroBlock {
+    let q = |v: f32| (v * scale * 2.0).round() / 2.0;
+    let pad = q(36.0);
+    let inner = hero.shrink2(Vec2::new(pad, pad * 0.8));
+    let gap = q(10.0);
+    let caption = tracked_fit(p, &board.caption, q(20.0), q(12.0).min(12.0), inner.width());
+    let song = fitted(p, &board.song, q(112.0), q(44.0), inner.width(), theme::CREAM);
+    let tempo = p.layout_no_wrap(board.tempo.clone(), theme::medium_font(q(44.0)), theme::CREAM_META);
+    let beside = inner.width() - tempo.size().x - q(48.0);
+    let stacked = board.part.as_ref().is_some_and(|t| p.layout_no_wrap(t.clone(), theme::medium_font(q(64.0)), theme::LIVE_TEAL).size().x > beside);
+    let part = board.part.as_ref().map(|t| fitted(p, t, q(64.0), q(32.0), if stacked { inner.width() } else { beside }, theme::LIVE_TEAL));
+    let lines = match (&part, stacked) {
+        (Some(g), false) => g.size().y,
+        (Some(g), true) => g.size().y + tempo.size().y,
+        (None, _) => tempo.size().y,
+    };
+    let height = caption.size.y + gap + song.size().y + gap + lines;
+    HeroBlock { inner, height, gap, caption, song, part, tempo, stacked }
 }
 
 impl DemoApp {
@@ -125,9 +178,17 @@ impl DemoApp {
                 self.fire_keys(semi, 0.0);
             }
             self.drag = Drag::None;
+            for c in &mut self.cables {
+                (c.over_a, c.over_b) = (None, None);
+            }
             self.press = None;
             self.pending = None;
             self.hover = None;
+            self.drag_cursor = None;
+            self.drop_ghost = None;
+            self.send_drag = None;
+            self.mixer_knob_drag = None;
+            self.mixer_strip_drag = None;
             self.cc_learn = None;
             self.setlist_footswitch_learn = None;
             self.show_mode = Some(ShowMode::default());
@@ -141,9 +202,12 @@ impl DemoApp {
         if let Some(bus) = &self.bus {
             bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::Panic);
         }
+        self.release_kb_drag_note();
         self.held_keys.clear();
         self.notes_down = [0; 128];
         self.note_offs.clear();
+        self.kb_sustain = false;
+        self.kb_sustained = [false; 128];
         let now = self.ui_time;
         if let Some(show) = &mut self.show_mode {
             show.panic_at = Some(now);
@@ -178,11 +242,15 @@ impl DemoApp {
         self.publish_patch();
         self.publish_pins();
         self.show_paint(ui);
+        // Leaving waits for the release: an Esc still held, and its key
+        // repeats, would otherwise reach the editing frame and close the
+        // view Show mode was opened from.
         let esc = ctx.input(|i| i.key_down(Key::Escape));
         let now = self.ui_time;
         let leave = self.show_mode.as_mut().is_some_and(|show| {
+            let held_out = show.esc_since.is_some_and(|t| now - t >= LEAVE_HOLD_SECS);
             show.esc_since = if esc { Some(show.esc_since.unwrap_or(now)) } else { None };
-            show.esc_since.is_some_and(|t| now - t >= LEAVE_HOLD_SECS)
+            !esc && held_out
         });
         if leave {
             self.set_show_mode(false);
@@ -205,7 +273,7 @@ impl DemoApp {
         };
         let rigs = (0..self.rig_count())
             .filter(|&r| self.rig_zones.get(r).is_none_or(|z| z.live))
-            .map(|r| (self.rig_name(r), rig_meter_pos(self.rig_levels.get(r).copied().unwrap_or(0.0))))
+            .map(|r| (self.rig_name(r), self.rig_levels.get(r).copied().unwrap_or(0.0)))
             .collect();
         Board {
             caption,
@@ -242,35 +310,24 @@ impl DemoApp {
         // centred in it.
         let hero = reg.hero;
         p.rect_filled(hero, 36.0, theme::DARK_PANEL);
-        let scale = (hero.height() / 330.0).clamp(0.5, 1.4);
-        let q = |v: f32| (v * scale * 2.0).round() / 2.0;
-        let pad = q(36.0);
-        let inner = hero.shrink2(Vec2::new(pad, pad * 0.8));
-        let cap = tracked(&p, &board.caption, q(20.0));
-        let song = fitted(&p, &board.song, q(112.0), q(44.0), inner.width(), theme::CREAM);
-        let tempo = p.layout_no_wrap(board.tempo.clone(), theme::medium_font(q(44.0)), theme::CREAM_META);
-        // The tempo sits right of the part, or under it when both do not fit.
-        let beside = inner.width() - tempo.size().x - q(48.0);
-        let stacked = board.part.as_ref().is_some_and(|t| p.layout_no_wrap(t.clone(), theme::medium_font(q(64.0)), theme::LIVE_TEAL).size().x > beside);
-        let part_w = if stacked { inner.width() } else { beside };
-        let part = board.part.as_ref().map(|t| fitted(&p, t, q(64.0), q(32.0), part_w, theme::LIVE_TEAL));
-        let part_h = part.as_ref().map_or(0.0, |g| g.size().y);
-        let lines_h = match (&part, stacked) {
-            (Some(_), false) => part_h,
-            (Some(_), true) => part_h + q(4.0) + tempo.size().y,
-            (None, _) => tempo.size().y,
-        };
-        let block_h = cap.size.y + q(10.0) + song.size().y + q(8.0) + lines_h;
-        let top = (hero.center().y - block_h / 2.0).max(inner.top());
+        let mut scale = (hero.height() / 330.0).clamp(0.5, 1.4);
+        let mut block = hero_block(&p, &board, hero, scale);
+        if block.height > block.inner.height() {
+            scale *= (block.inner.height() / block.height).clamp(0.5, 1.0);
+            block = hero_block(&p, &board, hero, scale);
+        }
+        let HeroBlock { inner, height, gap, caption: cap, song, part, tempo, stacked } = block;
+        let top = (hero.center().y - height / 2.0).max(inner.top());
         theme::paint_tracked(&p, Pos2::new(inner.left(), top), &cap, theme::CREAM_DIM);
-        let song_top = top + cap.size.y + q(10.0);
-        let line_top = song_top + song.size().y + q(8.0);
+        let song_top = top + cap.size.y + gap;
+        let line_top = song_top + song.size().y + gap;
         p.galley(Pos2::new(inner.left(), song_top), song, theme::CREAM);
         let tempo_pos = match part {
             Some(part) => {
+                let part_h = part.size().y;
                 p.galley(Pos2::new(inner.left(), line_top), part, theme::LIVE_TEAL);
                 if stacked {
-                    Pos2::new(inner.left(), line_top + part_h + q(4.0))
+                    Pos2::new(inner.left(), line_top + part_h)
                 } else {
                     Pos2::new(inner.right() - tempo.size().x, line_top + part_h - tempo.size().y)
                 }
@@ -302,7 +359,8 @@ impl DemoApp {
             let g = fitted(&p, name, 28.0, 18.0, label_w - 12.0, theme::INK);
             p.galley(Pos2::new(cell.left(), cell.center().y - g.size().y / 2.0), g, theme::INK);
             let bar = Rect::from_min_max(Pos2::new(cell.left() + label_w, cell.center().y - 10.0), Pos2::new(cell.right(), cell.center().y + 10.0));
-            paint_bar(&p, bar, *pos, *peak);
+            let floor = if peak.is_some() { MASTER_FLOOR_DB } else { RIG_FLOOR_DB };
+            paint_bar(&p, bar, *pos, *peak, floor);
         }
 
         // Panic (destructive, rule 85) and the way out.
@@ -328,7 +386,9 @@ impl DemoApp {
             let note = p.layout_no_wrap("All notes off".into(), theme::medium_font(28.0), theme::CREAM_META);
             p.galley(Pos2::new(panic_rect.right() + 24.0, panic_rect.center().y - note.size().y / 2.0), note, theme::CREAM_META);
         }
-        let hint = p.layout_no_wrap("Hold Esc to leave".into(), theme::medium_font(28.0), theme::INK_2);
+        let held_out = show.esc_since.is_some_and(|t| now - t >= LEAVE_HOLD_SECS);
+        let hint = if held_out { "Let go of Esc to leave" } else { "Hold Esc to leave" };
+        let hint = p.layout_no_wrap(hint.into(), theme::medium_font(28.0), theme::INK_2);
         let hint_w = hint.size().x;
         let hint_pos = Pos2::new(bottom.right() - hint_w, bottom.center().y - hint.size().y / 2.0 - 4.0);
         let track = Rect::from_min_size(Pos2::new(hint_pos.x, hint_pos.y + hint.size().y + 6.0), Vec2::new(hint_w, 4.0));
@@ -560,6 +620,33 @@ mod tests {
         }
     }
 
+    /// Rules 30 and 53: a rig whose level decays towards silence reads dark.
+    #[test]
+    fn a_silent_rig_reads_dark() {
+        let mut app = gig();
+        let ctx = egui::Context::default();
+        app.set_show_mode(true);
+        settle(&mut app, &ctx, WIDE);
+        for u in &mut app.units {
+            u.led = 0.0;
+        }
+        app.rig_levels = vec![1e-4, 0.0];
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, WIDE));
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        fn lit(shape: &Shape, n: &mut usize) {
+            match shape {
+                Shape::Rect(r) if [theme::CREAM, theme::ACCENT, theme::CLIP_RED].contains(&r.fill) => *n += 1,
+                Shape::Vec(v) => v.iter().for_each(|s| lit(s, n)),
+                _ => {}
+            }
+        }
+        let mut n = 0;
+        out.shapes.iter().for_each(|cs| lit(&cs.shape, &mut n));
+        assert_eq!(n, 0, "no lit meter segment in silence");
+    }
+
     #[test]
     fn page_keys_step_the_part_and_song_and_a_held_esc_leaves() {
         let mut app = gig();
@@ -580,20 +667,28 @@ mod tests {
         tap(&mut app, &ctx, Key::PageUp, Modifiers::NONE);
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
 
-        // 1/60 s a frame: half the hold does nothing, the whole hold leaves.
+        // 1/60 s a frame, with the OS repeating the held key: half the hold
+        // does nothing; a full hold leaves when Esc is let go, and none of
+        // its repeats reaches the editing frame.
         let frames = (LEAVE_HOLD_SECS * 60.0) as usize;
+        let repeat = egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: true, modifiers: Modifiers::NONE };
         frame(&mut app, &ctx, WIDE, vec![key(Key::Escape, true, Modifiers::NONE)]);
         for _ in 0..frames / 2 {
-            frame(&mut app, &ctx, WIDE, vec![]);
+            frame(&mut app, &ctx, WIDE, vec![repeat.clone()]);
         }
         frame(&mut app, &ctx, WIDE, vec![key(Key::Escape, false, Modifiers::NONE)]);
         assert!(app.show_mode.is_some(), "a short press does not leave");
         frame(&mut app, &ctx, WIDE, vec![key(Key::Escape, true, Modifiers::NONE)]);
-        for _ in 0..frames + 2 {
-            frame(&mut app, &ctx, WIDE, vec![]);
+        let mut texts = Vec::new();
+        for _ in 0..frames * 2 {
+            texts = frame(&mut app, &ctx, WIDE, vec![repeat.clone()]);
         }
-        assert!(app.show_mode.is_none(), "holding Esc leaves");
-        assert_eq!(app.stage_view, StageView::Setlist, "back where Show mode was opened");
+        assert!(app.show_mode.is_some(), "still held: still on stage");
+        assert!(texts.iter().any(|(t, _)| t == "Let go of Esc to leave"), "the screen says what leaves");
+        frame(&mut app, &ctx, WIDE, vec![key(Key::Escape, false, Modifiers::NONE)]);
+        assert!(app.show_mode.is_none(), "letting go after a full hold leaves");
+        frame(&mut app, &ctx, WIDE, vec![]);
+        assert_eq!(app.stage_view, StageView::Setlist, "back where Show mode was opened, not closed by the held Esc");
     }
 
     #[test]

@@ -8093,11 +8093,18 @@ impl DemoApp {
     // -- setlist (#204) ------------------------------------------------------
 
     /// Recall the currently active setlist part (or open every rig when none is
-    /// active): sends the part's gates (`send_show_gates`, never routing), updates tempo/time
-    /// signature if specified on the song, recalls rig levels and stored knobs,
-    /// and switches the rack view to the first live rig if needed.
+    /// active): sends the part's gates (`send_show_gates`, never routing)
+    /// and the engine's active part, then `recall_setlist_part`.
     fn apply_setlist_part(&mut self) {
         self.send_show_gates();
+        self.publish_show();
+        self.recall_setlist_part();
+    }
+
+    /// Update tempo/time signature if specified on the song, recall the
+    /// song-level rigs' levels and stored knobs, and switch the rack view to
+    /// the first live rig if needed.
+    fn recall_setlist_part(&mut self) {
         // Only song-level rigs are recalled: show- and set-level rigs keep
         // their fader and knobs through every switch (#273).
         let graph = self.mirror_graph();
@@ -8569,7 +8576,8 @@ impl DemoApp {
     }
 
     /// Recall the part the engine stepped to on a show control (#261). The
-    /// engine switched the zones already; tempo, levels and knobs follow.
+    /// engine switched the zones already, and sending them again could undo
+    /// a second step it took meanwhile; tempo, levels and knobs follow.
     fn follow_show(&mut self) {
         let Some(p) = &self.graph_pub else { return };
         let Ok(g) = p.lock() else { return };
@@ -8584,7 +8592,8 @@ impl DemoApp {
         if self.setlist.active != Some(pos) {
             self.setlist.active = Some(pos);
             self.setlist_edit_song = Some(pos.song);
-            self.apply_setlist_part();
+            self.rig_zones = self.setlist.active_zones();
+            self.recall_setlist_part();
         }
     }
 
@@ -31854,10 +31863,12 @@ impl DemoApp {
                 }
             }
         }
+        // Before the assistant and remote edits: a part they pick this frame
+        // wins over a foot-switch step the engine took before it.
+        self.follow_show();
         self.poll_assistant();
         self.serve_ui_inbox();
         self.sync_from_engine();
-        self.follow_show();
         for main in &mut self._surge_main {
             main.pump();
         }
@@ -31948,7 +31959,6 @@ impl DemoApp {
         self.publish_patch();
         self.publish_pins();
         self.refresh_knob_readouts();
-        self.publish_show();
 
         self.tessellate();
         if !(self.dock == DockView::Keyboard && self.kb_expanded) {
@@ -31980,6 +31990,9 @@ impl DemoApp {
         self.save_rig_modal(&ctx);
         self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
+        // After every view and dialog of the frame, so their setlist edits
+        // reach the engine before the next foot-switch press can.
+        self.publish_show();
 
         // Full frame rate while focused (the cables are the show) or while an
         // animation / agent run is active; ~30 fps when unfocused and idle.
@@ -47646,7 +47659,8 @@ mod navigator_tests {
             "name": "Opener",
             "parts": [
                 {"name": "Verse", "rigs": [{"rig": 0, "level": 0.9}]},
-                {"name": "Chorus", "rigs": [{"rig": 1, "transpose": 12, "level": 0.6}]}
+                {"name": "Chorus", "rigs": [{"rig": 1, "transpose": 12, "level": 0.6}]},
+                {"name": "Bridge", "rigs": [{"rig": 1, "transpose": -5, "level": 0.7}]}
             ]
         }));
         let _ = app.exec_tool("set_setlist_footswitch", &serde_json::json!({"action": "next", "cc": 80}));
@@ -47655,17 +47669,26 @@ mod navigator_tests {
         let mut buf = vec![0.0f32; 64 * 2];
         engine.render(&mut buf, 2);
 
-        assert!(bus.lock().unwrap().send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 80, value: 127 }));
+        let pedal = |value: u8| Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 80, value };
+        assert!(bus.lock().unwrap().send(pedal(127)));
         engine.render(&mut buf, 2);
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }), "no frame ran yet");
         let chorus = app.setlist.songs[0].parts[1].zones();
         assert_eq!(pub_.lock().unwrap().zones, chorus, "the engine plays the chorus already");
 
+        // The second press reaches the bus before the app follows the first.
+        assert!(bus.lock().unwrap().send(pedal(0)));
+        assert!(bus.lock().unwrap().send(pedal(127)));
         app.sync_from_engine();
         app.follow_show();
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }), "the app follows");
         assert_eq!(app.rig_zones, chorus);
         assert!((app.rig_mix[1].vol - 0.6).abs() < 1e-6, "and recalls the chorus level: {:?}", app.rig_mix[1]);
+        engine.render(&mut buf, 2);
+        let bridge = app.setlist.songs[0].parts[2].zones();
+        assert_eq!(pub_.lock().unwrap().zones, bridge, "following the chorus did not undo the step to the bridge");
+        app.follow_show();
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 2 }));
     }
 
     #[test]

@@ -36,7 +36,9 @@ agents are in [AGENTS.md](../AGENTS.md).
   engine also holds every part's zones (`SetShowParts`) and the active part
   (`SetShowPart`), steps the part itself in the block the CC arrives in, and
   publishes `GraphPub::show_part`/`show_steps`; the UI then recalls the
-  part's tempo, levels and knobs. `ShowSent` sends a setlist's changes.
+  part's tempo, levels and knobs. `ShowSent` sends a setlist's changes and
+  keeps each part table (`PartZones`, an `Arc`) until the engine let go, so
+  the audio thread frees none.
 - `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
   atomics, read once), `NodeTimes` (lock-free render time per unit) and the
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`

@@ -8,7 +8,9 @@
 //! the part it stepped to (`GraphPub::show_part`, `show_steps`) and the UI
 //! recalls the rest of that part (tempo, levels, knobs).
 
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::control::{Command, RigZone};
 use crate::matrix::SourceId;
@@ -53,6 +55,30 @@ impl ShowControl {
     }
 }
 
+/// Every setlist part's zones, in setlist order (`Command::SetShowParts`).
+/// Shared, not copied: the app keeps each table it sent until the engine has
+/// let go of it (`ShowSent`), so the audio thread never frees one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartZones(Arc<[[RigZone; 8]]>);
+
+impl PartZones {
+    pub fn new(parts: Vec<[RigZone; 8]>) -> Self {
+        Self(parts.into())
+    }
+}
+
+impl Serialize for PartZones {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for PartZones {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::deserialize(d).map(Self::new)
+    }
+}
+
 /// What the engine does with a hardware message.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Take {
@@ -64,20 +90,19 @@ pub enum Take {
     Part([RigZone; 8]),
 }
 
-/// The engine's show state. Allocation-free: `set_parts` keeps the table it
-/// is given and hands back the one it replaces.
+/// The engine's show state. It neither allocates nor frees: a replaced part
+/// table is still held by the app that sent it.
 #[derive(Default)]
 pub struct Show {
     controls: ShowControls,
     /// Per slot: the control is down (its last value was 64 or above).
     down: [bool; MAX_SHOW_CONTROLS],
-    /// Per slot: the next release still reaches the instruments, once. A
-    /// control learned from a press, or bound while it was pressed, has
-    /// reached them already; without its release a sustain pedal would stay
-    /// down.
-    release_owed: [bool; MAX_SHOW_CONTROLS],
-    /// Every part's zones, in setlist order.
-    parts: Vec<[RigZone; 8]>,
+    /// Per MIDI channel, one bit per CC: the last value of it the instruments
+    /// got from hardware was 64 or above. A press heard before its control
+    /// was bound (the press a learn binds) gets its release through, so a
+    /// sustain pedal never stays down; one bound at rest passes nothing.
+    held: [u128; 16],
+    parts: Option<PartZones>,
     /// The active part, as an index into `parts`.
     part: Option<usize>,
     /// Parts the engine stepped to itself.
@@ -85,20 +110,28 @@ pub struct Show {
 }
 
 impl Show {
-    /// Replace the table. A slot whose control changed starts up, and owes
-    /// its next release to the instruments.
+    /// Replace the table. A slot whose control changed starts down when the
+    /// instruments hold its press, so that press steps nothing.
     pub fn set_controls(&mut self, controls: ShowControls) {
         for (i, c) in controls.iter().enumerate() {
             if *c != self.controls[i] {
-                self.down[i] = false;
-                self.release_owed[i] = c.is_some();
+                self.down[i] = c.is_some_and(|c| self.held_by_instruments(c));
             }
         }
         self.controls = controls;
     }
 
-    pub fn set_parts(&mut self, parts: Vec<[RigZone; 8]>) -> Vec<[RigZone; 8]> {
-        std::mem::replace(&mut self.parts, parts)
+    fn held_by_instruments(&self, c: ShowControl) -> bool {
+        let ShowMsg::Cc(cc) = c.msg;
+        let bit = 1u128 << (cc & 0x7F);
+        match c.channel {
+            Some(ch) => self.held[(ch & 0x0F) as usize] & bit != 0,
+            None => self.held.iter().any(|h| h & bit != 0),
+        }
+    }
+
+    pub fn set_parts(&mut self, parts: PartZones) {
+        self.parts = Some(parts);
     }
 
     pub fn set_part(&mut self, part: Option<usize>) {
@@ -116,13 +149,17 @@ impl Show {
     /// A message from `source`, `value` its data byte (a CC's value).
     pub fn take(&mut self, source: SourceId, channel: u8, msg: ShowMsg, value: u8) -> Take {
         let SourceId::Hardware(device) = source else { return Take::Route };
+        let ShowMsg::Cc(cc) = msg;
+        let (held, bit) = (&mut self.held[(channel & 0x0F) as usize], 1u128 << (cc & 0x7F));
+        let down = value >= 64;
         let Some(i) = self.controls.iter().position(|c| c.is_some_and(|c| c.takes(device, channel, msg))) else {
+            if down { *held |= bit } else { *held &= !bit }
             return Take::Route;
         };
-        let down = value >= 64;
         let pressed = down && !self.down[i];
         self.down[i] = down;
-        if !down && std::mem::take(&mut self.release_owed[i]) {
+        if !down && *held & bit != 0 {
+            *held &= !bit;
             return Take::Route;
         }
         if !pressed {
@@ -138,7 +175,8 @@ impl Show {
     /// Move by `by` parts and stop at either end. With no part active, any
     /// step goes to the first part (as `Setlist::next_part` does).
     fn step(&mut self, by: isize) -> Take {
-        let Some(last) = self.parts.len().checked_sub(1) else { return Take::Consumed };
+        let parts = self.parts.as_ref().map_or(&[][..], |p| &p.0[..]);
+        let Some(last) = parts.len().checked_sub(1) else { return Take::Consumed };
         let to = match self.part {
             None => 0,
             Some(p) => p.min(last).saturating_add_signed(by).min(last),
@@ -146,9 +184,10 @@ impl Show {
         if self.part == Some(to) {
             return Take::Consumed;
         }
+        let zones = parts[to];
         self.part = Some(to);
         self.steps += 1;
-        Take::Part(self.parts[to])
+        Take::Part(zones)
     }
 }
 
@@ -157,7 +196,8 @@ impl Show {
 #[derive(Default)]
 pub struct ShowSent {
     controls: ShowControls,
-    parts: Vec<[RigZone; 8]>,
+    /// Every part table the engine may still hold, the one sent last at the end.
+    parts: Vec<PartZones>,
     /// The active part as the engine knows it. Set it when the engine moved
     /// the part itself, so the frontend does not send that move back.
     pub part: Option<usize>,
@@ -165,15 +205,19 @@ pub struct ShowSent {
 
 impl ShowSent {
     /// Send what changed; a command `send` refuses (bus full) is sent again
-    /// next time.
+    /// next time. A part table the engine let go of is freed here.
     pub fn publish(&mut self, setlist: &crate::setlist::Setlist, mut send: impl FnMut(Command) -> bool) {
         let controls = setlist.show_controls();
         if controls != self.controls && send(Command::SetShowControls { controls }) {
             self.controls = controls;
         }
-        let parts = setlist.part_zones();
-        if parts != self.parts && send(Command::SetShowParts { parts: parts.clone() }) {
-            self.parts = parts;
+        self.parts.retain(|p| Arc::strong_count(&p.0) > 1);
+        let zones = setlist.part_zones();
+        if self.parts.last().map_or(&[][..], |p| &p.0[..]) != &zones[..] {
+            let parts = PartZones::new(zones);
+            if send(Command::SetShowParts { parts: parts.clone() }) {
+                self.parts.push(parts);
+            }
         }
         let part = setlist.active_index();
         if part != self.part && send(Command::SetShowPart { part }) {
@@ -202,7 +246,7 @@ mod tests {
             *slot = Some(*c);
         }
         s.set_controls(t);
-        s.set_parts(vec![part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN), part(RigZone::OPEN, RigZone::OPEN)]);
+        s.set_parts(PartZones::new(vec![part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN), part(RigZone::OPEN, RigZone::OPEN)]));
         s
     }
 
@@ -219,15 +263,15 @@ mod tests {
         let mut s = show(&[NEXT, PREV]);
         assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, OFF)), "nothing active: the first part");
         assert_eq!(cc(&mut s, 80, 127), Take::Consumed, "held: no second step");
-        assert_eq!(cc(&mut s, 80, 0), Take::Route, "the first release after binding is owed");
+        assert_eq!(cc(&mut s, 80, 0), Take::Consumed, "nor does its release reach the instruments");
         assert_eq!(cc(&mut s, 80, 127), Take::Part(part(OFF, RigZone::OPEN)));
-        assert_eq!(cc(&mut s, 80, 0), Take::Consumed, "later releases are the switch's own");
+        assert_eq!(cc(&mut s, 80, 0), Take::Consumed);
         assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, RigZone::OPEN)));
         assert_eq!(cc(&mut s, 80, 0), Take::Consumed);
         assert_eq!(cc(&mut s, 80, 127), Take::Consumed, "at the last part");
         assert_eq!((s.part(), s.steps()), (Some(2), 3));
         assert_eq!(cc(&mut s, 81, 127), Take::Part(part(OFF, RigZone::OPEN)));
-        assert_eq!(cc(&mut s, 81, 0), Take::Route);
+        assert_eq!(cc(&mut s, 81, 0), Take::Consumed);
         assert_eq!(cc(&mut s, 81, 127), Take::Part(part(RigZone::OPEN, OFF)));
         assert_eq!(cc(&mut s, 81, 0), Take::Consumed);
         assert_eq!(cc(&mut s, 81, 127), Take::Consumed, "at the first part");
@@ -248,24 +292,37 @@ mod tests {
     #[test]
     fn a_press_with_no_parts_is_still_consumed() {
         let mut s = show(&[NEXT]);
-        s.set_parts(Vec::new());
+        s.set_parts(PartZones::new(Vec::new()));
         assert_eq!(cc(&mut s, 80, 127), Take::Consumed);
         assert_eq!(s.part(), None);
     }
 
     #[test]
-    fn rebinding_a_slot_owes_one_release_and_an_unchanged_slot_keeps_its_state() {
+    fn the_press_a_control_is_learned_from_steps_nothing_and_its_release_gets_through() {
+        let mut s = show(&[]);
+        assert_eq!(cc(&mut s, 80, 127), Take::Route, "not bound yet: the instruments hear the press");
+        let mut t = NO_SHOW_CONTROLS;
+        t[0] = Some(NEXT);
+        s.set_controls(t);
+        assert_eq!(cc(&mut s, 80, 127), Take::Consumed, "the held press steps nothing");
+        assert_eq!(cc(&mut s, 80, 0), Take::Route, "its release reaches the instruments, so nothing stays held");
+        assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, OFF)));
+        assert_eq!(cc(&mut s, 80, 0), Take::Consumed, "from then on the switch is the show's alone");
+    }
+
+    #[test]
+    fn a_rebind_changes_only_its_own_slot() {
         let mut s = show(&[NEXT, PREV]);
         cc(&mut s, 80, 127);
-        cc(&mut s, 80, 0);
-        cc(&mut s, 81, 127);
         let mut t = NO_SHOW_CONTROLS;
         t[0] = Some(NEXT);
         t[1] = Some(ShowControl { msg: ShowMsg::Cc(82), ..PREV });
         s.set_controls(t);
-        assert_eq!(cc(&mut s, 80, 0), Take::Consumed, "NEXT was not rebound: its release was paid");
-        assert_eq!(cc(&mut s, 82, 0), Take::Route, "the new PREV owes one");
-        assert_eq!(cc(&mut s, 81, 0), Take::Route, "CC 81 is no show control any more");
+        assert_eq!(cc(&mut s, 80, 127), Take::Consumed, "NEXT was not rebound: it is still down");
+        assert_eq!(cc(&mut s, 81, 127), Take::Route, "CC 81 is no show control any more");
+        cc(&mut s, 80, 0);
+        assert_eq!(cc(&mut s, 80, 127), Take::Part(part(OFF, RigZone::OPEN)));
+        assert_eq!(cc(&mut s, 82, 127), Take::Part(part(RigZone::OPEN, OFF)), "the new PREV steps back");
     }
 
     #[test]
@@ -285,20 +342,44 @@ mod tests {
             Command::SetShowControls { controls },
             Command::SetShowParts { parts },
             Command::SetShowPart { part: Some(1) },
-        ] if controls[0].is_some_and(|c| c.msg == ShowMsg::Cc(80) && c.action == ShowAction::NextPart) && parts.len() == 2));
-        out.clear();
+        ] if controls[0].is_some_and(|c| c.msg == ShowMsg::Cc(80) && c.action == ShowAction::NextPart) && parts.0.len() == 2));
         sent.publish(&sl, |c| {
             out.push(c);
             true
         });
-        assert!(out.is_empty(), "nothing changed, nothing sent");
+        assert_eq!(out.len(), 3, "nothing changed, nothing sent");
         sl.select(0, 0);
         sent.publish(&sl, |_| false);
         sent.publish(&sl, |c| {
             out.push(c);
             true
         });
-        assert!(matches!(&out[..], [Command::SetShowPart { part: Some(0) }]), "the refused move is sent again");
+        assert!(matches!(&out[3..], [Command::SetShowPart { part: Some(0) }]), "the refused move is sent again");
+    }
+
+    #[test]
+    fn a_replaced_part_table_is_freed_by_the_app_never_by_the_engine() {
+        use crate::setlist::{Part, PartRig, Setlist, Song};
+        let mut sl = Setlist::default();
+        sl.songs.push(Song::new("Opener", vec![Part::new("Verse", vec![PartRig::new(0)])]));
+        let mut engine = Show::default();
+        let mut sent = ShowSent::default();
+        let mut publish = |sent: &mut ShowSent, sl: &Setlist| {
+            sent.publish(sl, |c| {
+                if let Command::SetShowParts { parts } = c {
+                    engine.set_parts(parts);
+                }
+                true
+            })
+        };
+        publish(&mut sent, &sl);
+        let first = Arc::downgrade(&sent.parts[0].0);
+        sl.songs[0].parts[0].rigs[0].transpose = 5;
+        publish(&mut sent, &sl);
+        assert_eq!(first.strong_count(), 1, "the engine let go of the old table while the app still held it");
+        publish(&mut sent, &sl);
+        assert_eq!(first.strong_count(), 0, "the app freed it on its next publish");
+        assert_eq!(sent.parts.len(), 1, "and keeps the table the engine holds");
     }
 
     #[test]

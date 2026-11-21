@@ -416,9 +416,8 @@ fn switch(cc: u8, value: u8) -> Command {
 }
 
 /// The foot-switch scenario's setlist in the engine: `SONGS` as parts, and
-/// `NEXT_CC` / `PREV_CC` as the foot switches that step through them. The
-/// last two commands pay the release each new switch owes the instruments.
-fn show_commands() -> [Command; 4] {
+/// `NEXT_CC` / `PREV_CC` as the foot switches that step through them.
+fn show_commands() -> [Command; 2] {
     use crate::show::{ShowAction, ShowControl, ShowMsg};
     let control = |cc, action| Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action });
     let mut controls = crate::show::NO_SHOW_CONTROLS;
@@ -429,7 +428,7 @@ fn show_commands() -> [Command; 4] {
         zones[..2].copy_from_slice(song);
         zones
     });
-    [Command::SetShowControls { controls }, Command::SetShowParts { parts: parts.collect() }, switch(NEXT_CC, 0), switch(PREV_CC, 0)]
+    [Command::SetShowControls { controls }, Command::SetShowParts { parts: crate::show::PartZones::new(parts.collect()) }]
 }
 
 /// Keys(0) → Surge A(1) and Surge B(3) over MIDI cables 1 and 6, both into

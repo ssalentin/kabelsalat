@@ -431,8 +431,6 @@ pub enum VoiceMsg {
 pub enum VoiceBack {
     Voice(VoiceSlot),
     Table(Vec<VoiceSlot>),
-    /// A setlist part table `SetShowParts` replaced.
-    Parts(Vec<[RigZone; 8]>),
 }
 
 /// Voices the engine holds before the host has to send a larger table.
@@ -4503,10 +4501,7 @@ impl GraphEngine {
             Command::SetBusLive { bus, live } => self.show_gates.set_bus(bus, live),
             Command::SetBindingLive { source, dest, cc, live } => self.show_gates.set_binding(source, dest, cc, live),
             Command::SetShowControls { controls } => self.show.set_controls(controls),
-            Command::SetShowParts { parts } => {
-                let old = self.show.set_parts(parts);
-                self.send_back(VoiceBack::Parts(old));
-            }
+            Command::SetShowParts { parts } => self.show.set_parts(parts),
             Command::SetShowPart { part } => self.show.set_part(part),
             Command::SetStripMix { node, pan, mute, solo } => {
                 self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo, send: None });
@@ -8260,7 +8255,7 @@ mod tests {
             z
         };
         bus.send(Command::SetShowControls { controls });
-        bus.send(Command::SetShowParts { parts: vec![part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN)] });
+        bus.send(Command::SetShowParts { parts: crate::show::PartZones::new(vec![part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN)]) });
         bus.send(Command::SetShowPart { part: Some(0) });
         play(e, bus, zones(RigZone::OPEN, OFF));
     }
@@ -8299,6 +8294,7 @@ mod tests {
         let cc = |value: u8| Command::Cc { source: PEDAL, channel: 0, cc: 64, value };
         assert!(passed(&mut e, &mut bus, cc(127)).is_empty(), "the press holds no sustain");
         assert!(!e.rig_zones[0].live && e.rig_zones[1].live, "it stepped");
+        assert!(passed(&mut e, &mut bus, cc(0)).is_empty(), "and its release lifts none");
     }
 
     #[test]

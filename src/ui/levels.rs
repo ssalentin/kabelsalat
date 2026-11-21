@@ -39,13 +39,27 @@ impl DemoApp {
     /// Put the active part's zones, closed buses and pinned bindings into the
     /// engine (everything open when no part is active).
     pub(super) fn send_show_gates(&mut self) {
+        self.ui_zone_grace = self.ui_time + 0.6;
+        self.send_gates(true);
+    }
+
+    /// The gates of a part the engine stepped to on a foot switch (#261):
+    /// its closed buses and pinned bindings, one UI frame after the step.
+    /// The engine switched the zones itself, and sending them again could
+    /// undo a second step it took meanwhile.
+    pub(super) fn send_show_gates_after_engine_step(&mut self) {
+        self.send_gates(false);
+    }
+
+    fn send_gates(&mut self, zones: bool) {
         let gates = self.setlist.gates(&self.mirror_graph());
         self.rig_zones = gates.zones;
-        self.ui_zone_grace = self.ui_time + 0.6;
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap_or_else(|e| e.into_inner());
             for c in gates.commands() {
-                let _ = b.send(c);
+                if zones || !matches!(c, Command::SetRigZones { .. }) {
+                    let _ = b.send(c);
+                }
             }
         }
     }

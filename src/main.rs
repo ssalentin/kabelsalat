@@ -48,6 +48,7 @@ mod record;
 mod rope;
 mod session;
 mod setlist;
+mod show;
 mod sounds;
 mod theme;
 mod transport;

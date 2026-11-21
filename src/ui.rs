@@ -3752,8 +3752,10 @@ struct DemoApp {
     setlist: crate::setlist::Setlist,
     /// When armed, the next hardware MIDI CC binds that foot-switch action.
     setlist_footswitch_learn: Option<crate::setlist::FootSwitchAction>,
-    /// Tracks rising edge (>= 64) per `(channel, cc)` for foot-switch triggers.
-    setlist_cc_high: std::collections::HashMap<(u8, u8), bool>,
+    /// The engine's copy of the setlist's show controls and parts (#261).
+    show_sent: crate::show::ShowSent,
+    /// `GraphPub::show_steps` last followed.
+    show_steps_seen: u64,
     /// Song index currently selected for editing in the Setlist view.
     setlist_edit_song: Option<usize>,
     /// Text input for adding a new song in the Setlist view.
@@ -4346,7 +4348,8 @@ impl DemoApp {
             ui_zone_grace: -1.0,
             setlist: crate::setlist::Setlist::default(),
             setlist_footswitch_learn: None,
-            setlist_cc_high: std::collections::HashMap::new(),
+            show_sent: crate::show::ShowSent::default(),
+            show_steps_seen: 0,
             setlist_edit_song: None,
             setlist_new_song_name: String::new(),
             setlist_new_part_name: String::new(),
@@ -8090,11 +8093,18 @@ impl DemoApp {
     // -- setlist (#204) ------------------------------------------------------
 
     /// Recall the currently active setlist part (or open every rig when none is
-    /// active): sends the part's gates (`send_show_gates`, never routing), updates tempo/time
-    /// signature if specified on the song, recalls rig levels and stored knobs,
-    /// and switches the rack view to the first live rig if needed.
+    /// active): sends the part's gates (`send_show_gates`, never routing)
+    /// and the engine's active part, then `recall_setlist_part`.
     fn apply_setlist_part(&mut self) {
         self.send_show_gates();
+        self.publish_show();
+        self.recall_setlist_part();
+    }
+
+    /// Update tempo/time signature if specified on the song, recall the
+    /// song-level rigs' levels and stored knobs, and switch the rack view to
+    /// the first live rig if needed.
+    fn recall_setlist_part(&mut self) {
         // Only song-level rigs are recalled: show- and set-level rigs keep
         // their fader and knobs through every switch (#273).
         let graph = self.mirror_graph();
@@ -8535,11 +8545,11 @@ impl DemoApp {
         Ok((song_idx, new_rig_indices))
     }
 
-    /// Handle incoming hardware MIDI CC for setlist foot-switch learn or step.
-    /// Returns `true` if the CC was consumed by setlist learn or trigger.
-    fn handle_setlist_cc(&mut self, ch: u8, cc: u8, val: u8) -> bool {
+    /// Learn a hardware CC as a setlist foot switch. Returns `true` when the
+    /// CC is a foot switch's, so no knob learns or follows it; the engine
+    /// steps the part on it (#261).
+    fn handle_setlist_cc(&mut self, ch: u8, cc: u8) -> bool {
         let cc = cc & 0x7F;
-        let high = val >= 64;
         if let Some(action) = self.setlist_footswitch_learn.take() {
             let fs = crate::setlist::FootSwitch { cc, channel: None };
             match action {
@@ -8552,24 +8562,39 @@ impl DemoApp {
                     self.session_msg = format!("Learned CC {cc} for Previous part");
                 }
             }
-            self.setlist_cc_high.insert((ch, cc), high);
             return true;
         }
-        let prev_high = self.setlist_cc_high.insert((ch, cc), high).unwrap_or(false);
-        let rising = high && !prev_high;
-        if self.setlist.next_cc.is_some_and(|fs| fs.matches(ch, cc)) {
-            if rising && !self.setlist.songs.is_empty() {
-                let _ = self.step_setlist("next_part");
-            }
-            return true;
+        [self.setlist.next_cc, self.setlist.prev_cc].iter().flatten().any(|fs| fs.matches(ch, cc))
+    }
+
+    /// Send the engine what changed of the setlist's show controls, parts
+    /// and active part (#261).
+    fn publish_show(&mut self) {
+        let Some(bus) = &self.bus else { return };
+        let mut b = bus.lock().unwrap_or_else(|e| e.into_inner());
+        self.show_sent.publish(&self.setlist, |cmd| b.send(cmd));
+    }
+
+    /// Recall the part the engine stepped to on a show control (#261). The
+    /// engine switched the zones already; buses, bindings, tempo, levels and
+    /// knobs follow here.
+    fn follow_show(&mut self) {
+        let Some(p) = &self.graph_pub else { return };
+        let Ok(g) = p.lock() else { return };
+        if g.show_steps == self.show_steps_seen {
+            return;
         }
-        if self.setlist.prev_cc.is_some_and(|fs| fs.matches(ch, cc)) {
-            if rising && !self.setlist.songs.is_empty() {
-                let _ = self.step_setlist("prev_part");
-            }
-            return true;
+        self.show_steps_seen = g.show_steps;
+        let part = g.show_part;
+        drop(g);
+        self.show_sent.part = part;
+        let Some(pos) = part.and_then(|i| self.setlist.pos_at(i)) else { return };
+        if self.setlist.active != Some(pos) {
+            self.setlist.active = Some(pos);
+            self.setlist_edit_song = Some(pos.song);
+            self.send_show_gates_after_engine_step();
+            self.recall_setlist_part();
         }
-        false
     }
 
     /// Restore an LV2 node's plugin state (a Vital patch) and keep it for
@@ -31838,6 +31863,9 @@ impl DemoApp {
                 }
             }
         }
+        // Before the assistant and remote edits: a part they pick this frame
+        // wins over a foot-switch step the engine took before it.
+        self.follow_show();
         self.poll_assistant();
         self.serve_ui_inbox();
         self.sync_from_engine();
@@ -31899,7 +31927,7 @@ impl DemoApp {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
             self.last_midi = Some(self.midi_event_text(src, &format!("CC{cc} {val}")));
-            if self.handle_setlist_cc(ch, cc, val) {
+            if self.handle_setlist_cc(ch, cc) {
                 continue;
             }
             let learned = self.feed_cc_learn(src, cc, val);
@@ -31962,6 +31990,9 @@ impl DemoApp {
         self.save_rig_modal(&ctx);
         self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
+        // After every view and dialog of the frame, so their setlist edits
+        // reach the engine before the next foot-switch press can.
+        self.publish_show();
 
         // Full frame rate while focused (the cables are the show) or while an
         // animation / agent run is active; ~30 fps when unfocused and idle.
@@ -47615,6 +47646,81 @@ mod navigator_tests {
     }
 
     #[test]
+    fn after_an_engine_step_the_app_sends_the_parts_gates_but_not_its_zones() {
+        let (mut app, _) = two_rigs_with_inserts(false);
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Opener",
+            "parts": [{"name": "Verse", "rigs": [{"rig": 0}]}, {"name": "Chorus", "rigs": [{"rig": 1}]}]
+        }));
+        app.select_setlist(0, 0).unwrap();
+        drain.drain(|_| {});
+        let stepped = crate::engine::GraphPub { show_part: Some(1), show_steps: 1, ..Default::default() };
+        app.graph_pub = Some(Arc::new(Mutex::new(stepped)));
+        app.follow_show();
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
+        assert!(sent.iter().any(|c| matches!(c, Command::ClearShowGates)), "the chorus's buses and bindings go out: {sent:?}");
+        assert!(
+            !sent.iter().any(|c| matches!(c, Command::SetRigZones { .. })),
+            "its zones do not: the engine set them, and may be past them already"
+        );
+        assert_eq!(app.rig_zones, app.setlist.active_zones());
+    }
+
+    #[test]
+    fn a_foot_switch_steps_the_part_in_the_engine_and_the_app_recalls_the_rest() {
+        let (mut app, _) = two_rigs_with_inserts(false);
+        let (tx, drain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let bus = Arc::new(Mutex::new(tx));
+        app.bus = Some(bus.clone());
+        app.graph_pub = Some(pub_.clone());
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Opener",
+            "parts": [
+                {"name": "Verse", "rigs": [{"rig": 0, "level": 0.9}]},
+                {"name": "Chorus", "rigs": [{"rig": 1, "transpose": 12, "level": 0.6}]},
+                {"name": "Bridge", "rigs": [{"rig": 1, "transpose": -5, "level": 0.7}]}
+            ]
+        }));
+        let _ = app.exec_tool("set_setlist_footswitch", &serde_json::json!({"action": "next", "cc": 80}));
+        // Rig A plays through the whole show (#273), whatever the part names.
+        app.setlist.pin_rig(0, crate::setlist::Level::Show);
+        app.select_setlist(0, 0).unwrap();
+        app.publish_show();
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let zones_of = |app: &DemoApp, part: usize| app.setlist.zones_of(&app.setlist.songs[0], &app.setlist.songs[0].parts[part]);
+
+        let pedal = |value: u8| Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 80, value };
+        assert!(bus.lock().unwrap().send(pedal(127)));
+        engine.render(&mut buf, 2);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }), "no frame ran yet");
+        let chorus = zones_of(&app, 1);
+        assert!(chorus[0].live && chorus[1].live && chorus[1].transpose == 12, "{chorus:?}");
+        assert_eq!(pub_.lock().unwrap().zones, chorus, "the engine plays the chorus already, the show-level rig A too");
+
+        // The second press reaches the bus before the app follows the first.
+        assert!(bus.lock().unwrap().send(pedal(0)));
+        assert!(bus.lock().unwrap().send(pedal(127)));
+        app.sync_from_engine();
+        app.follow_show();
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }), "the app follows");
+        assert_eq!(app.rig_zones, chorus);
+        assert!((app.rig_mix[1].vol - 0.6).abs() < 1e-6, "and recalls the chorus level: {:?}", app.rig_mix[1]);
+        engine.render(&mut buf, 2);
+        let bridge = zones_of(&app, 2);
+        assert_eq!(pub_.lock().unwrap().zones, bridge, "following the chorus did not undo the step to the bridge");
+        app.follow_show();
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 2 }));
+    }
+
+    #[test]
     fn setlist_ui_tests_tools_persistence_rig_edits_undo_and_footswitch() {
         // 1. Agent / MCP parity (rules 6, 23).
         let tools = crate::assistant::tools();
@@ -47655,16 +47761,14 @@ mod navigator_tests {
         assert!(app.rig_zones[0].live && app.rig_zones[0].key_hi == 59);
         assert!(app.rig_zones[1].live && app.rig_zones[1].key_lo == 60 && app.rig_zones[1].transpose == 12);
 
-        // 3. Foot-switch CC learn & rising-edge trigger (no double-step on hold/release).
+        // 3. Foot-switch CC learn. The engine steps on it (#261), the app only
+        // keeps it away from its knobs.
         app.setlist_footswitch_learn = Some(crate::setlist::FootSwitchAction::Prev);
-        assert!(app.handle_setlist_cc(0, 67, 127), "learn consumes CC");
+        assert!(app.handle_setlist_cc(0, 67), "learn consumes CC");
         assert_eq!(app.setlist.prev_cc, Some(crate::setlist::FootSwitch { cc: 67, channel: None }));
+        assert!(app.handle_setlist_cc(0, 67), "a foot switch's CC moves no knob");
+        assert!(!app.handle_setlist_cc(0, 1));
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
-        // Release pedal (val 0), then press again (val 127): steps back to Verse (part 0).
-        assert!(app.handle_setlist_cc(0, 67, 0));
-        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
-        assert!(app.handle_setlist_cc(0, 67, 127));
-        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }));
 
         // 4. Survives save/load round-trip.
         let dir = std::env::temp_dir().join(format!("kabelsalat-setlist-ui-{}", std::process::id()));

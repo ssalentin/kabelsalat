@@ -61,6 +61,18 @@ out / in) and `LoadStart` (which opens every zone). The engine's
 `rig_zones` are part of the fingerprint. Property as in the routing
 scenario: a released key leaves nothing it started sounding.
 
+## Foot-switch scenario (issue #261)
+
+`held_notes_are_released_across_foot_switch_steps` starts from the zones
+scenario's patch with `SONGS` as the engine's setlist parts
+(`SetShowParts`) and two show controls: hardware CC 80 steps to the next
+part, CC 81 to the previous one. Its alphabet is the notes, a tap on either
+switch (press, then release: the engine steps the part and switches the
+zones itself), `SetRigZones` with songs 3 and 4 (a song picked in the UI
+meanwhile), Keys → A transpose +12 / 0, split at 60 / none, and `LoadStart`.
+The engine's part index is part of the fingerprint, its step counter is
+not (it only grows). Expect about 19.5k states to a fixpoint, ~15 s.
+
 ## How it works (enough to judge a result)
 
 - A breadth-first search over the **real** `GraphEngine::apply`

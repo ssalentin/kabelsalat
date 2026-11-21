@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::{Graph, NodeId, RigZone};
 use crate::session::ParamValue;
+use crate::show::{ShowAction, ShowControl, ShowControls, ShowMsg, ShowPart, NO_SHOW_CONTROLS};
 use crate::transport::TimeSig;
 
 /// Maximum number of rigs the engine's zone table serves right now (#205 raises this).
@@ -218,6 +219,48 @@ impl Setlist {
         let song = self.songs.get(pos.song)?;
         let part = song.parts.get(pos.part)?;
         Some((song, part, pos))
+    }
+
+    /// Every part in setlist order as the engine steps through it on a foot
+    /// switch (#261): its song, whether stepping passes over that song, and
+    /// its level-aware zones. Songs without parts add nothing.
+    pub fn show_parts(&self) -> Vec<ShowPart> {
+        self.songs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, song)| {
+                let skip = self.song_skipped(i);
+                song.parts.iter().map(move |part| ShowPart { song: i, skip, zones: self.zones_of(song, part) })
+            })
+            .collect()
+    }
+
+    /// The active part's index in `show_parts`.
+    pub fn active_index(&self) -> Option<usize> {
+        let (_, _, pos) = self.current()?;
+        Some(self.songs[..pos.song].iter().map(|s| s.parts.len()).sum::<usize>() + pos.part)
+    }
+
+    /// The position of `show_parts()[index]`.
+    pub fn pos_at(&self, index: usize) -> Option<SetlistPos> {
+        let mut first = 0;
+        for (song, s) in self.songs.iter().enumerate() {
+            if index < first + s.parts.len() {
+                return Some(SetlistPos { song, part: index - first });
+            }
+            first += s.parts.len();
+        }
+        None
+    }
+
+    /// The foot switches as the engine's show controls (#261).
+    pub fn show_controls(&self) -> ShowControls {
+        let mut t = NO_SHOW_CONTROLS;
+        let bound = [(self.next_cc, ShowAction::NextPart), (self.prev_cc, ShowAction::PrevPart)];
+        for (slot, (fs, action)) in t.iter_mut().zip(bound) {
+            *slot = fs.map(|fs| ShowControl { device: None, channel: fs.channel, msg: ShowMsg::Cc(fs.cc), action });
+        }
+        t
     }
 
     /// Select `(song, part)` if it exists.
@@ -628,6 +671,27 @@ mod tests {
         assert_eq!(sl.prev_part(), None, "stops at the start");
         assert_eq!(sl.next_song(), Some(SetlistPos { song: 1, part: 0 }));
         assert_eq!(sl.prev_song(), Some(SetlistPos { song: 0, part: 0 }));
+    }
+
+    #[test]
+    fn the_engines_part_table_steps_like_next_part() {
+        let mut sl = sample_setlist();
+        sl.songs.insert(1, Song::new("Empty", vec![]));
+        let parts = sl.show_parts();
+        assert_eq!(parts.len(), 3, "a song without parts adds none");
+        assert_eq!(sl.active_index(), None);
+        let mut i = 0;
+        sl.next_part();
+        loop {
+            assert_eq!((sl.active_index(), sl.pos_at(i)), (Some(i), sl.active));
+            assert_eq!(parts[i].zones, sl.active_zones(), "the level-aware zones of the part");
+            if sl.next_part().is_none() {
+                break;
+            }
+            i += 1;
+        }
+        assert_eq!((i, sl.active), (2, Some(SetlistPos { song: 2, part: 0 })));
+        assert_eq!(sl.pos_at(3), None);
     }
 
     #[test]

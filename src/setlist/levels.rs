@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{ParamValue, PartRig, Setlist, MAX_RIGS};
+use super::{ParamValue, Part, PartRig, Setlist, Song, MAX_RIGS};
 use crate::control::{Command, Graph, NodeId, RigZone};
 use crate::matrix::{CcTarget, SourceId};
 
@@ -124,6 +124,16 @@ impl Gates {
     }
 }
 
+/// Does something at `level` take part in `song`? `named`: the part names
+/// it (a song-level rig or bus).
+fn live_in(song: &Song, level: Level, named: bool) -> bool {
+    match level {
+        Level::Show => true,
+        Level::Set(id) => song.set == Some(id),
+        Level::Song => named,
+    }
+}
+
 impl Setlist {
     pub fn set(&self, id: SetId) -> Option<&Set> {
         self.sets.iter().find(|s| s.id == id)
@@ -207,26 +217,29 @@ impl Setlist {
     /// part names it (a song-level rig or bus). With no active part
     /// everything is live.
     fn live_at(&self, level: Level, named: bool) -> bool {
-        let Some((song, _, _)) = self.current() else { return true };
-        match level {
-            Level::Show => true,
-            Level::Set(id) => song.set == Some(id),
-            Level::Song => named,
+        self.current().is_none_or(|(song, _, _)| live_in(song, level, named))
+    }
+
+    /// The zone table for the engine right now (every rig open without an
+    /// active part).
+    pub fn active_zones(&self) -> [RigZone; MAX_RIGS] {
+        match self.current() {
+            Some((song, part, _)) => self.zones_of(song, part),
+            None => [RigZone::OPEN; MAX_RIGS],
         }
     }
 
-    /// The zone table for the engine right now: a show-level rig, and a
-    /// set-level rig inside its set, always takes the whole keyboard; a
-    /// song-level rig takes what the part gives it, or nothing.
-    pub fn active_zones(&self) -> [RigZone; MAX_RIGS] {
+    /// The zone table of `part` of `song`: a show-level rig, and a set-level
+    /// rig inside its set, always takes the whole keyboard; a song-level rig
+    /// takes what the part gives it, or nothing.
+    pub fn zones_of(&self, song: &Song, part: &Part) -> [RigZone; MAX_RIGS] {
         let mut zones = [RigZone::OPEN; MAX_RIGS];
-        let Some((_, part, _)) = self.current() else { return zones };
         for (rig, z) in zones.iter_mut().enumerate() {
             let rig = rig as u8;
             let entry = part.rigs.iter().find(|r| r.rig == rig);
             *z = match self.rig_level(rig) {
                 Level::Song => entry.map_or(RigZone { live: false, ..RigZone::OPEN }, |r| r.to_zone()),
-                level if self.live_at(level, false) => RigZone::OPEN,
+                level if live_in(song, level, false) => RigZone::OPEN,
                 _ => RigZone { live: false, ..RigZone::OPEN },
             };
         }

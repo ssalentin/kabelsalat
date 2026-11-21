@@ -121,6 +121,9 @@ const UNIT_LED_TAU: f32 = 0.12;
 const UNIT_NAME_INSET: f32 = 34.0 + 28.0;
 /// Subtitle sits below the LED row: left inset + 12px right margin.
 const UNIT_SUB_INSET: f32 = 34.0 + 12.0;
+/// Dimensions of the crisp Hurricane `BYPASSED` chip on unit faces (#305).
+const BYPASS_BADGE_W: f32 = 68.0;
+const BYPASS_BADGE_H: f32 = 18.0;
 
 /// Shrink-to-fit for one-line unit labels (C4): scale the `natural` px size
 /// down so `text` fits `avail` (floor `floor`); if it still overflows at the
@@ -782,6 +785,8 @@ struct Unit {
     /// Unit width the name/subtitle galleys were fitted to (C4 shrink-to-
     /// fit); INFINITY = natural size (rects not laid out yet).
     label_fit_w: f32,
+    /// Whether the title galley was fitted with room reserved for the BYPASSED chip.
+    bypassed_fit: bool,
     back_g: Option<Arc<theme::TrackedLabel>>,
 }
 
@@ -1569,6 +1574,40 @@ fn hurricane_slider(
         }
         (changed, committed)
     }).inner
+}
+
+/// Right-click context menu for a rack unit plate on front or back (#305).
+#[derive(Clone, Copy)]
+struct UnitMenu {
+    node: u32,
+    pos: Pos2,
+    side: Side,
+}
+
+/// Compatibility key for Copy/Paste unit settings (#305): only units of the
+/// same DSP kind or plugin identity accept pasted settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UnitCompatKey {
+    Keys,
+    Master,
+    AudioIn,
+    SystemAudio,
+    Arp,
+    Dsp(crate::control::DspKind),
+    Clap(String),
+    Lv2(String),
+    MidiFxBuiltin,
+    MidiFxLv2(String),
+}
+
+/// Copied unit parameter & plugin state clipboard (#305).
+#[derive(Clone)]
+struct UnitClipboard {
+    compat: UnitCompatKey,
+    source_name: String,
+    knobs: Vec<(String, Option<u32>, f32)>,
+    extra_params: Vec<(u32, f32)>,
+    plugin_state: Option<(String, Vec<u8>)>,
 }
 
 /// One bit per note source for `notes_down`: the computer keyboard, each
@@ -2380,7 +2419,7 @@ fn make_unit(node: &Node) -> Unit {
         split: if matches!(node.kind, NodeKind::Keys) { node.split } else { None },
         device,
         channels,
-        name_g: None, sub_g: None, back_g: None, label_fit_w: f32::INFINITY,
+        name_g: None, sub_g: None, back_g: None, label_fit_w: f32::INFINITY, bypassed_fit: false,
     }
 }
 
@@ -3057,7 +3096,8 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "save_rig", "load_rig", "list_rig_presets", "load_template",
     "list_instruments", "install_instrument", "play_file", "stop_file",
     "set_scale", "set_arp",
-    "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
+    "set_strip_mix", "set_node_bypass", "duplicate_node", "reset_node_params", "randomize_node_params",
+    "add_insert", "remove_insert",
     "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
     "get_engine_info", "reset_engine_peaks", "set_buffer_size",
     "get_strip_knobs", "set_strip_knob",
@@ -3631,6 +3671,15 @@ struct DemoApp {
     /// The Keys-face scale picker (issue #90), open on a SCALE readout.
     scale_menu: Option<ScaleMenu>,
     scale_menu_rect: Rect,
+    /// Right-click context menu on a rack unit plate (#305).
+    unit_menu: Option<UnitMenu>,
+    unit_menu_rect: Rect,
+    /// Rendered row rects of the open unit context menu (tests click by label).
+    unit_menu_row_rects: Vec<(String, Rect)>,
+    /// Clipboard for Copy / Paste unit settings (#305).
+    unit_clipboard: Option<UnitClipboard>,
+    /// Monotonic counter so consecutive Ctrl+R randomizations vary cleanly.
+    rand_counter: u64,
     rule_cc_num: u8,
     rule_param_id: u32,
     rule_param_filter: String,
@@ -4221,6 +4270,11 @@ impl DemoApp {
             kb_learn_rects: Vec::new(),
             scale_menu: None,
             scale_menu_rect: Rect::NOTHING,
+            unit_menu: None,
+            unit_menu_rect: Rect::NOTHING,
+            unit_menu_row_rects: Vec::new(),
+            unit_clipboard: None,
+            rand_counter: 0,
             rule_cc_num: 74,
             rule_param_id: 0,
             rule_param_filter: String::new(),
@@ -4497,6 +4551,9 @@ impl DemoApp {
         self.press = None;
         self.knob_menu = None;
         self.knob_menu_rect = Rect::NOTHING;
+        self.unit_menu = None;
+        self.unit_menu_rect = Rect::NOTHING;
+        self.unit_menu_row_rects.clear();
         self.hover = None;
         self.nav_pan_target = None;
         self.mixer_scroll_target = None;
@@ -4651,6 +4708,9 @@ impl DemoApp {
         self.press = None;
         self.knob_menu = None;
         self.knob_menu_rect = Rect::NOTHING;
+        self.unit_menu = None;
+        self.unit_menu_rect = Rect::NOTHING;
+        self.unit_menu_row_rects.clear();
         self.hover = None;
         // Keep MCP/bridge get_rigs consistent with the UI selection (the audio
         // render path never locks this snapshot).
@@ -4798,12 +4858,16 @@ impl DemoApp {
         for (ui, u) in self.units.iter_mut().enumerate() {
             let w = self.unit_rects.get(ui).map_or(f32::NAN, |r| r.width());
             let fit_w = if w.is_finite() && w > 0.0 { w } else { f32::INFINITY };
-            let refit = u.name_g.is_none() || u.sub_g.is_none() || (fit_w - u.label_fit_w).abs() > 0.5;
+            let is_bypassed = self.strips.iter().any(|s| s.node == u.node_id && s.bypass);
+            let reserve_bypass = is_bypassed && !matches!(u.node_kind, UnitKind::Keys | UnitKind::Arp) && !u.transport;
+            let refit = u.name_g.is_none() || u.sub_g.is_none() || (fit_w - u.label_fit_w).abs() > 0.5 || u.bypassed_fit != reserve_bypass;
             if refit {
                 // Name: Medium 16px, sentence case (§4.3), beside the LED.
                 // Subtitle: tracked micro-caps 10px (+0.14em), below it.
+                // When bypassed, leave room on the header row for the BYPASSED chip.
                 let name = sentence_case(&u.name);
-                let (name, size) = fit_label(&name, 16.0, 8.0, fit_w - UNIT_NAME_INSET, |t, sz| {
+                let extra = if reserve_bypass && fit_w > 150.0 { BYPASS_BADGE_W + 10.0 } else { 0.0 };
+                let (name, size) = fit_label(&name, 16.0, 8.0, fit_w - UNIT_NAME_INSET - extra, |t, sz| {
                     layout(t, theme::medium_font(sz), TEXT, f32::INFINITY).size().x
                 });
                 u.name_g = Some(layout(&name, theme::medium_font(size), TEXT, f32::INFINITY));
@@ -4811,6 +4875,7 @@ impl DemoApp {
                 let (sub, size) = fit_label(&sub, 10.0, 8.0, fit_w - UNIT_SUB_INSET, |t, sz| tracked(t, sz, 0.14).size.x);
                 u.sub_g = Some(tracked(&sub, size, 0.14));
                 u.label_fit_w = fit_w;
+                u.bypassed_fit = reserve_bypass;
             }
             if u.back_g.is_none() {
                 // Same display name as the front (rule 28), still small + tracked.
@@ -6254,6 +6319,18 @@ impl DemoApp {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 format!("Bypass {}", self.unit_display_name(node))
             }
+            "duplicate_node" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Duplicate {}", self.unit_display_name(node))
+            }
+            "reset_node_params" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Initialize {}", self.unit_display_name(node))
+            }
+            "randomize_node_params" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Randomize {}", self.unit_display_name(node))
+            }
             "add_bus" => "Add aux bus".into(),
             "remove_bus" => "Remove aux bus".into(),
             "get_sends" => "Read sends".into(),
@@ -6821,6 +6898,581 @@ impl DemoApp {
             }
         }
         self.undo_job = Some((origin, now));
+    }
+
+    /// Snapshot the rack before a single user-initiated mutating action (unit
+    /// context menu or Ctrl+E/D/R shortcut) so Ctrl+Z undoes it in one step.
+    fn push_user_undo(&mut self) {
+        if let Some(snap) = self.capture_undo() {
+            self.undo_past.push(snap);
+            if self.undo_past.len() > UNDO_LIMIT { self.undo_past.remove(0); }
+            self.undo_future.clear();
+            self.undo_job = None;
+        }
+    }
+
+    // -- rack unit actions & context menu (#305) --------------------------
+
+    fn unit_can_bypass(&self, ui: usize) -> bool {
+        self.units.get(ui).is_some_and(|u| {
+            !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master | UnitKind::Dsp(DspKind::Bus))
+        })
+    }
+
+    fn unit_can_duplicate(&self, ui: usize) -> bool {
+        self.units.get(ui).is_some_and(|u| {
+            !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master)
+        })
+    }
+
+    fn unit_can_remove(&self, ui: usize) -> bool {
+        self.units.get(ui).is_some_and(|u| {
+            !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master)
+        })
+    }
+
+    fn unit_compat_key(&self, node_id: u32) -> Option<UnitCompatKey> {
+        let n = self.base_graph.node(node_id)?;
+        Some(match &n.kind {
+            NodeKind::Keys => UnitCompatKey::Keys,
+            NodeKind::MasterOut => UnitCompatKey::Master,
+            NodeKind::AudioIn { .. } => UnitCompatKey::AudioIn,
+            NodeKind::SystemAudio => UnitCompatKey::SystemAudio,
+            NodeKind::Arp => UnitCompatKey::Arp,
+            NodeKind::Dsp(dk) => UnitCompatKey::Dsp(dk.clone()),
+            NodeKind::Clap { plugin_id } => UnitCompatKey::Clap(plugin_id.as_str().to_string()),
+            NodeKind::Lv2 { uri } => UnitCompatKey::Lv2(uri.as_str().to_string()),
+            NodeKind::MidiFx { plugin } => match plugin {
+                crate::control::MidiFxPlugin::Builtin { .. } => UnitCompatKey::MidiFxBuiltin,
+                crate::control::MidiFxPlugin::Lv2 { uri } => UnitCompatKey::MidiFxLv2(uri.as_str().to_string()),
+            },
+        })
+    }
+
+    /// True factory default (0..=1) for knob `ki` of unit `ui`, bypassing
+    /// session-loaded `k.default` overrides.
+    fn factory_knob_default(&mut self, ui: usize, ki: usize) -> f32 {
+        let Some(u) = self.units.get(ui) else { return 0.5 };
+        let Some(k) = u.knobs.get(ki) else { return 0.5 };
+        let node_id = u.node_id;
+        let fallback = k.default;
+        let clap_pin = k.clap;
+        let param = k.param;
+        let label = k.label.clone();
+        if let Some(pin) = clap_pin {
+            if let Some(rig) = self.rig_of_unit(ui) {
+                if let Some(idx) = self.clap_pool_idx(rig) {
+                    if let Some(m) = self._surge_main.get_mut(idx) {
+                        if let Some(desc) = m.param_list().into_iter().find(|p| p.id == pin.id) {
+                            let span = (desc.max - desc.min).abs();
+                            if span > 1e-9 {
+                                return ((desc.default - desc.min) / (desc.max - desc.min)).clamp(0.0, 1.0) as f32;
+                            }
+                        }
+                    }
+                }
+            }
+            return fallback;
+        }
+        if let Some(node) = self.base_graph.node(node_id) {
+            if let Some(p) = param {
+                if let Some(spec) = crate::engine::knob_specs(&node.kind).iter().find(|s| s.param == Some(p)) {
+                    return spec.default;
+                }
+                if let NodeKind::Lv2 { uri } = &node.kind {
+                    if let Some(c) = crate::lv2::control_descs_for_uri(uri.as_str()).into_iter().find(|c| c.index as u32 == p) {
+                        let span = (c.max - c.min).abs();
+                        if span > 1e-9 {
+                            return ((c.default - c.min) / (c.max - c.min)).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                if let NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } } = &node.kind {
+                    if let Some(c) = crate::lv2::control_descs_for_uri(uri.as_str()).into_iter().find(|c| c.index as u32 == p) {
+                        let span = (c.max - c.min).abs();
+                        if span > 1e-9 {
+                            return ((c.default - c.min) / (c.max - c.min)).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+            }
+            if let Some(spec) = crate::engine::knob_specs(&node.kind).iter().find(|s| s.label == label) {
+                return spec.default;
+            }
+        }
+        fallback
+    }
+
+    fn toggle_unit_bypass(&mut self, node_id: u32, record_undo: bool) -> Result<bool, String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        if !self.unit_can_bypass(ui) {
+            return Err(format!("{} cannot be bypassed", self.unit_display_name(node_id)));
+        }
+        if record_undo {
+            self.push_user_undo();
+        }
+        let next = !self.strip_row(node_id).bypass;
+        self.with_strip_row(node_id, |row| row.bypass = next);
+        self.send_strip_bypass(node_id);
+        let state = if next { "bypassed" } else { "enabled" };
+        self.session_msg = format!("{} {state}", self.unit_display_name(node_id));
+        Ok(next)
+    }
+
+    fn unique_duplicate_name(&self, raw_name: &str) -> String {
+        let base = raw_name.trim();
+        let mut n = 2usize;
+        loop {
+            let cand: String = format!("{base} {n}").chars().take(24).collect();
+            if !self.units.iter().any(|u| u.name.eq_ignore_ascii_case(&cand)) {
+                return cand;
+            }
+            n += 1;
+        }
+    }
+
+    /// Duplicate one rack unit (node kind, knobs/params, hosted plugin state)
+    /// into its rig (or optional `target_rig`). Duplicated instruments are wired
+    /// into their rig; effects/MIDI-FX/arps are added ready to patch.
+    fn duplicate_unit(
+        &mut self,
+        node_id: u32,
+        target_rig: Option<usize>,
+        custom_name: Option<&str>,
+        record_undo: bool,
+    ) -> Result<(u32, String, usize), String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        if !self.unit_can_duplicate(ui) {
+            return Err(format!("{} cannot be duplicated", self.unit_display_name(node_id)));
+        }
+        let n_rigs = self.rig_count();
+        let src_rig = if n_rigs <= 1 { 0 } else { self.units[ui].rig as usize };
+        let dest_rig = target_rig.unwrap_or(src_rig);
+        if dest_rig >= n_rigs {
+            return Err(format!("no rig {dest_rig}: there are {n_rigs} (0..{})", n_rigs.saturating_sub(1)));
+        }
+        let Some(src_node) = self.base_graph.node(node_id).cloned() else {
+            return Err(format!("no node {node_id} in graph"));
+        };
+        let is_inst = match &src_node.kind {
+            NodeKind::Clap { .. } => !self.units[ui].clap_fx,
+            NodeKind::Lv2 { .. } => self.units[ui].lv2_inst,
+            _ => false,
+        };
+        let is_bus = matches!(src_node.kind, NodeKind::Dsp(DspKind::Bus));
+        let new_name = custom_name
+            .map(|s| s.trim().chars().take(24).collect::<String>())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.unique_duplicate_name(&self.units[ui].name));
+
+        if record_undo {
+            self.push_user_undo();
+        }
+        let s = self.capture_session("Duplicate unit").map_err(|e| e.to_string())?;
+        let voice_rows = self.voice_rows();
+        let keep_mix = self.rig_mix;
+        let keep_active = self.active_rig;
+        let keep_arms = self.arm_rigs;
+        let keep_arm_master = self.arm_master;
+
+        let (ns, new_id, new_voice_rows) = if n_rigs <= 1 {
+            let mut ns = s.clone();
+            let nid = ns.graph.add_node(src_node.kind.clone(), name_bytes(&new_name));
+            ns.graph.set_rig(nid, 0);
+            if is_inst {
+                let _ = ns.graph.wire_instrument(nid);
+            } else if is_bus {
+                ns.graph.wire_bus(nid);
+            }
+            for p in s.params() {
+                if p.node == node_id {
+                    ns.set_param(nid, p.param, p.value);
+                }
+            }
+            if let Some(st) = s.plugin_state(node_id) {
+                ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone());
+            }
+            (ns, nid, voice_rows)
+        } else {
+            let (mut graphs, old_bases) = crate::control::split_rigs(&s.graph);
+            if dest_rig >= graphs.len() {
+                return Err(format!("rig {dest_rig} has no graph"));
+            }
+            let local_new = graphs[dest_rig].add_node(src_node.kind.clone(), name_bytes(&new_name));
+            if is_inst {
+                let _ = graphs[dest_rig].wire_instrument(local_new);
+            } else if is_bus {
+                graphs[dest_rig].wire_bus(local_new);
+            }
+            let devices: Vec<Option<u32>> = {
+                let snap = self.rig_snapshot.lock().ok();
+                (0..graphs.len())
+                    .map(|i| snap.as_ref().and_then(|sn| sn.rigs.get(i).and_then(|m| m.midi_device)))
+                    .collect()
+            };
+            let list: Vec<crate::control::Rig> = graphs.into_iter().enumerate()
+                .map(|(i, g)| crate::control::Rig::new(self.rig_name(i), g, devices[i]))
+                .collect();
+            let new_bases = crate::control::rig_bases(&list);
+            let merged = crate::control::merge_rigs(&list);
+            let remap_existing = |old: u32| -> Option<u32> {
+                let o = s.graph.node(old)?.rig as usize;
+                Some(new_bases[o] + (old - old_bases[o]))
+            };
+            let nid = new_bases[dest_rig] + local_new;
+            let mut ns = remap_session(&s, merged, remap_existing);
+            ns.rig_names = list.iter().map(|r| r.name.clone()).collect();
+            for p in s.params() {
+                if p.node == node_id {
+                    ns.set_param(nid, p.param, p.value);
+                }
+            }
+            if let Some(st) = s.plugin_state(node_id) {
+                ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone());
+            }
+            let remapped_rows: Vec<VoiceRow> = voice_rows.into_iter()
+                .filter_map(|r| remap_existing(r.node).map(|node| VoiceRow { node, ..r }))
+                .collect();
+            self.load_as_rigs = Some((list, keep_active));
+            (ns, nid, remapped_rows)
+        };
+
+        // Ensure multi-rig metadata stays aligned after apply_session.
+        self.apply_session(&ns).map_err(|e| e.to_string())?;
+        self.restore_voice_rows(&new_voice_rows);
+        self.rig_mix = keep_mix;
+        self.set_record_arm(None, keep_arm_master);
+        for i in 0..self.rig_count().min(8) {
+            self.set_record_arm(Some(i), keep_arms[i]);
+            self.send_rig_mix(i);
+        }
+        self.active_rig = usize::MAX;
+        self.set_active_rig(dest_rig);
+        self.selected_unit = Some(new_id);
+        let disp = sentence_case(&new_name);
+        self.session_msg = format!("Duplicated → {disp}");
+        Ok((new_id, disp, dest_rig))
+    }
+
+    /// Initialize (reset) a unit's knobs and hosted plugin parameters back to
+    /// factory defaults.
+    fn reset_unit_params(
+        &mut self,
+        node_id: u32,
+        record_undo: bool,
+    ) -> Result<(String, Vec<(String, Option<u32>, f32)>), String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        if record_undo {
+            self.push_user_undo();
+        }
+        self.node_params.retain(|&(n, _), _| n != node_id);
+        let n_knobs = self.units[ui].knobs.len();
+        let mut reset: Vec<(String, Option<u32>, f32)> = Vec::new();
+        for ki in 0..n_knobs {
+            let def = self.factory_knob_default(ui, ki);
+            let (label, param) = (self.units[ui].knobs[ki].label.clone(), self.units[ui].knobs[ki].param);
+            self.set_unit_knob(ui, ki, def);
+            if let Some(p) = param {
+                self.node_params.insert((node_id, p), def);
+            }
+            reset.push((label, param, def));
+        }
+        // Also reset non-face native DSP parameters (e.g. Delay pingpong/damping)
+        // back to their catalog defaults so Initialize covers every control.
+        if let Some(NodeKind::Dsp(dk)) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
+            for spec in crate::dsp::dsp_param_specs(&dk) {
+                if reset.iter().any(|(_, p, _)| *p == Some(spec.engine_param)) { continue; }
+                self.send_node_engine_param(node_id, spec.engine_param, spec.default);
+            }
+        }
+        // Reset hosted CLAP plugin parameters to declared defaults too.
+        if matches!(self.units[ui].node_kind, UnitKind::Clap) {
+            if let Some(rig) = self.rig_of_unit(ui) {
+                if let Some(idx) = self.clap_pool_idx(rig) {
+                    let defaults: Vec<(u32, f64)> = self._surge_main.get_mut(idx)
+                        .map(|m| {
+                            m.param_list()
+                                .into_iter()
+                                .filter(|p| !p.readonly && !p.hidden)
+                                .map(|p| (p.id, p.default))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(ctl) = self.surge_controllers.get(idx) {
+                        for (pid, def) in defaults {
+                            ctl.set_param(ClapId::new(pid), def);
+                        }
+                    }
+                }
+            }
+        }
+        // Reset LV2 controls not currently shown as face knobs.
+        if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
+            let ctrls = crate::lv2::control_descs_for_uri(uri.as_str());
+            if let Some(bus) = &self.bus {
+                let mut b = bus.lock().unwrap();
+                for c in ctrls {
+                    let pid = c.index as u32;
+                    if reset.iter().any(|(_, p, _)| *p == Some(pid)) { continue; }
+                    let span = (c.max - c.min).abs();
+                    let norm = if span > 1e-9 { ((c.default - c.min) / (c.max - c.min)).clamp(0.0, 1.0) } else { 0.0 };
+                    let _ = b.send(Command::SetParam { node: node_id, param: pid, value: norm as f64 });
+                    reset.push((c.name, Some(pid), norm));
+                }
+            }
+        }
+        let disp = self.unit_display_name(node_id);
+        self.session_msg = format!("Initialized {disp} parameters");
+        Ok((disp, reset))
+    }
+
+    /// Randomize a unit's knobs within sensible musical bounds as one undo step.
+    fn randomize_unit_params(
+        &mut self,
+        node_id: u32,
+        amount: f32,
+        seed: Option<u64>,
+        record_undo: bool,
+    ) -> Result<(String, Vec<(String, Option<u32>, f32)>), String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        let Some(node_kind) = self.base_graph.node(node_id).map(|n| n.kind.clone()) else {
+            return Err(format!("no node {node_id} in graph"));
+        };
+        let amount = amount.clamp(0.0, 1.0);
+        let n_knobs = self.units[ui].knobs.len();
+        let has_other = self.units[ui].knobs.iter().filter(|k| !k.hidden).count() > 1;
+        let mut eligible: Vec<(usize, f32, f32)> = Vec::new();
+        for ki in 0..n_knobs {
+            let k = &self.units[ui].knobs[ki];
+            if k.hidden && !crate::organ::is_organ(&node_kind) {
+                continue;
+            }
+            if let Some((lo, hi)) = crate::engine::knob_random_bounds(&node_kind, &k.label, k.param, has_other) {
+                eligible.push((ki, lo, hi));
+            }
+        }
+        if eligible.is_empty() {
+            return Err(format!("{} has no randomizable parameters", self.unit_display_name(node_id)));
+        }
+        if record_undo {
+            self.push_user_undo();
+        }
+        self.rand_counter = self.rand_counter.wrapping_add(1);
+        let mut rng = seed.unwrap_or_else(|| {
+            ((self.ui_time.to_bits() as u64) << 32)
+                ^ ((node_id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                ^ self.rand_counter.wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                ^ 0xa5a5_5a5a_1234_5678
+        });
+        let mut changed: Vec<(String, Option<u32>, f32)> = Vec::new();
+        for (ki, lo, hi) in eligible {
+            let cur = self.units[ui].knobs[ki].value;
+            let r = crate::engine::next_rand_f32(&mut rng);
+            let target = lo + r * (hi - lo);
+            let blended = (cur + (target - cur) * amount).clamp(0.0, 1.0);
+            let val = self.units[ui].knobs[ki].quantize(blended);
+            let (label, param) = (self.units[ui].knobs[ki].label.clone(), self.units[ui].knobs[ki].param);
+            self.set_unit_knob(ui, ki, val);
+            changed.push((label, param, val));
+        }
+        let disp = self.unit_display_name(node_id);
+        self.session_msg = format!("Randomized {disp} ({} params)", changed.len());
+        Ok((disp, changed))
+    }
+
+    fn copy_unit_settings(&mut self, node_id: u32) -> Result<String, String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        let Some(compat) = self.unit_compat_key(node_id) else {
+            return Err(format!("no node {node_id} in graph"));
+        };
+        let source_name = self.unit_display_name(node_id);
+        let knobs: Vec<(String, Option<u32>, f32)> = self.units[ui].knobs.iter()
+            .map(|k| (k.label.clone(), k.param, k.value))
+            .collect();
+        let extra_params: Vec<(u32, f32)> = self.node_params.iter()
+            .filter_map(|(&(n, p), &v)| (n == node_id).then_some((p, v)))
+            .collect();
+        let mut plugin_state: Option<(String, Vec<u8>)> = None;
+        if matches!(self.units[ui].node_kind, UnitKind::Clap) {
+            if let Some(rig) = self.rig_of_unit(ui) {
+                if let Some(idx) = self.clap_pool_idx(rig) {
+                    let pid = self.clap_plugin_ids.get(idx).cloned().unwrap_or_else(|| SURGE_ID.to_string());
+                    if let Some(m) = self._surge_main.get_mut(idx) {
+                        if let Ok(blob) = m.save_state() {
+                            plugin_state = Some((pid, blob));
+                        }
+                    }
+                }
+            }
+        } else if let Some(blob) = self.lv2_states.get(&node_id) {
+            if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| &n.kind) {
+                plugin_state = Some((uri.as_str().to_string(), blob.clone()));
+            }
+        }
+        self.unit_clipboard = Some(UnitClipboard { compat, source_name: source_name.clone(), knobs, extra_params, plugin_state });
+        self.session_msg = format!("Copied settings from {source_name}");
+        Ok(source_name)
+    }
+
+    fn can_paste_unit_settings(&self, node_id: u32) -> Option<&str> {
+        let clip = self.unit_clipboard.as_ref()?;
+        let compat = self.unit_compat_key(node_id)?;
+        (clip.compat == compat).then_some(clip.source_name.as_str())
+    }
+
+    fn paste_unit_settings(&mut self, node_id: u32, record_undo: bool) -> Result<String, String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        let Some(compat) = self.unit_compat_key(node_id) else {
+            return Err(format!("no node {node_id} in graph"));
+        };
+        let Some(clip) = self.unit_clipboard.clone() else {
+            return Err("nothing copied to paste".into());
+        };
+        if clip.compat != compat {
+            return Err(format!("copied settings from {} do not match {}", clip.source_name, self.unit_display_name(node_id)));
+        }
+        if record_undo {
+            self.push_user_undo();
+        }
+        for &(pid, val) in &clip.extra_params {
+            self.send_node_engine_param(node_id, pid, val);
+        }
+        for (label, param, val) in &clip.knobs {
+            let ki = param.and_then(|p| self.units[ui].knobs.iter().position(|k| k.param == Some(p)))
+                .or_else(|| self.units[ui].knobs.iter().position(|k| k.label == *label));
+            if let Some(ki) = ki {
+                self.set_unit_knob(ui, ki, *val);
+            }
+        }
+        if let Some((pid, blob)) = &clip.plugin_state {
+            if matches!(self.units[ui].node_kind, UnitKind::Clap) {
+                if let Some(rig) = self.rig_of_unit(ui) {
+                    if let Some(idx) = self.clap_pool_idx(rig) {
+                        if let Some(m) = self._surge_main.get_mut(idx) {
+                            let _ = m.load_state(blob);
+                        }
+                    }
+                }
+            } else if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
+                if uri.as_str() == pid {
+                    let _ = self.restore_lv2_state(node_id, blob.clone());
+                }
+            }
+        }
+        let disp = self.unit_display_name(node_id);
+        self.session_msg = format!("Pasted settings from {} → {disp}", clip.source_name);
+        Ok(disp)
+    }
+
+    fn unit_cable_count(&self, ui: usize) -> usize {
+        self.cables.iter().filter(|c| c.dying < 0.0 && (c.src == ui || c.dst == ui)).count()
+    }
+
+    fn unplug_unit_cables(&mut self, node_id: u32, record_undo: bool) -> Result<usize, String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        let indices: Vec<(usize, bool)> = self.cables.iter().enumerate()
+            .filter(|(_, c)| c.dying < 0.0 && (c.src == ui || c.dst == ui))
+            .map(|(ci, c)| (ci, c.dst == ui))
+            .collect();
+        if indices.is_empty() {
+            return Ok(0);
+        }
+        if record_undo {
+            self.push_user_undo();
+        }
+        for (ci, detach_dst) in &indices {
+            self.unplug_cable(*ci, *detach_dst);
+        }
+        self.selected = None;
+        let disp = self.unit_display_name(node_id);
+        self.session_msg = format!("Unplugged {} cable{} from {disp}", indices.len(), if indices.len() == 1 { "" } else { "s" });
+        Ok(indices.len())
+    }
+
+    fn remove_unit_action(&mut self, node_id: u32, record_undo: bool) -> Result<String, String> {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Err(format!("no unit with node id {node_id}"));
+        };
+        if !self.unit_can_remove(ui) {
+            return Err(format!("{} cannot be removed", self.unit_display_name(node_id)));
+        }
+        let disp = self.unit_display_name(node_id);
+        if record_undo {
+            self.push_user_undo();
+        }
+        if self.selected_unit == Some(node_id) {
+            self.selected_unit = None;
+        }
+        self.strips.retain(|r| r.node != node_id);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::RemoveNode(node_id));
+        } else {
+            let mut g = self.mirror_graph();
+            let rig_of_fx = g.node(node_id).filter(|n| matches!(n.kind, NodeKind::MidiFx { .. })).map(|n| n.rig);
+            g.remove_node(node_id);
+            if let Some(rig) = rig_of_fx {
+                g.heal_midi_after_fx(rig);
+            }
+            self.reload_with_graph(g)?;
+        }
+        self.session_msg = format!("Removed {disp}");
+        Ok(disp)
+    }
+
+    /// Returns `Some(is_open)` if `node_id` has a hosted CLAP plugin GUI window.
+    fn unit_native_gui_state(&mut self, node_id: u32) -> Option<bool> {
+        let ui = self.units.iter().position(|u| u.node_id == node_id)?;
+        if !matches!(self.units[ui].node_kind, UnitKind::Clap) { return None; }
+        let rig = self.rig_of_unit(ui)?;
+        let idx = self.clap_pool_idx(rig)?;
+        let main = self._surge_main.get_mut(idx)?;
+        main.has_editor().then(|| main.editor_open())
+    }
+
+    fn toggle_unit_native_gui(&mut self, node_id: u32) {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else { return };
+        let Some(rig) = self.rig_of_unit(ui) else { return };
+        let Some(idx) = self.clap_pool_idx(rig) else { return };
+        let name = self.unit_display_name(node_id);
+        if let Some(main) = self._surge_main.get_mut(idx) {
+            self.plugin_window_error = None;
+            if main.editor_open() {
+                main.close_editor();
+            } else if let Err(e) = main.open_editor(&format!("{name} · kabelsalat")) {
+                self.plugin_window_error = Some(format!("{e:#}"));
+                self.session_msg = format!("Plugin GUI failed: {e:#}");
+            }
+        }
+    }
+
+    fn unit_has_param_editor(&self, node_id: u32) -> bool {
+        self.base_graph.node(node_id).is_some_and(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }))
+    }
+
+    fn open_unit_param_editor(&mut self, node_id: u32) {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else { return };
+        if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
+            self.lv2_editor_request = Some((node_id, uri.as_str().to_string(), self.units[ui].name.clone()));
+        } else if matches!(self.units[ui].node_kind, UnitKind::Clap) {
+            match self.rig_of_unit(ui) {
+                Some(rig) => self.editor_request = Some(rig),
+                None => self.editor_status = "no hosted synth voice for this unit".into(),
+            }
+        }
     }
 
     /// Restore a snapshot exactly the way a rig edit reloads (rule 20:
@@ -8938,7 +9590,8 @@ impl DemoApp {
                 }
             }
             "set_node_bypass" => {
-                // Insert bypass (#74): the FX passes its input through.
+                // Insert / unit bypass (#74, #305): FX passes input through,
+                // MIDI-FX/arp passes MIDI through, instrument mutes & releases.
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
                 if !self.units.iter().any(|u| u.node_id == node) {
                     return format!("no unit with node id {node} (see get_graph)");
@@ -8950,6 +9603,62 @@ impl DemoApp {
                 self.agent_activity.touch_node(node, now);
                 self.agent_activity.record(origin, format!("Bypass {} → {}", self.unit_display_name(node), if bypass { "on" } else { "off" }), vec![node], now);
                 format!("{} (node {node}): bypass {}", self.unit_display_name(node), bypass)
+            }
+            "duplicate_node" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize);
+                let custom = args.get("name").and_then(|v| v.as_str());
+                match self.duplicate_unit(node, rig, custom, false) {
+                    Ok((new_id, name, dest_rig)) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.touch_rig(dest_rig, now);
+                        self.agent_activity.touch_node(new_id, now);
+                        self.agent_activity.record(origin, format!("Duplicate → {name}"), vec![new_id], now);
+                        serde_json::json!({
+                            "node": new_id,
+                            "source": node,
+                            "name": name,
+                            "rig": dest_rig,
+                        }).to_string()
+                    }
+                    Err(e) => format!("error: duplicate_node: {e}"),
+                }
+            }
+            "reset_node_params" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                match self.reset_unit_params(node, false) {
+                    Ok((name, knobs)) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.touch_node(node, now);
+                        self.agent_activity.record(origin, format!("Initialize {name}"), vec![node], now);
+                        serde_json::json!({
+                            "node": node,
+                            "name": name,
+                            "reset_count": knobs.len(),
+                            "knobs": knobs.iter().map(|(l, p, v)| serde_json::json!({"label": l, "param": p, "value": v})).collect::<Vec<_>>(),
+                        }).to_string()
+                    }
+                    Err(e) => format!("error: reset_node_params: {e}"),
+                }
+            }
+            "randomize_node_params" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let amount = args.get("amount").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let seed = args.get("seed").and_then(|v| v.as_u64());
+                match self.randomize_unit_params(node, amount, seed, false) {
+                    Ok((name, knobs)) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.touch_node(node, now);
+                        self.agent_activity.record(origin, format!("Randomize {name}"), vec![node], now);
+                        serde_json::json!({
+                            "node": node,
+                            "name": name,
+                            "randomized_count": knobs.len(),
+                            "knobs": knobs.iter().map(|(l, p, v)| serde_json::json!({"label": l, "param": p, "value": v})).collect::<Vec<_>>(),
+                        }).to_string()
+                    }
+                    Err(e) => format!("error: randomize_node_params: {e}"),
+                }
             }
             "add_insert" => {
                 // Add an effect to a strip's insert chain (#74): source node
@@ -22839,6 +23548,9 @@ impl DemoApp {
         self.press = None;
         self.knob_menu = None;
         self.knob_menu_rect = Rect::NOTHING;
+        self.unit_menu = None;
+        self.unit_menu_rect = Rect::NOTHING;
+        self.unit_menu_row_rects.clear();
         eprintln!(
             "rack flip: {} -> {} (embedded editor stays in its fixed region)",
             if self.side == Side::Front { "front" } else { "back" },
@@ -24079,10 +24791,18 @@ impl DemoApp {
             }
         }
         let mut quick_save = false;
+        let mut unit_shortcut: Option<&'static str> = None;
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) { toggle_play = true; }
             if i.consume_key(Modifiers::SHIFT, Key::T) { tap_tempo = true; }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
+            // Unit shortcuts (Ctrl+E bypass, Ctrl+D duplicate, Ctrl+R randomize;
+            // checked BEFORE plain R so egui never swallows Ctrl+R as R — rule 143).
+            if self.selected_unit.is_some() && self.stage_view == StageView::Rack {
+                if i.consume_key(Modifiers::COMMAND, Key::E) { unit_shortcut = Some("bypass"); }
+                if i.consume_key(Modifiers::COMMAND, Key::D) { unit_shortcut = Some("duplicate"); }
+                if i.consume_key(Modifiers::COMMAND, Key::R) { unit_shortcut = Some("randomize"); }
+            }
             if i.consume_key(Modifiers::NONE, Key::R) { reset_knobs = true; }
             // I = info (MIDI + performance). Not D: D is a laptop note key.
             if i.consume_key(Modifiers::NONE, Key::I) { self.show_stats = !self.show_stats; }
@@ -24176,6 +24896,7 @@ impl DemoApp {
                     if self.confirm_session.is_some() { self.confirm_session = None; }
                     else { self.session_popover_open = false; }
                 }
+                else if self.unit_menu.is_some() { self.unit_menu = None; }
                 else if self.knob_menu.is_some() { self.knob_menu = None; }
                 else if self.scale_menu.is_some() { self.scale_menu = None; }
                 else if self.cable_menu.is_some() { self.cable_menu = None; }
@@ -24232,6 +24953,18 @@ impl DemoApp {
         if reset_knobs {
             for u in &mut self.units {
                 for k in &mut u.knobs { k.set_immediate(k.default); }
+            }
+        }
+        if let (Some(action), Some(node_id)) = (unit_shortcut, self.selected_unit) {
+            self.unit_menu = None;
+            let res: Result<(), String> = match action {
+                "bypass" => self.toggle_unit_bypass(node_id, true).map(|_| ()),
+                "duplicate" => self.duplicate_unit(node_id, None, None, true).map(|_| ()),
+                "randomize" => self.randomize_unit_params(node_id, 1.0, None, true).map(|_| ()),
+                _ => Ok(()),
+            };
+            if let Err(e) = res {
+                self.session_msg = e;
             }
         }
 
@@ -24311,6 +25044,7 @@ impl DemoApp {
             } else if self.side == Side::Front {
                 match self.hit_test(s) {
                     Hit::Knob { unit, idx } => {
+                        self.unit_menu = None;
                         let node_id = self.units[unit].node_id;
                         let target = self.units[unit].knobs[idx].cc_target();
                         if let Some((param, tgt)) = target {
@@ -24323,15 +25057,21 @@ impl DemoApp {
                     Hit::Unit(ui) => {
                         let lp = self.xf.inv(s).to_pos2();
                         if let Some(bar) = self.drawbar_rects(ui).and_then(|b| b.iter().position(|r| r.contains(lp))) {
+                            self.unit_menu = None;
                             let node_id = self.units[ui].node_id;
                             self.cc_right_click((node_id, crate::organ::drawbar_param(bar), CcTarget::Knob), s);
                         } else {
                             self.knob_menu = None;
+                            self.scale_menu = None;
                             self.cc_learn = None;
+                            let node_id = self.units[ui].node_id;
+                            self.selected_unit = Some(node_id);
+                            self.unit_menu = Some(UnitMenu { node: node_id, pos: s, side: self.side });
                         }
                     }
                     _ => {
                         self.knob_menu = None;
+                        self.unit_menu = None;
                         self.cc_learn = None;
                     }
                 }
@@ -24340,9 +25080,11 @@ impl DemoApp {
                 self.scale_menu = None;
                 match self.hit_test(s) {
                     Hit::Cable(id, _) if self.live_cable(id).is_some() => {
+                        self.unit_menu = None;
                         self.cable_menu = Some(CableMenu { target: CableMenuTarget::Cable(id), pos: s });
                     }
                     Hit::Jack { unit, jack } => {
+                        self.unit_menu = None;
                         let has_cables = self.units.get(unit)
                             .and_then(|u| u.jacks.get(jack))
                             .is_some_and(|j| !self.cables_on_jack(unit, j.dir, j.port).is_empty());
@@ -24351,13 +25093,29 @@ impl DemoApp {
                             pos: s,
                         });
                     }
+                    Hit::Unit(ui) => {
+                        self.cable_menu = None;
+                        let node_id = self.units[ui].node_id;
+                        self.selected_unit = Some(node_id);
+                        self.unit_menu = Some(UnitMenu { node: node_id, pos: s, side: self.side });
+                    }
                     _ => {
                         self.cable_menu = None;
+                        self.unit_menu = None;
                     }
                 }
             }
         }
 
+        if self.unit_menu.is_some() && self.unit_menu_rect.contains(s) {
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        if pressed && self.unit_menu.is_some() {
+            self.unit_menu = None;
+            self.hover = Some(Hit::Background);
+            return;
+        }
         if self.knob_menu.is_some() && self.knob_menu_rect.contains(s) {
             self.hover = Some(Hit::Background);
             return;
@@ -24709,9 +25467,25 @@ impl DemoApp {
                             if let Err(e) = self.toggle_aeolus_stop(node, stop) { self.plugin_msg = e; }
                         }
                     }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.bypass_badge_rect(ui).is_some_and(|b| b.contains(l.to_pos2())) => {
+                        // Clicking the BYPASSED chip re-enables the unit immediately.
+                        let node = self.units[ui].node_id;
+                        self.selected_unit = Some(node);
+                        let _ = self.toggle_unit_bypass(node, true);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Back
+                        && self.back_bypass_badge_rect(ui).is_some_and(|b| b.contains(l.to_pos2())) => {
+                        let node = self.units[ui].node_id;
+                        self.selected_unit = Some(node);
+                        let _ = self.toggle_unit_bypass(node, true);
+                    }
                     Some(Hit::Unit(ui)) => {
-                        // Double-click a CLAP or LV2 plugin unit → toggle its inline editor.
-                        // A single click still pings the unit.
+                        // Selecting a unit enables Ctrl+E/D/R shortcuts on it;
+                        // double-click a CLAP or LV2 plugin unit → toggle editor.
+                        if let Some(u) = self.units.get(ui) {
+                            self.selected_unit = Some(u.node_id);
+                        }
                         let lv2_info = self.units.get(ui).and_then(|u| {
                             self.base_graph.nodes.iter().find(|n| n.id == u.node_id).and_then(|n| match &n.kind {
                                 NodeKind::Lv2 { uri } => Some((u.node_id, uri.as_str().to_string(), u.name.clone())),
@@ -26513,6 +27287,59 @@ impl DemoApp {
         }
     }
 
+    /// Rack-local rect for the front-face `BYPASSED` chip (#305), shown only
+    /// while the unit is bypassed and placed clear of title, LED, knobs and
+    /// other face controls.
+    fn bypass_badge_rect(&self, ui: usize) -> Option<Rect> {
+        let u = self.units.get(ui)?;
+        if !self.strip_row(u.node_id).bypass { return None; }
+        let r = *self.unit_rects.get(ui)?;
+        if !(r.width() >= 110.0 && r.height() >= 64.0) { return None; }
+        let has_top_right_ctl = self.arp_status_rect(ui).is_some()
+            || self.transport_chip_rect(ui).is_some()
+            || self.bpm_rects(ui).is_some()
+            || self.split_rects(ui).is_some();
+        if !has_top_right_ctl {
+            let x = r.right() - 32.0 - BYPASS_BADGE_W;
+            let name_right = r.left() + FACE_X + u.name_g.as_ref().map_or(0.0, |g| g.size().x);
+            if x >= name_right + 4.0 {
+                return Some(Rect::from_min_size(Pos2::new(x, r.top() + 11.0), Vec2::new(BYPASS_BADGE_W, BYPASS_BADGE_H)));
+            }
+        }
+        // Fallback: right-aligned on the subtitle band, clear of subtitle and knobs.
+        let y = r.top() + 38.0;
+        let x = r.right() - 12.0 - BYPASS_BADGE_W;
+        let sub_right = r.left() + FACE_X + u.sub_g.as_ref().map_or(0.0, |g| g.size.x);
+        let clear_of_knobs = u.knobs.iter().all(|k| k.hidden)
+            || y + BYPASS_BADGE_H + 4.0 <= self.knob_row_y(ui) - KNOB_R - 4.0;
+        if x >= sub_right + 4.0 && clear_of_knobs {
+            return Some(Rect::from_min_size(Pos2::new(x, y), Vec2::new(BYPASS_BADGE_W, BYPASS_BADGE_H)));
+        }
+        None
+    }
+
+    /// Rack-local rect for the back-face `BYPASSED` chip (#305): top-right,
+    /// clear of the back label and the centered jack row.
+    fn back_bypass_badge_rect(&self, ui: usize) -> Option<Rect> {
+        let u = self.units.get(ui)?;
+        if !self.strip_row(u.node_id).bypass { return None; }
+        let r = *self.unit_rects.get(ui)?;
+        if !(r.width() >= 110.0 && r.height() >= 64.0) { return None; }
+        Some(Rect::from_min_size(
+            Pos2::new(r.right() - 12.0 - BYPASS_BADGE_W, r.top() + 8.0),
+            Vec2::new(BYPASS_BADGE_W, BYPASS_BADGE_H),
+        ))
+    }
+
+    /// Crisp Hurricane `BYPASSED` chip on a unit face (front or back).
+    fn draw_bypass_badge(&self, painter: &egui::Painter, rect: Rect) {
+        if self.text_alpha <= 0.01 { return; }
+        let sr = self.xf.rect(rect);
+        painter.rect_filled(sr, 2.0, alpha(theme::DARK_PANEL_HI, self.text_alpha));
+        painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(theme::CABLE_AMBER, self.text_alpha)), egui::StrokeKind::Inside);
+        self.face_text(painter, rect.center(), "BYPASSED", theme::medium_font(9.5), theme::CABLE_AMBER);
+    }
+
     fn draw_front(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
@@ -26520,33 +27347,24 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let unit_selected = self.selected_unit == Some(u.node_id);
+            let bypassed = self.strip_row(u.node_id).bypass;
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
-            // Single near-black family (§2.4): plates are the chassis color;
-            // zones are drawn with 1px hairline rules that brighten on hover
-            // (~120ms ease). Drag = 2px accent inset keyline; Agent = teal keyline.
-            painter.rect_filled(sr, 2.0, CHASSIS);
+            // Single near-black family (§2.4): plates are the chassis color
+            // (recessed to PAPER_SINK while bypassed); zones are drawn with
+            // 1px hairline rules that brighten on hover (~120ms ease).
+            // Drag/selected = 2px accent inset keyline; Agent = teal keyline.
+            painter.rect_filled(sr, 2.0, if bypassed { theme::PAPER_SINK } else { CHASSIS });
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
-            if dragging || unit_selected {
-                theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
-            } else if agent_t > 0.01 {
-                let sw = 1.8 + 1.4 * pulse;
-                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
-                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
-            } else {
-                // Faint default rule; hover eases to the accent (clear
-                // interactive state without shadows — DeepSeek review fix).
-                let rule = mix(BORDER, theme::ACCENT, ht);
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
-            }
 
-            // Label strip: 2px rule, accent while dragged (§4.3), teal when
-            // touched by an agent. Activity is the LED's job alone — the
-            // strip no longer flashes with it (one signal, not two).
+            // Label strip: 2px rule, accent while dragged/selected (§4.3),
+            // dimmed when bypassed, teal when touched by an agent.
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
             let strip_col = if dragging || unit_selected {
                 theme::ACCENT
+            } else if bypassed {
+                alpha(BORDER, 0.35)
             } else if agent_t > 0.01 {
                 mix(BORDER, theme::AGENT_COLOR, agent_t)
             } else {
@@ -26557,15 +27375,19 @@ impl DemoApp {
             // Labels are fitted to the unit (ensure_galleys) AND clipped to
             // it: no label pixel may leave its box into a neighbor (C4).
             let label_painter = painter.with_clip_rect(sr.intersect(painter.clip_rect()));
-            self.text(&label_painter, r.min.to_vec2() + Vec2::new(34.0, 17.0), &u.name_g, TEXT);
+            self.text(&label_painter, r.min.to_vec2() + Vec2::new(34.0, 17.0), &u.name_g, if bypassed { SUBTEXT } else { TEXT });
             self.text_tracked(&label_painter, r.min.to_vec2() + Vec2::new(34.0, 42.0), &u.sub_g, SUBTEXT);
 
             // Activity LED: flat teal disc (+ optional flat halo), accent
-            // while dragged. No glow stack.
+            // while dragged, dimmed dark dot when bypassed. No glow stack.
             let led = (r.right_top() + Vec2::new(-20.0, 20.0)).to_vec2();
-            let led_col = if dragging { theme::ACCENT } else { GREEN };
-            if u.led > 0.03 { self.ell(painter, led, 7.5, alpha(led_col, 0.15 * u.led), Stroke::NONE); }
-            self.ell(painter, led, 3.2, alpha(led_col, 0.25 + 0.75 * u.led), Stroke::NONE);
+            if bypassed {
+                self.ell(painter, led, 3.2, alpha(BORDER, 0.35), Stroke::NONE);
+            } else {
+                let led_col = if dragging { theme::ACCENT } else { GREEN };
+                if u.led > 0.03 { self.ell(painter, led, 7.5, alpha(led_col, 0.15 * u.led), Stroke::NONE); }
+                self.ell(painter, led, 3.2, alpha(led_col, 0.25 + 0.75 * u.led), Stroke::NONE);
+            }
 
             match &u.node_kind {
                 UnitKind::Keys => {
@@ -26594,8 +27416,32 @@ impl DemoApp {
                 self.draw_knob(painter, ui, ki);
             }
 
+            // Dim bypassed unit faces uniformly while keeping borders,
+            // selection keylines, and the BYPASSED chip crisp on top (#305).
+            if bypassed {
+                painter.rect_filled(sr, 2.0, alpha(theme::PAPER_SINK, 0.46));
+            }
+
+            if dragging || unit_selected {
+                theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
+            } else if agent_t > 0.01 {
+                let sw = 1.8 + 1.4 * pulse;
+                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
+                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
+            } else {
+                // Faint default rule; hover eases to the accent (clear
+                // interactive state without shadows — DeepSeek review fix).
+                let rule = mix(BORDER, theme::ACCENT, ht);
+                let base_a = if bypassed { 0.22 } else { 0.3 };
+                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, base_a + (1.0 - base_a) * ht)), egui::StrokeKind::Inside);
+            }
+
+            if let Some(badge) = self.bypass_badge_rect(ui) {
+                self.draw_bypass_badge(painter, badge);
+            }
+
             if Self::agent_badge_alpha(agent_t) > 0.05 {
-                let badge = if self.split_rects(ui).is_some() {
+                let badge = if self.split_rects(ui).is_some() || self.bypass_badge_rect(ui).is_some() {
                     Rect::from_min_size(Pos2::new(r.right() - 60.0, r.top() + 40.0), Vec2::new(46.0, 16.0))
                 } else {
                     Rect::from_min_size(Pos2::new(r.right() - 84.0, r.top() + 12.0), Vec2::new(46.0, 16.0))
@@ -27332,11 +28178,22 @@ impl DemoApp {
                 if let Some(m) = self.metro_action_rects(unit) {
                     obs.push(m.tap.union(m.count_in).union(m.sig.unwrap_or(m.count_in)));
                 }
+                if let Some(b) = self.bypass_badge_rect(unit) {
+                    obs.push(b);
+                }
             }
             Side::Back => {
                 obs.push(Rect::from_min_size(r.min + Vec2::new(32.0, 10.0), sz(&u.back_g)));
+                if let Some(b) = self.back_bypass_badge_rect(unit) {
+                    obs.push(b);
+                }
                 if Self::agent_badge_alpha(agent_t) > 0.05 {
-                    obs.push(Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0)));
+                    let x = if self.back_bypass_badge_rect(unit).is_some() {
+                        r.right() - 12.0 - BYPASS_BADGE_W - 52.0
+                    } else {
+                        r.right() - 56.0
+                    };
+                    obs.push(Rect::from_min_size(Pos2::new(x, r.top() + 8.0), Vec2::new(46.0, 16.0)));
                 }
                 for (ji, j) in u.jacks.iter().enumerate() {
                     let c = self.jack_pos(unit, ji);
@@ -28734,6 +29591,207 @@ impl DemoApp {
         }
     }
 
+    /// Right-click context menu for a rack unit plate on front or back (#305).
+    fn unit_menu_ui(&mut self, ctx: &egui::Context) {
+        self.unit_menu_row_rects.clear();
+        let Some(menu) = self.unit_menu else {
+            self.unit_menu_rect = Rect::NOTHING;
+            return;
+        };
+        let close = |app: &mut Self| {
+            app.unit_menu = None;
+            app.unit_menu_rect = Rect::NOTHING;
+            app.unit_menu_row_rects.clear();
+        };
+        if self.stage_view != StageView::Rack || self.side != menu.side || (self.dock == DockView::Keyboard && self.kb_expanded) {
+            return close(self);
+        }
+        let Some(ui_idx) = self.units.iter().position(|u| u.node_id == menu.node) else {
+            return close(self);
+        };
+        let node_id = menu.node;
+        let title = self.unit_display_name(node_id);
+        let bypassed = self.strip_row(node_id).bypass;
+        let can_bypass = self.unit_can_bypass(ui_idx);
+        let can_dup = self.unit_can_duplicate(ui_idx);
+        let can_remove = self.unit_can_remove(ui_idx);
+        let has_knobs = !self.units[ui_idx].knobs.is_empty()
+            || self.base_graph.node(node_id).is_some_and(|n| matches!(n.kind, NodeKind::Lv2 { .. }));
+        let can_randomize = self.base_graph.node(node_id).is_some_and(|n| {
+            let has_other = self.units[ui_idx].knobs.iter().filter(|k| !k.hidden).count() > 1;
+            self.units[ui_idx].knobs.iter().any(|k| {
+                (!k.hidden || crate::organ::is_organ(&n.kind))
+                    && crate::engine::knob_random_bounds(&n.kind, &k.label, k.param, has_other).is_some()
+            })
+        });
+        let paste_from = self.can_paste_unit_settings(node_id).map(str::to_string);
+        let cable_count = self.unit_cable_count(ui_idx);
+        let native_gui = self.unit_native_gui_state(node_id);
+        let has_param_ed = self.unit_has_param_editor(node_id);
+
+        #[derive(Clone, Copy)]
+        enum Action {
+            Bypass,
+            Duplicate,
+            Init,
+            Randomize,
+            Copy,
+            Paste,
+            UnplugAll,
+            NativeGui,
+            ParamEditor,
+            Remove,
+        }
+        let mut chosen: Option<Action> = None;
+        let mut row_rects: Vec<(String, Rect)> = Vec::new();
+
+        let area = egui::Area::new(egui::Id::unique("unit_context_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                theme::dropdown_popup_frame()
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.set_width(228.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        // Header row: unit name + subtle status pill when bypassed.
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&title).font(theme::medium_font(12.5)).color(theme::CREAM));
+                            if bypassed {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("BYPASSED").font(theme::medium_font(9.5)).color(theme::CABLE_AMBER));
+                                });
+                            }
+                        });
+                        ui.add_space(2.0);
+                        Self::stage_hairline(ui);
+                        ui.add_space(2.0);
+
+                        let mut menu_row = |ui: &mut egui::Ui, key: &str, label: &str, shortcut: &str, enabled: bool, danger: bool| -> bool {
+                            let w = ui.available_width();
+                            let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+                            let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), sense);
+                            row_rects.push((key.to_string(), r));
+                            let hov = enabled && resp.hovered();
+                            if hov {
+                                ui.painter().rect_filled(r, 2.0, if danger { theme::DANGER_BG } else { theme::DARK_PANEL_HI });
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            let col = if !enabled {
+                                theme::MUTED
+                            } else if danger {
+                                theme::CLIP_BRIGHT
+                            } else {
+                                theme::CREAM
+                            };
+                            ui.painter().text(
+                                Pos2::new(r.left() + 8.0, r.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                FontId::proportional(12.0),
+                                col,
+                            );
+                            if !shortcut.is_empty() {
+                                ui.painter().text(
+                                    Pos2::new(r.right() - 8.0, r.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    shortcut,
+                                    FontId::proportional(10.5),
+                                    if enabled { theme::CREAM_DIM } else { theme::MUTED },
+                                );
+                            }
+                            enabled && resp.clicked()
+                        };
+
+                        if can_bypass {
+                            let lbl = if bypassed { "Enable unit" } else { "Bypass unit" };
+                            if menu_row(ui, "bypass", lbl, "Ctrl+E", true, false) { chosen = Some(Action::Bypass); }
+                        }
+                        if can_dup {
+                            if menu_row(ui, "duplicate", "Duplicate unit", "Ctrl+D", true, false) { chosen = Some(Action::Duplicate); }
+                        }
+                        if can_bypass || can_dup {
+                            ui.add_space(2.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(2.0);
+                        }
+                        if has_knobs {
+                            if menu_row(ui, "init", "Initialize parameters", "", true, false) { chosen = Some(Action::Init); }
+                        }
+                        if can_randomize {
+                            if menu_row(ui, "randomize", "Randomize parameters", "Ctrl+R", true, false) { chosen = Some(Action::Randomize); }
+                        }
+                        if menu_row(ui, "copy", "Copy settings", "", true, false) { chosen = Some(Action::Copy); }
+                        let paste_lbl = match &paste_from {
+                            Some(src) => {
+                                let short: String = if src.chars().count() > 12 {
+                                    format!("{}…", src.chars().take(11).collect::<String>())
+                                } else {
+                                    src.clone()
+                                };
+                                format!("Paste settings ({short})")
+                            }
+                            None => "Paste settings".to_string(),
+                        };
+                        if menu_row(ui, "paste", &paste_lbl, "", paste_from.is_some(), false) { chosen = Some(Action::Paste); }
+
+                        ui.add_space(2.0);
+                        Self::stage_hairline(ui);
+                        ui.add_space(2.0);
+
+                        let unplug_lbl = if cable_count > 0 {
+                            format!("Unplug all cables ({cable_count})")
+                        } else {
+                            "Unplug all cables".to_string()
+                        };
+                        if menu_row(ui, "unplug", &unplug_lbl, "", cable_count > 0, false) { chosen = Some(Action::UnplugAll); }
+
+                        if let Some(open) = native_gui {
+                            let lbl = if open { "Close plugin GUI" } else { "Open plugin GUI" };
+                            if menu_row(ui, "plugin_gui", lbl, "", true, false) { chosen = Some(Action::NativeGui); }
+                        }
+                        if has_param_ed {
+                            if menu_row(ui, "param_editor", "Parameters & presets…", "", true, false) { chosen = Some(Action::ParamEditor); }
+                        }
+                        if can_remove {
+                            ui.add_space(2.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(2.0);
+                            if menu_row(ui, "remove", "Remove unit", "", true, true) { chosen = Some(Action::Remove); }
+                        }
+                    });
+            });
+        self.unit_menu_rect = area.response.rect;
+        self.unit_menu_row_rects = row_rects;
+
+        let Some(action) = chosen else { return };
+        close(self);
+        let res: Result<(), String> = match action {
+            Action::Bypass => self.toggle_unit_bypass(node_id, true).map(|_| ()),
+            Action::Duplicate => self.duplicate_unit(node_id, None, None, true).map(|_| ()),
+            Action::Init => self.reset_unit_params(node_id, true).map(|_| ()),
+            Action::Randomize => self.randomize_unit_params(node_id, 1.0, None, true).map(|_| ()),
+            Action::Copy => self.copy_unit_settings(node_id).map(|_| ()),
+            Action::Paste => self.paste_unit_settings(node_id, true).map(|_| ()),
+            Action::UnplugAll => self.unplug_unit_cables(node_id, true).map(|_| ()),
+            Action::NativeGui => {
+                self.toggle_unit_native_gui(node_id);
+                Ok(())
+            }
+            Action::ParamEditor => {
+                self.open_unit_param_editor(node_id);
+                Ok(())
+            }
+            Action::Remove => self.remove_unit_action(node_id, true).map(|_| ()),
+        };
+        if let Err(e) = res {
+            self.session_msg = e;
+        }
+    }
+
     fn draw_back(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
@@ -28741,11 +29799,12 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let unit_selected = self.selected_unit == Some(u.node_id);
+            let bypassed = self.strip_row(u.node_id).bypass;
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
-            // Same flat plate treatment as the front (§4.4).
-            painter.rect_filled(sr, 2.0, CHASSIS);
+            // Same flat plate treatment as the front (§4.4), dimmed when bypassed (#305).
+            painter.rect_filled(sr, 2.0, if bypassed { theme::PAPER_SINK } else { CHASSIS });
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging || unit_selected {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
@@ -28757,12 +29816,15 @@ impl DemoApp {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
                 let rule = mix(BORDER, theme::ACCENT, ht);
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
+                let base_a = if bypassed { 0.22 } else { 0.3 };
+                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, base_a + (1.0 - base_a) * ht)), egui::StrokeKind::Inside);
             }
-            let active = u.led > 0.05 || dragging || unit_selected;
+            let active = (!bypassed && u.led > 0.05) || dragging || unit_selected;
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
             let strip_col = if active {
                 theme::ACCENT
+            } else if bypassed {
+                alpha(BORDER, 0.35)
             } else if agent_t > 0.01 {
                 mix(BORDER, theme::AGENT_COLOR, agent_t)
             } else {
@@ -28779,20 +29841,27 @@ impl DemoApp {
         self.draw_pulses(painter, &hl, has_focus);
         self.draw_pending(painter);
 
-        // Paint order fix (§4.4): unit titles + jack labels LAST, so cables
-        // never cross them.
+        // Paint order fix (§4.4): unit titles + jack labels + BYPASSED chips
+        // LAST, so cables never cross them.
         for (ui, u) in self.units.iter().enumerate() {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             let sr = xf.rect(r);
-            self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
+            let bypassed = self.strip_row(u.node_id).bypass;
+            self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, if bypassed { alpha(SUBTEXT, 0.55) } else { SUBTEXT });
+            let bypass_rect = self.back_bypass_badge_rect(ui);
+            if let Some(badge) = bypass_rect {
+                self.draw_bypass_badge(painter, badge);
+            }
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             if Self::agent_badge_alpha(agent_t) > 0.05 {
-                let badge = Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0));
+                let x = if bypass_rect.is_some() { r.right() - 12.0 - BYPASS_BADGE_W - 52.0 } else { r.right() - 56.0 };
+                let badge = Rect::from_min_size(Pos2::new(x, r.top() + 8.0), Vec2::new(46.0, 16.0));
                 self.draw_agent_badge(painter, badge, agent_t);
             }
             let label_painter = painter.with_clip_rect(sr.intersect(painter.clip_rect()));
             self.draw_cpu_badge(&label_painter, ui, Side::Back);
+            let plate_bg = if bypassed { theme::PAPER_SINK } else { CHASSIS };
             for (ji, j) in u.jacks.iter().enumerate() {
                 let c = self.jack_pos(ui, ji);
                 let (jw, jh) = j.label_g.as_ref().map_or((0.0, 0.0), |g| (g.size.x, g.size.y));
@@ -28800,9 +29869,9 @@ impl DemoApp {
                 // never through its glyphs ("L" read as "WARM" in review).
                 if jw > 0.0 && self.text_alpha > 0.01 {
                     let plate = Rect::from_min_size((c + Vec2::new(-jw / 2.0 - 3.0, 16.0)).to_pos2(), Vec2::new(jw + 6.0, jh + 2.0));
-                    painter.rect_filled(self.xf.rect(plate), 2.0, alpha(CHASSIS, self.text_alpha));
+                    painter.rect_filled(self.xf.rect(plate), 2.0, alpha(plate_bg, self.text_alpha));
                 }
-                self.text_tracked(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, SUBTEXT);
+                self.text_tracked(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, if bypassed { alpha(SUBTEXT, 0.55) } else { SUBTEXT });
             }
         }
         self.draw_fading_units(painter);
@@ -30677,6 +31746,7 @@ impl DemoApp {
         self.knob_menu_ui(&ctx);
         self.scale_menu_ui(&ctx);
         self.cable_menu_ui(&ctx);
+        self.unit_menu_ui(&ctx);
         self.jack_tooltip_ui(&ctx);
         self.engine_info_ui(&ctx);
         self.session_popover_ui(&ctx);
@@ -39542,6 +40612,7 @@ mod face_layout_tests {
                 v.push(("cpu badge".into(), b.rect));
             }
         }
+        if let Some(b) = app.bypass_badge_rect(ui) { v.push(("bypass badge".into(), b)); }
         v
     }
 
@@ -39625,6 +40696,27 @@ mod face_layout_tests {
         arp.set_keys_scale(k, Some(crate::arp::ScaleChoice { scale: crate::arp::Scale::MinorPentatonic, key: 9 }));
         seed_cpu(&mut arp);
         check(arp, "arp split scale cpu overlay");
+    }
+
+    #[test]
+    fn bypassed_faces_are_padded_and_clear() {
+        let mut app = DemoApp::new_with_sink(None);
+        let delay = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap().node_id;
+        let surge = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        app.with_strip_row(delay, |r| r.bypass = true);
+        app.with_strip_row(surge, |r| r.bypass = true);
+        check(app, "bypassed demo");
+
+        // Rule 121: in the rack the app opens with, the BYPASSED chip IS drawn.
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            let mut app = DemoApp::new_with_sink(None);
+            let di = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+            let nid = app.units[di].node_id;
+            app.with_strip_row(nid, |r| r.bypass = true);
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            assert!(app.bypass_badge_rect(di).is_some(), "BYPASSED chip shown on Delay at {size:?}");
+        }
     }
 
     #[test]
@@ -46563,6 +47655,206 @@ mod navigator_tests {
         let set_cut: serde_json::Value = serde_json::from_str(&app.exec_tool("set_param", &serde_json::json!({"node": lv2_node, "name": "cutoff", "text": "2.5 kHz"}))).unwrap();
         assert_eq!(set_cut["ok"], true);
         assert_eq!(set_cut["text"], "2500.0 Hz");
+    }
+
+    #[test]
+    fn unit_context_menu_and_bypass_faces_work_front_back_shortcuts_undo_and_parity() {
+        // 1. Parity: assistant tools + UI_BRIDGE_TOOLS + undoable (not read-only).
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        for t in ["set_node_bypass", "duplicate_node", "reset_node_params", "randomize_node_params"] {
+            assert!(names.contains(&t), "assistant::tools missing {t}");
+            assert!(UI_BRIDGE_TOOLS.contains(&t), "UI_BRIDGE_TOOLS missing {t}");
+            assert!(!tool_is_read_only(t), "{t} must record undo");
+        }
+
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let rclick_at = |app: &mut DemoApp, pos: Pos2| {
+            run_frame_at(app, &ctx, size, vec![egui::Event::PointerMoved(pos)]);
+            run_frame_at(app, &ctx, size, vec![egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE,
+            }]);
+            run_frame_at(app, &ctx, size, vec![egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE,
+            }]);
+            run_frame_at(app, &ctx, size, vec![]);
+        };
+        let cmd_key = |k: Key| vec![egui::Event::Key {
+            key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND,
+        }];
+        let collect_texts = |shapes: &[egui::epaint::ClippedShape]| -> Vec<String> {
+            fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+                match s {
+                    egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                    egui::Shape::Vec(v) => for c in v { walk(c, out); },
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for cs in shapes { walk(&cs.shape, &mut out); }
+            out
+        };
+
+        let mut app = DemoApp::new_with_sink(None);
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+
+        let delay_idx = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap();
+        let delay_id = app.units[delay_idx].node_id;
+        // Pick a plate point clear of knobs (upper-middle of unit plate).
+        let plate_pt = |app: &DemoApp, ui: usize| {
+            let r = app.unit_rects[ui];
+            app.xf.p(Vec2::new(r.center().x, r.top() + 30.0))
+        };
+
+        // 2. Right-clicking a unit plate on Front opens the context menu and selects it.
+        let front_pt = plate_pt(&app, delay_idx);
+        rclick_at(&mut app, front_pt);
+        assert!(app.unit_menu.is_some_and(|m| m.node == delay_id), "right-click opened unit menu");
+        assert_eq!(app.selected_unit, Some(delay_id));
+        let bypass_row = app.unit_menu_row_rects.iter().find(|(k, _)| k == "bypass").expect("bypass row").1.center();
+
+        // Clicking "Bypass unit" toggles bypass, shows BYPASSED chip, and records 1 undo step.
+        let undo_before = app.undo_past.len();
+        click_at(&mut app, &ctx, size, bypass_row);
+        assert!(app.unit_menu.is_none(), "menu closed after click");
+        assert!(app.strip_row(delay_id).bypass, "Delay is bypassed");
+        assert_eq!(app.undo_past.len(), undo_before + 1, "bypass recorded 1 undo step");
+        let shapes = run_frame_at(&mut app, &ctx, size, vec![]);
+        let texts = collect_texts(&shapes);
+        assert!(texts.iter().any(|t| t == "BYPASSED"), "Front face draws BYPASSED chip: {texts:?}");
+
+        // 3. Flip to Back: BYPASSED chip also renders on Back, and right-clicking opens the menu.
+        app.side = Side::Back;
+        app.flipping = false;
+        let shapes_back = run_frame_at(&mut app, &ctx, size, vec![]);
+        let texts_back = collect_texts(&shapes_back);
+        assert!(texts_back.iter().any(|t| t == "BYPASSED"), "Back face draws BYPASSED chip: {texts_back:?}");
+        let back_pt = plate_pt(&app, delay_idx);
+        rclick_at(&mut app, back_pt);
+        assert!(app.unit_menu.is_some_and(|m| m.node == delay_id && m.side == Side::Back), "Back right-click opened menu");
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Escape));
+        assert!(app.unit_menu.is_none(), "Esc closes unit menu");
+        app.side = Side::Front;
+        run_frame_at(&mut app, &ctx, size, vec![]);
+
+        // 4. Ctrl+E toggles bypass back off (1 undo step), Ctrl+Z undoes it.
+        app.selected_unit = Some(delay_id);
+        run_frame_at(&mut app, &ctx, size, cmd_key(Key::E));
+        assert!(!app.strip_row(delay_id).bypass, "Ctrl+E re-enabled Delay");
+        run_frame_at(&mut app, &ctx, size, cmd_key(Key::Z));
+        assert!(app.strip_row(delay_id).bypass, "Ctrl+Z restored bypassed state");
+
+        // Clicking the BYPASSED chip directly re-enables the unit.
+        run_frame_at(&mut app, &ctx, size, vec![]);
+        let di = app.units.iter().position(|u| u.node_id == delay_id).unwrap();
+        let badge_pos = app.xf.p(app.bypass_badge_rect(di).expect("bypass badge rect").center().to_vec2());
+        click_at(&mut app, &ctx, size, badge_pos);
+        assert!(!app.strip_row(delay_id).bypass, "clicking BYPASSED chip re-enables unit");
+
+        // 5. Randomize (Ctrl+R) changes Delay knobs without touching Master VOLUME, and Initialize resets them.
+        let master_idx = app.master_idx().unwrap();
+        let vol_idx = app.units[master_idx].knob_index("VOLUME").unwrap();
+        let master_vol_before = app.units[master_idx].knobs[vol_idx].value;
+        app.selected_unit = Some(delay_id);
+        let undo_before = app.undo_past.len();
+        run_frame_at(&mut app, &ctx, size, cmd_key(Key::R));
+        assert_eq!(app.undo_past.len(), undo_before + 1, "Ctrl+R is one undo step");
+        assert!((app.units[master_idx].knobs[vol_idx].value - master_vol_before).abs() < 1e-6, "Ctrl+R did not reset Master VOLUME");
+
+        // Copy / Paste settings between two compatible Delays via duplicate + copy/paste.
+        let di = app.units.iter().position(|u| u.node_id == delay_id).unwrap();
+        app.set_unit_knob(di, 0, 0.77);
+        app.set_unit_knob(di, 1, 0.23);
+        let dup_out: serde_json::Value = serde_json::from_str(
+            &app.exec_tool("duplicate_node", &serde_json::json!({"node": delay_id}))
+        ).unwrap();
+        let dup_id = dup_out["node"].as_u64().unwrap() as u32;
+        assert_ne!(dup_id, delay_id);
+        let dup_ui = app.units.iter().position(|u| u.node_id == dup_id).unwrap();
+        assert!((app.units[dup_ui].knobs[0].value - 0.77).abs() < 1e-5, "duplicate copied TIME knob");
+        assert!((app.units[dup_ui].knobs[1].value - 0.23).abs() < 1e-5, "duplicate copied MIX knob");
+
+        // Reset duplicate back to true factory defaults (0.4, 0.5 — NOT the copied 0.77/0.23!).
+        let rst_out: serde_json::Value = serde_json::from_str(
+            &app.exec_tool("reset_node_params", &serde_json::json!({"node": dup_id}))
+        ).unwrap();
+        assert_eq!(rst_out["reset_count"], serde_json::json!(2));
+        let dup_ui = app.units.iter().position(|u| u.node_id == dup_id).unwrap();
+        assert!((app.units[dup_ui].knobs[0].value - 0.4).abs() < 1e-5, "reset restored factory default TIME");
+        assert!((app.units[dup_ui].knobs[1].value - 0.5).abs() < 1e-5, "reset restored factory default MIX");
+
+        // Copy from Delay A → Paste into Delay duplicate works; Paste into Master fails.
+        app.copy_unit_settings(delay_id).unwrap();
+        let master_id = app.units[app.master_idx().unwrap()].node_id;
+        assert!(app.can_paste_unit_settings(master_id).is_none(), "incompatible unit cannot paste");
+        assert!(app.can_paste_unit_settings(dup_id).is_some(), "compatible Delay accepts paste");
+        app.paste_unit_settings(dup_id, true).unwrap();
+        let dup_ui = app.units.iter().position(|u| u.node_id == dup_id).unwrap();
+        assert!((app.units[dup_ui].knobs[0].value - 0.77).abs() < 1e-5, "paste restored TIME");
+        assert!((app.units[dup_ui].knobs[1].value - 0.23).abs() < 1e-5, "paste restored MIX");
+
+        // Unplug all cables on Delay A, then undo restores them.
+        let cables_before = app.cables.iter().filter(|c| c.dying < 0.0).count();
+        let unplugged = app.unplug_unit_cables(delay_id, true).unwrap();
+        assert!(unplugged > 0, "Delay A had cables to unplug");
+        assert_eq!(app.cables.iter().filter(|c| c.dying < 0.0).count(), cables_before - unplugged);
+        app.undo_agent(true).unwrap();
+        assert_eq!(app.cables.iter().filter(|c| c.dying < 0.0).count(), cables_before, "undo restored all cables");
+
+        // Remove duplicate unit, then undo restores it.
+        let units_before = app.units.len();
+        app.remove_unit_action(dup_id, true).unwrap();
+        assert_eq!(app.units.len(), units_before - 1, "removed duplicate");
+        app.undo_agent(true).unwrap();
+        assert_eq!(app.units.len(), units_before, "undo restored removed unit");
+
+        // 6. Multi-rig duplicate keeps node IDs disjoint across rigs.
+        let (mut multi, _) = two_rigs_with_inserts(false);
+        let rig0_delay = multi.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap().node_id;
+        let before_count = multi.units.len();
+        let (multi_dup, _, dest_rig) = multi.duplicate_unit(rig0_delay, Some(0), Some("Tape Echo"), true).unwrap();
+        assert_eq!(dest_rig, 0);
+        assert_eq!(multi.units.len(), before_count + 1);
+        assert!(multi.units.iter().any(|u| u.node_id == multi_dup && u.rig == 0));
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat unit_context_menu_and_bypass_shots -- --ignored"]
+    fn unit_context_menu_and_bypass_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = Vec2::new(1280.0, 800.0);
+
+        // 1. Before: plain demo rack front (no bypass, no menu).
+        let mut before = DemoApp::new_with_sink(None);
+        super::offline_shots::shot(&mut before, size, &dir.join("before-front.png"));
+
+        // 2. After (front): Delay B bypassed + dimmed + crisp BYPASSED chip, with right-click menu open on Surge A.
+        let mut after_menu = DemoApp::new_with_sink(None);
+        let delay_b = after_menu.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).nth(1).unwrap().node_id;
+        let surge = after_menu.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        after_menu.with_strip_row(delay_b, |r| r.bypass = true);
+        after_menu.selected_unit = Some(surge);
+        after_menu.unit_menu = Some(UnitMenu { node: surge, pos: Pos2::new(430.0, 210.0), side: Side::Front });
+        super::offline_shots::shot(&mut after_menu, size, &dir.join("after-front-bypassed-menu.png"));
+
+        // 3. After (front, bypassed units only): Delay A and Surge B bypassed so dimmed faces read clearly.
+        let mut after_front = DemoApp::new_with_sink(None);
+        let delay_id = after_front.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap().node_id;
+        let surge_b = after_front.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).nth(1).unwrap().node_id;
+        after_front.with_strip_row(delay_id, |r| r.bypass = true);
+        after_front.with_strip_row(surge_b, |r| r.bypass = true);
+        super::offline_shots::shot(&mut after_front, size, &dir.join("after-front-bypassed.png"));
+
+        // 4. After (back): Back view with Delay A bypassed + dimmed + BYPASSED chip above cables.
+        let mut after_back = DemoApp::new_with_sink(None);
+        let delay_id = after_back.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Delay))).unwrap().node_id;
+        after_back.with_strip_row(delay_id, |r| r.bypass = true);
+        after_back.side = Side::Back;
+        super::offline_shots::shot(&mut after_back, size, &dir.join("after-back-bypassed.png"));
     }
 }
 

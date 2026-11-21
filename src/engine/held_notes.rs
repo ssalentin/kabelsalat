@@ -70,6 +70,8 @@ pub(super) enum Kind {
     Demo,
     /// A song switch (`SetRigZones`).
     Zone,
+    /// Toggling unit bypass (`SetStripBypass`, #305).
+    Bypass,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +126,8 @@ enum Edit {
     DemoStop,
     /// SetRigZones with `SONGS[n]` for rigs 0 (Surge A) and 1 (Surge B).
     Zones(u8),
+    /// SetStripBypass on a node (#305).
+    Bypass(u32, bool),
 }
 
 /// Which scenario a search runs: the plain rack, the arp (#90), the rack
@@ -136,6 +140,7 @@ enum Scenario {
     Fx,
     Demo,
     Zones,
+    Bypass,
 }
 
 /// C# major pentatonic: B (59) snaps down to A#, C (60) up to C#. Two keys
@@ -232,6 +237,31 @@ const ARP_EDITS: [Edit; 7] = [
     Edit::Wire { id: 1, from: KEYS, to: SURGE_A },
 ];
 
+/// Focused arp-bypass scenario (#305): bypassing an Arp mid-note with scale
+/// snap and mode switches passes notes through cleanly without stranding any.
+const ARP_BYPASS_EDITS: [Edit; 6] = [
+    Edit::AddArp,
+    Edit::ArpParam { param: crate::arp::P_ARP_MODE, pct: 0 },
+    Edit::ArpParam { param: crate::arp::P_ARP_MODE, pct: 75 },
+    Edit::Bypass(ARP, true),
+    Edit::Bypass(ARP, false),
+    Edit::Remove(ARP),
+];
+
+/// Edits of the unit bypass scenario (#305): bypassing an instrument or a
+/// transposing MIDI strip mid-note, combined with transposition and unplugging.
+const BYPASS_EDITS: [Edit; 9] = [
+    Edit::Bypass(SURGE_A, true),
+    Edit::Bypass(SURGE_A, false),
+    Edit::Bypass(FX, true),
+    Edit::Bypass(FX, false),
+    Edit::FxSemis(12),
+    Edit::FxSemis(0),
+    Edit::Unplug(8),
+    Edit::Unplug(9),
+    Edit::RemoveFx,
+];
+
 /// Edits of the rig demo scenario (#200): demo start/stop, time, and one
 /// edit of each routing kind (split, zone octave, scale, matrix rule, cable,
 /// node removal, arp take-over, source switch, template load).
@@ -264,6 +294,7 @@ impl Edit {
             Edit::Source { .. } => Kind::Source,
             Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
             Edit::Zones(_) => Kind::Zone,
+            Edit::Bypass(..) => Kind::Bypass,
         }
     }
 
@@ -348,6 +379,7 @@ impl Edit {
                 zones[..2].copy_from_slice(&SONGS[n as usize]);
                 Command::SetRigZones { zones }
             }
+            Edit::Bypass(node, bypass) => Command::SetStripBypass { node, bypass },
         }
     }
 }
@@ -402,7 +434,7 @@ fn start_graph_two_rigs() -> Graph {
 
 fn start_graph_for(scn: Scenario) -> Graph {
     match scn {
-        Scenario::RoutingWithStrip | Scenario::Fx => start_graph_with_strip(),
+        Scenario::RoutingWithStrip | Scenario::Fx | Scenario::Bypass => start_graph_with_strip(),
         Scenario::Routing | Scenario::Arp | Scenario::Demo => start_graph(),
         Scenario::Zones => start_graph_two_rigs(),
     }
@@ -553,11 +585,12 @@ impl Run {
         .expect("serialize state");
         let arps: Vec<String> = self.engine.arp.iter().map(|a| a.fingerprint()).collect();
         let fx: Vec<i8> = self.engine.midi_fx.iter().map(|s| s.semis).collect();
+        let bypassed: Vec<u32> = self.engine.strips.iter().filter(|(_, m)| m.bypass).map(|(n, _)| *n).collect();
         let demo = self.engine.demo.as_ref().map(|d| d.fingerprint());
         // Hashed: 100k states of a kilobyte of JSON each is memory the check
         // does not need to keep.
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{routing}|{fx:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}", self.held, self.sounding, self.arp_added, self.engine.rig_zones).hash(&mut h);
+        format!("{routing}|{fx:?}|{bypassed:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}", self.held, self.sounding, self.arp_added, self.engine.rig_zones).hash(&mut h);
         h.finish()
     }
 }
@@ -601,6 +634,7 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::DemoPlay(kind)) => format!("DemoPlay rig 0 {kind:?}"),
         Step::Edit(Edit::DemoStop) => "DemoStop".to_string(),
         Step::Edit(Edit::Zones(n)) => format!("SetRigZones (rig 0, rig 1) = {:?}", SONGS[n as usize]),
+        Step::Edit(Edit::Bypass(node, on)) => format!("SetStripBypass node {node} = {on}"),
         Step::Tick => "Tick (time passes)".to_string(),
     }
 }
@@ -665,6 +699,23 @@ pub(super) fn explore_zones(max_states: usize) -> Report {
     alphabet.extend(ZONE_EDITS.iter().map(|&e| Step::Edit(e)));
     alphabet.push(Step::Edit(Edit::LoadStart));
     explore_with(&alphabet, max_states, Scenario::Zones)
+}
+
+/// Unit bypass toggles on an instrument and a MIDI strip (#305).
+pub(super) fn explore_bypass(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.extend(BYPASS_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::Bypass)
+}
+
+/// Focused arp bypass toggles (#305).
+pub(super) fn explore_arp_bypass(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.push(Step::Tick);
+    alphabet.extend(ARP_BYPASS_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::Arp)
 }
 
 fn explore_with(alphabet: &[Step], max_states: usize, scn: Scenario) -> Report {
@@ -804,4 +855,23 @@ fn held_notes_and_demo_phrases_are_released_under_routing_edits() {
     }
     assert!(report.stuck.is_empty(), "stuck notes with the demo phrase player (traces above)");
     assert!(report.complete, "state bound hit before fixpoint: the demo alphabet's state space grew");
+}
+
+#[test]
+fn held_notes_are_released_across_unit_bypass() {
+    for (what, report) in [
+        ("instrument + MIDI-FX", explore_bypass(100_000)),
+        ("arp", explore_arp_bypass(50_000)),
+    ] {
+        let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+        eprintln!("held-notes (bypass, {what}): {} reachable states {reach}", report.states);
+        for s in &report.stuck {
+            eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+            for (i, line) in s.trace.iter().enumerate() {
+                eprintln!("  {}. {line}", i + 1);
+            }
+        }
+        assert!(report.stuck.is_empty(), "stuck notes across unit bypass ({what}) (traces above)");
+        assert!(report.complete, "state bound hit before fixpoint: the bypass ({what}) alphabet's state space grew");
+    }
 }

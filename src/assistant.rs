@@ -728,11 +728,16 @@ fn system_prompt() -> String {
      the true peak under -1 dBTP; sound must have played. Tell the user the loudness before and, \
      once sound played again, after (get_master_target). \
      - Mixing (the Mixer view, F10): every source strip has set_strip_mix (pan/mute/solo at \
-     the source itself — solo stays within its rig), set_node_bypass, and its inserts are the \
-     rack cables: add_insert/remove_insert edit the chain (omit source for a MASTER insert, \
-     before the fixed limiter). rename_strip / set_strip_color / move_strip / collapse_strip \
-     shape the strip itself; get_strip_knobs / set_strip_knob read or assign each slot's \
-     quick knob; faders are dB with double-click at 0 dB. \
+     the source itself — solo stays within its rig), set_node_bypass (bypasses any FX, \
+     instrument, MIDI-FX or arp unit, dimmed with a BYPASSED chip on the rack face), and its \
+     inserts are the rack cables: add_insert/remove_insert edit the chain (omit source for a \
+     MASTER insert, before the fixed limiter). rename_strip / set_strip_color / move_strip / \
+     collapse_strip shape the strip itself; get_strip_knobs / set_strip_knob read or assign \
+     each slot's quick knob; faders are dB with double-click at 0 dB. \
+     - Unit actions (also on the rack unit right-click menu): duplicate_node copies a unit \
+     (kind, parameters, plugin state) into its rig (or a target rig); reset_node_params \
+     initializes a unit's parameters back to defaults; randomize_node_params randomizes a \
+     unit's parameters within sensible musical bounds as one undo step. \
      - Sends (a shared reverb or delay for several rigs): add_bus makes an aux bus, \
      add_insert with source = the bus node puts the effect on it (set that effect fully \
      wet), set_send sends a rig (rig=) or one source (node=) into it at a level, pre or \
@@ -1055,8 +1060,23 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_node_bypass",
-            "description":"Bypass one effect node (#74): a bypassed FX passes its input through unchanged, its knobs are kept. True = bypass, false = enable.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"FX node id (get_graph)"},"bypass":{"type":"boolean","description":"Default true"}},"required":["node"]}
+            "description":"Bypass or enable one rack unit (#74, #305): a bypassed audio effect passes its input through unchanged (preserving PDC latency), a bypassed MIDI-FX/arp passes MIDI through unmodified, and a bypassed instrument is muted with held notes released; its knobs are kept and its rack face dims with a BYPASSED chip. True = bypass, false = enable.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Unit node id (get_graph)"},"bypass":{"type":"boolean","description":"Default true"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"duplicate_node",
+            "description":"Duplicate one rack unit (#305): copies its node kind, knob/parameter values, and hosted plugin state (CLAP/LV2) into its rig (or optional target 0-based rig index). Duplicated instruments are wired into the rig; effects/MIDI-FX/arps are added ready to patch without disturbing existing cables. One undo step. Cannot duplicate Keys or Master out.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source unit node id (get_graph)"},"rig":{"type":"integer","description":"Optional target 0-based rig index (default: source node's rig)"},"name":{"type":"string","description":"Optional display name (up to 24 characters)"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"reset_node_params",
+            "description":"Initialize (reset) a rack unit's parameters and knobs back to their default values (#305). One undo step.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Unit node id (get_graph)"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"randomize_node_params",
+            "description":"Randomize a rack unit's parameters within sensible musical bounds as one undo step (#305). Leaves safety-critical controls like Master VOLUME and AudioIn MON untouched. Optional amount (0..1, default 1.0) blends from current values; optional seed makes results reproducible.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Unit node id (get_graph)"},"amount":{"type":"number","description":"0..1 randomization strength (default 1.0)"},"seed":{"type":"integer","description":"Optional deterministic RNG seed"}},"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"add_insert",

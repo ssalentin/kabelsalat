@@ -2100,6 +2100,64 @@ impl ClapVoiceMain {
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_else(|_| format!("{value:.3}"))
     }
+
+    /// Parse human-readable parameter text (e.g. `"440 Hz"`, `"-6 dB"`) using
+    /// the plugin's own CLAP `text_to_value` callback.
+    pub fn param_text_to_value(&mut self, id: u32, text: &str) -> Option<f64> {
+        let params = self.exts.params?;
+        let cstr = CString::new(text).ok()?;
+        params.text_to_value(&self.instance.plugin_handle(), ClapId::new(id), &cstr)
+    }
+
+    /// Enumerate discrete labeled options for stepped parameters (up to 32 steps),
+    /// e.g. Surge XT's Oscillator Type, Filter Type, Waveshaper, FX Type, LFO Shape.
+    pub fn param_options(&mut self, p: &ParamDesc) -> Vec<(f64, String)> {
+        if !p.stepped {
+            return Vec::new();
+        }
+        let lo = p.min.round() as i64;
+        let hi = p.max.round() as i64;
+        if hi < lo || (hi - lo) > 32 {
+            return Vec::new();
+        }
+        let mut opts = Vec::with_capacity((hi - lo + 1) as usize);
+        for v in lo..=hi {
+            let vf = v as f64;
+            let label = self.param_text(p.id, vf);
+            opts.push((vf, label));
+        }
+        opts
+    }
+
+    /// Resolve a textual parameter value: first asks the plugin's `text_to_value`,
+    /// then matches discrete option labels for stepped parameters, then falls back
+    /// to plain numeric parsing clamped to `[min, max]`.
+    pub fn resolve_param_text(&mut self, p: &ParamDesc, text: &str) -> Option<f64> {
+        let trimmed = text.trim();
+        if let Some(v) = self.param_text_to_value(p.id, trimmed) {
+            if v.is_finite() {
+                return Some(v.clamp(p.min, p.max));
+            }
+        }
+        if p.stepped {
+            let q = trimmed.to_ascii_lowercase();
+            let opts = self.param_options(p);
+            if let Some((v, _)) = opts.iter().find(|(_, lbl)| lbl.trim().to_ascii_lowercase() == q) {
+                return Some(*v);
+            }
+            if let Some((v, _)) = opts
+                .iter()
+                .find(|(_, lbl)| lbl.to_ascii_lowercase().contains(&q))
+            {
+                return Some(*v);
+            }
+        }
+        trimmed
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(p.min, p.max))
+    }
 }
 
 /// A plugin parameter description for the native editor (no X11 / plugin GUI).

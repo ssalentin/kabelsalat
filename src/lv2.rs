@@ -40,6 +40,14 @@ struct LilvIter {
 struct LilvPort {
     _private: [u8; 0],
 }
+#[repr(C)]
+struct LilvScalePoints {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct LilvScalePoint {
+    _private: [u8; 0],
+}
 
 /// LV2 plugin descriptor (lv2/core/lv2.h) — function pointers we call directly.
 /// `activate`/`deactivate` may be NULL per the spec.
@@ -310,7 +318,10 @@ extern "C" {
     fn lilv_free(ptr: *mut c_void);
     fn lilv_node_free(val: *mut LilvNode);
     fn lilv_new_uri(world: *mut LilvWorld, uri: *const c_char) -> *mut LilvNode;
+    fn lilv_node_is_float(value: *const LilvNode) -> bool;
+    fn lilv_node_is_int(value: *const LilvNode) -> bool;
     fn lilv_node_as_float(value: *const LilvNode) -> f32;
+    fn lilv_node_as_int(value: *const LilvNode) -> i32;
     fn lilv_plugin_instantiate(
         plugin: *const LilvPlugin,
         sample_rate: f64,
@@ -321,7 +332,16 @@ extern "C" {
     fn lilv_port_get_name(plugin: *const LilvPlugin, port: *const LilvPort) -> *mut LilvNode;
     fn lilv_port_is_a(plugin: *const LilvPlugin, port: *const LilvPort, class: *const LilvNode) -> bool;
     fn lilv_port_has_property(plugin: *const LilvPlugin, port: *const LilvPort, property: *const LilvNode) -> bool;
+    fn lilv_port_get(plugin: *const LilvPlugin, port: *const LilvPort, predicate: *const LilvNode) -> *mut LilvNode;
     fn lilv_port_get_value(plugin: *const LilvPlugin, port: *const LilvPort, predicate: *const LilvNode) -> *mut LilvNodes;
+    fn lilv_port_get_scale_points(plugin: *const LilvPlugin, port: *const LilvPort) -> *mut LilvScalePoints;
+    fn lilv_scale_points_begin(collection: *const LilvScalePoints) -> *mut LilvIter;
+    fn lilv_scale_points_is_end(collection: *const LilvScalePoints, iter: *const LilvIter) -> bool;
+    fn lilv_scale_points_get(collection: *const LilvScalePoints, iter: *const LilvIter) -> *const LilvScalePoint;
+    fn lilv_scale_points_next(collection: *const LilvScalePoints, iter: *const LilvIter) -> *mut LilvIter;
+    fn lilv_scale_points_free(collection: *mut LilvScalePoints);
+    fn lilv_scale_point_get_label(point: *const LilvScalePoint) -> *const LilvNode;
+    fn lilv_scale_point_get_value(point: *const LilvScalePoint) -> *const LilvNode;
     fn lilv_port_get_range(
         plugin: *const LilvPlugin,
         port: *const LilvPort,
@@ -369,6 +389,32 @@ pub struct Lv2ControlDesc {
     pub max: f32,
     pub default: f32,
     pub value: f32,
+}
+
+/// One discrete labeled value declared by an LV2 control port (`lv2:scalePoint`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lv2ScalePoint {
+    pub label: String,
+    pub value: f32,
+}
+
+/// Rich LV2 control-input port metadata (units, port properties, scale points)
+/// for assistant inspection, formatting, and musical-text parsing.
+#[derive(Clone, Debug)]
+pub struct Lv2ControlInfo {
+    pub index: usize,
+    pub port_index: usize,
+    pub symbol: String,
+    pub name: String,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub unit: String,
+    pub toggled: bool,
+    pub integer: bool,
+    pub logarithmic: bool,
+    pub enumeration: bool,
+    pub scale_points: Vec<Lv2ScalePoint>,
 }
 
 #[derive(Clone, Debug)]
@@ -675,6 +721,281 @@ pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
         lilv_world_free(world);
         descs
     }
+}
+
+fn lv2_unit_symbol(uri: &str) -> Option<&'static str> {
+    let local = uri.rsplit('#').next().unwrap_or(uri);
+    match local {
+        "db" => Some("dB"),
+        "hz" => Some("Hz"),
+        "khz" => Some("kHz"),
+        "mhz" => Some("MHz"),
+        "ms" => Some("ms"),
+        "s" => Some("s"),
+        "min" => Some("min"),
+        "pc" => Some("%"),
+        "bpm" => Some("BPM"),
+        "semitone12TET" => Some("st"),
+        "cent" => Some("cents"),
+        "oct" => Some("oct"),
+        "degree" => Some("deg"),
+        "midiNote" => Some("note"),
+        "coef" => Some("x"),
+        "bar" => Some("bars"),
+        "beat" => Some("beats"),
+        "frame" => Some("frames"),
+        "m" => Some("m"),
+        "cm" => Some("cm"),
+        "mm" => Some("mm"),
+        "km" => Some("km"),
+        "inch" => Some("in"),
+        "mile" => Some("mi"),
+        _ => None,
+    }
+}
+
+unsafe fn read_control_infos(world: *mut LilvWorld, plugin: *const LilvPlugin) -> Vec<Lv2ControlInfo> {
+    let uri = |u: &[u8]| lilv_new_uri(world, u.as_ptr() as *const c_char);
+    let toggled_u = uri(b"http://lv2plug.in/ns/lv2core#toggled\0");
+    let integer_u = uri(b"http://lv2plug.in/ns/lv2core#integer\0");
+    let enum_u = uri(b"http://lv2plug.in/ns/lv2core#enumeration\0");
+    let log_u = uri(b"http://lv2plug.in/ns/ext/port-props#logarithmic\0");
+    let unit_pred = uri(b"http://lv2plug.in/ns/extensions/units#unit\0");
+
+    let metas = read_control_meta(world, plugin);
+    let mut out = Vec::with_capacity(metas.len());
+    for (index, meta) in metas.into_iter().enumerate() {
+        let port = lilv_plugin_get_port_by_index(plugin, meta.port_index as u32);
+        let toggled = lilv_port_has_property(plugin, port, toggled_u);
+        let integer = lilv_port_has_property(plugin, port, integer_u);
+        let enumeration = lilv_port_has_property(plugin, port, enum_u);
+        let logarithmic = lilv_port_has_property(plugin, port, log_u);
+
+        let unit_node = lilv_port_get(plugin, port, unit_pred);
+        let unit = if !unit_node.is_null() {
+            let u = if lilv_node_is_uri(unit_node) {
+                let raw = node_borrowed(unit_node);
+                lv2_unit_symbol(&raw).map(str::to_string).unwrap_or_default()
+            } else {
+                node_borrowed(unit_node)
+            };
+            lilv_node_free(unit_node);
+            u
+        } else {
+            String::new()
+        };
+
+        let mut scale_points = Vec::new();
+        let sps = lilv_port_get_scale_points(plugin, port);
+        if !sps.is_null() {
+            let mut it = lilv_scale_points_begin(sps);
+            while !lilv_scale_points_is_end(sps, it) {
+                let sp = lilv_scale_points_get(sps, it);
+                if !sp.is_null() {
+                    let lbl = node_borrowed(lilv_scale_point_get_label(sp));
+                    let val_node = lilv_scale_point_get_value(sp);
+                    if !val_node.is_null() && !lbl.is_empty() {
+                        let val = if lilv_node_is_float(val_node) {
+                            lilv_node_as_float(val_node)
+                        } else if lilv_node_is_int(val_node) {
+                            lilv_node_as_int(val_node) as f32
+                        } else {
+                            lilv_node_as_float(val_node)
+                        };
+                        if val.is_finite() {
+                            scale_points.push(Lv2ScalePoint { label: lbl, value: val });
+                        }
+                    }
+                }
+                it = lilv_scale_points_next(sps, it);
+            }
+            lilv_scale_points_free(sps);
+            scale_points.sort_by(|a, b| a.value.partial_cmp(&b.value).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        out.push(Lv2ControlInfo {
+            index,
+            port_index: meta.port_index,
+            symbol: meta.symbol,
+            name: meta.name,
+            min: meta.min,
+            max: meta.max,
+            default: meta.default,
+            unit,
+            toggled,
+            integer,
+            logarithmic,
+            enumeration,
+            scale_points,
+        });
+    }
+
+    lilv_node_free(toggled_u);
+    lilv_node_free(integer_u);
+    lilv_node_free(enum_u);
+    lilv_node_free(log_u);
+    lilv_node_free(unit_pred);
+    out
+}
+
+pub fn control_infos_for_uri(uri: &str) -> Vec<Lv2ControlInfo> {
+    let _lilv = lilv_guard();
+    unsafe {
+        let world = lilv_world_new();
+        if world.is_null() {
+            return Vec::new();
+        }
+        lilv_world_load_all(world);
+        let plugin = find_plugin(world, uri);
+        let infos = if plugin.is_null() {
+            Vec::new()
+        } else {
+            read_control_infos(world, plugin)
+        };
+        lilv_world_free(world);
+        infos
+    }
+}
+
+type ControlInfosCache = std::sync::Mutex<Vec<(String, Option<Vec<Lv2ControlInfo>>)>>;
+static CONTROL_INFOS: ControlInfosCache = std::sync::Mutex::new(Vec::new());
+
+/// Rich LV2 control metadata per URI, resolved once on a worker thread.
+/// Test-safe under `cfg(test)`: returns only what [`set_control_infos_for_test`] stored.
+pub fn control_infos_cached(uri: &str) -> Option<Vec<Lv2ControlInfo>> {
+    let mut cache = CONTROL_INFOS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, found)) = cache.iter().find(|(u, _)| u == uri) {
+        return found.clone();
+    }
+    if cfg!(test) {
+        return None;
+    }
+    cache.push((uri.to_string(), None));
+    drop(cache);
+    let uri = uri.to_string();
+    std::thread::spawn(move || {
+        let found = control_infos_for_uri(&uri);
+        store_control_infos(&uri, found);
+    });
+    None
+}
+
+/// Blocking variant of [`control_infos_cached`] for headless MCP callers.
+pub fn control_infos_blocking(uri: &str) -> Vec<Lv2ControlInfo> {
+    if let Some(found) = control_infos_cached(uri) {
+        return found;
+    }
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let found = control_infos_for_uri(uri);
+    store_control_infos(uri, found.clone());
+    found
+}
+
+fn store_control_infos(uri: &str, found: Vec<Lv2ControlInfo>) {
+    let mut cache = CONTROL_INFOS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(u, _)| u != uri);
+    cache.push((uri.to_string(), Some(found)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_control_infos_for_test(uri: &str, found: Vec<Lv2ControlInfo>) {
+    store_control_infos(uri, found);
+}
+
+/// Convert an LV2 port's native value to normalized 0..1 (matches `Lv2Plugin::set_control_normalized`).
+pub fn lv2_native_to_norm(info: &Lv2ControlInfo, native: f32) -> f32 {
+    let span = info.max - info.min;
+    if span.abs() < 1e-12 {
+        0.0
+    } else {
+        ((native - info.min) / span).clamp(0.0, 1.0)
+    }
+}
+
+/// Convert normalized 0..1 to an LV2 port's native value.
+pub fn lv2_norm_to_native(info: &Lv2ControlInfo, norm: f32) -> f32 {
+    let mut v = info.min + norm.clamp(0.0, 1.0) * (info.max - info.min);
+    if info.toggled {
+        v = if v >= 0.5 * (info.min + info.max) { info.max } else { info.min };
+    } else if info.integer {
+        v = v.round().clamp(info.min, info.max);
+    }
+    v
+}
+
+/// Format an LV2 control port's native value with scale-point labels, toggle names, or units.
+pub fn format_lv2_control_value(info: &Lv2ControlInfo, native: f32) -> String {
+    if let Some(sp) = info.scale_points.iter().find(|sp| (sp.value - native).abs() < 1e-3) {
+        return sp.label.clone();
+    }
+    if info.toggled {
+        return if native >= 0.5 * (info.min + info.max) { "On".into() } else { "Off".into() };
+    }
+    let num = if info.integer {
+        format!("{:.0}", native.round())
+    } else if native.abs() >= 100.0 {
+        format!("{native:.1}")
+    } else {
+        format!("{native:.2}")
+    };
+    if info.unit.is_empty() {
+        num
+    } else {
+        format!("{num} {}", info.unit)
+    }
+}
+
+/// Parse a musical text string (scale-point label, `"on"`/`"off"`, `"1.2 kHz"`, `"250 ms"`,
+/// `"-6 dB"`, `"50%"`, or plain number) into an LV2 control port's native value.
+pub fn parse_lv2_control_text(info: &Lv2ControlInfo, text: &str) -> Option<f32> {
+    let raw = text.trim();
+    let lower = raw.to_ascii_lowercase();
+    if let Some(sp) = info.scale_points.iter().find(|sp| sp.label.eq_ignore_ascii_case(raw)) {
+        return Some(sp.value.clamp(info.min, info.max));
+    }
+    if let Some(sp) = info.scale_points.iter().find(|sp| sp.label.to_ascii_lowercase().contains(&lower)) {
+        return Some(sp.value.clamp(info.min, info.max));
+    }
+    if info.toggled {
+        if matches!(lower.as_str(), "on" | "true" | "yes" | "1") {
+            return Some(info.max);
+        }
+        if matches!(lower.as_str(), "off" | "false" | "no" | "0") {
+            return Some(info.min);
+        }
+    }
+    let mut num_end = 0;
+    for (i, ch) in lower.char_indices() {
+        if ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-') {
+            num_end = i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if num_end == 0 {
+        return None;
+    }
+    let mut val: f32 = lower[..num_end].parse().ok()?;
+    let unit = lower[num_end..].trim();
+    if unit == "khz" && info.unit.eq_ignore_ascii_case("hz") {
+        val *= 1000.0;
+    } else if unit == "hz" && info.unit.eq_ignore_ascii_case("khz") {
+        val /= 1000.0;
+    } else if unit == "s" && info.unit.eq_ignore_ascii_case("ms") {
+        val *= 1000.0;
+    } else if unit == "ms" && info.unit.eq_ignore_ascii_case("s") {
+        val /= 1000.0;
+    } else if unit == "%" && info.unit != "%" {
+        // Treat % as percentage of the control's range when the port's native unit isn't %.
+        return Some(lv2_norm_to_native(info, val / 100.0));
+    }
+    let mut out = val.clamp(info.min, info.max);
+    if info.integer {
+        out = out.round().clamp(info.min, info.max);
+    }
+    Some(out)
 }
 
 /// Classify a plugin as an instrument (#26): its declared LV2 types decide
@@ -3046,6 +3367,72 @@ mod tests {
         assert_eq!(primary_lv2_class(&mk(&["Plugin", "UtilityPlugin", "AnalyserPlugin"])), "AnalyserPlugin");
         assert_eq!(primary_lv2_class(&mk(&["Plugin", "GeneratorPlugin", "InstrumentPlugin"])), "InstrumentPlugin");
         assert_eq!(primary_lv2_class(&mk(&["Plugin"])), "");
+    }
+
+    #[test]
+    fn lv2_control_info_format_and_parse_units_and_scale_points() {
+        let filter_mode = Lv2ControlInfo {
+            index: 0,
+            port_index: 2,
+            symbol: "mode".into(),
+            name: "Filter Mode".into(),
+            min: 0.0,
+            max: 2.0,
+            default: 0.0,
+            unit: String::new(),
+            toggled: false,
+            integer: true,
+            logarithmic: false,
+            enumeration: true,
+            scale_points: vec![
+                Lv2ScalePoint { label: "Lowpass".into(), value: 0.0 },
+                Lv2ScalePoint { label: "Bandpass".into(), value: 1.0 },
+                Lv2ScalePoint { label: "Highpass".into(), value: 2.0 },
+            ],
+        };
+        assert_eq!(format_lv2_control_value(&filter_mode, 1.0), "Bandpass");
+        assert_eq!(parse_lv2_control_text(&filter_mode, "highpass"), Some(2.0));
+        assert_eq!(parse_lv2_control_text(&filter_mode, "band"), Some(1.0));
+
+        let cutoff = Lv2ControlInfo {
+            index: 1,
+            port_index: 3,
+            symbol: "cutoff".into(),
+            name: "Cutoff".into(),
+            min: 20.0,
+            max: 20000.0,
+            default: 1000.0,
+            unit: "Hz".into(),
+            toggled: false,
+            integer: false,
+            logarithmic: true,
+            enumeration: false,
+            scale_points: Vec::new(),
+        };
+        assert_eq!(format_lv2_control_value(&cutoff, 1200.0), "1200.0 Hz");
+        assert_eq!(parse_lv2_control_text(&cutoff, "2.5 kHz"), Some(2500.0));
+        let norm = lv2_native_to_norm(&cutoff, 2500.0);
+        assert!((lv2_norm_to_native(&cutoff, norm) - 2500.0).abs() < 1e-2);
+
+        let bypass = Lv2ControlInfo {
+            index: 2,
+            port_index: 4,
+            symbol: "enabled".into(),
+            name: "Enabled".into(),
+            min: 0.0,
+            max: 1.0,
+            default: 1.0,
+            unit: String::new(),
+            toggled: true,
+            integer: false,
+            logarithmic: false,
+            enumeration: false,
+            scale_points: Vec::new(),
+        };
+        assert_eq!(format_lv2_control_value(&bypass, 1.0), "On");
+        assert_eq!(format_lv2_control_value(&bypass, 0.0), "Off");
+        assert_eq!(parse_lv2_control_text(&bypass, "off"), Some(0.0));
+        assert_eq!(parse_lv2_control_text(&bypass, "on"), Some(1.0));
     }
 }
 

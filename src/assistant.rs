@@ -566,13 +566,43 @@ fn system_prompt() -> String {
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
      list_channels (rigs, source channels with colours, and their plugin chains), \
-     get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
+     get_status, list_plugins, inspect_plugin (deep profile of any built-in DSP, CLAP, \
+     LV2, or catalog plugin — architecture, signal role, modules, parameters, units, and \
+     scale points, either by plugin name/id/uri or live node id), list_params (live node \
+     parameters with current values, formatted musical text, min/max/default, units, \
+     stepped options, module breakdown, and only_modified diff), measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe), \
      get_master_target (the master's loudness target with loudness before and after), \
      get_engine_info (DSP load, buffer and latency, xruns, CPU time per unit — for \
      \"why does it crackle\" or \"what uses the CPU\"; reset_engine_peaks restarts its maxima; \
      set_buffer_size changes the audio buffer size in frames live — smaller for lower latency, \
      larger to stop dropouts/xruns).\n\
+     - Shape & configure plugins: set_param dials ANY parameter on a CLAP synth/FX, LV2 \
+     plugin, setBfree tonewheel organ, built-in DSP unit, Audio In, or Master — by exact \
+     param id OR parameter name (+ optional module), accepting musical text (e.g. \"300 ms\", \
+     \"1.2 kHz\", \"+4 dB\", \"Ping-Pong\", \"Highpass\", \"FAST\", \"6/8\"), plain native \
+     value, or normalized 0..1. Call multiple set_param calls in ONE step when sculpting a \
+     patch or effect chain. reset_params resets all or matching (module/query) parameters of \
+     a node back to their defaults.\n\
+     - Plugin intuition (think like a sound designer and mix engineer): \
+     (1) Start from list_params (prefer main_controls first, or filter by module/query, or \
+     only_modified=true to audit what changed from default) before guessing parameter names; \
+     use inspect_plugin before adding an unfamiliar plugin to verify its parameters and role. \
+     (2) Built-in DSP units expose ALL native controls (not just face knobs): Delay has time \
+     (50..2000 ms), feedback (0..95%), mix, pingpong (Stereo/Ping-Pong), and damping \
+     (20 kHz..500 Hz for dark analog/tape tails); Reverb has size, damping, mix, width; Eq3 \
+     has low/mid/high gain (±18 dB) plus low/mid/high frequencies and mid Q; Filter has \
+     cutoff, resonance, and mode (Lowpass/Highpass/DJ Combo); Limiter has ceiling, drive, \
+     release; Saturation has drive, mix, output trim. \
+     (3) CLAP synths (e.g. Surge XT) are organized into modules (Scene A/B Oscillators, \
+     Filters, Envelopes AEG/FEG, LFOs, FX, Global) — filter list_params by module to see a \
+     clean slice, and pass include_options=true when picking discrete waveforms or filter \
+     types. \
+     (4) setBfree organ has 9 upper drawbars (16' through 1', positions 0..8), Leslie \
+     (STOP/SLOW/FAST), Percussion (OFF/ON/SOFT), Drive, and Reverb — all directly adjustable \
+     via set_param by name/footage (e.g. name=\"8'\", text=\"8\" or name=\"Leslie\", text=\"FAST\"). \
+     (5) LV2 plugins declare native units (Hz, dB, ms, %) and discrete scale points; pass \
+     musical text or native values directly to set_param.\n\
      - Hear: listen records the next seconds of the master and a listening model scores \
      it 0-10 on the words you pass as attributes (take them from the user's request: \
      \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
@@ -593,12 +623,6 @@ fn system_prompt() -> String {
      (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome and by the \
      tempo-synced features of hosted CLAP plugins (synced LFOs, sequencers, arps); \
      the user drags it on any metronome's face).\n\
-     - Synth & effect parameters: list_params(node, query) inspects a unit's main_controls and \
-     full internal parameter list (id, name, current value, formatted text, min..max, default, \
-     stepped) for any synth or effect (Starbreath, Surge XT, Dexed, Vitalium, LV2, built-in \
-     DSP, Master). set_param(node, param or name, value or normalized) directly edits any \
-     internal parameter or rack knob live — call several set_param calls in one step to shape \
-     a patch (undo reverts them).\n\
      - Transport: start/stop is a property of each rack instrument that supports it \
      (metronome today; get_graph marks them transport=true with their playing state). \
      set_node_playing(node, playing) starts/stops ONE instrument; transport_play/\
@@ -689,7 +713,7 @@ fn system_prompt() -> String {
 }
 
 pub(crate) fn tools() -> Value {
-    json!([
+    let mut list = match json!([
         {"type":"function","function":{
             "name":"get_graph",
             "description":"The current patch as JSON: nodes (id, kind, name, rig, playing — the per-instrument transport state of metronomes, split — a Keys node's split point or null) and edges/cables (id, from/to node+port, kind). ALWAYS call this first to find node and cable ids for connect/disconnect.",
@@ -876,18 +900,27 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_params",
-            "description":"List a node's parameters (for set_param, set_cc_map, or learn_cc). main_controls comes first: the few parameters the instrument's designer marked as most important (page, name, id, current value and text, min..max, and the face knob that shows it). Prefer them when shaping or mapping a sound. params is the full internal parameter list (id, name, current value, text, min, max, default, stepped), filtered by query words: use it to inspect and edit any internal synth or effect parameter (e.g. Starbreath, Surge XT, Vitalium, LV2, DSP). knobs are the rack face knobs.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"query":{"type":"string"}},"required":["node"]}
+            "description":"Inspect a node's parameters (for set_param, set_cc_map, or learn_cc) with current values, formatted musical text, defaults, min..max ranges, units, and stepped options. main_controls comes first (designer-marked highlights). For CLAP synths/FX (Starbreath, Surge XT, Dexed, …), also returns a modules summary and total_modified count. Filter with query words, module name, or only_modified=true (to see what differs from default). Set include_options=true to enumerate discrete choices for stepped/enum params. Works on CLAP, LV2, setBfree organ (all 13 controls), all built-in DSP native params, Audio In, Arp, MidiFx, and Master.",
+            "parameters":{"type":"object","properties":{
+                "node":{"type":"integer","description":"Node id from get_graph"},
+                "query":{"type":"string","description":"Optional case-insensitive filter words matching name, module, or description"},
+                "module":{"type":"string","description":"Optional CLAP module/group filter (e.g. 'Filter', 'Osc', 'AEG', 'FX')"},
+                "only_modified":{"type":"boolean","description":"When true, return only parameters currently differing from their default"},
+                "include_options":{"type":"boolean","description":"When true, include discrete option labels for stepped/enum parameters"},
+                "limit":{"type":"integer","description":"Max parameters to return (default 50, max 200)"}
+            },"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"set_param",
-            "description":"Directly edit a node's internal parameter or rack knob live (for any CLAP synth/FX like Starbreath or Surge XT, LV2 plugin, built-in DSP, Master, Arp, Audio In, or MIDI FX). Call list_params(node, query) first to discover parameter ids, names, and min..max ranges. Identify the parameter by param (numeric id) or name (parameter name, main control name, or face knob label from list_params). Pass value in the parameter's plain units (min..max from list_params), OR normalized (0..1 across min..max). On CLAP nodes, target defaults to 'plugin' (internal synth/FX parameters); pass target='knob' or name='LEVEL' for the rack LEVEL knob. Call several set_param calls in one step to shape a patch; undo reverts them.",
+            "description":"Directly edit any parameter or rack knob live on a node (CLAP synth/FX like Starbreath or Surge XT, LV2 plugin, setBfree organ, built-in DSP, Audio In, System Audio, MidiFx, Arp, or Master). Identify the parameter by param=<id> OR name=<parameter name, main control name, face knob label, or musical alias> (plus optional module=<CLAP module> to disambiguate). Supply the target value as musical text (e.g. '300 ms', '1.2 kHz', '+4 dB', '40%', 'Ping-Pong', 'Highpass', 'FAST', '6/8'), native value (min..max from list_params), or normalized (0..1). On CLAP nodes, target defaults to 'plugin' (internal synth/FX parameter); pass target='knob' or name='LEVEL' for the rack LEVEL knob. Call several set_param calls in ONE step to shape a patch; undo reverts them.",
             "parameters":{"type":"object","properties":{
                 "node":{"type":"integer","description":"Target node id (get_graph or context)"},
-                "param":{"type":"integer","description":"Parameter id from list_params"},
-                "name":{"type":"string","description":"Parameter name, main control name, or face knob label from list_params"},
-                "value":{"type":"number","description":"New value in plain units (min..max from list_params)"},
-                "normalized":{"type":"number","description":"New value normalized 0..1 across min..max (alternative to value)"},
+                "param":{"type":"integer","description":"Parameter id from list_params; optional when name is given"},
+                "name":{"type":"string","description":"Parameter name, main control name, face knob label, or musical alias (e.g. 'cutoff', 'feedback', 'pingpong', '8\\'', 'leslie', 'low_gain')"},
+                "module":{"type":"string","description":"Optional CLAP module filter when matching by name (e.g. 'Scene A', 'Filter 1', 'AEG')"},
+                "value":{"type":"number","description":"New value in plain/native units (min..max from list_params, or 0..1 for built-in DSP/organ)"},
+                "normalized":{"type":"number","description":"New value normalized 0..1 across min..max (alternative to value/text)"},
+                "text":{"type":"string","description":"Musical/formatted value text (e.g. '300 ms', '2.5 kHz', '-6 dB', 'Ping-Pong', 'FAST', '8/8', '40%')"},
                 "target":{"type":"string","enum":["plugin","knob"],"description":"On CLAP nodes: 'plugin' (default, internal plugin parameter) or 'knob' (rack LEVEL knob)"}
             },"required":["node"]}
         }},
@@ -1231,7 +1264,31 @@ pub(crate) fn tools() -> Value {
             "description":"Remove a node by id (see get_graph); its cables are removed too. Use this to delete duplicate or unwanted instruments/effects.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"}},"required":["node"]}
         }}
-    ])
+    ]) {
+        Value::Array(v) => v,
+        _ => unreachable!(),
+    };
+    list.extend([
+        json!({"type":"function","function":{
+            "name":"inspect_plugin",
+            "description":"Deep technical and musical inspection of any plugin — built-in DSP (delay, reverb, eq3, filter, limiter, saturation, gain, pan, bus, metronome), installed CLAP/LV2 plugins, catalog instruments (even before installing), or a live rack node. Returns role/category, description, module architecture, and full parameter specifications (ids, ranges, defaults, units, scale points). Pass either node=<id> (inspect a loaded unit) or query=<name, id, or URI>.",
+            "parameters":{"type":"object","properties":{
+                "query":{"type":"string","description":"Plugin name, CLAP id, LV2 URI, built-in DSP kind, or catalog id (e.g. 'delay', 'eq3', 'setbfree', 'surge')"},
+                "format":{"type":"string","enum":["all","builtin","clap","lv2","catalog"],"description":"Optional format filter (default all)"},
+                "node":{"type":"integer","description":"Optional live node id from get_graph to inspect its active plugin and configuration"}
+            }}
+        }}),
+        json!({"type":"function","function":{
+            "name":"reset_params",
+            "description":"Reset parameters of a node back to their defaults (CLAP synth/FX, built-in DSP, setBfree organ, LV2 plugin, or Master). Omit module and query to reset all parameters of the node, or pass module/query to reset only matching parameters.",
+            "parameters":{"type":"object","properties":{
+                "node":{"type":"integer","description":"Target node id from get_graph"},
+                "module":{"type":"string","description":"Optional CLAP module filter (only reset params in matching modules)"},
+                "query":{"type":"string","description":"Optional name filter words (only reset matching params)"}
+            },"required":["node"]}
+        }}),
+    ]);
+    Value::Array(list)
 }
 
 /// The chat models the picker offers: the ones Settings lists, with the
@@ -2371,6 +2428,36 @@ mod tests {
                 assert!(props.contains_key(required.as_str().unwrap()), "{name}: required {required} is not a property");
             }
         }
+    }
+
+    #[test]
+    fn plugin_intelligence_tools_are_registered_and_parseable() {
+        let all = tools();
+        let names: Vec<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()))
+            .collect();
+        for want in ["inspect_plugin", "list_params", "set_param", "reset_params"] {
+            assert!(names.contains(&want), "missing tool {want}");
+        }
+        assert_eq!(
+            parse_tool_call(&all, "set_param", r#"{"node":2,"name":"time","text":"300 ms"}"#).unwrap(),
+            json!({"node": 2, "name": "time", "text": "300 ms"})
+        );
+        assert_eq!(
+            parse_tool_call(&all, "list_params", r#"{"node":1,"module":"Filter","only_modified":true,"include_options":true,"limit":20}"#).unwrap(),
+            json!({"node": 1, "module": "Filter", "only_modified": true, "include_options": true, "limit": 20})
+        );
+        assert_eq!(
+            parse_tool_call(&all, "inspect_plugin", r#"{"query":"delay","format":"builtin"}"#).unwrap(),
+            json!({"query": "delay", "format": "builtin"})
+        );
+        assert_eq!(
+            parse_tool_call(&all, "reset_params", r#"{"node":2,"query":"mix"}"#).unwrap(),
+            json!({"node": 2, "query": "mix"})
+        );
     }
 
     fn tool_step(id: &str, result: &str) -> Vec<Value> {

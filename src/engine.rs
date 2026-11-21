@@ -1925,6 +1925,7 @@ impl GraphEngine {
 
     /// Attach a system-audio capture source (started off the audio thread).
     pub fn set_system_capture(&mut self, cap: SystemCapture) {
+        cap.set_wanted(self.system_gain > 0.0);
         self.system_capture = Some(cap);
     }
 
@@ -3220,6 +3221,9 @@ impl GraphEngine {
         let g = gain.clamp(0.0, 1.0);
         if g != self.system_gain {
             self.system_gain = g;
+            if let Some(cap) = &self.system_capture {
+                cap.set_wanted(g > 0.0);
+            }
             self.mix_dirty = true;
         }
     }
@@ -5279,11 +5283,11 @@ impl GraphEngine {
 
         // 3. Master sums everything wired to it.
         // Pull system-audio capture once per block (RT-safe ring pop).
+        // Read also while muted: what a reader still delivers must not wait
+        // in its ring for the gain to come up.
         let sys = self.system_gain > 0.0 && self.system_capture.is_some();
-        if sys {
-            if let Some(cap) = &mut self.system_capture {
-                cap.read(&mut self.system_buf[..n2]);
-            }
+        if let Some(cap) = &mut self.system_capture {
+            cap.read(&mut self.system_buf[..n2]);
         }
         // File player: read the decoded buffer at the clock's position
         // (loop/sync/beat-offset all live in the engine, issue #84). Runs
@@ -6693,6 +6697,26 @@ mod tests {
         let peak_restored = buf.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         assert!(peak_restored > 0.01, "unmuting must restore audio, got {peak_restored}");
         assert!(!pub_.lock().unwrap().master_mute);
+    }
+
+    /// #27: the capture's `wanted` flag follows system_gain and muted blocks
+    /// still drain the capture ring without leaking audio to the master.
+    #[test]
+    fn system_capture_tracks_gain_and_drains_while_muted() {
+        let (mut bus, drain) = command_bus();
+        let g = crate::control::Graph::demo_patch();
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let (cap, _feed) = crate::capture::system_capture(48000);
+        cap.set_wanted(true);
+        engine.set_system_capture(cap);
+        assert!(!engine.system_capture.as_ref().unwrap().is_wanted(), "attaching syncs wanted to muted gain");
+        let mut buf = vec![0.0f32; 64 * 2];
+        bus.send(Command::SetSystemAudio { gain: 0.5 });
+        engine.render(&mut buf, 2);
+        assert!(engine.system_capture.as_ref().unwrap().is_wanted(), "raising gain arms capture");
+        bus.send(Command::SetSystemAudio { gain: 0.0 });
+        engine.render(&mut buf, 2);
+        assert!(!engine.system_capture.as_ref().unwrap().is_wanted(), "muting stops capture");
     }
 
     /// #19: one knob table — rack labels canonical, long names as aliases.

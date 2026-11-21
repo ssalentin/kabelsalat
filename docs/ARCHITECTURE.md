@@ -624,10 +624,10 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
   range (splits/layers), CC map. MIDI-learn binds CCs to any parameter.
 - **Latency comp:** nodes report latency; parallel paths are aligned at every
   summing point (built-in units today, see below).
-- **System audio:** capture the default output's monitor via PipeWire's PulseAudio
-  compatibility (works today, no extra packages); per-app stream selection later via
-  native PipeWire (pipewire-rs) or pipewire-jack input ports. Feedback guard: exclude
-  our own output from capture (dedicated sink / node filter), warn in the UI.
+- **System audio:** capture each other app's playback stream via PipeWire's PulseAudio
+  compatibility (`parec --monitor-stream`, no extra packages) and sum them in the
+  engine. Our own output is never one of the captured streams, so the capture cannot
+  feed back, whichever output is chosen (`src/capture.rs`, `kabelsalat capture-test`).
 - **One render path** for realtime and offline bounce.
 - **Sessions:** `name.ksalat/` package: `session.ron` + plugin state + copied assets;
   atomic temp-then-rename; originals never modified.
@@ -771,7 +771,7 @@ Estimates: playable host ≈ 3–4 weeks · AUM-core ≈ 6 weeks · full ≈ 3 m
 | Animation costs UI frame time | tessellation caps, LOD, snapshot-driven; never on audio thread |
 | In-process plugin crash | autosave; out-of-process later |
 | ARM plugin ecosystem thinner | verified list §4; CLAP-first; no emulation |
-| System-audio feedback loop (capturing our own output) | exclude own stream; dedicated sink or per-app capture; UI warning |
+| System-audio feedback loop (capturing our own output) | per-app capture that never includes our own stream (done, #27) |
 | Plugin embedding quirks (resize, focus, HiDPI under XWayland) | CLAP resize negotiation; per-plugin fallback flag; XWayland scaling config; P0 proof with Surge |
 | Scope creep toward DAW | non-goals §5; the graph is the product |
 

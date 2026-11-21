@@ -156,6 +156,9 @@ pub struct OutputState {
     pub outputs: Vec<OutputDevice>,
     pub current: Option<String>,
     pub streams: Vec<AppStream>,
+    /// The `streams` the system-audio capture may record (sink-input
+    /// indices): those known to belong to another process.
+    pub capturable: Vec<u64>,
 }
 
 /// Other apps' playing streams from `pactl -f json list sink-inputs`:
@@ -238,7 +241,44 @@ pub fn find_our_stream(sink_inputs_json: &str, clients_json: &str, pid: u32) -> 
     })
 }
 
-fn pactl(args: &[&str]) -> Option<String> {
+/// Sink-inputs that provably belong to another program: the stream's client
+/// is listed with a process id, and `ours` says that process is not us. The
+/// system-audio capture records only these, so a stream of ours that the
+/// scan has not matched (or cannot match, because `pactl` gave no client
+/// list) is never captured and cannot feed back (#27).
+pub fn foreign_streams(sink_inputs_json: &str, clients_json: &str, ours: impl Fn(u32) -> bool) -> Vec<u64> {
+    let (Ok(clients), Ok(inputs)) = (serde_json::from_str::<Value>(clients_json), serde_json::from_str::<Value>(sink_inputs_json))
+    else { return Vec::new() };
+    let foreign: Vec<u64> = clients.as_array().into_iter().flatten().filter(|c| {
+        c.get("properties").and_then(|p| p.get("application.process.id")).and_then(Value::as_str)
+            .and_then(|p| p.parse::<u32>().ok())
+            .is_some_and(|p| !ours(p))
+    }).filter_map(|c| c.get("index").and_then(Value::as_u64)).collect();
+    inputs.as_array().into_iter().flatten().filter_map(|i| {
+        let client = i.get("client").and_then(|c| c.as_u64().or_else(|| c.as_str()?.parse().ok()))?;
+        foreign.contains(&client).then(|| i.get("index")?.as_u64())?
+    }).collect()
+}
+
+/// Whether `pid` is this process or one it started (a helper that plays our
+/// sound is our output too), by walking the parents in /proc. A process that
+/// cannot be read is taken for ours: when in doubt, do not capture.
+pub fn is_own_process(pid: u32) -> bool {
+    let me = std::process::id();
+    let mut p = pid;
+    for _ in 0..64 {
+        if p == me { return true; }
+        if p <= 1 { return false; }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else { return true };
+        // "pid (comm) state ppid …": comm may hold spaces and parentheses.
+        let Some(ppid) = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok())
+        else { return true };
+        p = ppid;
+    }
+    true
+}
+
+pub(crate) fn pactl(args: &[&str]) -> Option<String> {
     let o = std::process::Command::new("pactl").args(args).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
@@ -290,12 +330,11 @@ pub fn scan_and_apply(target: Target) -> OutputState {
             .and_then(|s| s.get("name")?.as_str().map(str::to_string))
     };
     let inputs_json = pactl(&["-f", "json", "list", "sink-inputs"]).unwrap_or_default();
-    let stream = find_our_stream(
-        &inputs_json,
-        &pactl(&["-f", "json", "list", "clients"]).unwrap_or_default(),
-        std::process::id(),
-    );
+    let clients_json = pactl(&["-f", "json", "list", "clients"]).unwrap_or_default();
+    let stream = find_our_stream(&inputs_json, &clients_json, std::process::id());
     let streams = parse_app_streams(&inputs_json, stream.map(|(i, _)| i));
+    let foreign = foreign_streams(&inputs_json, &clients_json, is_own_process);
+    let capturable = streams.iter().map(|s| s.index).filter(|i| foreign.contains(i)).collect();
     let current = stream.and_then(|(_, sink)| index_to_name(sink));
     let wanted = match target {
         Target::Follow => None,
@@ -314,7 +353,83 @@ pub fn scan_and_apply(target: Target) -> OutputState {
             if ok { eprintln!("audio out: asked PipeWire to move the stream to {w}"); }
         }
     }
-    OutputState { outputs, current, streams }
+    OutputState { outputs, current, streams, capturable }
+}
+
+/// What the self-tests against a real PipeWire share (`audio-out-test`,
+/// `capture-test`).
+pub(crate) mod selftest {
+    pub(crate) use super::pactl;
+    use std::time::{Duration, Instant};
+
+    /// Unloads the test's null sinks and ends the tone, also on a failed check.
+    pub(crate) struct Cleanup { pub(crate) modules: Vec<String>, pub(crate) app: Option<ToneApp>, default: String }
+    impl Cleanup {
+        /// Remembers the default sink, to put it back at the end.
+        pub(crate) fn new() -> Self {
+            Self { modules: Vec::new(), app: None, default: pactl(&["get-default-sink"]).unwrap_or_default().trim().to_string() }
+        }
+        pub(crate) fn null_sink(&mut self, name: &str, label: &str) -> anyhow::Result<()> {
+            let id = pactl(&["load-module", "module-null-sink", &format!("sink_name={name}"),
+                &format!("sink_properties=device.description={label}")])
+                .ok_or_else(|| anyhow::anyhow!("could not load a null sink"))?;
+            self.modules.push(id.trim().to_string());
+            Ok(())
+        }
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.app.take();
+            if !self.default.is_empty() { let _ = pactl(&["set-default-sink", &self.default]); }
+            for m in &self.modules { let _ = pactl(&["unload-module", m]); }
+        }
+    }
+
+    pub(crate) fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> anyhow::Result<T> {
+        let end = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(v) = f() { return Ok(v); }
+            anyhow::ensure!(Instant::now() < end, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    /// "Another app": a process playing a sine of 0.5 peak to `sink`. It is
+    /// started through a shell that exits, so it is not a child of this
+    /// process: what we start ourselves counts as our own output.
+    pub(crate) struct ToneApp { pid: String, file: std::path::PathBuf }
+
+    impl ToneApp {
+        pub(crate) fn stop(self) {}
+    }
+    impl Drop for ToneApp {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill").args(["-9", &self.pid]).status();
+            let _ = std::fs::remove_file(&self.file);
+        }
+    }
+
+    pub(crate) fn tone_app(sink: &str, app: &str, title: &str, freq: f32) -> anyhow::Result<ToneApp> {
+        // Two minutes of tone, a whole number of cycles per second.
+        let second: Vec<u8> = (0..48000).flat_map(|i| {
+            let v = (i as f32 * freq / 48000.0).fract();
+            (((v * std::f32::consts::TAU).sin() * 0.5 * 32767.0) as i16).to_le_bytes()
+        }).collect();
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let dir = std::path::PathBuf::from(home).join(".cache");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join(format!("ksalat-tone-{}-{freq}.raw", std::process::id()));
+        std::fs::write(&file, second.repeat(120))?;
+        let out = std::process::Command::new("sh")
+            .args(["-c", r#"pacat --playback --device="$1" --raw --format=s16le --rate=48000 --channels=1 --client-name="$2" --stream-name="$3" --latency-msec=50 "$4" >/dev/null 2>&1 & echo $!"#,
+                "sh", sink, app, title])
+            .arg(&file)
+            .stdin(std::process::Stdio::null())
+            .output().map_err(|e| anyhow::anyhow!("pacat: {e}"))?;
+        let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        anyhow::ensure!(pid.parse::<u32>().is_ok(), "pacat did not start: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(ToneApp { pid, file })
+    }
 }
 
 // -- buses on their own output (#147) -----------------------------------
@@ -515,26 +630,8 @@ impl Drop for BusOutputs {
 /// loaded for it and unloaded at the end, so nothing is heard.
 pub fn run_test() -> anyhow::Result<()> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use std::io::Write;
-    use std::time::{Duration, Instant};
+    use selftest::{tone_app, until, Cleanup};
 
-    /// Unloads the test's null sinks and ends the tone, also on a failed check.
-    struct Cleanup { modules: Vec<String>, app: Option<std::process::Child>, default: String }
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            if let Some(mut c) = self.app.take() { let _ = c.kill(); let _ = c.wait(); }
-            if !self.default.is_empty() { let _ = pactl(&["set-default-sink", &self.default]); }
-            for m in &self.modules { let _ = pactl(&["unload-module", m]); }
-        }
-    }
-    fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> anyhow::Result<T> {
-        let end = Instant::now() + Duration::from_secs(8);
-        loop {
-            if let Some(v) = f() { return Ok(v); }
-            anyhow::ensure!(Instant::now() < end, "timed out waiting for: {what}");
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    }
     fn sink_of_input(input: u64) -> Option<String> {
         let inputs: Value = serde_json::from_str(&pactl(&["-f", "json", "list", "sink-inputs"])?).ok()?;
         let sink = inputs.as_array()?.iter().find(|i| i.get("index").and_then(Value::as_u64) == Some(input))?
@@ -546,17 +643,10 @@ pub fn run_test() -> anyhow::Result<()> {
 
     let info = pactl(&["info"]).ok_or_else(|| anyhow::anyhow!("pactl info failed: no PipeWire/PulseAudio server"))?;
     println!("server: {}", info.lines().find(|l| l.starts_with("Server Name")).unwrap_or("?"));
-    let mut cleanup = Cleanup {
-        modules: Vec::new(), app: None,
-        default: pactl(&["get-default-sink"]).unwrap_or_default().trim().to_string(),
-    };
+    let mut cleanup = Cleanup::new();
     let (home, other) = ("kabelsalat_test_home", "kabelsalat_test_other");
-    for (name, label) in [(home, "Test-Home"), (other, "Test-Other")] {
-        let id = pactl(&["load-module", "module-null-sink", &format!("sink_name={name}"),
-            &format!("sink_properties=device.description={label}")])
-            .ok_or_else(|| anyhow::anyhow!("could not load a null sink"))?;
-        cleanup.modules.push(id.trim().to_string());
-    }
+    cleanup.null_sink(home, "Test-Home")?;
+    cleanup.null_sink(other, "Test-Other")?;
     anyhow::ensure!(pactl(&["set-default-sink", home]).is_some(), "set-default-sink failed");
 
     // Our own output stream, the way the engine opens it (cpal, default device).
@@ -572,27 +662,7 @@ pub fn run_test() -> anyhow::Result<()> {
     stream.play()?;
 
     // "Another app": a second process playing a 440 Hz tone.
-    let mut app = std::process::Command::new("pacat")
-        .args(["--playback", &format!("--device={home}"), "--format=float32le", "--rate=48000", "--channels=2",
-            "--client-name=Test Browser", "--stream-name=(2) Backing track - Video", "--latency-msec=50"])
-        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().map_err(|e| anyhow::anyhow!("pacat: {e}"))?;
-    let mut tone_in = app.stdin.take().expect("piped stdin");
-    cleanup.app = Some(app);
-    std::thread::spawn(move || {
-        let mut phase = 0.0f32;
-        let mut buf = Vec::with_capacity(4800 * 8);
-        loop {
-            buf.clear();
-            for _ in 0..4800 {
-                phase = (phase + 440.0 / 48000.0).fract();
-                let v = ((phase * std::f32::consts::TAU).sin() * 0.5).to_le_bytes();
-                buf.extend_from_slice(&v);
-                buf.extend_from_slice(&v);
-            }
-            if tone_in.write_all(&buf).is_err() { break; }
-        }
-    });
+    cleanup.app = Some(tone_app(home, "Test Browser", "(2) Backing track - Video", 440.0)?);
 
     // 1. No choice: our stream is found where PipeWire put it, both outputs are listed.
     let st = until("our stream in the scan", || Some(scan_and_apply(Target::Follow)).filter(|s| s.current.is_some()))?;
@@ -642,7 +712,10 @@ pub fn run_test() -> anyhow::Result<()> {
     println!("app stream: {theirs:?}");
     anyhow::ensure!(theirs.title == "(2) Backing track - Video", "title, got {:?}", theirs.title);
     anyhow::ensure!((theirs.volume - 1.0).abs() < 0.02 && !theirs.muted, "starts at 100 %, unmuted: {theirs:?}");
-    anyhow::ensure!(scan_and_apply(Target::Follow).streams.iter().all(|s| s.index != ours), "our own stream is not an app strip");
+    let st = scan_and_apply(Target::Follow);
+    anyhow::ensure!(st.streams.iter().all(|s| s.index != ours), "our own stream is not an app strip");
+    anyhow::ensure!(st.capturable.contains(&theirs.index) && !st.capturable.contains(&ours),
+        "the capture may record the other app and never our own stream, got {:?}", st.capturable);
 
     // 6. Its meter moves while it plays.
     let levels: StreamLevels = Default::default();
@@ -662,7 +735,7 @@ pub fn run_test() -> anyhow::Result<()> {
         .find(|s| s.index == theirs.index).filter(|s| (s.volume - 1.0).abs() < 0.02 && !s.muted))?;
 
     // 8. The app stops: its strip and its meter reader go.
-    if let Some(mut c) = cleanup.app.take() { let _ = c.kill(); let _ = c.wait(); }
+    if let Some(app) = cleanup.app.take() { app.stop(); }
     let st = until("the stream leaving the scan", || Some(scan_and_apply(Target::Follow)).filter(|s| s.streams.iter().all(|x| x.index != theirs.index)))?;
     meters.sync(&st.streams);
     anyhow::ensure!(!meters.readers.contains_key(&theirs.index), "the meter reader of an ended stream is stopped");
@@ -938,6 +1011,7 @@ mod tests {
             ],
             current: Some(current.into()),
             streams: Vec::new(),
+            capturable: Vec::new(),
         };
         let m2 = || Some("m2".to_string());
         assert_eq!(remember(None, m2(), &seen("m2")), m2(), "still on the old card: ask again next pass");
@@ -1006,5 +1080,44 @@ mod tests {
         assert_eq!(backlog_cut(200, 200), 0);
         assert_eq!(backlog_cut(205, 200), 104, "cuts whole stereo frames down to half max");
         assert_eq!(backlog_cut(205, 200) % 2, 0);
+    }
+
+    #[test]
+    fn only_streams_known_to_be_another_process_are_capture_targets() {
+        // Real output of `pactl -f json list clients` and `list sink-inputs`
+        // during a `capture-test` run (PipeWire 1.6.2, trimmed to the fields
+        // read): the cpal output stream of process 312057 and a `pacat` of
+        // process 312100. The last client and the last two streams are added
+        // by hand: what nobody can place.
+        let clients = r#"[
+          {"index":33,"driver":"PipeWire","properties":{"application.name":"WirePlumber","application.process.binary":"wireplumber","application.process.id":"1881593"}},
+          {"index":39,"driver":"PipeWire","properties":{"application.name":"pipewire","application.process.binary":"pipewire","application.process.id":"1881626"}},
+          {"index":6533,"driver":"PipeWire","properties":{"application.name":"PipeWire ALSA [kabelsalat]","application.process.binary":"kabelsalat","application.process.id":"312057"}},
+          {"index":6539,"driver":"PipeWire","properties":{"application.name":"Test Browser 312057","application.process.binary":"pacat","application.process.id":"312100"}},
+          {"index":6573,"driver":"PipeWire","properties":{"application.name":"kabelsalat-capture","application.process.binary":"pacat","application.process.id":"312291"}},
+          {"index":7000,"driver":"PipeWire","properties":{"application.name":"No pid"}}
+        ]"#;
+        let inputs = r#"[
+          {"index":6534,"sink":6526,"client":"6533","corked":false,"properties":{"application.name":"PipeWire ALSA [kabelsalat]","media.class":"Stream/Output/Audio","media.name":"ALSA Playback"}},
+          {"index":6540,"sink":6519,"client":"6539","corked":false,"properties":{"application.name":"Test Browser 312057","media.class":"Stream/Output/Audio","media.name":"(2) Backing track - Video"}},
+          {"index":7001,"sink":6519,"client":"7000","corked":false,"properties":{"application.name":"No pid"}},
+          {"index":7002,"sink":6519,"properties":{"media.name":"no client"}}
+        ]"#;
+        assert_eq!(foreign_streams(inputs, clients, |p| p == 312057), vec![6540], "not ours, and not what nobody can place");
+        assert_eq!(foreign_streams(inputs, clients, |p| p == 312100), vec![6534], "seen from the other process");
+        assert!(foreign_streams(inputs, "", |p| p == 312057).is_empty(), "no client list: nothing is known to be foreign");
+        assert!(foreign_streams("x", clients, |p| p == 312057).is_empty());
+    }
+
+    #[test]
+    fn a_process_we_started_is_ours_and_others_are_not() {
+        assert!(is_own_process(std::process::id()));
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(is_own_process(child.id()), "a helper process plays our sound");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!is_own_process(1), "init is not ours");
+        assert!(!is_own_process(std::os::unix::process::parent_id()), "nor is our parent");
+        assert!(is_own_process(u32::MAX), "a process that cannot be read is not captured");
     }
 }

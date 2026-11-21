@@ -1,0 +1,2 @@
+### Fixed
+- **Device bindings survive another scan order (#227):** an LV2 instrument bound to one MIDI device, routes and MIDI-learned CC bindings from a hardware controller, and a rig bound to one device now come back on the same keyboard when a session or rig preset is reopened, even when the devices are found in another order or one is not plugged in. A rig's device binding is now saved with the session, and loading a rig preset no longer sends the other rigs' synths back to all hardware.

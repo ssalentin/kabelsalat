@@ -136,6 +136,14 @@ pub struct Session {
     midi_sources: Vec<MidiSources>,
     /// The gig's setlist (#204): ordered songs and parts over the loaded rigs.
     pub setlist: crate::setlist::Setlist,
+    /// The port name of each hardware MIDI device index the session's
+    /// routing depends on (#227): matrix rules and rig devices hold indices,
+    /// which are only places in the scan of the run that saved them. A load
+    /// moves them through [`HwIndexMap`].
+    hw_ports: BTreeMap<u32, String>,
+    /// Each rig's hardware MIDI device in rig order (#227); `None` = the
+    /// keyboard and every device. Empty while no rig is bound to one.
+    pub rig_devices: Vec<Option<u32>>,
 }
 
 /// One CLAP synth's input selection (#124): the keyboard switch, the
@@ -157,6 +165,59 @@ impl MidiSources {
     /// True for a synth nobody changed: keyboard and all hardware.
     pub fn is_default(&self) -> bool {
         self.keyboard && self.hardware && self.device.is_none()
+    }
+}
+
+const HW_DEVICES: usize = crate::engine::MAX_HW_DEVICES as usize;
+
+/// Where each hardware MIDI device index of a saved session lands in this
+/// run (#227). A port the session names goes to its index here, or to a
+/// place of its own while it is not plugged in, or, with the device list
+/// full, past the list where no device sends. Every other index stays where
+/// it is while that is free, else takes a free one, so the 15 "off" rules
+/// of an LV2 instrument bound to one device still leave exactly that device
+/// on.
+pub struct HwIndexMap([u32; HW_DEVICES]);
+
+impl HwIndexMap {
+    /// `listed`: this run's ports by index, without ALSA's client:port
+    /// numbers. `place`: a new place for a port that is not listed (or
+    /// whose listed ones are taken), None when the list is full.
+    pub fn new(saved: &BTreeMap<u32, String>, listed: &[&str], mut place: impl FnMut(&str) -> Option<u32>) -> Self {
+        let mut to = [None; HW_DEVICES];
+        let named = saved.iter().filter(|(&i, _)| (i as usize) < HW_DEVICES);
+        for (&i, port) in named.clone() {
+            if listed.get(i as usize) == Some(&port.as_str()) {
+                to[i as usize] = Some(i);
+            }
+        }
+        for (&i, port) in named {
+            if to[i as usize].is_some() {
+                continue;
+            }
+            let listed_at = (0..listed.len()).find(|&d| listed[d] == port && !to.contains(&Some(d as u32)));
+            let d = listed_at.map(|d| d as u32).or_else(|| place(port));
+            let d = d.filter(|&d| (d as usize) < HW_DEVICES && !to.contains(&Some(d)));
+            to[i as usize] = Some(d.unwrap_or(HW_DEVICES as u32 + i));
+        }
+        let mut free: Vec<u32> = (0..HW_DEVICES as u32).filter(|d| !to.contains(&Some(*d))).collect();
+        for (i, d) in to.iter_mut().enumerate() {
+            if let (None, Some(k)) = (*d, free.iter().position(|&f| f == i as u32)) {
+                *d = Some(free.remove(k));
+            }
+        }
+        let mut free = free.into_iter();
+        Self(to.map(|d| d.or_else(|| free.next()).expect("one free index per unnamed one")))
+    }
+
+    pub fn get(&self, d: u32) -> u32 {
+        self.0.get(d as usize).copied().unwrap_or(d)
+    }
+
+    /// The devices of this run no saved index lands on (only while a named
+    /// device went past a full list).
+    pub fn unclaimed(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..HW_DEVICES as u32).filter(|d| !self.0.contains(d))
     }
 }
 
@@ -219,11 +280,14 @@ impl Session {
             time_sig: None,
             midi_sources: Vec::new(),
             setlist: crate::setlist::Setlist::default(),
+            hw_ports: BTreeMap::new(),
+            rig_devices: Vec::new(),
         }
     }
 
     /// True when both hold the same patch, knobs, plugin states, routes, rig
-    /// names, mixer strips, and setlist; the session name is not compared.
+    /// names, mixer strips, and setlist; the session name is not compared,
+    /// nor are the port names, which a device plugged in later only adds to.
     pub fn same_content(&self, other: &Session) -> bool {
         self.params == other.params
             && self.states == other.states
@@ -240,6 +304,7 @@ impl Session {
             && self.time_sig == other.time_sig
             && self.midi_sources == other.midi_sources
             && self.setlist == other.setlist
+            && self.rig_devices == other.rig_devices
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -332,6 +397,16 @@ impl Session {
             self.midi_sources.push(row);
             self.midi_sources.sort_by_key(|m| m.node);
         }
+    }
+
+    // -- hardware MIDI device names (#227) -----------------------------------
+
+    pub fn hw_ports(&self) -> &BTreeMap<u32, String> {
+        &self.hw_ports
+    }
+
+    pub fn set_hw_ports(&mut self, ports: BTreeMap<u32, String>) {
+        self.hw_ports = ports;
     }
 
     // -- mixer strips (#72–77) ----------------------------------------------
@@ -619,6 +694,8 @@ impl Session {
             time_signature: self.time_sig,
             midi_sources: self.midi_sources.clone(),
             setlist: self.setlist.clone(),
+            hw_ports: self.hw_ports.clone(),
+            rig_devices: self.rig_devices.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -669,6 +746,8 @@ impl Session {
             time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
             midi_sources: manifest.midi_sources,
             setlist,
+            hw_ports: manifest.hw_ports,
+            rig_devices: manifest.rig_devices,
         };
         session.validate()?;
         Ok(session)
@@ -806,6 +885,13 @@ struct SessionFile {
     /// The setlist (#204); older/plain sessions omit it.
     #[serde(default, skip_serializing_if = "crate::setlist::Setlist::is_empty")]
     setlist: crate::setlist::Setlist,
+    /// Port names of the device indices in use (#227); older sessions have
+    /// none, and their indices load as they are.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hw_ports: BTreeMap<u32, String>,
+    /// Rig devices (#227); older sessions have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rig_devices: Vec<Option<u32>>,
 }
 
 /// A file's rig marks: its own, or an old session's single keyboard pin,
@@ -1092,6 +1178,7 @@ pub struct RigPreset {
     pub rig_name: String,
     pub session: Session,
     pub mix: RigMix,
+    /// An index in the space `session.hw_ports()` names (#227).
     pub midi_device: Option<u32>,
     pub clap_meta: Vec<RigClapMeta>,
 }
@@ -1149,6 +1236,7 @@ impl RigPreset {
                 clap_meta: self.clap_meta.clone(),
                 strip_knobs: self.session.strip_knobs().clone(),
                 rig_type: self.session.rig_types.first().copied().flatten(),
+                hw_ports: self.session.hw_ports().clone(),
             };
             let json = serde_json::to_vec_pretty(&manifest)?;
             write_atomic(&staging.join(RIG_PRESET_FILE), &json)
@@ -1186,6 +1274,7 @@ impl RigPreset {
             session.set_strip_knob(node, knob);
         }
         session.rig_types = manifest.rig_type.map(|t| vec![Some(t)]).unwrap_or_default();
+        session.set_hw_ports(manifest.hw_ports);
         let preset = RigPreset {
             name: manifest.name,
             rig_name: manifest.rig_name,
@@ -1223,6 +1312,9 @@ struct RigPresetFile {
     /// The rig's instrument-type mark (#198); absent while it follows its instrument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rig_type: Option<crate::keyboard::KeyboardType>,
+    /// Port names of the device indices in `matrix` and `midi_device` (#227).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hw_ports: BTreeMap<u32, String>,
 }
 
 /// Default directory for saved rig presets (sibling to `~/kabelsalat-sessions`).
@@ -2010,6 +2102,95 @@ mod tests {
         s.graph.remove_node(4);
         s.prune_to_graph();
         assert!(s.midi_sources().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const FM1: &str = "M-Wave FM-1:M-Wave FM-1 MIDI 1";
+    const U6: &str = "U6MIDI Pro:U6MIDI Pro MIDI 1";
+
+    fn ports(named: &[(u32, &str)]) -> BTreeMap<u32, String> {
+        named.iter().map(|&(i, p)| (i, p.to_string())).collect()
+    }
+
+    fn mapped(m: &HwIndexMap) -> Vec<u32> {
+        (0..HW_DEVICES as u32).map(|d| m.get(d)).collect()
+    }
+
+    fn is_permutation(m: &HwIndexMap) -> bool {
+        let mut all = mapped(m);
+        all.sort_unstable();
+        all == (0..HW_DEVICES as u32).collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn device_indices_follow_their_port_into_another_scan_order() {
+        let saved = ports(&[(0, FM1), (1, U6)]);
+        let same = HwIndexMap::new(&saved, &[FM1, U6], |_| panic!("both are listed"));
+        assert_eq!(mapped(&same), (0..HW_DEVICES as u32).collect::<Vec<_>>(), "the same scan keeps every index");
+
+        let swapped = HwIndexMap::new(&saved, &[U6, FM1], |_| panic!("both are listed"));
+        assert_eq!((swapped.get(0), swapped.get(1)), (1, 0));
+        assert!(is_permutation(&swapped));
+
+        // A device not plugged in gets the place the app gives it; an index
+        // nobody named stays where it is, or takes the one that came free.
+        let mut placed = Vec::new();
+        let missing = HwIndexMap::new(&saved, &[FM1], |p| { placed.push(p.to_string()); Some(1) });
+        assert_eq!(placed, [U6]);
+        assert_eq!((missing.get(0), missing.get(1), missing.get(2)), (0, 1, 2));
+        let elsewhere = HwIndexMap::new(&ports(&[(1, U6)]), &[FM1], |_| Some(5));
+        assert_eq!((elsewhere.get(0), elsewhere.get(1), elsewhere.get(2), elsewhere.get(5)), (0, 5, 2, 1));
+        assert!(is_permutation(&elsewhere));
+
+        // A full device list has no place: the device goes past it, never
+        // onto a listed one, and the listed device left over is unclaimed.
+        let full = HwIndexMap::new(&ports(&[(3, U6)]), &[FM1; HW_DEVICES], |_| None);
+        assert!(full.get(3) >= HW_DEVICES as u32);
+        assert_eq!(full.unclaimed().collect::<Vec<_>>(), [3]);
+        assert_eq!(missing.unclaimed().count(), 0);
+
+        // Two identical keyboards keep apart, also while one is unplugged.
+        let twins = HwIndexMap::new(&ports(&[(1, FM1), (3, FM1)]), &[FM1, U6, FM1], |_| None);
+        assert_eq!((twins.get(1), twins.get(3)), (0, 2));
+        assert!(is_permutation(&twins));
+        let one_twin = HwIndexMap::new(&ports(&[(0, FM1), (1, FM1)]), &[FM1, U6], |_| Some(2));
+        assert_eq!((one_twin.get(0), one_twin.get(1)), (0, 2), "the second FM-1 waits in a place of its own");
+
+        // A file without names (before #227) keeps its indices.
+        let older = HwIndexMap::new(&BTreeMap::new(), &[U6, FM1], |_| None);
+        assert_eq!(mapped(&older), (0..HW_DEVICES as u32).collect::<Vec<_>>());
+        assert_eq!(older.get(40), 40, "beyond the device list an index passes as it is");
+    }
+
+    #[test]
+    fn port_names_and_rig_devices_round_trip_through_session_and_rig_preset() {
+        let dir = std::env::temp_dir().join(format!("ksalat-hwports-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::new("devices", Graph::demo_patch());
+        s.set_hw_ports(ports(&[(0, FM1), (2, U6)]));
+        s.rig_devices = vec![None, Some(2)];
+        let pkg = dir.join("devices.ksalat");
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert_eq!(loaded.hw_ports(), &ports(&[(0, FM1), (2, U6)]));
+        assert_eq!(loaded.rig_devices, [None, Some(2)]);
+        assert!(!loaded.same_content(&Session::new("devices", Graph::demo_patch())), "a rig device is content");
+
+        let mut preset = RigPreset::new("Bass", "Bass", Session::new("Bass", Graph::demo_patch()));
+        preset.session.set_hw_ports(ports(&[(2, U6)]));
+        preset.midi_device = Some(2);
+        let rpkg = RigPreset::package_path(&dir, "Bass").unwrap();
+        preset.save(&rpkg).unwrap();
+        let back = RigPreset::load(&rpkg).unwrap();
+        assert_eq!((back.midi_device, back.session.hw_ports()), (Some(2), &ports(&[(2, U6)])));
+
+        // Files that name no ports write no such field and load as before.
+        let plain = dir.join("plain.ksalat");
+        Session::new("plain", Graph::demo_patch()).save(&plain).unwrap();
+        let text = std::fs::read_to_string(plain.join(SESSION_FILE)).unwrap();
+        assert!(!text.contains("hw_ports") && !text.contains("rig_devices"));
+        let older = Session::load(&plain).unwrap();
+        assert!(older.hw_ports().is_empty() && older.rig_devices.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

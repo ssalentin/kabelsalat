@@ -1626,3 +1626,17 @@ Learned so far (2026-11-15, UI polish pass):
     (`soloing_a_rig_unsolos_every_other_rig`,
     `a_rig_solo_unsolos_the_other_rigs_in_the_mixer`). Source-strip solo
     (`SetStripMix`) still stacks within a rig.
+195. **A device index a file saves loads through the file's port names:**
+    matrix rules (`SavedRule.source`), rig devices (`Session::rig_devices`)
+    and a rig preset's `midi_device` hold `SourceId::Hardware(i)`, a place in
+    the scan of the run that saved them, so another scan order moved an LV2
+    organ's device, a learned CC and a rig binding onto the other keyboard
+    (#227). `capture_session` names only the devices the routing depends on
+    (`hw_ports`, `hw_indices_in_use`; any other name becomes an unplugged
+    row on load), and each load path moves the indices through `HwIndexMap`
+    (`map_session_hw`) before they meet this run's: `apply_session`, the
+    preset in `apply_rig_preset`, an imported song. A missing device never
+    lands on a listed one, also with two identical keyboards or a full list.
+    A rack rebuilt from parts carries each synth's `VoiceRow`, device
+    included, never only its switches. A new field holding a device index
+    goes through `map_session_hw` too (`ui::hw_ports_tests`).

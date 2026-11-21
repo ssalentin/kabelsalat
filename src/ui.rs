@@ -474,6 +474,9 @@ fn hw_midi_in(dev: u32, msg: &[u8], queues: &HwQueues, direct: &HwDirect) {
             let ch = msg[0] & 0x0F;
             let cc = msg[1] & 0x7F;
             let val = msg[2] & 0x7F;
+            if direct.is_cc_ignored(dev, cc) {
+                return;
+            }
             let src = SourceId::Hardware(dev);
             let _ = direct.send_cc(src, ch, cc, val, std::time::Instant::now());
             push_bounded(&queues.ccs, (src, ch, cc, val));
@@ -488,20 +491,49 @@ fn connect_hw_input(port: &midir::MidiInputPort, dev: u32, queues: &HwQueues, di
     mi.connect(port, "kabelsalat-hw", move |_stamp, msg: &[u8], _| hw_midi_in(dev, msg, &queues, &direct), ()).ok()
 }
 
+const MAX_HW_IGNORED_DEVS: usize = 64;
+
 struct HwDirect {
     bus: Mutex<Option<Arc<Mutex<CommandBus>>>>,
     /// Keys VEL knob as f32 bits (starts at the knob's 0.8 default).
     keys_vel: std::sync::atomic::AtomicU32,
+    /// Lock-free per-device bitmask of ignored MIDI CCs (0..=127), synced from
+    /// `DemoApp::ignored_ccs` so noisy pots are dropped before engine & UI.
+    ignored_ccs: [[std::sync::atomic::AtomicU64; 2]; MAX_HW_IGNORED_DEVS],
 }
 
 impl Default for HwDirect {
     fn default() -> Self {
-        Self { bus: Mutex::new(None), keys_vel: std::sync::atomic::AtomicU32::new(0.8f32.to_bits()) }
+        Self {
+            bus: Mutex::new(None),
+            keys_vel: std::sync::atomic::AtomicU32::new(0.8f32.to_bits()),
+            ignored_ccs: std::array::from_fn(|_| [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ]),
+        }
     }
 }
 
 impl HwDirect {
     fn set_keys_vel(&self, v: f32) { self.keys_vel.store(v.to_bits(), Ordering::Relaxed); }
+
+    fn is_cc_ignored(&self, dev: u32, cc: u8) -> bool {
+        let Some(mask) = self.ignored_ccs.get(dev as usize) else { return false };
+        let cc = (cc & 0x7F) as usize;
+        (mask[cc / 64].load(Ordering::Relaxed) & (1u64 << (cc % 64))) != 0
+    }
+
+    fn set_ignored_ccs(&self, dev: u32, ccs: &[u8]) {
+        let Some(mask) = self.ignored_ccs.get(dev as usize) else { return };
+        let (mut lo, mut hi) = (0u64, 0u64);
+        for &cc in ccs {
+            let cc = (cc & 0x7F) as usize;
+            if cc < 64 { lo |= 1u64 << cc; } else { hi |= 1u64 << (cc - 64); }
+        }
+        mask[0].store(lo, Ordering::Relaxed);
+        mask[1].store(hi, Ordering::Relaxed);
+    }
 
     /// Send one hardware note to the engine. False when no engine is attached
     /// (the UI frame then sounds it through the note sink).
@@ -1290,6 +1322,92 @@ impl RuleEdit {
             vel_lo: self.vel_lo, vel_hi: self.vel_hi,
             enabled: self.enabled,
         }
+    }
+}
+
+/// Sliding window for detecting continuously chattering MIDI CCs (e.g. a
+/// scratchy hardware potentiometer) so MIDI learn ignores them instead of
+/// getting hijacked.
+const CHATTER_WINDOW_SECS: f32 = 2.5;
+/// How long a CC stays flagged as chattering after its latest burst, so
+/// occasional larger chassis-vibration dips on the same pot stay suppressed.
+const CHATTER_HOLD_SECS: f32 = 5.0;
+const CHATTER_MIN_SAMPLES: usize = 4;
+const CHATTER_MIN_REVERSALS: usize = 2;
+const CHATTER_MAX_SAMPLES: usize = 24;
+
+#[derive(Clone, Debug, Default)]
+struct CcChatterEntry {
+    samples: VecDeque<(f32, u8)>,
+    chatter_until: Option<f32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct CcChatter {
+    entries: std::collections::HashMap<(SourceId, u8), CcChatterEntry>,
+}
+
+impl CcChatter {
+    pub(super) fn record(&mut self, src: SourceId, cc: u8, val: u8, now: f32) {
+        let cc = cc & 0x7F;
+        let val = val & 0x7F;
+        let e = self.entries.entry((src, cc)).or_default();
+        let cutoff = now - CHATTER_WINDOW_SECS;
+        while e.samples.front().is_some_and(|&(t, _)| t < cutoff) {
+            e.samples.pop_front();
+        }
+        if e.samples.len() >= CHATTER_MAX_SAMPLES {
+            e.samples.pop_front();
+        }
+        e.samples.push_back((now, val));
+        if e.samples.len() >= CHATTER_MIN_SAMPLES {
+            let mut min_v = u8::MAX;
+            let mut max_v = 0u8;
+            let mut prev_dir: i8 = 0;
+            let mut reversals = 0usize;
+            let mut prev_v: Option<u8> = None;
+            for &(_, v) in &e.samples {
+                min_v = min_v.min(v);
+                max_v = max_v.max(v);
+                if let Some(p) = prev_v {
+                    let dir = (v as i16 - p as i16).signum() as i8;
+                    if dir != 0 {
+                        if prev_dir != 0 && dir != prev_dir {
+                            reversals += 1;
+                        }
+                        prev_dir = dir;
+                    }
+                }
+                prev_v = Some(v);
+            }
+            // Oscillating pot (up→down→up) or repeated identical values.
+            if reversals >= CHATTER_MIN_REVERSALS || max_v == min_v {
+                e.chatter_until = Some(now + CHATTER_HOLD_SECS);
+            }
+        }
+    }
+
+    pub(super) fn is_chattering(&self, src: SourceId, cc: u8, now: f32) -> bool {
+        self.entries
+            .get(&(src, cc & 0x7F))
+            .and_then(|e| e.chatter_until)
+            .is_some_and(|until| now <= until)
+    }
+
+    fn chattering_ccs_for(&self, src: SourceId, now: f32) -> Vec<u8> {
+        let mut out: Vec<u8> = self
+            .entries
+            .iter()
+            .filter_map(|(&(s, cc), e)| {
+                (s == src && e.chatter_until.is_some_and(|until| now <= until)).then_some(cc)
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn clear_cc(&mut self, src: SourceId, cc: u8) {
+        self.entries.remove(&(src, cc & 0x7F));
     }
 }
 
@@ -4032,6 +4150,14 @@ struct DemoApp {
     /// profile id, or "" for none. A device without an entry is matched by
     /// its port name. Stored in config.json as `instrument_devices`.
     device_instruments: std::collections::BTreeMap<String, String>,
+    /// Per-hardware-port ignored MIDI CCs, keyed by `midi_port_key`. Dropped
+    /// right at `hw_midi_in` (via `hw_direct`) so a broken/noisy pot never
+    /// reaches plugins, knobs, or MIDI learn. Stored in config.json as
+    /// `ignored_ccs`.
+    ignored_ccs: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Tracks continuously chattering CCs so MIDI learn / show learn skip them
+    /// automatically even before the user ignores them.
+    pub(super) cc_chatter: CcChatter,
     /// The CC bindings profiles put into the matrix, so a profile change
     /// takes back exactly those.
     instrument_bound: Vec<(SourceId, u32, crate::instruments::Binding)>,
@@ -4550,6 +4676,19 @@ impl DemoApp {
             device_instruments: crate::assistant::load_config_value("instrument_devices")
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default(),
+            ignored_ccs: crate::assistant::load_config_value("ignored_ccs")
+                .and_then(|v| serde_json::from_value::<std::collections::BTreeMap<String, Vec<u8>>>(v).ok())
+                .map(|mut m| {
+                    for v in m.values_mut() {
+                        v.retain(|&c| c <= 127);
+                        v.sort_unstable();
+                        v.dedup();
+                    }
+                    m.retain(|_, v| !v.is_empty());
+                    m
+                })
+                .unwrap_or_default(),
+            cc_chatter: CcChatter::default(),
             instrument_bound: Vec::new(),
             node_params: std::collections::HashMap::new(),
             surge_status: "no synth loaded".into(),
@@ -7222,6 +7361,61 @@ impl DemoApp {
             } else {
                 format!("MIDI in: {}", live.join(", "))
             };
+        }
+        self.sync_ignored_ccs();
+    }
+
+    /// Push `self.ignored_ccs` into `self.hw_direct`'s lock-free per-device bitmasks.
+    fn sync_ignored_ccs(&self) {
+        for (d, raw) in self.hw_devices.iter().enumerate() {
+            let ccs = self.ignored_ccs.get(midi_port_key(raw)).map(Vec::as_slice).unwrap_or(&[]);
+            self.hw_direct.set_ignored_ccs(d as u32, ccs);
+        }
+    }
+
+    fn is_cc_ignored(&self, src: SourceId, cc: u8) -> bool {
+        let SourceId::Hardware(d) = src else { return false };
+        if self.hw_direct.is_cc_ignored(d, cc) {
+            return true;
+        }
+        self.hw_devices
+            .get(d as usize)
+            .and_then(|raw| self.ignored_ccs.get(midi_port_key(raw)))
+            .is_some_and(|v| v.binary_search(&(cc & 0x7F)).is_ok())
+    }
+
+    fn ignored_ccs_for_device(&self, d: u32) -> &[u8] {
+        self.hw_devices
+            .get(d as usize)
+            .and_then(|raw| self.ignored_ccs.get(midi_port_key(raw)))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Ignore or un-ignore a MIDI CC on hardware device `d` (persisted by port
+    /// name in `config.json` as `ignored_ccs`).
+    fn set_cc_ignored(&mut self, d: u32, cc: u8, ignored: bool) {
+        let Some(raw) = self.hw_devices.get(d as usize) else { return };
+        let key = midi_port_key(raw).to_string();
+        let cc = cc & 0x7F;
+        if ignored {
+            let entry = self.ignored_ccs.entry(key).or_default();
+            if entry.binary_search(&cc).is_err() {
+                entry.push(cc);
+                entry.sort_unstable();
+            }
+            self.cc_chatter.clear_cc(SourceId::Hardware(d), cc);
+        } else if let Some(entry) = self.ignored_ccs.get_mut(&key) {
+            entry.retain(|&c| c != cc);
+            if entry.is_empty() {
+                self.ignored_ccs.remove(&key);
+            }
+        }
+        self.sync_ignored_ccs();
+        if let Ok(v) = serde_json::to_value(&self.ignored_ccs) {
+            if let Err(e) = crate::assistant::save_config_value("ignored_ccs", v) {
+                eprintln!("ignored_ccs: config not saved: {e}");
+            }
         }
     }
 
@@ -11669,6 +11863,62 @@ impl DemoApp {
         pick
     }
 
+    /// Compact chips on a hardware port row in the MIDI Matrix: removable
+    /// badges for ignored CCs (`CC 114 ×`) and a one-click `Ignore CC N`
+    /// action whenever a continuously chattering CC is detected on that port.
+    /// Returns `(cc, ignore)` when clicked.
+    fn hw_ignored_cc_chips(&self, ui: &mut egui::Ui, d: u32) -> Option<(u8, bool)> {
+        let ignored = self.ignored_ccs_for_device(d);
+        let chattering = self.cc_chatter.chattering_ccs_for(SourceId::Hardware(d), self.ui_time);
+        if ignored.is_empty() && chattering.is_empty() {
+            return None;
+        }
+        let mut action: Option<(u8, bool)> = None;
+        let pad = egui::vec2(8.0, 4.0);
+        for &cc in ignored {
+            let btn = egui::Button::new(
+                egui::RichText::new(format!("Ignored CC {cc} ×"))
+                    .font(theme::medium_font(11.0))
+                    .color(theme::INK_2),
+            )
+            .fill(theme::PAPER_SINK)
+            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+            .corner_radius(3.0)
+            .min_size(egui::vec2(0.0, 22.0));
+            let resp = ui.scope(|ui| {
+                ui.spacing_mut().button_padding = pad;
+                ui.add(btn)
+            }).inner
+            .on_hover_text(format!("CC {cc} is ignored on this port — click to re-enable"));
+            if resp.clicked() {
+                action = Some((cc, false));
+            }
+        }
+        for cc in chattering {
+            if ignored.binary_search(&cc).is_ok() {
+                continue;
+            }
+            let btn = egui::Button::new(
+                egui::RichText::new(format!("Ignore CC {cc}"))
+                    .font(theme::medium_font(11.0))
+                    .color(theme::CABLE_AMBER),
+            )
+            .fill(theme::alpha(theme::CABLE_AMBER, 0.12))
+            .stroke(Stroke::new(1.0, theme::alpha(theme::CABLE_AMBER, 0.55)))
+            .corner_radius(3.0)
+            .min_size(egui::vec2(0.0, 22.0));
+            let resp = ui.scope(|ui| {
+                ui.spacing_mut().button_padding = pad;
+                ui.add(btn)
+            }).inner
+            .on_hover_text(format!("CC {cc} is firing continuously on this port — click to ignore it"));
+            if resp.clicked() {
+                action = Some((cc, true));
+            }
+        }
+        action
+    }
+
     /// A matrix row header: activity LED, a kind badge (KEYS, ANY HW, HW),
     /// the source's name, its port chip and an UNPLUGGED chip. Further ports
     /// of one device hang off the first by an elbow instead of a badge.
@@ -11774,6 +12024,7 @@ impl DemoApp {
         let mut toggles: Vec<(usize, MatrixRow, bool)> = Vec::new();
         let mut edit_requests: Vec<(usize, MatrixRow)> = Vec::new();
         let mut profile_picks: Vec<(u32, String)> = Vec::new();
+        let mut cc_ignore_edits: Vec<(u32, u8, bool)> = Vec::new();
         let rows = self.matrix_rows();
         // Header cells never wrap ("Surge A" split across lines): Extend
         // labels + a min column width keep names and status on fixed rows.
@@ -11826,10 +12077,15 @@ impl DemoApp {
                     ui.end_row();
                 }
                 match src.row {
-                    MatrixRow::HwDev(d) if !src.continues => {
+                    MatrixRow::HwDev(d) => {
                         ui.horizontal(|ui| {
                             Self::matrix_source_head(ui, src);
-                            if let Some(id) = self.instrument_dropdown(ui, d) { profile_picks.push((d, id)); }
+                            if !src.continues {
+                                if let Some(id) = self.instrument_dropdown(ui, d) { profile_picks.push((d, id)); }
+                            }
+                            if let Some((cc, ignore)) = self.hw_ignored_cc_chips(ui, d) {
+                                cc_ignore_edits.push((d, cc, ignore));
+                            }
                         });
                     }
                     _ => Self::matrix_source_head(ui, src),
@@ -11890,6 +12146,7 @@ impl DemoApp {
         self.midi_clock_ui(ui);
         for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
         for (d, id) in profile_picks { self.pick_device_profile(d, &id); }
+        for (d, cc, ignore) in cc_ignore_edits { self.set_cc_ignored(d, cc, ignore); }
         if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
     }
 
@@ -14190,6 +14447,9 @@ impl DemoApp {
         };
         let cc = cc & 0x7F;
         let val = val & 0x7F;
+        if learn.capture.is_none() && self.cc_chatter.is_chattering(bind_src, cc, self.ui_time) {
+            return false;
+        }
         if learn.is_switch() {
             if learn.replace_existing {
                 self.clear_knob_bindings(learn.dest, learn.param, learn.target);
@@ -32777,11 +33037,17 @@ impl DemoApp {
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
         for (src, ch, cc, val) in hw_ccs {
+            let cc = cc & 0x7F;
+            let val = val & 0x7F;
+            if self.is_cc_ignored(src, cc) {
+                continue;
+            }
+            self.cc_chatter.record(src, cc, val, self.ui_time);
             if let SourceId::Hardware(d) = src {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
             self.last_midi = Some(self.midi_event_text(src, &format!("CC{cc} {val}")));
-            if self.show_control_msg(src, ch, crate::show::ShowMsg::Cc(cc & 0x7F), val >= 64) {
+            if self.show_control_msg(src, ch, crate::show::ShowMsg::Cc(cc), val >= 64) {
                 continue;
             }
             let learned = self.feed_cc_learn(src, cc, val);
@@ -50447,6 +50713,122 @@ mod precision_knob_tests {
         ]);
         assert!(app.knob_menu.is_none(), "click outside closes knob menu while VALUE focused");
         assert!(!ctx.text_edit_focused(), "click outside releases VALUE focus");
+    }
+
+    #[test]
+    fn chattering_cc_is_detected_and_skipped_by_knob_and_show_learn() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dev = SourceId::Hardware(0);
+        let node = app.units[app.master_idx().unwrap()].node_id;
+
+        // Simulate a scratchy pot (Nord Electro 2 EQ Bass CC 114) oscillating 88/87/88/87.
+        for (i, &val) in [88u8, 87, 88, 87].iter().enumerate() {
+            app.ui_time = 1.0 + i as f32 * 0.1;
+            app.cc_chatter.record(dev, 114, val, app.ui_time);
+        }
+        assert!(app.cc_chatter.is_chattering(dev, 114, app.ui_time), "oscillating pot flagged as chatter");
+
+        // Even a subsequent chassis-vibration dip (88 -> 45) stays suppressed during the hold window.
+        app.ui_time += 0.5;
+        app.cc_chatter.record(dev, 114, 45, app.ui_time);
+        assert!(app.cc_chatter.is_chattering(dev, 114, app.ui_time));
+
+        // Normal monotonic knob sweep on CC 74 is NEVER flagged as chatter.
+        for (i, &val) in [0u8, 20, 45, 70, 100, 127].iter().enumerate() {
+            app.cc_chatter.record(dev, 74, val, app.ui_time + i as f32 * 0.05);
+        }
+        assert!(!app.cc_chatter.is_chattering(dev, 74, app.ui_time + 0.25), "monotonic sweep is not chatter");
+
+        // Single up-and-down gesture (e.g. expression pedal / EWI bite) is NEVER flagged as chatter.
+        for (i, &val) in [0u8, 30, 60, 30, 0].iter().enumerate() {
+            app.cc_chatter.record(dev, 11, val, app.ui_time + i as f32 * 0.05);
+        }
+        assert!(!app.cc_chatter.is_chattering(dev, 11, app.ui_time + 0.20), "single up-down gesture is not chatter");
+
+        // Arm continuous knob learn: chattering CC 114 must NOT hijack it.
+        app.cc_learn = Some(CcLearn::new(SourceId::Keys, node, 0, CcTarget::Knob, true));
+        assert!(!app.feed_cc_learn(dev, 114, 88), "chattering CC 114 skipped by knob learn");
+        assert!(app.cc_learn.as_ref().is_some_and(|l| l.capture.is_none()), "learn still armed and clean");
+
+        // Real knob CC 74 completes capture immediately.
+        assert!(app.feed_cc_learn(dev, 74, 64), "real CC 74 accepted by knob learn");
+        assert_eq!(app.cc_learn.as_ref().and_then(|l| l.capture.as_ref()).map(|c| c.cc), Some(74));
+
+        // Arm switch learn (sustain pedal): chattering CC 114 must NOT hijack it.
+        app.cc_learn = Some(CcLearn::new(SourceId::Keys, node, 64, CcTarget::MidiCc, true));
+        assert!(!app.feed_cc_learn(dev, 114, 88), "chattering CC 114 skipped by switch learn");
+        assert!(app.cc_learn.is_some(), "switch learn still armed");
+        assert!(app.feed_cc_learn(dev, 66, 127), "real switch CC 66 accepted");
+        assert!(app.cc_learn.is_none());
+
+        // Arm show-control learn: chattering CC 114 (>= 64) must NOT hijack it.
+        app.show_learn = Some(crate::show::ShowAction::NextPart);
+        assert!(!app.show_control_msg(dev, 0, crate::show::ShowMsg::Cc(114), true), "chattering CC 114 skipped by show learn");
+        assert_eq!(app.show_learn, Some(crate::show::ShowAction::NextPart), "show learn stays armed");
+        assert!(app.show_control_msg(dev, 0, crate::show::ShowMsg::Cc(80), true), "real foot switch CC 80 accepted");
+        assert_eq!(app.show_learn, None);
+    }
+
+    #[test]
+    fn ignored_cc_is_dropped_at_hw_midi_in_and_synced_by_port_key() {
+        let (bus, mut rx) = crate::control::command_bus();
+        let direct = HwDirect::default();
+        *direct.bus.lock().unwrap() = Some(Arc::new(Mutex::new(bus)));
+        let queues = HwQueues {
+            notes: Arc::new(Mutex::new(VecDeque::new())),
+            ccs: Arc::new(Mutex::new(VecDeque::new())),
+            programs: Arc::new(Mutex::new(VecDeque::new())),
+        };
+
+        direct.set_ignored_ccs(0, &[114]);
+        // Ignored CC 114 on device 0 is dropped before engine AND UI queue.
+        hw_midi_in(0, &[0xB0, 114, 88], &queues, &direct);
+        let mut cmds = Vec::new();
+        rx.drain(|c| cmds.push(c));
+        assert!(cmds.is_empty(), "ignored CC 114 must not reach engine: {cmds:?}");
+        assert!(queues.ccs.lock().unwrap().is_empty(), "ignored CC 114 must not reach UI queue");
+
+        // Other CCs on device 0 and CC 114 on device 1 still pass through.
+        hw_midi_in(0, &[0xB0, 74, 64], &queues, &direct);
+        hw_midi_in(1, &[0xB0, 114, 88], &queues, &direct);
+        rx.drain(|c| cmds.push(c));
+        assert_eq!(cmds.len(), 2, "non-ignored CCs pass through: {cmds:?}");
+        assert_eq!(queues.ccs.lock().unwrap().len(), 2);
+
+        // DemoApp syncs ignored_ccs by stable port key (ignoring ALSA client:port suffix).
+        let mut app = DemoApp::new_with_sink(None);
+        app.hw_devices = vec!["ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0".into()];
+        app.ignored_ccs.insert("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1".into(), vec![114]);
+        app.sync_ignored_ccs();
+        assert!(app.hw_direct.is_cc_ignored(0, 114));
+        assert!(!app.hw_direct.is_cc_ignored(0, 74));
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat ignored_cc_matrix_shot -- --ignored"]
+    fn ignored_cc_matrix_shot() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = Vec2::new(1280.0, 800.0);
+
+        let mut app = DemoApp::new_with_sink(None);
+        *app.hw_midi.devices.lock().unwrap() = vec![
+            ("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0".into(), true),
+            ("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 2 28:1".into(), true),
+            ("U6MIDI Pro:U6MIDI Pro MIDI 1 32:0".into(), true),
+        ];
+        app.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+        app.adopt_hw_devices();
+        app.stage_view = StageView::Matrix;
+        app.ui_time = 2.0;
+        // Port 0: CC 114 chattering (shows amber "Ignore CC 114" chip).
+        for (i, &val) in [88u8, 87, 88, 87].iter().enumerate() {
+            app.cc_chatter.record(SourceId::Hardware(0), 114, val, 1.5 + i as f32 * 0.1);
+        }
+        // Port 2: CC 114 already ignored (shows "Ignored CC 114 ×" chip).
+        app.ignored_ccs.insert("U6MIDI Pro:U6MIDI Pro MIDI 1".into(), vec![114]);
+        app.sync_ignored_ccs();
+        super::offline_shots::shot(&mut app, size, &dir.join("matrix-ignored-cc.png"));
     }
 
     #[test]

@@ -1761,3 +1761,13 @@ Learned so far (2026-11-15, UI polish pass):
     collapsed width, leaving the single top-right dot exclusively for
     setlist `zone_live` state (never paint a second `LIVE_TEAL` dot for
     audio activity; `collapsed_rig_pill_shows_meter_bar_not_two_dots`).
+206. **Chattering hardware CCs must not hijack MIDI learn, and ignored CCs are
+    dropped at `hw_midi_in`:** a scratchy hardware pot (e.g. Nord Electro 2
+    EQ Bass CC 114) firing continuously hijacked knob, switch, and show-control
+    learn on its next packet. `CcChatter` tracks oscillating/stuck CCs so
+    `feed_cc_learn` and `show_control_msg` skip them, while per-port
+    `ignored_ccs` (synced by `midi_port_key` into `HwDirect`'s lock-free
+    bitmasks) drops muted CCs before `HwDirect::send_cc` and `HwQueues::ccs`
+    (`chattering_cc_is_detected_and_skipped_by_knob_and_show_learn`,
+    `ignored_cc_is_dropped_at_hw_midi_in_and_synced_by_port_key`).
+

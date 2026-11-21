@@ -32,6 +32,11 @@ impl DemoApp {
     pub(super) fn show_control_msg(&mut self, source: SourceId, channel: u8, msg: ShowMsg, press: bool) -> bool {
         let SourceId::Hardware(device) = source else { return false };
         if let Some(action) = self.show_learn.filter(|_| press) {
+            if let ShowMsg::Cc(cc) = msg {
+                if self.cc_chatter.is_chattering(source, cc, self.ui_time) {
+                    return false;
+                }
+            }
             self.show_learn = None;
             let what = crate::setlist::msg_label(msg);
             self.session_msg = match self.setlist.learn(action, Some(device), msg) {

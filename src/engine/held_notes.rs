@@ -35,7 +35,8 @@
 //! setlist's parts; two foot switches step through them in the engine, next
 //! to songs picked with `SetRigZones` and the routing edits the zone
 //! transpose stacks on. A step taps a switch (press, then release): only the
-//! press moves the zones, the release moves nothing.
+//! press moves the zones, the release moves nothing. The switches' device
+//! also selects songs by program change (#208), one with no song included.
 //!
 //! The layers scenario (#276) plays the same two rigs soft and hard through
 //! velocity layers, velocity curves and a floating split, whose hands
@@ -145,6 +146,8 @@ enum Edit {
     Bypass(u32, bool),
     /// A tap on a foot switch: hardware CC `NEXT_CC` or `PREV_CC` down, then up.
     Switch(u8),
+    /// A program change from the foot switches' device: selects song N+1.
+    Program(u8),
 }
 
 /// Which scenario a search runs: the plain rack, the arp (#90), the rack
@@ -267,9 +270,11 @@ const ZONE_EDITS: [Edit; 11] = [
 
 /// Edits of the foot-switch scenario: both switches, a song picked in the UI
 /// meanwhile, and the matrix transpose and split the zone transpose stacks on.
-const SWITCH_EDITS: [Edit; 8] = [
+const SWITCH_EDITS: [Edit; 10] = [
     Edit::Switch(NEXT_CC),
     Edit::Switch(PREV_CC),
+    Edit::Program(3),
+    Edit::Program(SONGS.len() as u8),
     Edit::Zones(3),
     Edit::Zones(4),
     Edit::Rule { dest: SURGE_A, transpose: 12, enabled: true },
@@ -360,7 +365,7 @@ impl Edit {
             Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
             Edit::Source { .. } => Kind::Source,
             Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
-            Edit::Zones(_) | Edit::Layers(_) | Edit::Switch(_) => Kind::Zone,
+            Edit::Zones(_) | Edit::Layers(_) | Edit::Switch(_) | Edit::Program(_) => Kind::Zone,
             Edit::Bypass(..) => Kind::Bypass,
         }
     }
@@ -453,6 +458,7 @@ impl Edit {
             }
             Edit::Bypass(node, bypass) => Command::SetStripBypass { node, bypass },
             Edit::Switch(cc) => switch(cc, 127),
+            Edit::Program(program) => Command::Program { source: SourceId::Hardware(0), channel: 0, program },
         }
     }
 }
@@ -469,6 +475,7 @@ fn show_commands() -> [Command; 2] {
     let mut controls = crate::show::NO_SHOW_CONTROLS;
     controls[0] = control(NEXT_CC, ShowAction::NextPart);
     controls[1] = control(PREV_CC, ShowAction::PrevPart);
+    controls[2] = Some(ShowControl { device: Some(0), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
     let parts = SONGS.iter().enumerate().map(|(song, rigs)| {
         let mut zones = [RigZone::OPEN; crate::control::MAX_RIGS];
         zones[..2].copy_from_slice(rigs);
@@ -745,6 +752,7 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::Layers(n)) => format!("SetRigZones (rig 0, rig 1) = {:?}", LAYER_SONGS[n as usize]),
         Step::Edit(Edit::Bypass(node, on)) => format!("SetStripBypass node {node} = {on}"),
         Step::Edit(Edit::Switch(cc)) => format!("Tap foot switch CC {cc}"),
+        Step::Edit(Edit::Program(n)) => format!("Program change {n} from the foot switches' device"),
         Step::Tick => "Tick (time passes)".to_string(),
     }
 }

@@ -422,12 +422,13 @@ fn rescan_hw_midi(
     }
 }
 
-/// A hardware pitch bend or aftertouch as the engine command it becomes.
-/// Wind controllers send breath as channel pressure, which is 2 bytes on
-/// the wire.
+/// A hardware pitch bend, aftertouch or program change as the engine
+/// command it becomes. Wind controllers send breath as channel pressure,
+/// which is 2 bytes on the wire, like a program change.
 fn hw_expression(dev: u32, msg: &[u8]) -> Option<Command> {
     let (source, channel) = (SourceId::Hardware(dev), *msg.first()? & 0x0F);
     match msg.first()? & 0xF0 {
+        0xC0 => Some(Command::Program { source, channel, program: *msg.get(1)? & 0x7F }),
         0xD0 => Some(Command::Pressure { source, channel, note: None, value: *msg.get(1)? & 0x7F }),
         0xA0 => Some(Command::Pressure { source, channel, note: Some(*msg.get(1)? & 0x7F), value: *msg.get(2)? & 0x7F }),
         0xE0 => {
@@ -1164,7 +1165,7 @@ fn hw_indices_in_use(rules: &[SavedRule], rig_devices: &[Option<u32>]) -> std::c
 }
 
 /// `s` with every hardware device index it holds (matrix rule sources, rig
-/// devices, binding levels) moved through `map` (#227). What is left is in this run's
+/// devices, binding levels, program-change devices) moved through `map` (#227). What is left is in this run's
 /// indices, so its table of port names goes.
 fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndexMap) {
     let rules: Option<Vec<SavedRule>> = s.matrix().and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1188,6 +1189,7 @@ fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndex
     for p in &mut s.setlist.levels.bindings {
         if let SourceId::Hardware(d) = &mut p.of.source { *d = map.get(*d); }
     }
+    for d in &mut s.setlist.program_devices { *d = map.get(*d); }
     s.set_hw_ports(Default::default());
 }
 
@@ -7771,9 +7773,11 @@ impl DemoApp {
         }
         s.rig_devices = self.rig_snapshot.lock().map(|sn| sn.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
         while s.rig_devices.last() == Some(&None) { s.rig_devices.pop(); }
-        // Rules and rig devices hold device indices, places in this run's
-        // scan only, so the session names the devices it depends on.
-        s.set_hw_ports(self.hw_ports_in_use(&rules, &s.rig_devices));
+        // Rules, rig devices and the devices whose program change selects
+        // the song (#208) hold device indices, places in this run's scan
+        // only, so the session names the devices it depends on.
+        let devices: Vec<Option<u32>> = s.rig_devices.iter().copied().chain(self.setlist.program_devices.iter().map(|&d| Some(d))).collect();
+        s.set_hw_ports(self.hw_ports_in_use(&rules, &devices));
         // Each synth's input selection (#124). The device goes by its port
         // name: its index is only its place in this run's scan (rule 58).
         for row in self.voice_rows() {
@@ -17617,6 +17621,10 @@ impl DemoApp {
         let song_sets: Vec<Option<(String, bool)>> = (0..self.setlist.songs.len())
             .map(|si| self.setlist.set_of(si).map(|s| (s.name.clone(), s.skip)))
             .collect();
+        // Hardware devices whose program change can select the song (#208).
+        let program_rows: Vec<(u32, String, bool)> = (0..self.hw_devices.len() as u32)
+            .map(|d| (d, self.hw_device_label(d), self.hw_live.get(d as usize).copied().unwrap_or(true)))
+            .collect();
 
         // Keep selected song index valid.
         if self.setlist.songs.is_empty() {
@@ -17714,6 +17722,8 @@ impl DemoApp {
                                  move_song: &mut Option<(usize, usize)>,
                                  remove_song: &mut Option<usize>,
                                  jump_to: &mut Option<(usize, usize)>| {
+                    const PROGRAM_ROW_H: f32 = 28.0;
+                    const PROGRAM_ROWS_SHOWN: usize = 3;
                     theme::section_label(ui, "Songs");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -17766,7 +17776,8 @@ impl DemoApp {
                     }
                     ui.add_space(10.0);
 
-                    let list_h = (avail_h - 210.0).max(80.0);
+                    let program_h = 40.0 + PROGRAM_ROW_H * program_rows.len().clamp(1, PROGRAM_ROWS_SHOWN) as f32;
+                    let list_h = (avail_h - 210.0 - program_h).max(80.0);
                     egui::ScrollArea::vertical()
                         .id_salt("setlist_songs_scroll")
                         .min_scrolled_height(list_h.min(80.0))
@@ -17865,6 +17876,37 @@ impl DemoApp {
                         });
                         ui.add_space(4.0);
                     }
+
+                    ui.add_space(6.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(8.0);
+                    theme::section_label(ui, "Program change picks the song");
+                    ui.add_space(6.0);
+                    if program_rows.is_empty() {
+                        ui.label(egui::RichText::new("Plug in a MIDI device to pick songs with its program buttons.").size(11.5).color(theme::INK_2));
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("setlist_program_devices")
+                        .min_scrolled_height(0.0)
+                        .max_height(PROGRAM_ROW_H * PROGRAM_ROWS_SHOWN as f32)
+                        .show(ui, |ui| {
+                            for (d, name, live) in &program_rows {
+                                let on = setlist.program_selects_song(*d);
+                                ui.horizontal(|ui| {
+                                    ui.set_min_height(PROGRAM_ROW_H - 4.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let hint = "Program N selects song N+1; this device's program changes no longer reach its instruments";
+                                        if theme::chip_button(ui, if on { "On" } else { "Off" }, on).on_hover_text(hint).clicked() {
+                                            setlist.set_program_selects_song(*d, !on);
+                                        }
+                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            let color = if *live { theme::INK } else { theme::INK_2 };
+                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(color)).truncate());
+                                        });
+                                    });
+                                });
+                            }
+                        });
                 };
 
                 let draw_right = |ui: &mut egui::Ui,
@@ -40120,6 +40162,8 @@ mod ui_polish_agent_tests {
         assert!(matches!(super::hw_expression(2, &[0xA0, 60, 70]), Some(Command::Pressure { note: Some(60), value: 70, .. })));
         assert!(matches!(super::hw_expression(2, &[0xE0, 0x7F, 0x5F]), Some(Command::PitchBend { value: 4095, .. })));
         assert!(super::hw_expression(2, &[0xA0, 60]).is_none(), "a truncated message is dropped");
+        assert!(matches!(super::hw_expression(2, &[0xC3, 5]), Some(Command::Program { source, channel: 3, program: 5 }) if source == hw), "a program change is 2 bytes");
+        assert!(super::hw_expression(2, &[0xC3]).is_none());
         assert!(super::hw_expression(2, &[0x90, 60, 100]).is_none(), "notes take their own path");
     }
 
@@ -47902,6 +47946,49 @@ mod navigator_tests {
             "its zones do not: the engine set them, and may be past them already"
         );
         assert_eq!(app.rig_zones, app.setlist.active_zones());
+    }
+
+    /// #208: program change N from the device chosen for it, as its raw
+    /// bytes arrive, selects song N+1 in the engine and the app follows;
+    /// another device's program change selects nothing.
+    #[test]
+    fn a_program_change_from_the_chosen_device_selects_the_song_in_the_engine_and_the_app_follows() {
+        let (mut app, _) = two_rigs_with_inserts(false);
+        let (tx, drain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let bus = Arc::new(Mutex::new(tx));
+        app.bus = Some(bus.clone());
+        app.graph_pub = Some(pub_.clone());
+        for (name, rig) in [("Opener", 0), ("Ballad", 1)] {
+            let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+                "name": name,
+                "parts": [{"name": "Verse", "rigs": [{"rig": rig}]}, {"name": "Outro", "rigs": [{"rig": 0}, {"rig": 1}]}]
+            }));
+        }
+        app.setlist.set_program_selects_song(2, true);
+        app.select_setlist(0, 1).unwrap();
+        app.publish_show();
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let mut send_raw = |dev: u32, bytes: &[u8]| {
+            assert!(bus.lock().unwrap().send(super::hw_expression(dev, bytes).expect("a program change")));
+            engine.render(&mut buf, 2);
+        };
+
+        send_raw(2, &[0xC4, 1]);
+        let ballad = app.setlist.zones_of(&app.setlist.songs[1], &app.setlist.songs[1].parts[0]);
+        assert_eq!(pub_.lock().unwrap().zones, ballad, "the engine plays song 2 before any frame ran");
+        app.sync_from_engine();
+        app.follow_show();
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "the app follows to song 2's first part");
+
+        send_raw(0, &[0xC0, 0]);
+        send_raw(2, &[0xC0, 9]);
+        app.sync_from_engine();
+        app.follow_show();
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "neither another device's program nor one with no song moves it");
     }
 
     #[test]

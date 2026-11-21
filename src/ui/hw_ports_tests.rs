@@ -209,6 +209,24 @@ fn a_device_missing_at_load_keeps_its_rules_in_a_place_of_its_own() {
     assert!(matches!(cc[..], [SourceId::Hardware(d)] if d >= crate::engine::MAX_HW_DEVICES), "{cc:?}");
 }
 
+/// The device whose program change selects the song (#208) is saved by
+/// its port: in another scan order it is still that device, and while it
+/// is not plugged in it never becomes another one.
+#[test]
+fn a_program_change_device_follows_its_port_into_another_scan_order() {
+    let (mut app, _) = opened(&session_of(&[rig("Synth", surge(), "SURGE")]), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+    app.setlist.set_program_selects_song(1, true);
+    let loaded = saved_and_loaded(&mut app, "hw-ports-program");
+    assert_eq!(loaded.hw_ports().get(&1).map(String::as_str), Some(U6_PORT));
+
+    let (app, _) = opened(&loaded, &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+    assert_eq!(app.setlist.program_devices, [0], "the U6MIDI Pro, device 0 now");
+    let (app, _) = opened(&loaded, &[(FM1_PORT, "24:0")]);
+    let u6 = index_of(&app, U6_PORT);
+    assert_ne!(u6, 0);
+    assert_eq!(app.setlist.program_devices, [u6], "unplugged, never the FM-1");
+}
+
 /// A file from before #227 names no ports: its indices load as they are.
 #[test]
 fn a_session_without_port_names_loads_its_indices_as_saved() {

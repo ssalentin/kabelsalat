@@ -98,8 +98,9 @@ const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fi
 /// The reference CLAP instrument (docs/ARCHITECTURE.md §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
 use crate::sounds::{DEXED_ID, SURGE_ID};
-/// Ring slots between the voice host (this thread) and the audio thread.
-const VOICE_RING: usize = 64;
+/// Ring slots between the voice host (this thread) and the audio thread:
+/// a session swap retires every rig's voice and adds the new ones.
+const VOICE_RING: usize = 4 * crate::control::MAX_RIGS;
 
 const MAX_SAMPLES: usize = rope::MAX_SAMPLES;
 const MAX_PULSES: usize = 12;
@@ -155,9 +156,9 @@ fn edge_display_level(peak: f32) -> f32 {
     if !(peak > 0.0) { return 0.0; }
     ((20.0 * peak.log10() + 48.0) / 48.0).clamp(0.0, 1.0)
 }
-/// Cables of the whole rack, every rig's: eight per rig (Keys → synth →
-/// two effects → master), each with its own published edge level.
-const MAX_CABLES: usize = 8 * crate::control::MAX_RIGS;
+/// Cables of the whole rack, every rig's: sixteen per rig, each with its
+/// own published edge level.
+const MAX_CABLES: usize = 16 * crate::control::MAX_RIGS;
 const _: () = assert!(MAX_CABLES <= crate::engine::EDGE_LEVEL_SLOTS);
 const FLIP_SECS: f32 = 0.35;
 
@@ -3452,6 +3453,9 @@ struct DemoApp {
     patch_notice: Option<(String, f32)>,
     /// Last frame's rig-chip rects in the overview strip (points), per rig.
     rig_chip_rects: Vec<Rect>,
+    /// The rig whose pill the top bar's scrolling strip last brought into
+    /// view: it follows a rig switch, never the player's own scrolling.
+    rig_strip_follows: usize,
     /// Last frame's "+ Rig" button rect in the overview strip (points).
     add_rig_rect: Rect,
     /// Top-bar external-agent chip (tests).
@@ -4179,6 +4183,7 @@ impl DemoApp {
             confirm_session: None,
             patch_notice: None,
             rig_chip_rects: Vec::new(),
+            rig_strip_follows: usize::MAX,
             add_rig_rect: Rect::NOTHING,
             agent_chip_rect: Rect::NOTHING,
             undo_past: Vec::new(),
@@ -8416,7 +8421,7 @@ impl DemoApp {
     }
 
     /// "Add song from session" (#204): import a saved session's rigs into the
-    /// current gig (up to MAX_RIGS = 8) and create a song pointing at them.
+    /// current gig (up to `MAX_RIGS`) and create a song pointing at them.
     fn add_song_from_session_in(
         &mut self,
         dir: &std::path::Path,
@@ -16923,11 +16928,19 @@ impl DemoApp {
             theme::section_label(ui, "Load into");
             ui.add_space(6.0);
             ui.spacing_mut().item_spacing.y = 4.0;
-            for (t, label) in &targets {
-                if Self::load_target_row(ui, label, target == *t).clicked() {
-                    target = *t;
-                }
-            }
+            // Many rigs scroll in a list four and a half rows tall: the
+            // presets and Close stay in the window (#205).
+            egui::ScrollArea::vertical()
+                .id_salt("load_rig_targets_scroll")
+                .max_height(170.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (t, label) in &targets {
+                        if Self::load_target_row(ui, label, target == *t).clicked() {
+                            target = *t;
+                        }
+                    }
+                });
             ui.add_space(16.0);
             theme::section_label(ui, "Presets");
             ui.add_space(6.0);
@@ -17139,6 +17152,7 @@ impl DemoApp {
                             let rig_budget = (bar_right - left_used - right_w - view_w - gap * 3.0 - 8.0).max(if narrow { 56.0 } else { 86.0 });
                             let active_max_w = if narrow { 56.0 } else if compact { 84.0 } else { 116.0 };
                             let est_pills_w = active_max_w + (n.saturating_sub(1) as f32) * 30.0 + 30.0;
+                            let follow = self.rig_strip_follows != self.active_rig;
                             let needs_scroll = est_pills_w > rig_budget;
 
                             let mut draw_pills = |ui: &mut egui::Ui| -> Rect {
@@ -17211,16 +17225,17 @@ impl DemoApp {
                                     .show(ui, |ui| {
                                         // Content-sized row so the strip really scrolls.
                                         let active_rect = ui.horizontal(|ui| draw_pills(ui)).inner;
-                                        // Performance mode: the rig in view stays
-                                        // reachable even with many rigs — scroll its
-                                        // pill into view when it is off screen.
-                                        if active_rect.is_positive() && !ui.clip_rect().contains_rect(active_rect) {
+                                        // Performance mode: a rig switch brings the
+                                        // rig's pill into view; the player's own
+                                        // scrolling is left alone.
+                                        if follow && active_rect.is_positive() && !ui.clip_rect().contains_rect(active_rect) {
                                             ui.scroll_to_rect(active_rect, Some(egui::Align::Center));
                                         }
                                     });
                             } else {
                                 ui.horizontal(|ui| draw_pills(ui));
                             }
+                            self.rig_strip_follows = self.active_rig;
                         }
 
                         nav_separator(ui);
@@ -35723,6 +35738,19 @@ mod rig_switch_tests {
     }
 
     #[test]
+    fn load_rig_dialog_with_twenty_rigs_keeps_its_presets_and_close_in_the_window() {
+        // #205: 21 "Load into" rows pushed the presets list and Close below
+        // the window; they scroll in a short list now.
+        let (mut app, ctx) = two_rigs();
+        while app.rig_count() < 20 { app.edit_rigs(None); }
+        app.load_rig_dialog = Some(None);
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        let rect = ctx.memory(|m| m.area_rect(egui::Id::new("load_rig_modal"))).expect("modal shown");
+        assert!(rect.height() <= 560.0, "modal grew tall: {rect:?}");
+        let _ = std::fs::remove_dir_all(&app.rig_presets_dir);
+    }
+
+    #[test]
     fn info_line_never_runs_over_the_top_bar_buttons() {
         // A long MIDI event in narrow windows (down to the 760 px minimum):
         // nothing in the top bar — buttons or the info line — may run past
@@ -46160,9 +46188,13 @@ mod window_size_layout_tests {
                 let ctx = egui::Context::default();
                 let size = Vec2::new(w, h);
                 let t = texts(&mut app, &ctx, size);
-                let scroll_x_clip = (app.stage_view == StageView::Mixer).then(|| {
-                    app.stage_sheet_rects(Rect::from_min_size(Pos2::ZERO, size), 200.0).1.right()
-                });
+                // The mixer and the matrix scroll sideways when their strips or
+                // columns (20 rigs) do not fit; text cut at that edge is fine.
+                let scroll_x_clip = match app.stage_view {
+                    StageView::Mixer => Some(app.stage_sheet_rects(Rect::from_min_size(Pos2::ZERO, size), 200.0).1.right()),
+                    StageView::Matrix => Some(app.stage_sheet_rects(Rect::from_min_size(Pos2::ZERO, size), 160.0).0.right()),
+                    _ => None,
+                };
                 for v in audit(&t, size, scroll_x_clip) { all.push(format!("[{w}x{h} {dname}] {v}")); }
                 if app.stage_view == StageView::Rack && app.rack_overflow != Vec2::ZERO {
                     let what = if app.rack_overflow.x > 0.0 { "rack overflows sideways" } else { "rack pans vertically" };
@@ -46202,7 +46234,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 36] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 38] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {
@@ -46245,6 +46277,8 @@ mod window_size_layout_tests {
             ("two rigs", &|a| a.load_multi_rig_demo()),
             ("twenty rigs", &|a| while a.rig_count() < 20 { a.edit_rigs(None) }),
             ("twenty-rig mixer", &|a| { while a.rig_count() < 20 { a.edit_rigs(None) } a.stage_view = StageView::Mixer }),
+            ("twenty-rig matrix", &|a| { while a.rig_count() < 20 { a.edit_rigs(None) } a.stage_view = StageView::Matrix }),
+            ("twenty-rig setlist", &|a| { while a.rig_count() < 20 { a.edit_rigs(None) } a.stage_view = StageView::Setlist }),
             ("mixer", &|a| a.stage_view = StageView::Mixer),
             ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
             ("mixer with a loudness target", &|a| {
@@ -47354,6 +47388,10 @@ mod navigator_tests {
         assert_eq!(app.rig_count(), 20);
         assert_eq!(app.rig_name(19), "Rig T");
         app.exec_tool("rename_rig", &serde_json::json!({"rig": 19, "name": "Encore pad"}));
+        let r = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Encore", "parts": [{"name": "Main", "rigs": [{"rig": 19, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.3}]}]
+        }));
+        assert!(r.contains("Encore"), "{r}");
         round_trip(&mut app, "twenty");
         assert_eq!(app.rig_count(), 20, "every rig comes back");
         assert_eq!(app.rig_name(19), "Encore pad");
@@ -47367,13 +47405,9 @@ mod navigator_tests {
         assert_eq!((app.rig_mix[19].vol, app.rig_mix[19].pan), (0.4, 0.5));
         assert_eq!(app.rig_mix[7], crate::engine::RigMix::DEFAULT, "rig 8 keeps its own fader");
         assert!(app.arm_rigs[19] && !app.arm_rigs[7], "rig 20 arms its own stem");
-        let r = app.exec_tool("set_setlist_song", &serde_json::json!({
-            "name": "Encore", "parts": [{"name": "Main", "rigs": [{"rig": 19, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.3}]}]
-        }));
-        assert!(r.contains("Encore"), "{r}");
         let sel = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 0}));
         assert!(sel.contains("\"song_name\":\"Encore\""), "{sel}");
-        assert_eq!(app.rig_mix[19].vol, 0.3, "the part sets rig 20's level");
+        assert_eq!(app.rig_mix[19].vol, 0.3, "the saved part sets rig 20's level");
         assert!(app.rig_zones[19].live, "rig 20 plays in its part");
 
         for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
@@ -47402,6 +47436,33 @@ mod navigator_tests {
         assert!(app.nav_panel_rect.contains_rect(row), "the rail scrolls to rig 20: {row:?} in {:?}", app.nav_panel_rect);
         click_at(&mut app, &ctx, size, row.center());
         assert_eq!(app.active_rig, 19, "rig 20 is reachable from the rail");
+    }
+
+    #[test]
+    fn the_top_bars_rig_strip_scrolls_to_rig_twenty_and_stays_there() {
+        // #205: the strip scrolled the active rig's pill back into view every
+        // frame, so a rig past the visible pills could not be clicked.
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        while app.rig_count() < 20 { app.edit_rigs(None); }
+        app.set_active_rig(0);
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+        assert!(!app.nav_open && app.rig_chip_rects.len() == 20);
+        let strip = app.rig_chip_rects[0].center();
+        let start = app.rig_chip_rects[19].center().x;
+        for _ in 0..12 {
+            run_frame_at(&mut app, &ctx, size, vec![
+                egui::Event::PointerMoved(strip),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(-240.0, 0.0),
+                    phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown, modifiers: Modifiers::NONE },
+            ]);
+        }
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+        let last = app.rig_chip_rects[19];
+        assert!(last.center().x < start - 100.0, "the strip scrolled and stayed: {start} -> {last:?}");
+        click_at(&mut app, &ctx, size, last.center());
+        assert_eq!(app.active_rig, 19, "rig 20's pill takes the click");
     }
 
     #[test]

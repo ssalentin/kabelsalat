@@ -602,7 +602,7 @@ source-only. **No box64/emulation for live audio** — native ARM plugins only.
 | Ableton Link, MIDI clock receive, OSC | later |
 
 **Non-goals:** timeline/arranger, piano roll, notation, video, x86 bridging, VST2, AU.
-Fixed limits for RT safety: 64 nodes, 8 inserts/channel, stereo buses (multichannel later).
+Fixed limits for RT safety: 32 rigs (`control::MAX_RIGS`; every per-rig and whole-rack table is sized from it), 8 inserts/channel, stereo buses (multichannel later).
 
 ## 6. Hosting strategy
 

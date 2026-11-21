@@ -542,6 +542,9 @@ impl Session {
         if self.name.trim().is_empty() {
             bail!("The session needs a name before it can be saved.");
         }
+        if let Some(n) = self.graph.nodes.iter().find(|n| n.rig as usize >= crate::control::MAX_RIGS) {
+            bail!("The patch has a rig {} — a session holds at most {} rigs.", n.rig as usize + 1, crate::control::MAX_RIGS);
+        }
         let mut node_ids: Vec<NodeId> = self.graph.nodes.iter().map(|n| n.id).collect();
         node_ids.sort_unstable();
         if node_ids.windows(2).any(|w| w[0] == w[1]) {
@@ -1052,6 +1055,9 @@ impl MultiRigSession {
         }
         if self.rigs.is_empty() {
             bail!("A multi-rig session needs at least one rig.");
+        }
+        if self.rigs.len() > crate::control::MAX_RIGS {
+            bail!("A session holds at most {} rigs; this one has {}.", crate::control::MAX_RIGS, self.rigs.len());
         }
         if self.active >= self.rigs.len() {
             bail!(
@@ -2407,6 +2413,20 @@ mod tests {
                 "graph": serde_json::to_value(&r.graph).unwrap(),
             })).collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn a_session_holds_at_most_max_rigs() {
+        // #205: a 33rd rig would share rig 32's tables; it is refused at the
+        // file boundary instead.
+        let rigs = |n: usize| (0..n).map(|i| mini_rig(&format!("R{i}"), None)).collect::<Vec<_>>();
+        let max = crate::control::MAX_RIGS;
+        MultiRigSession::new("full", rigs(max), 0).validate().unwrap();
+        let err = MultiRigSession::new("over", rigs(max + 1), 0).validate().unwrap_err();
+        assert!(err.to_string().contains("at most 32 rigs"), "{err}");
+        let over = Session::new("over", crate::control::merge_rigs(&rigs(max + 1)));
+        assert!(over.validate().unwrap_err().to_string().contains("at most 32 rigs"));
+        Session::new("full", crate::control::merge_rigs(&rigs(max))).validate().unwrap();
     }
 
     #[test]

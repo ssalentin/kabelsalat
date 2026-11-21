@@ -1156,7 +1156,7 @@ pub enum Command {
     SetShowControls { controls: crate::show::ShowControls },
     /// Every setlist part's zones in setlist order, the table a
     /// `ShowAction::NextPart`/`PrevPart` steps through. Kept across graph
-    /// loads. Sent as JSON, it is a list of 8-zone lists.
+    /// loads. Sent as JSON, it is a list of `MAX_RIGS`-zone lists.
     SetShowParts { parts: crate::show::ShowParts },
     /// The active part as an index into `SetShowParts` (`None`: no part).
     SetShowPart { part: Option<usize> },

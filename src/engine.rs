@@ -668,7 +668,7 @@ impl AudioInSlot {
 /// Lock-free per-AudioIn-node input level (pre-gain), engine → UI (rule 33).
 /// Same slot/tag scheme as [`EdgeLevels`], keyed by node id.
 pub struct AudioInLevels {
-    slots: [AtomicU64; 64],
+    slots: [AtomicU64; MAX_STRIP_MIXES],
 }
 
 impl AudioInLevels {
@@ -677,10 +677,10 @@ impl AudioInLevels {
     }
     pub fn store(&self, node: u32, peak: f32) {
         let packed = ((node as u64) << 32) | peak.max(0.0).to_bits() as u64;
-        self.slots[node as usize % 64].store(packed, Ordering::Relaxed);
+        self.slots[node as usize % MAX_STRIP_MIXES].store(packed, Ordering::Relaxed);
     }
     pub fn load(&self, node: u32) -> f32 {
-        let v = self.slots[node as usize % 64].load(Ordering::Relaxed);
+        let v = self.slots[node as usize % MAX_STRIP_MIXES].load(Ordering::Relaxed);
         if (v >> 32) as u32 == node { f32::from_bits(v as u32) } else { 0.0 }
     }
 }
@@ -737,8 +737,10 @@ enum Lv2Response {
     Restored { node: NodeId, gen: u64, slot: Lv2Slot },
 }
 
-const LV2_RING: usize = 64;
-const LV2_SLOT_CAP: usize = 32;
+/// LV2 instances the engine hosts at once: two per rig (an organ and an
+/// effect, say). The rings carry a request and a reply for each.
+const LV2_SLOT_CAP: usize = 2 * MAX_RIGS;
+const LV2_RING: usize = 2 * LV2_SLOT_CAP;
 
 fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
     match crate::lv2::Lv2Plugin::load(uri, sample_rate, 8192) {
@@ -837,8 +839,9 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
         .collect()
 }
 
-/// Number of lock-free per-edge level slots (`EdgeLevels`).
-pub const EDGE_LEVEL_SLOTS: usize = 256;
+/// Number of lock-free per-edge level slots (`EdgeLevels`): sixteen cables
+/// per rig.
+pub const EDGE_LEVEL_SLOTS: usize = 16 * MAX_RIGS;
 
 /// Per-edge audio levels, engine → UI (docs/ARCHITECTURE.md §2: cables breathe with live
 /// level). Fixed-size lock-free slots indexed by `edge id % EDGE_LEVEL_SLOTS`;
@@ -934,8 +937,9 @@ pub const MAX_BUSES: usize = 8;
 const _: () = assert!(MAX_BUSES == crate::matrix::MixControl::SEND_SLOTS as usize);
 /// One bus accumulator: a stereo block of the largest device buffer.
 const BUS_SPAN: usize = 8192 * 2;
-/// Sends the engine tracks and publishes; one past it is dropped.
-pub const MAX_SENDS: usize = 64;
+/// Sends the engine tracks and publishes, eight per rig; one past it is
+/// dropped.
+pub const MAX_SENDS: usize = 8 * MAX_RIGS;
 
 /// Outputs besides the master's that buses can play to at once (#147): one
 /// stereo mix, one ring and one playback stream each.
@@ -1091,10 +1095,10 @@ impl Default for RigMix {
     fn default() -> Self { Self::DEFAULT }
 }
 
-/// How many per-node strip states the engine tracks (and publishes). The
-/// architecture's fixed RT limit is 64 nodes; the table is allocated once in
-/// the constructor and never grows — an entry past it is dropped.
-pub const MAX_STRIP_MIXES: usize = 64;
+/// How many per-node strip states the engine tracks (and publishes): eight
+/// per rig. The table is allocated once in the constructor and never grows —
+/// an entry past it is dropped.
+pub const MAX_STRIP_MIXES: usize = 8 * MAX_RIGS;
 
 /// How many master-insert FX the render path walks per block (#77). A longer
 /// chain than this keeps playing but its tail is ignored.
@@ -1682,8 +1686,9 @@ impl GraphEngine {
             dsp,
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
-            fx_done: Vec::with_capacity(256),
-            fx_after_bus: Vec::with_capacity(256),
+            // Sixteen effect units per rig before a push would allocate.
+            fx_done: Vec::with_capacity(16 * MAX_RIGS),
+            fx_after_bus: Vec::with_capacity(16 * MAX_RIGS),
             sends: Vec::with_capacity(MAX_SENDS),
             bus_acc: vec![0.0; MAX_BUSES * BUS_SPAN],
             bus_outs: Vec::with_capacity(MAX_BUS_OUTS),

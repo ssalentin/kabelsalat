@@ -8141,7 +8141,7 @@ impl DemoApp {
         let n_rigs = self.rig_count();
         for pr in &part_rigs {
             let r = pr.rig as usize;
-            if r < n_rigs && r < 8 {
+            if r < n_rigs && r < Self::MAX_RIGS {
                 self.rig_mix[r].vol = pr.level.clamp(0.0, 1.0);
                 self.send_rig_mix(r);
             }
@@ -47367,6 +47367,14 @@ mod navigator_tests {
         assert_eq!((app.rig_mix[19].vol, app.rig_mix[19].pan), (0.4, 0.5));
         assert_eq!(app.rig_mix[7], crate::engine::RigMix::DEFAULT, "rig 8 keeps its own fader");
         assert!(app.arm_rigs[19] && !app.arm_rigs[7], "rig 20 arms its own stem");
+        let r = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Encore", "parts": [{"name": "Main", "rigs": [{"rig": 19, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.3}]}]
+        }));
+        assert!(r.contains("Encore"), "{r}");
+        let sel = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 0}));
+        assert!(sel.contains("\"song_name\":\"Encore\""), "{sel}");
+        assert_eq!(app.rig_mix[19].vol, 0.3, "the part sets rig 20's level");
+        assert!(app.rig_zones[19].live, "rig 20 plays in its part");
 
         for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
         assert_eq!(app.rig_chip_rects.len(), 20, "the top bar's rig strip holds every rig, not the first nine");

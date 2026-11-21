@@ -3502,7 +3502,7 @@ impl GraphEngine {
     /// chain: feedback) or the table is full. Allocation-free.
     fn set_send(&mut self, from: SendSource, bus: NodeId, level: Option<f32>, pre: Option<bool>) -> bool {
         let ok_from = match from {
-            SendSource::Rig(r) => r < 8,
+            SendSource::Rig(r) => (r as usize) < MAX_RIGS,
             SendSource::Node(n) => self.graph.node(n).is_some() && !self.graph.is_bus(n) && !self.is_after_bus(n),
         };
         if !self.graph.is_bus(bus) || !ok_from { return false; }
@@ -3534,7 +3534,7 @@ impl GraphEngine {
     /// extra output already plays another sink. Allocation-free.
     fn set_bus_output(&mut self, bus: SendSource, sink: Option<SinkName>) -> bool {
         let is_bus = match bus {
-            SendSource::Rig(r) => r < 8,
+            SendSource::Rig(r) => (r as usize) < MAX_RIGS,
             SendSource::Node(n) => self.graph.is_bus(n),
         };
         if !is_bus { return false; }
@@ -11487,6 +11487,22 @@ mod send_tests {
             AuxSend { from: SendSource::Rig(0), bus: r.aux, level: 0.5, pre: false },
             AuxSend { from: SendSource::Rig(1), bus: r.aux, level: 0.75, pre: false },
         ]);
+    }
+
+    #[test]
+    fn a_rig_past_the_eighth_sends_and_plays_to_its_own_output() {
+        // #205: sends and bus outputs took rigs 0..7 only.
+        let mut r = Rack::new();
+        let pubd = std::sync::Arc::new(std::sync::Mutex::new(GraphPub::default()));
+        r.engine.set_graph_pub(pubd.clone());
+        r.send(SendSource::Rig(19), 0.5, false);
+        r.send(SendSource::Rig(crate::control::MAX_RIGS as u8), 0.5, false);
+        route(&mut r, SendSource::Rig(19), Some("phones"));
+        r.render(1);
+        let g = pubd.lock().unwrap();
+        let sends: Vec<SendSource> = g.sends.iter().filter(|s| s.bus != NodeId::MAX).map(|s| s.from).collect();
+        assert_eq!(sends, vec![SendSource::Rig(19)], "rig 20 sends, a rig past the limit does not");
+        assert!(g.bus_outs.iter().any(|o| o.bus == SendSource::Rig(19) && o.sink == SinkName::new("phones")), "rig 20's bus plays to its own output");
     }
 
     #[test]

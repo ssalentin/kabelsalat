@@ -1680,7 +1680,10 @@ Learned so far (2026-11-15, UI polish pass):
     (#205), and two tables sized by other numbers broke first at 20 rigs:
     the recorder's stem delivery ring (16 wires) lost the stems of every rig
     armed past the 16th before the engine's next block, and the rack's
-    64-cable table left the 20th rig unwired. A per-rig array, mask or
-    whole-rack table that grows per rig takes its size from `MAX_RIGS`
+    64-cable table left the 20th rig unwired. Range checks hid too: `r < 8`
+    refused sends, bus outputs, stem arms and setlist levels of rig 9 on.
+    A per-rig array, mask, range check or whole-rack table that grows per
+    rig takes its size from `MAX_RIGS`
     (`twenty_rigs_each_mix_and_record_their_own_stem`,
-    `plus_rig_grows_a_single_rig_rack`).
+    `plus_rig_grows_a_single_rig_rack`,
+    `a_rig_past_the_eighth_sends_and_plays_to_its_own_output`).

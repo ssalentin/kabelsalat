@@ -4927,8 +4927,8 @@ impl McpServer {
             None
         } else {
             let r = args.rig.unwrap_or(0);
-            if r >= 8 {
-                return tool_err(format!("no rig {r}: stems exist for rigs 0..7"));
+            if r as usize >= control::MAX_RIGS {
+                return tool_err(format!("no rig {r}: stems exist for rigs 0..{}", control::MAX_RIGS - 1));
             }
             if matches!(st.backend, Backend::Local(_)) && armed {
                 st.record.ensure_stem(r);
@@ -5300,6 +5300,16 @@ mod tests {
         assert_ne!(v.get("isError").and_then(Value::as_bool), Some(true), "tool error: {v}");
         let text = v.pointer("/content/0/text").and_then(Value::as_str).expect("text content");
         serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn a_rig_past_the_eighth_arms_its_stem() {
+        // #205: the tool refused rigs 8 and up.
+        let (server, _engine) = local_server();
+        let arm = |rig: u8| server.set_record_arm(Parameters(SetRecordArmArgs { target: None, rig: Some(rig), armed: Some(true) }));
+        assert_eq!(tool_json(&arm(19))["rig"], 19);
+        let past = arm(control::MAX_RIGS as u8).unwrap();
+        assert_eq!(past.is_error, Some(true), "{past:?}");
     }
 
     #[test]

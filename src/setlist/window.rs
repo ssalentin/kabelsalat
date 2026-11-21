@@ -4,7 +4,7 @@
 
 use crate::control::{Graph, MidiFxPlugin, Node, NodeId, NodeKind, PortKind};
 
-use super::{Level, Setlist, MAX_RIGS};
+use super::{Setlist, MAX_RIGS};
 
 /// Default number of upcoming songs kept preloaded ahead of the active song
 /// when window loading is enabled (`current + 2 = 3` songs hosted).
@@ -70,26 +70,6 @@ pub fn is_master_insert(graph: &Graph, node: NodeId) -> bool {
     false
 }
 
-/// Find the aux bus node upstream of `node` (when `graph.after_bus(node)` is true).
-fn upstream_bus(graph: &Graph, node: NodeId) -> Option<NodeId> {
-    let mut frontier = vec![node];
-    let mut visited = vec![node];
-    while let Some(cur) = frontier.pop() {
-        for e in &graph.edges {
-            if e.kind == PortKind::Audio && e.to.node == cur {
-                if graph.is_bus(e.from.node) {
-                    return Some(e.from.node);
-                }
-                if !visited.contains(&e.from.node) {
-                    visited.push(e.from.node);
-                    frontier.push(e.from.node);
-                }
-            }
-        }
-    }
-    None
-}
-
 impl Setlist {
     /// True when the per-setlist load window actively restricts hosted rigs.
     pub fn window_enabled(&self) -> bool {
@@ -126,18 +106,10 @@ impl Setlist {
         out
     }
 
-    /// True when `bus` is used by `song` under the show's levels.
-    fn bus_needed_by_song(&self, song: usize, bus: NodeId) -> bool {
-        let Some(s) = self.songs.get(song) else { return false };
-        match self.bus_level(bus) {
-            Level::Show => true,
-            Level::Set(id) => s.set == Some(id),
-            Level::Song => s.parts.iter().any(|p| p.buses.contains(&bus)),
-        }
-    }
-
     /// Every plugin node (CLAP synth/effect, LV2 instrument/effect/MIDI-FX)
-    /// that `song` needs hosted to play cleanly.
+    /// that `song` needs hosted to play cleanly. Master inserts and aux-bus
+    /// chains stay always hosted (matching `GraphEngine`) so reverb/delay tails
+    /// and master processing never cut across song switches.
     pub fn plugin_nodes_needed_by_song(&self, song: usize, graph: &Graph) -> Vec<NodeId> {
         let rigs = self.rigs_needed_by_song(song, graph);
         let mut nodes: Vec<NodeId> = graph
@@ -147,12 +119,8 @@ impl Setlist {
                 if !is_plugin_node(n) {
                     return false;
                 }
-                if is_master_insert(graph, n.id) {
+                if is_master_insert(graph, n.id) || graph.after_bus(n.id) {
                     return true;
-                }
-                if graph.after_bus(n.id) {
-                    return upstream_bus(graph, n.id)
-                        .map_or(true, |bus| self.bus_needed_by_song(song, bus));
                 }
                 rigs.contains(&n.rig)
             })
@@ -180,11 +148,11 @@ impl Setlist {
         Some(rigs)
     }
 
-    /// 32-bit rig bitmask for `Command::SetHostedRigs` (`None` = host every rig).
-    pub fn window_rigs_mask(&self, graph: &Graph) -> Option<u32> {
+    /// 64-bit rig bitmask for `Command::SetHostedRigs` (`None` = host every rig).
+    pub fn window_rigs_mask(&self, graph: &Graph) -> Option<u64> {
         let rigs = self.window_rigs(graph)?;
-        Some(rigs.into_iter().fold(0u32, |m, r| {
-            if (r as usize) < MAX_RIGS { m | (1u32 << r) } else { m }
+        Some(rigs.into_iter().fold(0u64, |m, r| {
+            if (r as usize) < MAX_RIGS { m | (1u64 << r) } else { m }
         }))
     }
 
@@ -233,7 +201,7 @@ impl Setlist {
 mod tests {
     use super::*;
     use crate::control::{name_bytes, ClapId, Lv2Uri, PortRef, SURGE_PLUGIN_ID};
-    use crate::setlist::{Part, PartRig, SetlistPos, Song};
+    use crate::setlist::{Level, Part, PartRig, SetlistPos, Song};
 
     fn multi_rig_graph(n: usize) -> (Graph, Vec<NodeId>) {
         let mut g = Graph::default();

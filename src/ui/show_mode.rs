@@ -276,7 +276,7 @@ impl DemoApp {
                     caption = format!("{caption} · {}", set.name);
                 }
                 if loading {
-                    caption = format!("{caption} · Loading…");
+                    caption = format!("Loading… · {caption}");
                 }
                 (caption, s.name.clone(), Some(p.name.clone()))
             }
@@ -331,7 +331,8 @@ impl DemoApp {
         }
         let HeroBlock { inner, height, gap, caption: cap, song, part, tempo, stacked } = block;
         let top = (hero.center().y - height / 2.0).max(inner.top());
-        theme::paint_tracked(&p, Pos2::new(inner.left(), top), &cap, theme::CREAM_DIM);
+        let cap_col = if board.loading { theme::CABLE_AMBER } else { theme::CREAM_DIM };
+        theme::paint_tracked(&p, Pos2::new(inner.left(), top), &cap, cap_col);
         let song_top = top + cap.size.y + gap;
         let line_top = song_top + song.size().y + gap;
         p.galley(Pos2::new(inner.left(), song_top), song, theme::CREAM);

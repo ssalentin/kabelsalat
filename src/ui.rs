@@ -6070,8 +6070,16 @@ impl DemoApp {
             self.last_demo_rev = g.demo_rev;
             self.demo_playing = g.demo;
         }
+        self.setlist_window.rig_busy_mask = g.rig_busy_mask;
+        self.setlist_window.rig_held_mask = g.rig_held_mask;
+        let mut newly_attached_lv2: Vec<u32> = Vec::new();
         if g.lv2_rev != self.setlist_window.last_lv2_rev {
             self.setlist_window.last_lv2_rev = g.lv2_rev;
+            for &node in &g.lv2_loaded {
+                if !self.setlist_window.lv2_loaded.contains(&node) {
+                    newly_attached_lv2.push(node);
+                }
+            }
             self.setlist_window.lv2_loaded.clone_from(&g.lv2_loaded);
             self.setlist_window.lv2_loading.clone_from(&g.lv2_loading);
         }
@@ -6089,6 +6097,9 @@ impl DemoApp {
         };
         if !graph_rev_changed {
             drop(g);
+            for node in newly_attached_lv2 {
+                self.reapply_attached_lv2_node(node);
+            }
             if let Some(voices) = &voices {
                 let graph = self.base_graph.clone();
                 self.sync_clap_slots(&graph, Some(voices));
@@ -7657,6 +7668,9 @@ impl DemoApp {
         }
         if let Some((pid, blob)) = &clip.plugin_state {
             if matches!(self.units[ui].node_kind, UnitKind::Clap) {
+                self.setlist_window
+                    .clap_states
+                    .insert(node_id, (pid.clone(), blob.clone()));
                 if let Some(rig) = self.rig_of_unit(ui) {
                     if let Some(idx) = self.clap_pool_idx(rig) {
                         if let Some(m) = self._surge_main.get_mut(idx) {
@@ -8039,7 +8053,7 @@ impl DemoApp {
 
     /// Free the hosted voices the engine handed back (plugin main thread:
     /// stop, deactivate, drop) and the tables it grew out of.
-    fn free_returned_voices(&mut self) {
+    fn free_returned_voices(&mut self) -> bool {
         let mut freed = false;
         while let Some(rx) = self.voice_retire_rx.as_mut() {
             let Ok(back) = rx.pop() else { break };
@@ -8054,7 +8068,11 @@ impl DemoApp {
                 let node = self.setlist_window.clap_loaded_nodes.remove(&id).unwrap_or(u32::MAX);
                 if main.is_bg() {
                     if let Some(loader) = &self.setlist_window.loader {
-                        loader.retire(id, node, pid, slot, node != u32::MAX);
+                        let save = node != u32::MAX;
+                        if save && !self.setlist_window.clap_retiring_save.contains(&node) {
+                            self.setlist_window.clap_retiring_save.push(node);
+                        }
+                        loader.retire(id, node, pid, slot, save);
                     } else {
                         main.retire(slot.into_voice());
                     }
@@ -8074,6 +8092,7 @@ impl DemoApp {
                 break;
             }
         }
+        freed
     }
 
     /// Instantiate `plugin_id` on this (the plugins' main) thread and hand
@@ -8254,7 +8273,7 @@ impl DemoApp {
         for (node, state) in restored {
             let in_window = hosted_mask.map_or(true, |mask| {
                 s.graph.node(node).is_some_and(|n| {
-                    ((n.rig as usize) < Self::MAX_RIGS && (mask & (1u32 << n.rig)) != 0)
+                    ((n.rig as usize) < Self::MAX_RIGS && (mask & (1u64 << n.rig)) != 0)
                         || s.graph.after_bus(node)
                         || crate::setlist::is_master_insert(&s.graph, node)
                 })
@@ -8469,11 +8488,24 @@ impl DemoApp {
         out
     }
 
+    /// Peek which song `action` would land on without mutating `self.setlist`.
+    fn peek_step_song(&self, action: &str) -> Option<usize> {
+        let mut copy = self.setlist.clone();
+        match action {
+            "next_part" => copy.next_part().map(|p| p.song),
+            "prev_part" => copy.prev_part().map(|p| p.song),
+            "next_song" => copy.next_song().map(|p| p.song),
+            "prev_song" => copy.prev_song().map(|p| p.song),
+            _ => None,
+        }
+    }
+
     /// Step or clear the setlist and recall the new part.
     fn step_setlist(&mut self, action: &str) -> Result<Option<crate::setlist::SetlistPos>, String> {
-        let prev_ready = |this: &Self, song: usize| {
-            this.song_load_state(song) == crate::setlist::SongLoadState::Ready
-        };
+        let was_ready_before = self
+            .peek_step_song(action)
+            .map(|s| self.song_load_state(s) == crate::setlist::SongLoadState::Ready)
+            .unwrap_or(true);
         let moved = match action {
             "next_part" => self.setlist.next_part(),
             "prev_part" => self.setlist.prev_part(),
@@ -8488,11 +8520,10 @@ impl DemoApp {
             other => return Err(format!("unknown action '{other}' (use next_part, prev_part, next_song, prev_song or clear)")),
         };
         if let Some(pos) = moved {
-            let was_ready = prev_ready(self, pos.song);
             self.setlist_edit_song = Some(pos.song);
             self.apply_setlist_part();
             self.sync_setlist_window();
-            self.announce_if_unloaded_jump(pos.song, was_ready);
+            self.announce_if_unloaded_jump(pos.song, was_ready_before);
         }
         Ok(self.setlist.active)
     }
@@ -10505,13 +10536,18 @@ impl DemoApp {
                 let target_song_before = args
                     .get("song")
                     .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
+                    .map(|n| n as usize)
+                    .or_else(|| {
+                        args.get("action")
+                            .and_then(|v| v.as_str())
+                            .and_then(|a| self.peek_step_song(a))
+                    });
                 let was_ready_before = target_song_before
                     .map(|s| self.song_load_state(s) == crate::setlist::SongLoadState::Ready)
                     .unwrap_or(true);
                 let res = if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
                     self.step_setlist(action).map(|_| ())
-                } else if let Some(song) = target_song_before {
+                } else if let Some(song) = args.get("song").and_then(|v| v.as_u64()).map(|n| n as usize) {
                     let part = args.get("part").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     self.select_setlist(song, part).map(|_| ())
                 } else {
@@ -16380,6 +16416,18 @@ impl DemoApp {
         match unit.slot {
             Some(slot) => {
                 if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(sound.name.clone()); }
+                if let Some(idx) = self.clap_pool_idx(slot) {
+                    if let Some(m) = self._surge_main.get_mut(idx) {
+                        if let Ok(blob) = m.save_state() {
+                            let pid = self
+                                .clap_plugin_ids
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or_else(|| SURGE_ID.to_string());
+                            self.setlist_window.clap_states.insert(unit.node, (pid, blob));
+                        }
+                    }
+                }
                 if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == slot { self.refresh_editor_params(); }
             }
             None if self.lv2_editor_node == Some(unit.node) => self.lv2_preset_name = Some(sound.name.clone()),
@@ -17976,25 +18024,31 @@ impl DemoApp {
                             } else {
                                 (format!("LIVE  {}. {} · {}", pos.song + 1, s.name, p.name), theme::LIVE_TEAL)
                             };
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(live_txt)
-                                    .size(12.5)
-                                    .strong()
-                                    .color(live_col),
-                            ).truncate());
+                            let max_live_w = (ui.available_width() - 24.0).max(60.0);
+                            ui.add_sized(
+                                egui::vec2(max_live_w.min(ui.available_width()), 18.0),
+                                egui::Label::new(
+                                    egui::RichText::new(live_txt)
+                                        .size(12.5)
+                                        .strong()
+                                        .color(live_col),
+                                ).truncate(),
+                            );
                         }
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let subtitle = if show_instances.hosted > 0 {
-                                format!("{instances_badge} · PageUp/Dn step · F12: rack")
-                            } else {
-                                "songs & parts over loaded rigs · PageUp/Dn step · F12: rack".to_string()
-                            };
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(subtitle)
-                                    .size(12.5)
-                                    .color(theme::INK_2),
-                            ).truncate()).on_hover_text(&instances_tip);
-                        });
+                        if ui.available_width() >= 48.0 {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                let subtitle = if show_instances.hosted > 0 {
+                                    format!("{instances_badge} · PageUp/Dn step · F12: rack")
+                                } else {
+                                    "songs & parts over loaded rigs · PageUp/Dn step · F12: rack".to_string()
+                                };
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(subtitle)
+                                        .size(12.5)
+                                        .color(theme::INK_2),
+                                ).truncate()).on_hover_text(&instances_tip);
+                            });
+                        }
                     });
                 });
                 ui.add_space(10.0);
@@ -18128,7 +18182,26 @@ impl DemoApp {
                                     .corner_radius(6.0)
                                     .inner_margin(egui::Margin::symmetric(8, 6))
                                     .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
+                                        // Draw right-side buttons first in a fixed-height row so title/meta truncate into the remaining width (rule 196).
+                                        let row_w = ui.available_width();
+                                        const ROW_H: f32 = 32.0;
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(row_w, ROW_H),
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                            ui.spacing_mut().item_spacing.x = 3.0;
+                                            if theme::chip_button(ui, "×", false).on_hover_text("Remove song").clicked() {
+                                                *remove_song = Some(si);
+                                            }
+                                            if si + 1 < count && theme::chip_button(ui, "↓", false).on_hover_text("Move down").clicked() {
+                                                *move_song = Some((si, si + 1));
+                                            }
+                                            if si > 0 && theme::chip_button(ui, "↑", false).on_hover_text("Move up").clicked() {
+                                                *move_song = Some((si, si - 1));
+                                            }
+                                            if theme::chip_button(ui, "▶", is_live).on_hover_text("Play song (part 1)").clicked() {
+                                                *jump_to = Some((si, 0));
+                                            }
                                             let meta = {
                                                 let mut bits = vec![format!("{} part{}", song.parts.len(), if song.parts.len() == 1 { "" } else { "s" })];
                                                 if let Some(b) = song.bpm { bits.push(format!("{} BPM", b.round() as u32)); }
@@ -18141,41 +18214,56 @@ impl DemoApp {
                                             let title = format!("{}. {}", si + 1, song.name);
                                             let load_state = song_load_states.get(si).copied().unwrap_or(crate::setlist::SongLoadState::Ready);
                                             let show_load_state = setlist.load_ahead.is_some() || load_state != crate::setlist::SongLoadState::Ready;
-                                            let r = ui.vertical(|ui| {
-                                                ui.label(egui::RichText::new(&title).size(13.0).strong().color(if is_live { theme::LIVE_TEAL } else { theme::INK }));
-                                                if show_load_state {
-                                                    let (lbl, col) = match load_state {
-                                                        crate::setlist::SongLoadState::Ready => ("● Ready", theme::LIVE_TEAL),
-                                                        crate::setlist::SongLoadState::Loading => ("◐ Loading…", theme::CABLE_AMBER),
-                                                        crate::setlist::SongLoadState::Unloaded => ("○ Unloaded", theme::INK_2),
-                                                    };
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                                        ui.label(egui::RichText::new(&meta).size(11.0).color(theme::INK_2));
-                                                        ui.label(egui::RichText::new("·").size(11.0).color(theme::INK_2));
-                                                        ui.label(egui::RichText::new(lbl).size(10.5).color(col));
-                                                    });
-                                                } else {
-                                                    ui.label(egui::RichText::new(meta).size(11.0).color(theme::INK_2));
-                                                }
-                                            }).response.interact(egui::Sense::click());
+                                            let text_w = ui.available_width().max(40.0);
+                                            let r = ui.allocate_ui_with_layout(
+                                                egui::vec2(text_w, ROW_H),
+                                                egui::Layout::top_down(egui::Align::LEFT),
+                                                |ui| {
+                                                    ui.set_max_width(text_w);
+                                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&title)
+                                                                .size(13.0)
+                                                                .strong()
+                                                                .color(if is_live { theme::LIVE_TEAL } else { theme::INK }),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                    if show_load_state {
+                                                        let (lbl, col) = match load_state {
+                                                            crate::setlist::SongLoadState::Ready => ("● Ready", theme::LIVE_TEAL),
+                                                            crate::setlist::SongLoadState::Loading => ("◐ Loading…", theme::CABLE_AMBER),
+                                                            crate::setlist::SongLoadState::Unloaded => ("○ Unloaded", theme::INK_2),
+                                                        };
+                                                        ui.allocate_ui_with_layout(
+                                                            egui::vec2(text_w, 14.0),
+                                                            egui::Layout::right_to_left(egui::Align::Center),
+                                                            |ui| {
+                                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                                ui.label(egui::RichText::new(lbl).size(10.5).color(col));
+                                                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                            egui::RichText::new(&meta).size(11.0).color(theme::INK_2),
+                                                                        )
+                                                                        .truncate(),
+                                                                    );
+                                                                });
+                                                            },
+                                                        );
+                                                    } else {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(meta).size(11.0).color(theme::INK_2),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    }
+                                                },
+                                            ).response.interact(egui::Sense::click());
                                             if r.clicked() { *edit_song = Some(si); }
                                             if r.double_clicked() { *jump_to = Some((si, 0)); }
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.spacing_mut().item_spacing.x = 3.0;
-                                                if theme::chip_button(ui, "×", false).on_hover_text("Remove song").clicked() {
-                                                    *remove_song = Some(si);
-                                                }
-                                                if si + 1 < count && theme::chip_button(ui, "↓", false).on_hover_text("Move down").clicked() {
-                                                    *move_song = Some((si, si + 1));
-                                                }
-                                                if si > 0 && theme::chip_button(ui, "↑", false).on_hover_text("Move up").clicked() {
-                                                    *move_song = Some((si, si - 1));
-                                                }
-                                                if theme::chip_button(ui, "▶", is_live).on_hover_text("Play song (part 1)").clicked() {
-                                                    *jump_to = Some((si, 0));
-                                                }
-                                            });
                                         });
                                     });
                                 ui.add_space(4.0);
@@ -18207,7 +18295,8 @@ impl DemoApp {
                                   vary_rig: &mut Option<u8>,
                                   split_rig: &mut Option<(usize, usize, u8)>,
                                   jump_to: &mut Option<(usize, usize)>,
-                                  active_part_dirty: &mut bool| {
+                                  active_part_dirty: &mut bool,
+                                  window_dirty: &mut bool| {
                     let Some(si) = edit_song.filter(|&i| i < setlist.songs.len()) else {
                         ui.add_space(24.0);
                         ui.label(
@@ -18344,6 +18433,7 @@ impl DemoApp {
                                                         part.remove_rig(r_u8);
                                                     }
                                                     if is_live { *active_part_dirty = true; }
+                                                    *window_dirty = true;
                                                 }
                                                 if let Some(Some(tag)) = rig_level_tags.get(ri) {
                                                     ui.label(egui::RichText::new(tag).size(11.0).color(theme::INK_2))
@@ -18549,6 +18639,7 @@ impl DemoApp {
                                 &mut split_rig,
                                 &mut jump_to,
                                 &mut active_part_dirty,
+                                &mut window_dirty,
                             );
                         });
                     });
@@ -18587,6 +18678,7 @@ impl DemoApp {
                             &mut split_rig,
                             &mut jump_to,
                             &mut active_part_dirty,
+                            &mut window_dirty,
                         );
                     }
                 }
@@ -18609,6 +18701,7 @@ impl DemoApp {
             (part.params, part.plugin_params, part.fx) = self.capture_part_state(&part.rigs);
             self.setlist.songs.push(Song::new(title, vec![part]));
             self.setlist_edit_song = Some(self.setlist.songs.len() - 1);
+            window_dirty = true;
         }
         if let Some(sess) = import_session {
             if let Err(e) = self.add_song_from_session_in(sessions_dir, &sess, None) {
@@ -18644,6 +18737,7 @@ impl DemoApp {
                 if let Some(song) = self.setlist.songs.get_mut(si) {
                     song.parts.push(part);
                 }
+                window_dirty = true;
             }
         }
         if let Some((si, pi)) = remove_part {
@@ -18652,6 +18746,7 @@ impl DemoApp {
                     song.parts.remove(pi);
                     self.setlist.clamp_active();
                     self.apply_setlist_part();
+                    window_dirty = true;
                 }
             }
         }
@@ -18671,6 +18766,7 @@ impl DemoApp {
             if self.setlist.active.is_some() {
                 self.apply_setlist_part();
             }
+            window_dirty = true;
         }
         if let Some((si, pi, r)) = split_rig {
             if let Err(e) = self.split_part_rig_to_own_instance(si, pi, r) {
@@ -47001,7 +47097,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 42] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 44] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {
@@ -47123,6 +47219,32 @@ mod window_size_layout_tests {
                 a.setlist.set_program_selects_song(1, true);
                 a.show_learn = Some(crate::show::ShowAction::TapTempo);
                 a.stage_view = StageView::Setlist;
+            }),
+            ("windowed setlist", &|a| {
+                while a.rig_count() < 5 { a.edit_rigs(None); }
+                for (i, name) in ["Opening Overture With A Long Title", "Ballad", "Encore", "Outro"].into_iter().enumerate() {
+                    let parts = format!(r#"[{{"name": "Main", "rigs": [{{"rig": {i}}}]}}]"#);
+                    a.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "bpm": 120, "parts": parts}));
+                }
+                a.exec_tool("set_setlist_window", &serde_json::json!({"load_ahead": 1}));
+                a.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 0}));
+                if let Some(&n) = a.setlist.plugin_nodes_needed_by_song(0, &a.base_graph).first() {
+                    a.setlist_window.simulated_loading = vec![n];
+                }
+                a.stage_view = StageView::Setlist;
+            }),
+            ("show mode loading", &|a| {
+                while a.rig_count() < 3 { a.edit_rigs(None); }
+                for (i, name) in ["Opener", "A song with a title long enough to fill the stage screen twice"].into_iter().enumerate() {
+                    let parts = format!(r#"[{{"name": "Main", "rigs": [{{"rig": {i}}}]}}]"#);
+                    a.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "bpm": 132, "parts": parts}));
+                }
+                a.exec_tool("set_setlist_window", &serde_json::json!({"load_ahead": 1}));
+                a.exec_tool("select_setlist_part", &serde_json::json!({"song": 1, "part": 0}));
+                if let Some(&n) = a.setlist.plugin_nodes_needed_by_song(1, &a.base_graph).first() {
+                    a.setlist_window.simulated_loading = vec![n];
+                }
+                a.set_show_mode(true);
             }),
         ];
 }

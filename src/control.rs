@@ -1162,11 +1162,11 @@ pub enum Command {
     /// The active part as an index into `SetShowParts` (`None`: no part).
     SetShowPart { part: Option<usize> },
     /// Per-setlist load window (#207): which rigs are currently hosted as a
-    /// 32-bit bitmask (`None` = host every rig). When `for_next_load` is true,
+    /// 64-bit bitmask (`None` = host every rig). When `for_next_load` is true,
     /// the mask applies to the immediately following `LoadGraph` / `LoadRigs`
     /// so opening a windowed setlist never instantiates out-of-window plugins.
     SetHostedRigs {
-        mask: Option<u32>,
+        mask: Option<u64>,
         #[serde(default)]
         for_next_load: bool,
     },

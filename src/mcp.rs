@@ -4837,6 +4837,10 @@ impl McpServer {
                 return tool_err(e);
             }
         }
+        if st.setlist.window_enabled() {
+            let mask = st.setlist.window_rigs_mask(&st.graph);
+            let _ = send_cmd(&mut st, Command::SetHostedRigs { mask, for_next_load: false });
+        }
         ok_json(setlist_json(&st))
     }
 
@@ -4985,6 +4989,10 @@ impl McpServer {
                 return tool_err(e);
             }
         }
+        if st.setlist.window_enabled() {
+            let mask = st.setlist.window_rigs_mask(&st.graph);
+            let _ = send_cmd(&mut st, Command::SetHostedRigs { mask, for_next_load: false });
+        }
         let mut out = setlist_json(&st);
         out["result"] = json!(msg);
         ok_json(out)
@@ -5007,6 +5015,10 @@ impl McpServer {
             if let Err(e) = send_show_gates(&mut st) {
                 return tool_err(e);
             }
+        }
+        if st.setlist.window_enabled() {
+            let mask = st.setlist.window_rigs_mask(&st.graph);
+            let _ = send_cmd(&mut st, Command::SetHostedRigs { mask, for_next_load: false });
         }
         let mut out = setlist_json(&st);
         out["result"] = json!(msg);

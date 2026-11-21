@@ -298,12 +298,12 @@ impl WindowHarness {
             self.leaving.insert(vid, node);
             assert!(self.voice_tx.push(VoiceMsg::Retire(vid)).is_ok());
         }
-        let mut mask = 0u32;
+        let mut mask = 0u64;
         for &r in &desired_rigs {
-            mask |= 1u32 << r;
+            mask |= 1u64 << r;
         }
         for &r in self.draining.keys() {
-            mask |= 1u32 << r;
+            mask |= 1u64 << r;
         }
         self.send(Command::SetHostedRigs { mask: Some(mask), for_next_load: false });
     }

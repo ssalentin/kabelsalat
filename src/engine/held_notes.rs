@@ -169,6 +169,8 @@ enum Edit {
     /// The show controls with (true) or without the `PAD` key learned for
     /// the next part (#277).
     LearnPad(bool),
+    /// Per-setlist hosted-rig window mask (#207).
+    HostedRigs(Option<u64>),
 }
 
 /// Which scenario a search runs: the plain rack, the arp (#90), the rack
@@ -404,7 +406,7 @@ impl Edit {
             Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
             Edit::Source { .. } => Kind::Source,
             Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
-            Edit::Zones(_) | Edit::Layers(_) | Edit::Switch(_) | Edit::Program(_) | Edit::LearnPad(_) => Kind::Zone,
+            Edit::Zones(_) | Edit::Layers(_) | Edit::Switch(_) | Edit::Program(_) | Edit::LearnPad(_) | Edit::HostedRigs(_) => Kind::Zone,
             Edit::Bypass(..) => Kind::Bypass,
         }
     }
@@ -499,6 +501,7 @@ impl Edit {
             Edit::Switch(cc) => switch(cc, 127),
             Edit::Program(program) => Command::Program { source: SourceId::Hardware(0), channel: 0, program },
             Edit::LearnPad(pad) => Command::SetShowControls { controls: show_controls(pad) },
+            Edit::HostedRigs(mask) => Command::SetHostedRigs { mask, for_next_load: false },
         }
     }
 }
@@ -813,7 +816,14 @@ impl Run {
         self.engine.note_log.clear();
         self.engine.cc_passthrough_log.clear();
         match (cmd, step) {
-            (Some(cmd), _) => self.engine.apply(cmd),
+            (Some(cmd), _) => {
+                self.engine.apply(cmd);
+                if self.engine.hosted_lv2_dirty {
+                    self.engine.hosted_lv2_dirty = false;
+                    self.engine.sync_hosted_lv2();
+                    self.engine.bind_free_voices();
+                }
+            }
             (None, Step::Song(n)) => {
                 for cmd in setlist_switch(n) {
                     self.engine.apply(cmd.clone());
@@ -951,7 +961,7 @@ impl Run {
             self.held, self.sounding, self.arp_added, self.engine.rig_zones, self.engine.show.part(), self.engine.zone_hands, self.engine.show.edges(),
         )
         .hash(&mut h);
-        (self.pedal, &self.pedal_at, &self.sustained).hash(&mut h);
+        (self.pedal, &self.pedal_at, &self.sustained, self.engine.hosted_rigs()).hash(&mut h);
         h.finish()
     }
 }
@@ -1002,6 +1012,7 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::Program(n)) => format!("Program change {n} from the foot switches' device"),
         Step::Edit(Edit::LearnPad(true)) => format!("Learn key {PAD} of the foot switches' device for Next part"),
         Step::Edit(Edit::LearnPad(false)) => format!("Forget key {PAD} as a show control"),
+        Step::Edit(Edit::HostedRigs(m)) => format!("SetHostedRigs {m:?}"),
         Step::Pad(true) => format!("NoteOn {PAD} from the foot switches' device"),
         Step::Pad(false) => format!("NoteOff {PAD} from the foot switches' device"),
         Step::Tick => "Tick (time passes)".to_string(),
@@ -1386,4 +1397,30 @@ fn held_notes_are_released_across_shared_instrument_song_switches() {
     }
     assert!(report.stuck.is_empty(), "stuck notes across shared-instrument switches (traces above)");
     assert!(report.complete, "state bound hit before fixpoint: the shared alphabet's state space grew");
+}
+
+#[test]
+fn held_notes_are_released_across_hosted_rig_window_changes() {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.extend([
+        Step::Edit(Edit::Zones(0)),
+        Step::Edit(Edit::Zones(1)),
+        Step::Edit(Edit::Zones(2)),
+        Step::Edit(Edit::HostedRigs(Some(0b01))),
+        Step::Edit(Edit::HostedRigs(Some(0b10))),
+        Step::Edit(Edit::HostedRigs(Some(0b11))),
+        Step::Edit(Edit::HostedRigs(None)),
+        Step::Edit(Edit::LoadStart),
+    ]);
+    let report = explore_with(&alphabet, 50_000, Scenario::Zones);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (hosted-rigs): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes across SetHostedRigs window changes (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the hosted-rigs alphabet's state space grew");
 }

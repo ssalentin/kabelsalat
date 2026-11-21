@@ -1550,6 +1550,17 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Leak any `CLAP_NEVER_FREE` instances parked on a background loader thread
+/// before that thread exits so Rust TLS teardown never runs Dexed's destructor
+/// (rule 133).
+pub(crate) fn leak_parked_clap_on_thread_exit() {
+    CLAP_PARKED.with(|cell| {
+        for parked in cell.borrow_mut().drain(..) {
+            std::mem::forget(parked);
+        }
+    });
+}
+
 /// Post-activation state of each never-free plugin's *first* fresh
 /// instantiation: what a new instance starts with. Reloaded when a parked
 /// instance is reused, so the player never hears the previous unit's patch.

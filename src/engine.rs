@@ -1228,6 +1228,8 @@ impl Default for GraphPub {
             lv2_loaded: Vec::new(),
             lv2_loading: Vec::new(),
             lv2_rev: 0,
+            rig_busy_mask: 0,
+            rig_held_mask: 0,
         }
     }
 }
@@ -1367,6 +1369,12 @@ pub struct GraphPub {
     pub lv2_loaded: Vec<NodeId>,
     pub lv2_loading: Vec<NodeId>,
     pub lv2_rev: u64,
+    /// Per-rig activity bitmask (#207): bit `r` is 1 while rig `r` has pre-fader
+    /// audio > -100 dBFS, held notes, or sustain pedal down (updated every block).
+    pub rig_busy_mask: u64,
+    /// Subset of `rig_busy_mask`: bit `r` is 1 while rig `r` has held notes or
+    /// sustain pedal down (keyboard or hardware MIDI).
+    pub rig_held_mask: u64,
     /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
     pub transport: TransportPub,
     pub transport_rev: u64,
@@ -1689,18 +1697,27 @@ pub struct GraphEngine {
     /// Per-setlist hosted-rig bitmask (#207): `None` hosts every rig;
     /// `Some(mask)` hosts only rigs with bit `1 << rig` set (plus master
     /// inserts and aux-bus chains in `always_hosted_nodes`).
-    hosted_rigs: Option<u32>,
+    hosted_rigs: Option<u64>,
     /// Optional mask queued with `for_next_load: true` to take effect on the
     /// next `Command::LoadGraph` before it requests LV2 plugins.
-    next_load_hosted_rigs: Option<Option<u32>>,
+    next_load_hosted_rigs: Option<Option<u64>>,
+    /// Deferred `sync_hosted_lv2()` flag set by `Command::SetHostedRigs` so a
+    /// `Command::LoadLv2State` in the same frame claims `lv2_in_flight` first
+    /// instead of double-instantiating state-restored LV2 plugins (#207).
+    hosted_lv2_dirty: bool,
     /// Nodes that stay hosted regardless of `hosted_rigs` (aux-bus chains and
-    /// master inserts), refreshed on structural graph edits so audio-thread
-    /// `node_is_hosted` never allocates.
+    /// master inserts), refreshed allocation-free on structural graph edits.
     always_hosted_nodes: Vec<NodeId>,
     /// LV2 nodes currently loading on the loader thread (fixed capacity).
     lv2_in_flight: Vec<NodeId>,
     /// LV2 attachment / loading set changed since last publication.
     lv2_dirty: bool,
+    /// Per-rig held note bitsets and sustain-pedal mask for outgoing-rig drain
+    /// tracking (#207, allocation-free).
+    rig_notes_down: [u128; MAX_RIGS],
+    rig_sustain_mask: u64,
+    rig_busy_mask: u64,
+    rig_held_mask: u64,
     // Master recording tap (the final output). None = recording unavailable
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
@@ -1883,9 +1900,14 @@ impl GraphEngine {
             lv2_retire_backlog: Vec::new(),
             hosted_rigs: None,
             next_load_hosted_rigs: None,
-            always_hosted_nodes: Vec::new(),
+            hosted_lv2_dirty: false,
+            always_hosted_nodes: Vec::with_capacity(64),
             lv2_in_flight: Vec::with_capacity(LV2_SLOT_CAP),
             lv2_dirty: true,
+            rig_notes_down: [0u128; MAX_RIGS],
+            rig_sustain_mask: 0,
+            rig_busy_mask: 0,
+            rig_held_mask: 0,
             recorder: None,
             arm_master: true,
             arm_rigs: [false; MAX_RIGS],
@@ -1905,19 +1927,52 @@ impl GraphEngine {
     }
 
     /// Recompute nodes that stay hosted regardless of `hosted_rigs` (master
-    /// inserts and aux-bus chains). Structural ops only; no-op when windowing
-    /// is disabled so unwindowed routing edits pay zero overhead.
+    /// inserts and aux-bus chains) in a single allocation-free pass.
     fn refresh_always_hosted(&mut self) {
         self.always_hosted_nodes.clear();
-        if self.hosted_rigs.is_none() {
-            return;
-        }
+        let mut frontier = [NodeId::MAX; 128];
+        let mut f_len = 0usize;
+        let mut visited = [NodeId::MAX; 256];
+        let mut v_len = 0usize;
         for n in &self.graph.nodes {
-            if self.graph.is_bus(n.id)
-                || self.graph.after_bus(n.id)
-                || crate::setlist::is_master_insert(&self.graph, n.id)
-            {
-                self.always_hosted_nodes.push(n.id);
+            if matches!(n.kind, NodeKind::MasterOut | NodeKind::Dsp(DspKind::Bus)) {
+                if f_len < frontier.len() {
+                    frontier[f_len] = n.id;
+                    f_len += 1;
+                }
+                if v_len < visited.len() {
+                    visited[v_len] = n.id;
+                    v_len += 1;
+                }
+                if matches!(n.kind, NodeKind::Dsp(DspKind::Bus))
+                    && self.always_hosted_nodes.len() < self.always_hosted_nodes.capacity()
+                {
+                    self.always_hosted_nodes.push(n.id);
+                }
+            }
+        }
+        while f_len > 0 {
+            f_len -= 1;
+            let cur = frontier[f_len];
+            for e in &self.graph.edges {
+                if e.kind == PortKind::Audio && e.from.node == cur {
+                    let next = e.to.node;
+                    if !visited[..v_len].contains(&next) {
+                        if v_len < visited.len() {
+                            visited[v_len] = next;
+                            v_len += 1;
+                        }
+                        if f_len < frontier.len() {
+                            frontier[f_len] = next;
+                            f_len += 1;
+                        }
+                        if self.always_hosted_nodes.len() < self.always_hosted_nodes.capacity()
+                            && !self.always_hosted_nodes.contains(&next)
+                        {
+                            self.always_hosted_nodes.push(next);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1932,7 +1987,7 @@ impl GraphEngine {
         }
         self.graph
             .node(node)
-            .is_some_and(|n| (n.rig as usize) < MAX_RIGS && (mask & (1u32 << n.rig)) != 0)
+            .is_some_and(|n| (n.rig as usize) < MAX_RIGS && (mask & (1u64 << n.rig)) != 0)
     }
 
     fn is_lv2_attached(&self, node: NodeId) -> bool {
@@ -1942,8 +1997,17 @@ impl GraphEngine {
 
     /// Currently configured hosted-rigs bitmask (`None` = all rigs hosted).
     #[cfg(test)]
-    pub(crate) fn hosted_rigs(&self) -> Option<u32> {
+    pub(crate) fn hosted_rigs(&self) -> Option<u64> {
         self.hosted_rigs
+    }
+
+    /// Inspect a bound CLAP voice slot's `(level, src_keys, src_hw, rig_device)` in tests.
+    #[cfg(test)]
+    pub(crate) fn voice_settings_for_test(&self, node: NodeId) -> Option<(f32, bool, bool, Option<u32>)> {
+        self.voices
+            .iter()
+            .find(|s| s.node == node)
+            .map(|s| (s.level, s.src_keys, s.src_hw, s.rig_device))
     }
 
     /// Instantiate LV2 plugins, parse their presets and free them on a
@@ -2266,9 +2330,6 @@ impl GraphEngine {
                 VoiceMsg::Retire(id) => {
                     if let Some(i) = self.voices.iter().position(|v| v.voice.voice_id() == id) {
                         let slot = self.voices.swap_remove(i);
-                        for n in 0..128u16 {
-                            slot.voice.note_off(n);
-                        }
                         self.send_back(VoiceBack::Voice(slot));
                         changed = true;
                     }
@@ -2912,8 +2973,59 @@ impl GraphEngine {
         if let Ok(mut g) = p.try_lock() {
             g.meter = self.meter.snapshot();
             g.master_target = self.master_target;
+            g.rig_busy_mask = self.rig_busy_mask;
+            g.rig_held_mask = self.rig_held_mask;
             g.meter_rev = g.meter_rev.wrapping_add(1);
         }
+    }
+
+    /// Compute per-rig activity masks (pre-fader audio > -100 dBFS, held notes,
+    /// and sustain pedal) so outgoing rigs never retire while sounding or held
+    /// (#207, allocation-free).
+    fn update_rig_busy_masks(&mut self, n2: usize) {
+        const AUDIO_FLOOR: f32 = 1e-5;
+        let mut held = self.rig_sustain_mask;
+        for (r, &bits) in self.rig_notes_down.iter().enumerate() {
+            if bits != 0 {
+                held |= 1u64 << r;
+            }
+        }
+        let mut audio = 0u64;
+        for s in &self.voices {
+            if s.node == NodeId::MAX {
+                continue;
+            }
+            let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
+            if (audio & (1u64 << r)) != 0 || self.always_hosted_nodes.contains(&s.node) {
+                continue;
+            }
+            if s.scratch[..n2.min(s.scratch.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+                audio |= 1u64 << r;
+            }
+        }
+        for s in &self.lv2 {
+            let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
+            if (audio & (1u64 << r)) != 0 || self.always_hosted_nodes.contains(&s.node) {
+                continue;
+            }
+            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+                audio |= 1u64 << r;
+            }
+        }
+        for s in &self.dsp {
+            if s.kind == DspKind::Bus || self.always_hosted_nodes.contains(&s.node) {
+                continue;
+            }
+            let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
+            if (audio & (1u64 << r)) != 0 {
+                continue;
+            }
+            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+                audio |= 1u64 << r;
+            }
+        }
+        self.rig_held_mask = held;
+        self.rig_busy_mask = held | audio;
     }
 
     /// The master's loudness target as the engine holds it (self-tests).
@@ -4813,6 +4925,9 @@ impl GraphEngine {
                 self.lv2_gen = self.lv2_gen.wrapping_add(1);
                 self.lv2_in_flight.clear();
                 self.lv2_dirty = true;
+                self.hosted_lv2_dirty = false;
+                self.rig_notes_down = [0u128; MAX_RIGS];
+                self.rig_sustain_mask = 0;
                 self.hosted_rigs = self.next_load_hosted_rigs.take().flatten();
                 self.refresh_always_hosted();
                 // The hosted voices move over to the new graph's Clap nodes;
@@ -4978,9 +5093,13 @@ impl GraphEngine {
                 // The edges of every rig the key reaches move, whichever rig
                 // took it; a keyboard no rig of an edge hears moves nothing.
                 if msg.is_note_on() {
+                    let bit = 1u128 << (note & 0x7F);
                     for (rig, zone) in self.rig_zones.iter().enumerate() {
                         if heard & (1 << rig) != 0 {
                             self.zone_hands.play(zone, note);
+                            if zone.live {
+                                self.rig_notes_down[rig] |= bit;
+                            }
                         }
                     }
                 }
@@ -4991,8 +5110,12 @@ impl GraphEngine {
                 }
                 let msg = MidiMsg::note_off(channel & 0x0F, note, 0);
                 self.matrix.route_into(source, msg, &mut self.route_out);
+                let bit = 1u128 << (note & 0x7F);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
+                    if let Some(rig) = self.graph.node(dest).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                        self.rig_notes_down[rig] &= !bit;
+                    }
                     self.deliver_keys_note(dest, note, m, 0.0, Some(source), None);
                 }
             }
@@ -5037,9 +5160,7 @@ impl GraphEngine {
                     self.next_load_hosted_rigs = Some(mask);
                 } else {
                     self.hosted_rigs = mask;
-                    self.refresh_always_hosted();
-                    self.sync_hosted_lv2();
-                    self.bind_free_voices();
+                    self.hosted_lv2_dirty = true;
                 }
             }
             Command::SetStripMix { node, pan, mute, solo } => {
@@ -5188,6 +5309,20 @@ impl GraphEngine {
                 }
                 let msg = MidiMsg::cc(channel, cc, value);
                 self.matrix.route_into(source, msg, &mut self.route_out);
+                if cc == 64 {
+                    for i in 0..self.route_out.len() {
+                        let (dest, _) = self.route_out[i];
+                        if let Some(rig) = self.graph.node(dest).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                            if value >= 64 {
+                                if self.rig_zones[rig].live {
+                                    self.rig_sustain_mask |= 1u64 << rig;
+                                }
+                            } else {
+                                self.rig_sustain_mask &= !(1u64 << rig);
+                            }
+                        }
+                    }
+                }
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
                     let mapping = self
@@ -5571,7 +5706,11 @@ impl GraphEngine {
             Command::DemoStop => {
                 self.stop_demo();
             }
-            Command::Panic => self.panic(),
+            Command::Panic => {
+                self.rig_notes_down = [0u128; MAX_RIGS];
+                self.rig_sustain_mask = 0;
+                self.panic();
+            }
             Command::SetMasterMute { muted } => {
                 if self.master_mute != muted {
                     self.master_mute = muted;
@@ -5742,8 +5881,18 @@ impl GraphEngine {
         if let Some(rec) = &mut self.recorder {
             rec.drain_stems();
         }
+        // Drain newly-attached voices BEFORE commands so per-node setup
+        // commands (SetParam P_LEVEL, SetRigSource, SetRigDevice) pushed in
+        // the same frame as VoiceMsg::AddBound find the voice already bound
+        // (#207).
+        self.drain_voice_msgs();
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
+        }
+        if self.hosted_lv2_dirty {
+            self.hosted_lv2_dirty = false;
+            self.sync_hosted_lv2();
+            self.bind_free_voices();
         }
         self.drain_lv2_loader();
         // Sync-to-transport: begin the take the block the song clock starts at
@@ -6374,6 +6523,7 @@ impl GraphEngine {
         self.rig_buf = rig_v;
         self.bus_acc = bus_acc;
         self.out_mix = outs_v;
+        self.update_rig_busy_masks(n2);
         self.publish_meter();
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
@@ -12612,10 +12762,52 @@ mod send_tests {
         assert!(engine.node_is_hosted(synths[2]));
         assert!(engine.node_is_hosted(synths[3]));
 
+        // Same-frame SetHostedRigs + LoadLv2State claims lv2_in_flight once (no duplicate Load).
+        let lv2_node = {
+            let mut g2 = g.clone();
+            let lv2 = g2.add_node(
+                NodeKind::Lv2 { uri: crate::control::Lv2Uri::new("http://example.org/synth") },
+                name_bytes("LV2 SYNTH"),
+            );
+            g2.set_rig(lv2, 1);
+            bus.send(Command::SetHostedRigs { mask: Some(0b0001), for_next_load: true });
+            bus.send(Command::LoadGraph { graph: g2 });
+            engine.spawn_lv2_loader();
+            engine.render(&mut buf, 2);
+            assert!(!engine.node_is_hosted(lv2));
+            bus.send(Command::SetHostedRigs { mask: Some(0b0011), for_next_load: false });
+            bus.send(Command::LoadLv2State { node: lv2, state: b"dummy-state".to_vec() });
+            engine.render(&mut buf, 2);
+            lv2
+        };
+        assert!(engine.node_is_hosted(lv2_node));
+        assert_eq!(
+            engine.lv2_in_flight.iter().filter(|&&n| n == lv2_node).count(),
+            1,
+            "SetHostedRigs + LoadLv2State in same frame must not double-queue lv2_in_flight"
+        );
+
         // Plain LoadGraph without priming resets hosted_rigs back to None (all hosted).
         bus.send(Command::LoadGraph { graph: g });
         engine.render(&mut buf, 2);
         assert_eq!(engine.hosted_rigs(), None);
         assert!(synths.iter().all(|&s| engine.node_is_hosted(s)));
+
+        // Engine publishes rig_held_mask on NoteOn / sustain CC 64 and clears on NoteOff / CC 64 up.
+        bus.send(Command::NoteOn {
+            note: 60,
+            velocity: 0.8,
+            source: crate::matrix::SourceId::Keys,
+            channel: 0,
+        });
+        engine.render(&mut buf, 2);
+        assert_ne!(pub_.lock().unwrap().rig_held_mask & 1, 0, "rig 0 marked held on NoteOn");
+        bus.send(Command::NoteOff {
+            note: 60,
+            source: crate::matrix::SourceId::Keys,
+            channel: 0,
+        });
+        engine.render(&mut buf, 2);
+        assert_eq!(pub_.lock().unwrap().rig_held_mask & 1, 0, "rig 0 cleared on NoteOff");
     }
 }

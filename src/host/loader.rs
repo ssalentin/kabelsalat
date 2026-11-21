@@ -205,7 +205,7 @@ fn loader_loop(
                 }
             }
             Req::Retire { voice_id, node, plugin_id, slot, save_state } => {
-                busy.store(true, Ordering::Relaxed);
+                busy.store(true, Ordering::Release);
                 let saved_state = if let Some(mut main) = mains.remove(&voice_id) {
                     let st = if save_state { main.save_state().ok() } else { None };
                     main.retire(slot.into_voice());
@@ -220,7 +220,7 @@ fn loader_loop(
                         retired_states.insert((*cur_gen, node), st.clone());
                     }
                 }
-                busy.store(false, Ordering::Relaxed);
+                busy.store(false, Ordering::Release);
                 let _ = resp_tx.send(ClapLoaderResp::Retired {
                     voice_id,
                     node,
@@ -249,7 +249,10 @@ fn loader_loop(
                     &busy,
                 ),
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    teardown_loader_thread(mains);
+                    return;
+                }
             }
         }
 
@@ -260,22 +263,28 @@ fn loader_loop(
                 let _ = resp_tx.send(ClapLoaderResp::Cancelled { node: job.node, gen: job.gen });
                 continue;
             }
-            busy.store(true, Ordering::Relaxed);
+            busy.store(true, Ordering::Release);
             let effective_state = retired_states.remove(&(job.gen, job.node)).or(job.state);
             match ClapVoice::new_plugin(job.sample_rate, &job.plugin_id) {
                 Ok((mut voice, mut main)) => {
                     if let Some(blob) = &effective_state {
                         let _ = main.load_state(blob);
                     }
-                    // Warm up 2 silent blocks off the audio thread so CLAP
-                    // start_processing, state-load parsing (Surge XT applies
-                    // state inside process(), rule 38) and lazy allocations
-                    // finish here instead of spiking the audio callback.
-                    let mut warm = [0.0f32; 256 * 2];
-                    let mut t = Transport::default();
-                    voice.render(&mut warm, t);
-                    t.advance(256, job.sample_rate);
-                    voice.render(&mut warm, t);
+                    // Warm up 2 silent blocks on a separate warmup thread
+                    // (obeying CLAP's [audio-thread] != [main-thread] contract)
+                    // so start_processing, state-load XML parsing (Surge XT
+                    // applies state inside process(), rule 38), and lazy
+                    // allocations finish off the real audio callback.
+                    let sr = job.sample_rate;
+                    std::thread::scope(|s| {
+                        s.spawn(|| {
+                            let mut warm = [0.0f32; 256 * 2];
+                            let mut t = Transport::default();
+                            voice.render(&mut warm, t);
+                            t.advance(256, sr);
+                            voice.render(&mut warm, t);
+                        });
+                    });
                     main.service();
                     main.poll_main_controls();
 
@@ -306,7 +315,7 @@ fn loader_loop(
                     });
                 }
             }
-            busy.store(false, Ordering::Relaxed);
+            busy.store(false, Ordering::Release);
             if last_pump.elapsed() >= PUMP_EVERY {
                 for m in mains.values_mut() {
                     m.pump();
@@ -321,14 +330,20 @@ fn loader_loop(
         let msg = if mains.is_empty() {
             match req_rx.recv() {
                 Ok(m) => Some(m),
-                Err(_) => return,
+                Err(_) => {
+                    teardown_loader_thread(mains);
+                    return;
+                }
             }
         } else {
             let wait = PUMP_EVERY.saturating_sub(last_pump.elapsed());
             match req_rx.recv_timeout(wait) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    teardown_loader_thread(mains);
+                    return;
+                }
             }
         };
         if let Some(m) = msg {
@@ -352,6 +367,16 @@ fn loader_loop(
     }
 }
 
+/// Safe teardown when the `ClapLoader` handle drops: never run TLS destructors
+/// on `CLAP_NEVER_FREE` parked plugins (rule 133), and never drop a live
+/// `ClapVoiceMain` whose audio half may still exist on another thread.
+fn teardown_loader_thread(mut mains: HashMap<u64, ClapVoiceMain>) {
+    for (_, main) in mains.drain() {
+        std::mem::forget(main);
+    }
+    super::leak_parked_clap_on_thread_exit();
+}
+
 /// UI-side handle to a `ClapVoiceMain` hosted on `kabelsalat-clap-loader`.
 pub struct BgClapMain {
     voice_id: u64,
@@ -361,6 +386,10 @@ pub struct BgClapMain {
     has_editor: bool,
     editor_open: bool,
 }
+
+/// Bounded wait for non-blocking per-frame UI queries so a background plugin
+/// load can never freeze the UI thread (rule 46).
+const UI_POLL_TIMEOUT: Duration = Duration::from_millis(2);
 
 impl BgClapMain {
     fn call<R: Send + 'static>(&self, f: impl FnOnce(&mut ClapVoiceMain) -> R + Send + 'static) -> Option<R> {
@@ -372,6 +401,24 @@ impl BgClapMain {
             return None;
         }
         reply_rx.recv().ok().flatten()
+    }
+
+    fn try_call<R: Send + 'static>(
+        &self,
+        timeout: Duration,
+        f: impl FnOnce(&mut ClapVoiceMain) -> R + Send + 'static,
+    ) -> Option<R> {
+        if self.busy.load(Ordering::Acquire) {
+            return None;
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Option<R>>(1);
+        let op = Box::new(move |m: Option<&mut ClapVoiceMain>| {
+            let _ = reply_tx.send(m.map(f));
+        });
+        if self.tx.send(Req::Call { voice_id: self.voice_id, op }).is_err() {
+            return None;
+        }
+        reply_rx.recv_timeout(timeout).ok().flatten()
     }
 }
 
@@ -398,7 +445,7 @@ impl HostedClapMain {
     pub fn is_bg_busy(&self) -> bool {
         match self {
             HostedClapMain::Local(_) => false,
-            HostedClapMain::Bg(bg) => bg.busy.load(Ordering::Relaxed),
+            HostedClapMain::Bg(bg) => bg.busy.load(Ordering::Acquire),
         }
     }
 
@@ -448,8 +495,8 @@ impl HostedClapMain {
             HostedClapMain::Local(m) => m.pump(),
             // Background loader pumps its own mains every 16 ms.
             HostedClapMain::Bg(bg) => {
-                if bg.editor_open && !bg.busy.load(Ordering::Relaxed) {
-                    if let Some(open) = bg.call(|m| m.editor_open()) {
+                if bg.editor_open {
+                    if let Some(open) = bg.try_call(UI_POLL_TIMEOUT, |m| m.editor_open()) {
                         bg.editor_open = open;
                     }
                 }
@@ -460,12 +507,7 @@ impl HostedClapMain {
     pub fn poll_latency(&mut self) -> u32 {
         match self {
             HostedClapMain::Local(m) => m.poll_latency(),
-            HostedClapMain::Bg(bg) => {
-                if bg.busy.load(Ordering::Relaxed) {
-                    return 0;
-                }
-                bg.call(|m| m.poll_latency()).unwrap_or(0)
-            }
+            HostedClapMain::Bg(bg) => bg.try_call(UI_POLL_TIMEOUT, |m| m.poll_latency()).unwrap_or(0),
         }
     }
 
@@ -527,10 +569,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.poll_main_controls(),
             HostedClapMain::Bg(bg) => {
-                if bg.busy.load(Ordering::Relaxed) {
-                    return false;
-                }
-                if let Some((changed, mc)) = bg.call(|m| {
+                if let Some((changed, mc)) = bg.try_call(UI_POLL_TIMEOUT, |m| {
                     let c = m.poll_main_controls();
                     (c, if c { Some(m.main_controls().clone()) } else { None })
                 }) {
@@ -555,12 +594,7 @@ impl HostedClapMain {
     pub fn param_value(&mut self, id: u32) -> Option<f64> {
         match self {
             HostedClapMain::Local(m) => m.param_value(id),
-            HostedClapMain::Bg(bg) => {
-                if bg.busy.load(Ordering::Relaxed) {
-                    return None;
-                }
-                bg.call(move |m| m.param_value(id)).flatten()
-            }
+            HostedClapMain::Bg(bg) => bg.try_call(UI_POLL_TIMEOUT, move |m| m.param_value(id)).flatten(),
         }
     }
 
@@ -568,7 +602,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.param_text(id, value),
             HostedClapMain::Bg(bg) => bg
-                .call(move |m| m.param_text(id, value))
+                .try_call(UI_POLL_TIMEOUT, move |m| m.param_text(id, value))
                 .unwrap_or_else(|| format!("{value:.3}")),
         }
     }
@@ -576,7 +610,9 @@ impl HostedClapMain {
     pub fn param_text_opt(&mut self, id: u32, value: f64) -> Option<String> {
         match self {
             HostedClapMain::Local(m) => m.param_text_opt(id, value),
-            HostedClapMain::Bg(bg) => bg.call(move |m| m.param_text_opt(id, value)).flatten(),
+            HostedClapMain::Bg(bg) => bg
+                .try_call(UI_POLL_TIMEOUT, move |m| m.param_text_opt(id, value))
+                .flatten(),
         }
     }
 

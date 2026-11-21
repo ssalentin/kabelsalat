@@ -38,6 +38,7 @@ struct Board {
     part: Option<String>,
     next: Option<String>,
     tempo: String,
+    loading: bool,
     /// Live rigs: name and level (`rig_levels`, −48…0 dBFS).
     rigs: Vec<(String, f32)>,
     master: f32,
@@ -267,11 +268,15 @@ impl DemoApp {
 
     fn board(&self) -> Board {
         let sl = &self.setlist;
+        let loading = self.active_song_loading_notice().is_some();
         let (caption, song, part) = match sl.current() {
             Some((s, p, pos)) => {
                 let mut caption = format!("Song {} of {} · part {} of {}", pos.song + 1, sl.songs.len(), pos.part + 1, s.parts.len());
                 if let Some(set) = sl.set_of(pos.song) {
                     caption = format!("{caption} · {}", set.name);
+                }
+                if loading {
+                    caption = format!("Loading… · {caption}");
                 }
                 (caption, s.name.clone(), Some(p.name.clone()))
             }
@@ -288,6 +293,7 @@ impl DemoApp {
             part,
             next: sl.upcoming_song().map(|i| sl.songs[i].name.clone()),
             tempo: format!("{} BPM · {}", self.bpm.round() as u32, self.time_sig),
+            loading,
             rigs,
             master: meter_db_pos(self.meter),
             master_peak: meter_db_pos(self.meter_peak),
@@ -325,7 +331,8 @@ impl DemoApp {
         }
         let HeroBlock { inner, height, gap, caption: cap, song, part, tempo, stacked } = block;
         let top = (hero.center().y - height / 2.0).max(inner.top());
-        theme::paint_tracked(&p, Pos2::new(inner.left(), top), &cap, theme::CREAM_DIM);
+        let cap_col = if board.loading { theme::CABLE_AMBER } else { theme::CREAM_DIM };
+        theme::paint_tracked(&p, Pos2::new(inner.left(), top), &cap, cap_col);
         let song_top = top + cap.size.y + gap;
         let line_top = song_top + song.size().y + gap;
         p.galley(Pos2::new(inner.left(), song_top), song, theme::CREAM);
@@ -416,6 +423,7 @@ impl DemoApp {
             "part": b.part,
             "next_song": b.next,
             "tempo": b.tempo,
+            "loading": b.loading,
             "live_rigs": b.rigs.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         })
     }

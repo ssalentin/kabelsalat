@@ -190,6 +190,7 @@ impl DemoApp {
         if self.setlist.active == Some(crate::setlist::SetlistPos { song: song_idx, part: part_idx }) {
             self.apply_setlist_part();
         }
+        self.sync_setlist_window();
         self.session_msg = format!("Separate instance '{}' for '{song_name}' (own preset)", self.rig_name(new_rig));
         Ok(new_rig)
     }
@@ -395,6 +396,7 @@ impl DemoApp {
             self.setlist.songs.push(song);
             let song_idx = self.setlist.songs.len() - 1;
             self.setlist_edit_song = Some(song_idx);
+            self.sync_setlist_window();
             let hosted = self.show_instances().hosted;
             self.session_msg = format!(
                 "Added '{session_name}' sharing existing instrument ({hosted} {} hosted)",

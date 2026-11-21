@@ -99,6 +99,7 @@ impl DemoApp {
         if self.setlist.active.is_some() {
             self.send_show_gates();
         }
+        self.sync_setlist_window();
     }
 
     /// A dropdown that shows and sets one item's level: Show, Song or a set.
@@ -256,6 +257,7 @@ impl DemoApp {
                 }
             });
 
+        let mut window_changed = false;
         for e in edits {
             match e {
                 SetEdit::Add => {
@@ -263,6 +265,7 @@ impl DemoApp {
                     if let Some(si) = self.setlist_edit_song {
                         self.setlist_edit_song = self.setlist.assign_set(si, Some(id));
                     }
+                    window_changed = true;
                 }
                 SetEdit::Rename(id, name) => {
                     if let Some(s) = self.setlist.sets.iter_mut().find(|s| s.id == id) {
@@ -273,22 +276,32 @@ impl DemoApp {
                     if let Some(s) = self.setlist.sets.iter_mut().find(|s| s.id == id) {
                         s.skip = skip;
                     }
+                    window_changed = true;
                 }
                 SetEdit::Move(id, up) => {
                     if let Some(order) = self.setlist.move_set(id, up) {
                         self.setlist_edit_song = self.setlist_edit_song.and_then(|old| order.iter().position(|&o| o == old));
+                        window_changed = true;
                     }
                 }
                 SetEdit::Remove(id) => {
                     self.setlist.remove_set(id);
+                    window_changed = true;
                 }
                 SetEdit::Member(id, song, on) => {
                     let new = self.setlist.assign_set(song, on.then_some(id));
                     if self.setlist_edit_song == Some(song) {
                         self.setlist_edit_song = new;
                     }
+                    window_changed = true;
                 }
             }
+        }
+        if window_changed {
+            if self.setlist.active.is_some() {
+                self.send_show_gates();
+            }
+            self.sync_setlist_window();
         }
     }
 
@@ -299,6 +312,7 @@ impl DemoApp {
         if self.setlist.active.is_some() {
             self.send_show_gates();
         }
+        self.sync_setlist_window();
         let mut out = self.setlist_json();
         out["result"] = serde_json::json!(msg);
         Ok(out)
@@ -310,6 +324,7 @@ impl DemoApp {
         if self.setlist.active.is_some() {
             self.send_show_gates();
         }
+        self.sync_setlist_window();
         let mut out = self.setlist_json();
         out["result"] = serde_json::json!(msg);
         Ok(out)

@@ -1735,3 +1735,14 @@ Learned so far (2026-11-15, UI polish pass):
     pre-effect gain once the effect's echoes of the old level have faded
     (`a_rig_fader_a_part_recalls_under_a_held_note_moves_without_a_click`,
     `a_muted_rig_fades_out_and_back_in`).
+203. **Windowed voice attach runs before commands, waits for graph loads, and
+    drains from engine truth:** `poll_setlist_window` pushed
+    `VoiceMsg::AddBound` and `SetParam`/`SetRigSource`/`SetRigDevice` in the
+    same frame while `GraphEngine::render` drained commands before voice
+    messages, silently dropping every per-node setting on attach (#207).
+    Drain `voice_rx` before `drain` in `render()`, defer `AddBound` while
+    `voice_hold_rev` is set, defer `sync_hosted_lv2` until after `drain` so a
+    same-frame `LoadLv2State` claims `lv2_in_flight` without double-loading,
+    and judge outgoing-rig draining from the engine's pre-fader + held-note
+    `rig_busy_mask`/`rig_held_mask` rather than UI mirrors
+    (`demo_app_real_engine_window_attach_drain_and_bounce`).

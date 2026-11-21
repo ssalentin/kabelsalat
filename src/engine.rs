@@ -433,6 +433,10 @@ impl VoiceSlot {
 /// before a load is in place when the load binds voices.
 pub enum VoiceMsg {
     Add(VoiceSlot),
+    /// Attach a voice directly to a specific Clap node (#207), without letting
+    /// `bind_free_voices` steal it for an earlier unloaded node of the same
+    /// plugin.
+    AddBound { node: NodeId, slot: VoiceSlot },
     /// An empty table with more capacity than the engine's: the host sends
     /// it before the `Add` that would not fit, so the audio thread never
     /// allocates to hold another voice.
@@ -769,10 +773,12 @@ enum Lv2Request {
 /// What the loader hands back; attached at the next block boundary.
 enum Lv2Response {
     Loaded { node: NodeId, gen: u64, slot: Lv2Slot },
+    /// Instantiating `node` failed on the loader thread; clears in-flight state.
+    LoadFailed { node: NodeId, gen: u64 },
     Preset { node: NodeId, preset: crate::lv2::Lv2Preset },
     Restored { node: NodeId, gen: u64, slot: Lv2Slot },
     /// The plugin could not take a state (`State`): the node keeps its own.
-    Refused,
+    Refused { node: NodeId, gen: u64 },
 }
 
 /// LV2 instances the engine hosts at once: two per rig (an organ and an
@@ -824,19 +830,21 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
             continue;
         };
         let out = match r {
-            Lv2Request::Load { node, uri, gen } => {
-                load_lv2_slot(node, uri.as_str(), sample_rate).map(|slot| Lv2Response::Loaded { node, gen, slot })
-            }
+            Lv2Request::Load { node, uri, gen } => Some(
+                load_lv2_slot(node, uri.as_str(), sample_rate)
+                    .map_or(Lv2Response::LoadFailed { node, gen }, |slot| Lv2Response::Loaded { node, gen, slot }),
+            ),
             Lv2Request::Preset { node, uri, preset_uri } => crate::lv2::discover_presets(uri.as_str())
                 .into_iter()
                 .find(|p| p.uri == preset_uri)
                 .map(|preset| Lv2Response::Preset { node, preset }),
             Lv2Request::State { node, uri, gen, state } => Some(
                 restored_lv2_slot(node, uri.as_str(), &state, sample_rate)
-                    .map_or(Lv2Response::Refused, |slot| Lv2Response::Restored { node, gen, slot }),
+                    .map_or(Lv2Response::Refused { node, gen }, |slot| Lv2Response::Restored { node, gen, slot }),
             ),
             Lv2Request::Retire(slot) => {
                 crate::lv2::retire(slot.plugin); // parks never-free plugins (#14)
+                crate::host::trim_heap();
                 None
             }
             Lv2Request::RetirePreset(p) => {
@@ -1217,6 +1225,11 @@ impl Default for GraphPub {
             latency_rev: 0,
             demo: None,
             demo_rev: 0,
+            lv2_loaded: Vec::new(),
+            lv2_loading: Vec::new(),
+            lv2_rev: 0,
+            rig_busy_mask: 0,
+            rig_held_mask: 0,
         }
     }
 }
@@ -1351,6 +1364,17 @@ pub struct GraphPub {
     /// the plugins' main halves read which one serves which node here.
     pub voices: Vec<(u64, NodeId)>,
     pub voices_rev: u64,
+    /// Attached LV2 node ids and in-flight LV2 node ids on the loader thread
+    /// (#207), bumped by `lv2_rev` (allocation-free publication).
+    pub lv2_loaded: Vec<NodeId>,
+    pub lv2_loading: Vec<NodeId>,
+    pub lv2_rev: u64,
+    /// Per-rig activity bitmask (#207): bit `r` is 1 while rig `r` has pre-fader
+    /// audio > -100 dBFS, held notes, or sustain pedal down (updated every block).
+    pub rig_busy_mask: u64,
+    /// Subset of `rig_busy_mask`: bit `r` is 1 while rig `r` has held notes or
+    /// sustain pedal down (keyboard or hardware MIDI).
+    pub rig_held_mask: u64,
     /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
     pub transport: TransportPub,
     pub transport_rev: u64,
@@ -1389,6 +1413,27 @@ fn write_voices(g: &mut GraphPub, voices: &[VoiceSlot]) {
     g.voices_rev = g.voices_rev.wrapping_add(1);
 }
 
+fn write_lv2_status(g: &mut GraphPub, lv2: &[Lv2Slot], midi_fx: &[MidiFxSlot], loading: &[NodeId]) {
+    g.lv2_loaded.clear();
+    let cap = g.lv2_loaded.capacity();
+    for s in lv2 {
+        if g.lv2_loaded.len() < cap {
+            g.lv2_loaded.push(s.node);
+        }
+    }
+    for s in midi_fx {
+        if matches!(s.proc, Some(MidiFxProc::Lv2(_))) && g.lv2_loaded.len() < cap {
+            g.lv2_loaded.push(s.node);
+        }
+    }
+    g.lv2_loading.clear();
+    let lcap = g.lv2_loading.capacity();
+    for &n in loading.iter().take(lcap) {
+        g.lv2_loading.push(n);
+    }
+    g.lv2_rev = g.lv2_rev.wrapping_add(1);
+}
+
 /// The strip table as `GraphPub` publishes it: a fixed array (default =
 /// empty slots), so the audio thread never allocates for a strip edit.
 /// Public for tests that need to fake an engine publication.
@@ -1405,6 +1450,11 @@ impl GraphPub {
     /// whoever raises the engine's voice capacity.
     pub fn reserve_voices(&mut self, n: usize) {
         self.voices.reserve(n.saturating_sub(self.voices.len()));
+    }
+
+    pub fn reserve_lv2(&mut self, n: usize) {
+        self.lv2_loaded.reserve(n.saturating_sub(self.lv2_loaded.len()));
+        self.lv2_loading.reserve(n.saturating_sub(self.lv2_loading.len()));
     }
 }
 
@@ -1644,6 +1694,30 @@ pub struct GraphEngine {
     /// Slots waiting to be retired while the loader's queue is full
     /// (preallocated: freeing one here would stall the audio thread).
     lv2_retire_backlog: Vec<Lv2Slot>,
+    /// Per-setlist hosted-rig bitmask (#207): `None` hosts every rig;
+    /// `Some(mask)` hosts only rigs with bit `1 << rig` set (plus master
+    /// inserts and aux-bus chains in `always_hosted_nodes`).
+    hosted_rigs: Option<u64>,
+    /// Optional mask queued with `for_next_load: true` to take effect on the
+    /// next `Command::LoadGraph` before it requests LV2 plugins.
+    next_load_hosted_rigs: Option<Option<u64>>,
+    /// Deferred `sync_hosted_lv2()` flag set by `Command::SetHostedRigs` so a
+    /// `Command::LoadLv2State` in the same frame claims `lv2_in_flight` first
+    /// instead of double-instantiating state-restored LV2 plugins (#207).
+    hosted_lv2_dirty: bool,
+    /// Nodes that stay hosted regardless of `hosted_rigs` (aux-bus chains and
+    /// master inserts), refreshed allocation-free on structural graph edits.
+    always_hosted_nodes: Vec<NodeId>,
+    /// LV2 nodes currently loading on the loader thread (fixed capacity).
+    lv2_in_flight: Vec<NodeId>,
+    /// LV2 attachment / loading set changed since last publication.
+    lv2_dirty: bool,
+    /// Per-rig held note bitsets and sustain-pedal mask for outgoing-rig drain
+    /// tracking (#207, allocation-free).
+    rig_notes_down: [u128; MAX_RIGS],
+    rig_sustain_mask: u64,
+    rig_busy_mask: u64,
+    rig_held_mask: u64,
     // Master recording tap (the final output). None = recording unavailable
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
@@ -1824,6 +1898,16 @@ impl GraphEngine {
             lv2_resp: None,
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
+            hosted_rigs: None,
+            next_load_hosted_rigs: None,
+            hosted_lv2_dirty: false,
+            always_hosted_nodes: Vec::with_capacity(64),
+            lv2_in_flight: Vec::with_capacity(LV2_SLOT_CAP),
+            lv2_dirty: true,
+            rig_notes_down: [0u128; MAX_RIGS],
+            rig_sustain_mask: 0,
+            rig_busy_mask: 0,
+            rig_held_mask: 0,
             recorder: None,
             arm_master: true,
             arm_rigs: [false; MAX_RIGS],
@@ -1837,8 +1921,93 @@ impl GraphEngine {
             demo: None,
             demo_dirty: false,
         };
+        engine.refresh_always_hosted();
         engine.replan_delays(true);
         engine
+    }
+
+    /// Recompute nodes that stay hosted regardless of `hosted_rigs` (master
+    /// inserts and aux-bus chains) in a single allocation-free pass.
+    fn refresh_always_hosted(&mut self) {
+        self.always_hosted_nodes.clear();
+        let mut frontier = [NodeId::MAX; 128];
+        let mut f_len = 0usize;
+        let mut visited = [NodeId::MAX; 256];
+        let mut v_len = 0usize;
+        for n in &self.graph.nodes {
+            if matches!(n.kind, NodeKind::MasterOut | NodeKind::Dsp(DspKind::Bus)) {
+                if f_len < frontier.len() {
+                    frontier[f_len] = n.id;
+                    f_len += 1;
+                }
+                if v_len < visited.len() {
+                    visited[v_len] = n.id;
+                    v_len += 1;
+                }
+                if matches!(n.kind, NodeKind::Dsp(DspKind::Bus))
+                    && self.always_hosted_nodes.len() < self.always_hosted_nodes.capacity()
+                {
+                    self.always_hosted_nodes.push(n.id);
+                }
+            }
+        }
+        while f_len > 0 {
+            f_len -= 1;
+            let cur = frontier[f_len];
+            for e in &self.graph.edges {
+                if e.kind == PortKind::Audio && e.from.node == cur {
+                    let next = e.to.node;
+                    if !visited[..v_len].contains(&next) {
+                        if v_len < visited.len() {
+                            visited[v_len] = next;
+                            v_len += 1;
+                        }
+                        if f_len < frontier.len() {
+                            frontier[f_len] = next;
+                            f_len += 1;
+                        }
+                        if self.always_hosted_nodes.len() < self.always_hosted_nodes.capacity()
+                            && !self.always_hosted_nodes.contains(&next)
+                        {
+                            self.always_hosted_nodes.push(next);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Allocation-free check whether `node` should be hosted under `hosted_rigs`.
+    fn node_is_hosted(&self, node: NodeId) -> bool {
+        let Some(mask) = self.hosted_rigs else {
+            return true;
+        };
+        if self.always_hosted_nodes.contains(&node) {
+            return true;
+        }
+        self.graph
+            .node(node)
+            .is_some_and(|n| (n.rig as usize) < MAX_RIGS && (mask & (1u64 << n.rig)) != 0)
+    }
+
+    fn is_lv2_attached(&self, node: NodeId) -> bool {
+        self.lv2.iter().any(|s| s.node == node)
+            || self.midi_fx.iter().any(|s| s.node == node && matches!(s.proc, Some(MidiFxProc::Lv2(_))))
+    }
+
+    /// Currently configured hosted-rigs bitmask (`None` = all rigs hosted).
+    #[cfg(test)]
+    pub(crate) fn hosted_rigs(&self) -> Option<u64> {
+        self.hosted_rigs
+    }
+
+    /// Inspect a bound CLAP voice slot's `(level, src_keys, src_hw, rig_device)` in tests.
+    #[cfg(test)]
+    pub(crate) fn voice_settings_for_test(&self, node: NodeId) -> Option<(f32, bool, bool, Option<u32>)> {
+        self.voices
+            .iter()
+            .find(|s| s.node == node)
+            .map(|s| (s.level, s.src_keys, s.src_hw, s.rig_device))
     }
 
     /// Instantiate LV2 plugins, parse their presets and free them on a
@@ -1862,6 +2031,12 @@ impl GraphEngine {
     fn request_lv2(&mut self, node: NodeId, uri: crate::control::Lv2Uri) {
         if let Some(tx) = self.lv2_req.as_mut() {
             if tx.push(Lv2Request::Load { node, uri, gen: self.lv2_gen }).is_ok() {
+                if !self.lv2_in_flight.contains(&node)
+                    && self.lv2_in_flight.len() < self.lv2_in_flight.capacity()
+                {
+                    self.lv2_in_flight.push(node);
+                    self.lv2_dirty = true;
+                }
                 return;
             }
             // Queue full (dozens of LV2 nodes at once): one stall beats a
@@ -1870,6 +2045,7 @@ impl GraphEngine {
         }
         if let Some(slot) = load_lv2_slot(node, uri.as_str(), self.sample_rate) {
             self.attach_lv2(slot);
+            self.lv2_dirty = true;
         }
     }
 
@@ -1929,7 +2105,9 @@ impl GraphEngine {
 
     /// Put an instance with restored state in place of the node's own.
     fn adopt_restored_lv2(&mut self, node: NodeId, gen: u64, slot: Lv2Slot) {
-        let live = gen == self.lv2_gen && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }));
+        let live = gen == self.lv2_gen
+            && self.node_is_hosted(node)
+            && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }));
         match self.lv2.iter().position(|s| s.node == node) {
             Some(i) if live => {
                 self.lv2_restores += 1;
@@ -1938,10 +2116,12 @@ impl GraphEngine {
                     self.latency_dirty = true;
                 }
                 self.retire_lv2(old);
+                self.lv2_dirty = true;
             }
             None if live && self.lv2.len() < self.lv2.capacity() => {
                 self.lv2_restores += 1;
                 self.attach_lv2(slot);
+                self.lv2_dirty = true;
                 self.publish_graph();
             }
             _ => self.retire_lv2(slot),
@@ -1980,22 +2160,43 @@ impl GraphEngine {
             };
             match msg {
                 Lv2Response::Loaded { node, gen, slot } => {
+                    if gen == self.lv2_gen {
+                        self.lv2_in_flight.retain(|&n| n != node);
+                    }
                     let wanted = gen == self.lv2_gen
+                        && self.node_is_hosted(node)
                         && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. } | NodeKind::MidiFx { .. }))
-                        && !self.lv2.iter().any(|s| s.node == node)
+                        && !self.is_lv2_attached(node)
                         && self.lv2.len() < self.lv2.capacity();
                     if wanted {
                         self.attach_lv2(slot);
+                        self.lv2_dirty = true;
                         self.publish_graph();
                     } else {
+                        self.lv2_dirty = true;
                         self.retire_lv2(slot);
                     }
                 }
+                Lv2Response::LoadFailed { node, gen } => {
+                    if gen == self.lv2_gen {
+                        self.lv2_in_flight.retain(|&n| n != node);
+                        self.lv2_dirty = true;
+                    }
+                }
                 Lv2Response::Restored { node, gen, slot } => {
+                    if gen == self.lv2_gen {
+                        self.lv2_in_flight.retain(|&n| n != node);
+                    }
                     self.lv2_state_answers += 1;
                     self.adopt_restored_lv2(node, gen, slot);
                 }
-                Lv2Response::Refused => self.lv2_state_answers += 1,
+                Lv2Response::Refused { node, gen } => {
+                    if gen == self.lv2_gen {
+                        self.lv2_in_flight.retain(|&n| n != node);
+                        self.lv2_dirty = true;
+                    }
+                    self.lv2_state_answers += 1;
+                }
                 Lv2Response::Preset { node, preset } => {
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                         s.plugin.apply_preset(&preset);
@@ -2032,19 +2233,23 @@ impl GraphEngine {
     /// a host that has to know the outcome before the engine answers).
     /// Allocation-free.
     fn bind_free_voices(&mut self) {
-        for n in &self.graph.nodes {
-            let NodeKind::Clap { plugin_id } = &n.kind else { continue };
-            if self.voices.iter().any(|v| v.node == n.id) {
+        let n_nodes = self.graph.nodes.len();
+        for i in 0..n_nodes {
+            let (id, key) = match &self.graph.nodes[i].kind {
+                NodeKind::Clap { plugin_id } => (self.graph.nodes[i].id, *plugin_id),
+                _ => continue,
+            };
+            if !self.node_is_hosted(id) || self.voices.iter().any(|v| v.node == id) {
                 continue;
             }
-            let key = crate::control::clap_plugin_key(plugin_id.as_str());
+            let key = crate::control::clap_plugin_key(key.as_str());
             let free = self
                 .voices
                 .iter_mut()
                 .filter(|v| v.node == NodeId::MAX && v.voice.plugin_id() == key)
                 .min_by_key(|v| v.voice.voice_id());
             if let Some(v) = free {
-                v.bind(n.id);
+                v.bind(id);
             }
         }
         self.voices_dirty = true;
@@ -2103,6 +2308,18 @@ impl GraphEngine {
                         self.send_back(VoiceBack::Voice(slot));
                     }
                 }
+                VoiceMsg::AddBound { node, mut slot } => {
+                    let ok = self.voices.len() < self.voices.capacity()
+                        && self.graph.node(node).is_some_and(|n| matches!(n.kind, NodeKind::Clap { .. }))
+                        && !self.voices.iter().any(|v| v.node == node);
+                    if ok {
+                        slot.bind(node);
+                        self.voices.push(slot);
+                        changed = true;
+                    } else {
+                        self.send_back(VoiceBack::Voice(slot));
+                    }
+                }
                 VoiceMsg::Grow(mut table) => {
                     if table.capacity() > self.voices.capacity() {
                         table.extend(self.voices.drain(..));
@@ -2139,6 +2356,53 @@ impl GraphEngine {
         if let Ok(mut g) = p.try_lock() {
             write_voices(&mut g, &self.voices);
             self.voices_dirty = false;
+        }
+    }
+
+    fn publish_lv2(&mut self) {
+        if !self.lv2_dirty {
+            return;
+        }
+        let Some(p) = &self.graph_pub else {
+            self.lv2_dirty = false;
+            return;
+        };
+        if let Ok(mut g) = p.try_lock() {
+            write_lv2_status(&mut g, &self.lv2, &self.midi_fx, &self.lv2_in_flight);
+            self.lv2_dirty = false;
+        }
+    }
+
+    /// Reconcile hosted LV2 slots against `self.hosted_rigs` (allocation-free).
+    fn sync_hosted_lv2(&mut self) {
+        let n_nodes = self.graph.nodes.len();
+        for i in 0..n_nodes {
+            let id = self.graph.nodes[i].id;
+            let uri = match self.graph.nodes[i].kind {
+                NodeKind::Lv2 { uri } => uri,
+                NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { uri } } => uri,
+                _ => continue,
+            };
+            if self.node_is_hosted(id) {
+                if !self.is_lv2_attached(id) && !self.lv2_in_flight.contains(&id) {
+                    self.request_lv2(id, uri);
+                }
+            } else {
+                if let Some(pos) = self.lv2.iter().position(|s| s.node == id) {
+                    self.release_all(id);
+                    let slot = self.lv2.swap_remove(pos);
+                    self.retire_lv2(slot);
+                    self.latency_dirty = true;
+                    self.lv2_dirty = true;
+                }
+                if let Some(fx_pos) = self.midi_fx.iter().position(|s| s.node == id && s.proc.is_some()) {
+                    self.release_all(id);
+                    if let Some(MidiFxProc::Lv2(slot)) = self.midi_fx[fx_pos].proc.take() {
+                        self.retire_lv2(slot);
+                        self.lv2_dirty = true;
+                    }
+                }
+            }
         }
     }
 
@@ -2615,10 +2879,11 @@ impl GraphEngine {
     }
 
     pub fn set_graph_pub(&mut self, p: Arc<Mutex<GraphPub>>) {
-        // Room for the voice list now, so publishing it never allocates on
-        // the audio thread (the host reserves again when it sends `Grow`).
+        // Room for the voice & LV2 lists now, so publishing them never allocates
+        // on the audio thread (the host reserves again when it sends `Grow`).
         if let Ok(mut g) = p.lock() {
             g.reserve_voices(self.voices.capacity());
+            g.reserve_lv2(LV2_SLOT_CAP);
         }
         self.graph_pub = Some(p);
     }
@@ -2691,6 +2956,9 @@ impl GraphEngine {
                 self.demo_dirty = false;
                 write_voices(&mut g, &self.voices);
                 self.voices_dirty = false;
+                g.reserve_lv2(LV2_SLOT_CAP);
+                write_lv2_status(&mut g, &self.lv2, &self.midi_fx, &self.lv2_in_flight);
+                self.lv2_dirty = false;
             }
         }
     }
@@ -2705,8 +2973,59 @@ impl GraphEngine {
         if let Ok(mut g) = p.try_lock() {
             g.meter = self.meter.snapshot();
             g.master_target = self.master_target;
+            g.rig_busy_mask = self.rig_busy_mask;
+            g.rig_held_mask = self.rig_held_mask;
             g.meter_rev = g.meter_rev.wrapping_add(1);
         }
+    }
+
+    /// Compute per-rig activity masks (pre-fader audio > -100 dBFS, held notes,
+    /// and sustain pedal) so outgoing rigs never retire while sounding or held
+    /// (#207, allocation-free).
+    fn update_rig_busy_masks(&mut self, n2: usize) {
+        const AUDIO_FLOOR: f32 = 1e-5;
+        let mut held = self.rig_sustain_mask;
+        for (r, &bits) in self.rig_notes_down.iter().enumerate() {
+            if bits != 0 {
+                held |= 1u64 << r;
+            }
+        }
+        let mut audio = 0u64;
+        for s in &self.voices {
+            if s.node == NodeId::MAX {
+                continue;
+            }
+            let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
+            if (audio & (1u64 << r)) != 0 || self.always_hosted_nodes.contains(&s.node) {
+                continue;
+            }
+            if s.scratch[..n2.min(s.scratch.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+                audio |= 1u64 << r;
+            }
+        }
+        for s in &self.lv2 {
+            let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
+            if (audio & (1u64 << r)) != 0 || self.always_hosted_nodes.contains(&s.node) {
+                continue;
+            }
+            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+                audio |= 1u64 << r;
+            }
+        }
+        for s in &self.dsp {
+            if s.kind == DspKind::Bus || self.always_hosted_nodes.contains(&s.node) {
+                continue;
+            }
+            let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
+            if (audio & (1u64 << r)) != 0 {
+                continue;
+            }
+            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+                audio |= 1u64 << r;
+            }
+        }
+        self.rig_held_mask = held;
+        self.rig_busy_mask = held | audio;
     }
 
     /// The master's loudness target as the engine holds it (self-tests).
@@ -4374,6 +4693,7 @@ impl GraphEngine {
                         self.graph.wire_instrument(id);
                     }
                 }
+                self.refresh_always_hosted();
                 let sr = self.sample_rate;
                 match &kind {
                     NodeKind::Dsp(dk) => {
@@ -4382,13 +4702,19 @@ impl GraphEngine {
                             self.dsp.push(slot);
                         }
                     }
-                    NodeKind::Lv2 { uri } => self.request_lv2(id, *uri),
+                    NodeKind::Lv2 { uri } => {
+                        if self.node_is_hosted(id) {
+                            self.request_lv2(id, *uri);
+                        }
+                    }
                     NodeKind::MidiFx { plugin } => {
                         if let Some(n) = self.graph.node(id) {
                             self.midi_fx.push(midi_fx_slot(n));
                         }
                         if let MidiFxPlugin::Lv2 { uri } = plugin {
-                            self.request_lv2(id, *uri);
+                            if self.node_is_hosted(id) {
+                                self.request_lv2(id, *uri);
+                            }
                         }
                         self.setup_midi_fx(id, wire);
                     }
@@ -4455,11 +4781,14 @@ impl GraphEngine {
                     let slot = self.lv2.remove(i);
                     self.retire_lv2(slot);
                 }
+                self.lv2_in_flight.retain(|&n| n != id);
+                self.lv2_dirty = true;
                 for s in &mut self.voices {
                     if s.node == id {
                         s.bind(NodeId::MAX);
                     }
                 }
+                self.refresh_always_hosted();
                 self.publish_graph();
             }
             Command::Connect { id, from, to, kind } => {
@@ -4476,6 +4805,7 @@ impl GraphEngine {
                     if kind == PortKind::Midi && self.is_midi_fx(from.node) {
                         self.route_midi_fx_outputs(from.node);
                     }
+                    self.refresh_always_hosted();
                     self.publish_graph();
                 }
             }
@@ -4496,6 +4826,7 @@ impl GraphEngine {
                 let had = self.graph.edges.iter().any(|e| e.id == id);
                 self.graph.disconnect(id);
                 if had {
+                    self.refresh_always_hosted();
                     self.publish_graph();
                 }
             }
@@ -4518,10 +4849,18 @@ impl GraphEngine {
             }
             Command::LoadLv2State { node, state } => {
                 let Some(NodeKind::Lv2 { uri }) = self.graph.node(node).map(|n| n.kind.clone()) else { return };
+                if !self.node_is_hosted(node) {
+                    return;
+                }
                 let gen = self.lv2_gen;
                 if let Some(tx) = self.lv2_req.as_mut() {
                     if tx.push(Lv2Request::State { node, uri, gen, state }).is_err() {
                         eprintln!("lv2 loader queue full: state for node {node} dropped");
+                    } else if !self.lv2_in_flight.contains(&node)
+                        && self.lv2_in_flight.len() < self.lv2_in_flight.capacity()
+                    {
+                        self.lv2_in_flight.push(node);
+                        self.lv2_dirty = true;
                     }
                     return;
                 }
@@ -4584,6 +4923,13 @@ impl GraphEngine {
                     self.retire_lv2(slot);
                 }
                 self.lv2_gen = self.lv2_gen.wrapping_add(1);
+                self.lv2_in_flight.clear();
+                self.lv2_dirty = true;
+                self.hosted_lv2_dirty = false;
+                self.rig_notes_down = [0u128; MAX_RIGS];
+                self.rig_sustain_mask = 0;
+                self.hosted_rigs = self.next_load_hosted_rigs.take().flatten();
+                self.refresh_always_hosted();
                 // The hosted voices move over to the new graph's Clap nodes;
                 // voices it has no node for stay free.
                 for v in &mut self.voices {
@@ -4630,6 +4976,9 @@ impl GraphEngine {
                 self.lv2_pending = [None; MAX_RIGS];
                 for i in 0..self.graph.nodes.len() {
                     let id = self.graph.nodes[i].id;
+                    if !self.node_is_hosted(id) {
+                        continue;
+                    }
                     match self.graph.nodes[i].kind {
                         NodeKind::Lv2 { uri } => self.request_lv2(id, uri),
                         NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { uri } } => self.request_lv2(id, uri),
@@ -4744,9 +5093,13 @@ impl GraphEngine {
                 // The edges of every rig the key reaches move, whichever rig
                 // took it; a keyboard no rig of an edge hears moves nothing.
                 if msg.is_note_on() {
+                    let bit = 1u128 << (note & 0x7F);
                     for (rig, zone) in self.rig_zones.iter().enumerate() {
                         if heard & (1 << rig) != 0 {
                             self.zone_hands.play(zone, note);
+                            if zone.live {
+                                self.rig_notes_down[rig] |= bit;
+                            }
                         }
                     }
                 }
@@ -4757,8 +5110,12 @@ impl GraphEngine {
                 }
                 let msg = MidiMsg::note_off(channel & 0x0F, note, 0);
                 self.matrix.route_into(source, msg, &mut self.route_out);
+                let bit = 1u128 << (note & 0x7F);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
+                    if let Some(rig) = self.graph.node(dest).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                        self.rig_notes_down[rig] &= !bit;
+                    }
                     self.deliver_keys_note(dest, note, m, 0.0, Some(source), None);
                 }
             }
@@ -4798,6 +5155,14 @@ impl GraphEngine {
             Command::SetShowControls { controls } => self.show.set_controls(controls),
             Command::SetShowParts { parts } => self.show.set_parts(parts),
             Command::SetShowPart { part } => self.show.set_part(part),
+            Command::SetHostedRigs { mask, for_next_load } => {
+                if for_next_load {
+                    self.next_load_hosted_rigs = Some(mask);
+                } else {
+                    self.hosted_rigs = mask;
+                    self.hosted_lv2_dirty = true;
+                }
+            }
             Command::SetStripMix { node, pan, mute, solo } => {
                 self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo, send: None });
             }
@@ -4944,6 +5309,20 @@ impl GraphEngine {
                 }
                 let msg = MidiMsg::cc(channel, cc, value);
                 self.matrix.route_into(source, msg, &mut self.route_out);
+                if cc == 64 {
+                    for i in 0..self.route_out.len() {
+                        let (dest, _) = self.route_out[i];
+                        if let Some(rig) = self.graph.node(dest).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                            if value >= 64 {
+                                if self.rig_zones[rig].live {
+                                    self.rig_sustain_mask |= 1u64 << rig;
+                                }
+                            } else {
+                                self.rig_sustain_mask &= !(1u64 << rig);
+                            }
+                        }
+                    }
+                }
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
                     let mapping = self
@@ -5327,7 +5706,11 @@ impl GraphEngine {
             Command::DemoStop => {
                 self.stop_demo();
             }
-            Command::Panic => self.panic(),
+            Command::Panic => {
+                self.rig_notes_down = [0u128; MAX_RIGS];
+                self.rig_sustain_mask = 0;
+                self.panic();
+            }
             Command::SetMasterMute { muted } => {
                 if self.master_mute != muted {
                     self.master_mute = muted;
@@ -5498,8 +5881,18 @@ impl GraphEngine {
         if let Some(rec) = &mut self.recorder {
             rec.drain_stems();
         }
+        // Drain newly-attached voices BEFORE commands so per-node setup
+        // commands (SetParam P_LEVEL, SetRigSource, SetRigDevice) pushed in
+        // the same frame as VoiceMsg::AddBound find the voice already bound
+        // (#207).
+        self.drain_voice_msgs();
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
+        }
+        if self.hosted_lv2_dirty {
+            self.hosted_lv2_dirty = false;
+            self.sync_hosted_lv2();
+            self.bind_free_voices();
         }
         self.drain_lv2_loader();
         // Sync-to-transport: begin the take the block the song clock starts at
@@ -5520,6 +5913,7 @@ impl GraphEngine {
         }
         self.drain_voice_msgs();
         self.publish_voices();
+        self.publish_lv2();
         // A plugin reported another latency while it ran the last block:
         // the delay lines follow before this one, without allocating.
         if self.latency_dirty {
@@ -6129,6 +6523,7 @@ impl GraphEngine {
         self.rig_buf = rig_v;
         self.bus_acc = bus_acc;
         self.out_mix = outs_v;
+        self.update_rig_busy_masks(n2);
         self.publish_meter();
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
@@ -6392,6 +6787,7 @@ pub use bench::bench;
 pub mod analysis_test;
 pub mod setlist_test;
 pub mod setlist_switch_test;
+pub mod setlist_window_test;
 mod gain_ramp;
 pub mod levels_test;
 
@@ -9736,7 +10132,7 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
         Instrument::Clap(id) => {
             let (voice, main) = crate::host::ClapVoice::new_plugin(sr, id)?;
             let controller = voice.controller();
-            (GraphEngine::new(g, drain, sr, vec![(node, voice)]), Some((main, controller)))
+            (GraphEngine::new(g, drain, sr, vec![(node, voice)]), Some((crate::host::HostedClapMain::Local(main), controller)))
         }
         Instrument::Lv2(uri) => {
             // The app's path: the loader thread instantiates the plugin.
@@ -12309,5 +12705,109 @@ mod send_tests {
         assert_eq!(knob_random_bounds(&NodeKind::Keys, "VEL", None, true), None);
         let (lo, hi) = knob_random_bounds(&NodeKind::Dsp(DspKind::Delay), "MIX", Some(P_MIX), true).unwrap();
         assert!(lo >= 0.0 && hi <= 0.8 && lo < hi);
+    }
+
+    #[test]
+    fn set_hosted_rigs_restricts_hosted_nodes_and_preserves_master_inserts() {
+        let mut g = Graph::default();
+        let mut synths = Vec::new();
+        let mut masters = Vec::new();
+        let mut eid = 1u32;
+        for rig in 0..4u8 {
+            let k = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            let s = g.add_node(
+                NodeKind::Clap { plugin_id: crate::control::ClapId::new(crate::control::SURGE_PLUGIN_ID) },
+                name_bytes("SYNTH"),
+            );
+            let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            for id in [k, s, m] {
+                g.set_rig(id, rig);
+            }
+            g.connect_with_id(eid, PortRef { node: k, port: 0 }, PortRef { node: s, port: 0 }, PortKind::Midi);
+            g.connect_with_id(eid + 1, PortRef { node: s, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+            eid += 2;
+            synths.push(s);
+            masters.push(m);
+        }
+        // Master insert on rig 0 stays hosted even when rig 0 is out of the window.
+        let master_fx = g.add_node(
+            NodeKind::Lv2 { uri: crate::control::Lv2Uri::new("http://example.org/master-comp") },
+            name_bytes("MASTER COMP"),
+        );
+        g.set_rig(master_fx, 0);
+        g.connect_with_id(eid, PortRef { node: masters[0], port: 0 }, PortRef { node: master_fx, port: 0 }, PortKind::Audio);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::default(), drain, 48_000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let mut buf = vec![0.0f32; 64 * 2];
+
+        // Priming for_next_load applies the mask to the immediately following LoadGraph.
+        bus.send(Command::SetHostedRigs { mask: Some(0b0110), for_next_load: true });
+        bus.send(Command::LoadGraph { graph: g.clone() });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.hosted_rigs(), Some(0b0110));
+        assert!(!engine.node_is_hosted(synths[0]));
+        assert!(engine.node_is_hosted(synths[1]));
+        assert!(engine.node_is_hosted(synths[2]));
+        assert!(!engine.node_is_hosted(synths[3]));
+        assert!(engine.node_is_hosted(master_fx), "master insert stays hosted");
+
+        // Live mask update slides the window.
+        bus.send(Command::SetHostedRigs { mask: Some(0b1100), for_next_load: false });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.hosted_rigs(), Some(0b1100));
+        assert!(!engine.node_is_hosted(synths[1]));
+        assert!(engine.node_is_hosted(synths[2]));
+        assert!(engine.node_is_hosted(synths[3]));
+
+        // Same-frame SetHostedRigs + LoadLv2State claims lv2_in_flight once (no duplicate Load).
+        let lv2_node = {
+            let mut g2 = g.clone();
+            let lv2 = g2.add_node(
+                NodeKind::Lv2 { uri: crate::control::Lv2Uri::new("http://example.org/synth") },
+                name_bytes("LV2 SYNTH"),
+            );
+            g2.set_rig(lv2, 1);
+            bus.send(Command::SetHostedRigs { mask: Some(0b0001), for_next_load: true });
+            bus.send(Command::LoadGraph { graph: g2 });
+            engine.spawn_lv2_loader();
+            engine.render(&mut buf, 2);
+            assert!(!engine.node_is_hosted(lv2));
+            bus.send(Command::SetHostedRigs { mask: Some(0b0011), for_next_load: false });
+            bus.send(Command::LoadLv2State { node: lv2, state: b"dummy-state".to_vec() });
+            engine.render(&mut buf, 2);
+            lv2
+        };
+        assert!(engine.node_is_hosted(lv2_node));
+        assert_eq!(
+            engine.lv2_in_flight.iter().filter(|&&n| n == lv2_node).count(),
+            1,
+            "SetHostedRigs + LoadLv2State in same frame must not double-queue lv2_in_flight"
+        );
+
+        // Plain LoadGraph without priming resets hosted_rigs back to None (all hosted).
+        bus.send(Command::LoadGraph { graph: g });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.hosted_rigs(), None);
+        assert!(synths.iter().all(|&s| engine.node_is_hosted(s)));
+
+        // Engine publishes rig_held_mask on NoteOn / sustain CC 64 and clears on NoteOff / CC 64 up.
+        bus.send(Command::NoteOn {
+            note: 60,
+            velocity: 0.8,
+            source: crate::matrix::SourceId::Keys,
+            channel: 0,
+        });
+        engine.render(&mut buf, 2);
+        assert_ne!(pub_.lock().unwrap().rig_held_mask & 1, 0, "rig 0 marked held on NoteOn");
+        bus.send(Command::NoteOff {
+            note: 60,
+            source: crate::matrix::SourceId::Keys,
+            channel: 0,
+        });
+        engine.render(&mut buf, 2);
+        assert_eq!(pub_.lock().unwrap().rig_held_mask & 1, 0, "rig 0 cleared on NoteOff");
     }
 }

@@ -14,14 +14,18 @@
 mod controls;
 mod instances;
 mod levels;
+mod window;
 pub use controls::msg_label;
-#[allow(unused_imports)] // #207 consumes these directly from crate::setlist
+#[allow(unused_imports)]
 pub use instances::{
     find_matching_rig, is_audio_effect, is_instrument_node, merge_rig_effects_into,
     rig_instrument_signature, FxBypass, InstrumentSig, MatchResult, RigInstances, SharingKind,
     ShowInstances, SoundChange,
 };
 pub use levels::{part_buses, source_str, Binding, Gates, Level, Levels, Set, SetId};
+pub use window::{
+    is_master_insert, is_plugin_node, SongLoadState, DEFAULT_LOAD_AHEAD, MAX_LOAD_AHEAD,
+};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -306,6 +310,11 @@ pub struct Setlist {
     pub sets: Vec<Set>,
     #[serde(skip_serializing_if = "Levels::is_empty")]
     pub levels: Levels,
+    /// Optional song load window (#207): when `Some(n)`, only the rigs of the
+    /// current song and the next `n` playable songs stay hosted in memory.
+    /// `None` (default) keeps every rig loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_ahead: Option<u8>,
 }
 
 impl Setlist {
@@ -319,6 +328,7 @@ impl Setlist {
             && self.program_devices.is_empty()
             && self.sets.is_empty()
             && self.levels.is_empty()
+            && self.load_ahead.is_none()
     }
 
     /// The currently active `(song, part)` if any.
@@ -688,6 +698,7 @@ impl Setlist {
         }
         self.normalize_controls();
         self.normalize_levels();
+        self.load_ahead = self.load_ahead.map(|n| n.clamp(1, MAX_LOAD_AHEAD));
         self.clamp_active();
     }
 
@@ -839,6 +850,11 @@ impl Setlist {
                 if self.set(id).is_none() {
                     bail!("A rig, bus or binding is at the level of a set that does not exist.");
                 }
+            }
+        }
+        if let Some(n) = self.load_ahead {
+            if n == 0 || n > MAX_LOAD_AHEAD {
+                bail!("Setlist load_ahead must be 1..={MAX_LOAD_AHEAD} (got {n}).");
             }
         }
         Ok(())

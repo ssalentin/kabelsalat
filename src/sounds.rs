@@ -8,7 +8,7 @@
 //! keeps the results (rules 46, 57).
 
 use crate::control::{Command, CommandBus, NodeId, NodeKind};
-use crate::host::{ClapVoiceMain, ParamDesc, VoiceController};
+use crate::host::{HostedClapMain, ParamDesc, VoiceController};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -393,7 +393,7 @@ pub fn loaded_answer(unit: &Unit, sound: &Sound, rig_name: &str) -> String {
 pub struct Target<'a> {
     pub node: NodeId,
     /// A CLAP instrument's main-thread half and its parameter ring.
-    pub clap: Option<(&'a mut ClapVoiceMain, &'a VoiceController)>,
+    pub clap: Option<(&'a mut HostedClapMain, &'a VoiceController)>,
     pub bus: Option<&'a mut CommandBus>,
 }
 
@@ -415,7 +415,7 @@ pub fn load(sound: &Sound, to: Target) -> Result<(), String> {
             let state = crate::host::fxp_to_state(&data).map_err(|e| e.to_string())?;
             plugin()?.0.load_state(&state).map_err(|e| e.to_string())
         }
-        Load::DexedVoice { syx, program } => crate::host::load_dexed_voice(plugin()?.0, syx, *program).map_err(|e| e.to_string()),
+        Load::DexedVoice { syx, program } => crate::host::load_dexed_voice_hosted(plugin()?.0, syx, *program).map_err(|e| e.to_string()),
         Load::ValueTreePatch(path) => {
             let data = std::fs::read(path).map_err(|e| format!("reading patch: {e}"))?;
             let state = crate::juce::value_tree_to_state(&data).map_err(|e| format!("{}: {e}", path.display()))?;

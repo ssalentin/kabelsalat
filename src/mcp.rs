@@ -242,6 +242,10 @@ fn setlist_json(st: &State) -> Value {
                 "key_hi": r.key_hi,
                 "transpose": r.transpose,
                 "level": r.level,
+                "vel_lo": r.vel_lo,
+                "vel_hi": r.vel_hi,
+                "vel_curve": r.curve.as_str(),
+                "float": r.float,
             })).collect();
             json!({ "index": pi, "name": p.name, "rigs": rigs, "buses": p.buses, "params_count": p.params.len() })
         }).collect();
@@ -300,13 +304,17 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
                     if (r.rig as usize) >= crate::setlist::MAX_RIGS {
                         return Err(format!("rig {} is out of range (0..{})", r.rig, crate::setlist::MAX_RIGS));
                     }
-                    part.set_rig(PartRig {
+                    let mut pr = PartRig {
                         rig: r.rig,
                         key_lo: r.key_lo.unwrap_or(0).min(127),
                         key_hi: r.key_hi.unwrap_or(127).min(127),
                         transpose: r.transpose.unwrap_or(0).clamp(-48, 48),
                         level: r.level.unwrap_or(1.0).clamp(0.0, 1.0),
-                    });
+                        ..PartRig::default()
+                    };
+                    let num = |v: Option<u8>| v.map(u64::from);
+                    pr.set_layer(num(r.vel_lo), num(r.vel_hi), r.vel_curve.as_deref(), num(r.float))?;
+                    part.set_rig(pr);
                 }
             }
             out.push(part);
@@ -668,6 +676,14 @@ struct SetlistPartRigArg {
     transpose: Option<i8>,
     /// Rig mixer level (0.0..=1.0, default 1.0).
     level: Option<f32>,
+    /// Lowest struck velocity that plays this rig (0..=127, default 0): a velocity layer.
+    vel_lo: Option<u8>,
+    /// Highest struck velocity that plays this rig (0..=127, default 127).
+    vel_hi: Option<u8>,
+    /// Velocity curve: "linear" (default), "soft" (quiet playing louder) or "hard" (needs a firmer touch).
+    vel_curve: Option<String>,
+    /// Floating split: keys (0..=12, default 0) each edge of the key range follows the hand that plays across it.
+    float: Option<u8>,
 }
 
 /// One part inside `set_setlist_song`.
@@ -4639,7 +4655,7 @@ impl McpServer {
     }
 
     /// Read the session's setlist (#204).
-    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.")]
+    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.")]
     fn get_setlist(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4650,7 +4666,7 @@ impl McpServer {
     }
 
     /// Add, update, reorder, or remove a song in the setlist (#204).
-    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs.")]
+    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?, vel_lo?, vel_hi?, vel_curve?, float?}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs. vel_lo/vel_hi make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60), vel_curve is linear | soft | hard, float (0..12 keys) lets the key range's edges follow the hand that plays across them (a floating split).")]
     fn set_setlist_song(&self, Parameters(args): Parameters<SetSetlistSongArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -5967,13 +5983,16 @@ mod tests {
             parts: Some(vec![
                 SetlistPartArg {
                     name: "Verse".into(),
-                    rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9) }]),
+                    rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9), vel_lo: None, vel_hi: None, vel_curve: None, float: None }]),
                     buses: None,
                     capture_knobs: None,
                 },
                 SetlistPartArg {
                     name: "Chorus".into(),
-                    rigs: Some(vec![SetlistPartRigArg { rig: 1, key_lo: Some(48), key_hi: Some(96), transpose: Some(12), level: Some(0.8) }]),
+                    rigs: Some(vec![SetlistPartRigArg {
+                        rig: 1, key_lo: Some(48), key_hi: Some(96), transpose: Some(12), level: Some(0.8),
+                        vel_lo: Some(64), vel_hi: None, vel_curve: Some("hard".into()), float: Some(3),
+                    }]),
                     buses: None,
                     capture_knobs: None,
                 },
@@ -6004,6 +6023,19 @@ mod tests {
         assert_eq!(fs["foot_switch"]["next_cc"]["cc"], json!(64));
         let got = tool_json(&server.get_setlist());
         assert_eq!(got["active"]["part"], json!(1));
+        let chorus = &got["songs"][0]["parts"][1]["rigs"][0];
+        assert_eq!((&chorus["vel_lo"], &chorus["vel_hi"], &chorus["vel_curve"], &chorus["float"]), (&json!(64), &json!(127), &json!("hard"), &json!(3)), "{chorus}");
+        let bad = server.set_setlist_song(Parameters(SetSetlistSongArgs {
+            song: Some(0), name: None, bpm: None, time_signature: None,
+            parts: Some(vec![SetlistPartArg {
+                name: "Solo".into(),
+                rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: None, key_hi: None, transpose: None, level: None, vel_lo: None, vel_hi: None, vel_curve: Some("loud".into()), float: None }]),
+                buses: None,
+                capture_knobs: None,
+            }]),
+            move_to: None, remove: None,
+        }));
+        assert_eq!(bad.unwrap().is_error, Some(true), "an unknown curve is refused, never defaulted");
     }
 
     #[test]

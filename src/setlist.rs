@@ -18,6 +18,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::control::{Graph, NodeId, RigZone};
+use crate::layer::{VelCurve, FLOAT_MAX};
 use crate::session::ParamValue;
 use crate::show::{ShowAction, ShowControl, ShowControls, ShowMsg, ShowPart, NO_SHOW_CONTROLS};
 use crate::transport::TimeSig;
@@ -39,6 +40,14 @@ pub struct PartRig {
     pub transpose: i8,
     /// Rig mixer level (0.0..=1.0) applied when this part is recalled.
     pub level: f32,
+    /// Struck velocity range (inclusive, 0..=127) that plays this rig: a
+    /// velocity layer (#276).
+    pub vel_lo: u8,
+    pub vel_hi: u8,
+    /// What the rig makes of the struck velocity.
+    pub curve: VelCurve,
+    /// Keys each edge of the key range follows the hands (0..=12, 0 = fixed).
+    pub float: u8,
 }
 
 impl Default for PartRig {
@@ -49,6 +58,10 @@ impl Default for PartRig {
             key_hi: 127,
             transpose: 0,
             level: 1.0,
+            vel_lo: 0,
+            vel_hi: 127,
+            curve: VelCurve::Linear,
+            float: 0,
         }
     }
 }
@@ -58,16 +71,34 @@ impl PartRig {
         Self { rig, ..Self::default() }
     }
 
-    /// Convert to the engine's [`RigZone`] (always `live: true`, range ordered).
+    /// Convert to the engine's [`RigZone`] (always `live: true`, ranges ordered).
     pub fn to_zone(self) -> RigZone {
-        let lo = self.key_lo.min(127);
-        let hi = self.key_hi.min(127);
+        let (lo, hi) = (self.key_lo.min(127), self.key_hi.min(127));
+        let (vlo, vhi) = (self.vel_lo.min(127), self.vel_hi.min(127));
         RigZone {
             live: true,
             key_lo: lo.min(hi),
             key_hi: lo.max(hi),
             transpose: self.transpose.clamp(-48, 48),
+            vel_lo: vlo.min(vhi),
+            vel_hi: vlo.max(vhi),
+            curve: self.curve,
+            float: self.float.min(FLOAT_MAX),
         }
+    }
+
+    /// The velocity layer and floating split an agent tool names; what it
+    /// leaves out stays as it is.
+    pub fn set_layer(&mut self, vel_lo: Option<u64>, vel_hi: Option<u64>, curve: Option<&str>, float: Option<u64>) -> Result<(), String> {
+        if let Some(c) = curve {
+            self.curve = VelCurve::parse(c)?;
+        }
+        let (lo, hi) = (vel_lo.map_or(self.vel_lo, |v| v.min(127) as u8), vel_hi.map_or(self.vel_hi, |v| v.min(127) as u8));
+        (self.vel_lo, self.vel_hi) = (lo.min(hi), lo.max(hi));
+        if let Some(f) = float {
+            self.float = f.min(FLOAT_MAX as u64) as u8;
+        }
+        Ok(())
     }
 }
 
@@ -640,8 +671,8 @@ mod tests {
                 Part::new(
                     "Chorus",
                     vec![
-                        PartRig { rig: 0, key_lo: 0, key_hi: 59, transpose: 0, level: 0.9 },
-                        PartRig { rig: 1, key_lo: 60, key_hi: 127, transpose: 12, level: 0.8 },
+                        PartRig { rig: 0, key_lo: 0, key_hi: 59, transpose: 0, level: 0.9, ..PartRig::default() },
+                        PartRig { rig: 1, key_lo: 60, key_hi: 127, transpose: 12, level: 0.8, ..PartRig::default() },
                     ],
                 ),
             ],
@@ -720,6 +751,22 @@ mod tests {
         assert_eq!(sl.active, Some(SetlistPos { song: 1, part: 1 }));
         assert!(sl.remove_song(1).is_some());
         assert_eq!(sl.active, Some(SetlistPos { song: 0, part: 0 }));
+    }
+
+    #[test]
+    fn a_velocity_layer_and_a_floating_split_reach_the_zone_and_survive_a_save() {
+        let mut pad = PartRig::new(1);
+        pad.set_layer(Some(90), Some(20), Some("soft"), Some(40)).unwrap();
+        assert_eq!((pad.vel_lo, pad.vel_hi, pad.curve, pad.float), (20, 90, VelCurve::Soft, FLOAT_MAX), "ranges ordered, float capped");
+        pad.set_layer(None, Some(100), None, None).unwrap();
+        assert_eq!((pad.vel_lo, pad.vel_hi, pad.curve), (20, 100, VelCurve::Soft), "what a call leaves out stays");
+        assert!(pad.set_layer(None, None, Some("loud"), None).is_err());
+        let z = pad.to_zone();
+        assert_eq!((z.vel_lo, z.vel_hi, z.curve, z.float), (20, 100, VelCurve::Soft, FLOAT_MAX));
+        let back: PartRig = serde_json::from_str(&serde_json::to_string(&pad).unwrap()).unwrap();
+        assert_eq!(back, pad, "the layer is saved with the session");
+        let old: PartRig = serde_json::from_str(r#"{"rig":0,"key_lo":0,"key_hi":59,"transpose":0,"level":0.9}"#).unwrap();
+        assert_eq!(old.to_zone(), RigZone { key_hi: 59, ..RigZone::OPEN }, "a part saved before #276 plays every velocity, with a fixed split");
     }
 
     #[test]

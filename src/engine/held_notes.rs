@@ -37,11 +37,16 @@
 //! transpose stacks on. A step taps a switch (press, then release): only the
 //! press moves the zones, the release moves nothing.
 //!
+//! The layers scenario (#276) plays the same two rigs soft and hard through
+//! velocity layers, velocity curves and a floating split, whose hands
+//! (where each rig last saw a note-on) are part of the state.
+//!
 //! Run + interpret: `.claude/skills/verify-held-notes/SKILL.md`.
 
 use super::GraphEngine;
 use crate::arp::{Scale, ScaleChoice};
 use crate::control::{command_bus, name_bytes, Command, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef, RigZone};
+use crate::layer::VelCurve;
 use crate::matrix::SourceId;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -83,6 +88,8 @@ pub(super) enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     On(u8),
+    /// A soft press (velocity 0.3 = 38) of a key: another velocity layer.
+    Soft(u8),
     Off(u8),
     Edit(Edit),
     /// Time passes: every arp steps through a window that holds its next onset.
@@ -132,6 +139,8 @@ enum Edit {
     DemoStop,
     /// SetRigZones with `SONGS[n]` for rigs 0 (Surge A) and 1 (Surge B).
     Zones(u8),
+    /// SetRigZones with `LAYER_SONGS[n]`, like `Zones`.
+    Layers(u8),
     /// SetStripBypass on a node (#305).
     Bypass(u32, bool),
     /// A tap on a foot switch: hardware CC `NEXT_CC` or `PREV_CC` down, then up.
@@ -148,6 +157,7 @@ enum Scenario {
     Fx,
     Demo,
     Zones,
+    Layers,
     Bypass,
     FootSwitch,
 }
@@ -220,6 +230,43 @@ const SONGS: [[RigZone; 2]; 5] = [
     [RigZone { transpose: 2, ..RigZone::OPEN }, RigZone { transpose: -12, ..OFF }],
 ];
 
+/// The songs of the layers scenario (#276), as (rig 0, rig 1): both open, a
+/// soft and a hard layer with their curves, the same layers swapped, a split
+/// at C4 floating two keys (59 and 60 are each inside the other side's
+/// float) with rig 1 transposed, and that split with rig 1 out of the song.
+const LAYER_SONGS: [[RigZone; 2]; 5] = [
+    [RigZone::OPEN, RigZone::OPEN],
+    [
+        RigZone { vel_hi: 63, curve: VelCurve::Soft, ..RigZone::OPEN },
+        RigZone { vel_lo: 64, curve: VelCurve::Hard, ..RigZone::OPEN },
+    ],
+    [RigZone { vel_lo: 64, ..RigZone::OPEN }, RigZone { vel_hi: 63, ..RigZone::OPEN }],
+    [
+        RigZone { key_hi: 59, float: 2, ..RigZone::OPEN },
+        RigZone { key_lo: 60, float: 2, transpose: 12, ..RigZone::OPEN },
+    ],
+    [RigZone { key_hi: 59, float: 2, ..RigZone::OPEN }, RigZone { key_lo: 60, float: 2, transpose: 12, ..OFF }],
+]; 9] = [
+    [RigZone::OPEN, RigZone::OPEN],
+    [RigZone::OPEN, OFF],
+    [OFF, RigZone::OPEN],
+    [
+        RigZone { key_hi: 59, ..RigZone::OPEN },
+        RigZone { key_lo: 60, transpose: 12, ..RigZone::OPEN },
+    ],
+    [RigZone { transpose: 2, ..RigZone::OPEN }, RigZone { transpose: -12, ..OFF }],
+    [
+        RigZone { vel_hi: 63, curve: VelCurve::Soft, ..RigZone::OPEN },
+        RigZone { vel_lo: 64, curve: VelCurve::Hard, ..RigZone::OPEN },
+    ],
+    [RigZone { vel_lo: 64, ..RigZone::OPEN }, RigZone { vel_hi: 63, ..RigZone::OPEN }],
+    [
+        RigZone { key_hi: 59, float: 2, ..RigZone::OPEN },
+        RigZone { key_lo: 60, float: 2, transpose: 12, ..RigZone::OPEN },
+    ],
+    [RigZone { key_hi: 59, float: 2, ..RigZone::OPEN }, RigZone { key_lo: 60, float: 2, transpose: 12, ..OFF }],
+];
+
 /// Edits of the zones scenario: every song, and the routing edits that
 /// change what the zone's transpose is added to (matrix transpose, split
 /// port) or whether a note reaches the rig at all (cable).
@@ -248,6 +295,19 @@ const SWITCH_EDITS: [Edit; 8] = [
     Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
     Edit::Split(Some(60)),
     Edit::Split(None),
+];
+
+/// Edits of the layers scenario (#276): its songs, the plain one, and the
+/// routing edits a layer's note passes through (matrix transpose, cable).
+const LAYER_EDITS: [Edit; 8] = [
+    Edit::Layers(0),
+    Edit::Layers(1),
+    Edit::Layers(2),
+    Edit::Layers(3),
+    Edit::Layers(4),
+    Edit::Rule { dest: SURGE_B, transpose: -12, enabled: true },
+    Edit::Rule { dest: SURGE_B, transpose: 0, enabled: true },
+    Edit::Unplug(6),
 ];
 
 /// Edits of the arp scenario. Knob percents land on the stepped knobs'
@@ -319,7 +379,7 @@ impl Edit {
             Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
             Edit::Source { .. } => Kind::Source,
             Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
-            Edit::Zones(_) | Edit::Switch(_) => Kind::Zone,
+            Edit::Zones(_) | Edit::Layers(_) | Edit::Switch(_) => Kind::Zone,
             Edit::Bypass(..) => Kind::Bypass,
         }
     }
@@ -405,6 +465,11 @@ impl Edit {
                 zones[..2].copy_from_slice(&SONGS[n as usize]);
                 Command::SetRigZones { zones }
             }
+            Edit::Layers(n) => {
+                let mut zones = [RigZone::OPEN; 8];
+                zones[..2].copy_from_slice(&LAYER_SONGS[n as usize]);
+                Command::SetRigZones { zones }
+            }
             Edit::Bypass(node, bypass) => Command::SetStripBypass { node, bypass },
             Edit::Switch(cc) => switch(cc, 127),
         }
@@ -483,7 +548,7 @@ fn start_graph_for(scn: Scenario) -> Graph {
     match scn {
         Scenario::RoutingWithStrip | Scenario::Fx | Scenario::Bypass => start_graph_with_strip(),
         Scenario::Routing | Scenario::Arp | Scenario::Demo => start_graph(),
-        Scenario::Zones | Scenario::FootSwitch => start_graph_two_rigs(),
+        Scenario::Zones | Scenario::FootSwitch | Scenario::Layers => start_graph_two_rigs(),
     }
 }
 
@@ -537,7 +602,7 @@ impl Run {
 
     fn enabled(&self, step: Step) -> bool {
         match step {
-            Step::On(k) => !self.held.contains_key(&k),
+            Step::On(k) | Step::Soft(k) => !self.held.contains_key(&k),
             Step::Off(k) => self.held.contains_key(&k),
             Step::Edit(Edit::AddArp) => !self.arp_added,
             Step::Edit(_) | Step::Tick => true,
@@ -549,6 +614,7 @@ impl Run {
     fn step(&mut self, step: Step) -> Vec<(u32, u8)> {
         let (cmd, key) = match step {
             Step::On(k) => (Some(Command::NoteOn { note: k, velocity: 0.8, source: SourceId::Keys, channel: 0 }), Some(k)),
+            Step::Soft(k) => (Some(Command::NoteOn { note: k, velocity: 0.3, source: SourceId::Keys, channel: 0 }), Some(k)),
             Step::Off(k) => (Some(Command::NoteOff { note: k, source: SourceId::Keys, channel: 0 }), Some(k)),
             Step::Edit(e) => (Some(e.command(self.scn)), None),
             Step::Tick => (None, None),
@@ -576,7 +642,7 @@ impl Run {
             }
         }
         match step {
-            Step::On(k) => {
+            Step::On(k) | Step::Soft(k) => {
                 self.held.insert(k, BTreeSet::new());
                 Vec::new()
             }
@@ -646,7 +712,11 @@ impl Run {
         // does not need to keep. Of the show state only the part counts: the
         // switches are tapped (never left down) and the step counter only grows.
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{routing}|{fx:?}|{bypassed:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}|{:?}", self.held, self.sounding, self.arp_added, self.engine.rig_zones, self.engine.show.part()).hash(&mut h);
+        format!(
+            "{routing}|{fx:?}|{bypassed:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}|{:?}|{:?}",
+            self.held, self.sounding, self.arp_added, self.engine.rig_zones, self.engine.show.part(), self.engine.zone_hands,
+        )
+        .hash(&mut h);
         h.finish()
     }
 }
@@ -654,6 +724,7 @@ impl Run {
 fn describe(step: Step) -> String {
     match step {
         Step::On(k) => format!("NoteOn {k}"),
+        Step::Soft(k) => format!("NoteOn {k} soft (velocity 38)"),
         Step::Off(k) => format!("NoteOff {k}"),
         Step::Edit(Edit::Split(p)) => format!("SetNodeSplit {p:?}"),
         Step::Edit(Edit::ZoneOctave { zone, octave }) => format!("SetZoneOctave zone {zone} {octave:+}"),
@@ -690,6 +761,7 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::DemoPlay(kind)) => format!("DemoPlay rig 0 {kind:?}"),
         Step::Edit(Edit::DemoStop) => "DemoStop".to_string(),
         Step::Edit(Edit::Zones(n)) => format!("SetRigZones (rig 0, rig 1) = {:?}", SONGS[n as usize]),
+        Step::Edit(Edit::Layers(n)) => format!("SetRigZones (rig 0, rig 1) = {:?}", LAYER_SONGS[n as usize]),
         Step::Edit(Edit::Bypass(node, on)) => format!("SetStripBypass node {node} = {on}"),
         Step::Edit(Edit::Switch(cc)) => format!("Tap foot switch CC {cc}"),
         Step::Tick => "Tick (time passes)".to_string(),
@@ -756,6 +828,14 @@ pub(super) fn explore_zones(max_states: usize) -> Report {
     alphabet.extend(ZONE_EDITS.iter().map(|&e| Step::Edit(e)));
     alphabet.push(Step::Edit(Edit::LoadStart));
     explore_with(&alphabet, max_states, Scenario::Zones)
+}
+
+/// Velocity layers, curves and a floating split over two rigs (#276).
+pub(super) fn explore_layers(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Soft(k), Step::Off(k)]).collect();
+    alphabet.extend(LAYER_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::Layers)
 }
 
 /// Unit bypass toggles on an instrument and a MIDI strip (#305).
@@ -871,6 +951,21 @@ fn held_notes_are_released_across_foot_switch_steps() {
     }
     assert!(report.stuck.is_empty(), "stuck notes across foot-switch steps (traces above)");
     assert!(report.complete, "state bound hit before fixpoint: the foot-switch alphabet's state space grew");
+}
+
+#[test]
+fn held_notes_are_released_across_velocity_layers_and_a_floating_split() {
+    let report = explore_layers(100_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (layers): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes across velocity layers and a floating split (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the layers alphabet's state space grew");
 }
 
 #[test]

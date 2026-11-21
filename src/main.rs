@@ -29,6 +29,7 @@ mod engine_info;
 mod guitar;
 mod host;
 mod juce;
+mod layer;
 mod keyboard;
 mod listen;
 mod llm;

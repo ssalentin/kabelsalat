@@ -2640,7 +2640,7 @@ mod tests {
         let mut s = sample_session();
         let mut verse = Part::new(
             "Verse",
-            vec![PartRig { rig: 0, key_lo: 36, key_hi: 84, transpose: -12, level: 0.8 }],
+            vec![PartRig { rig: 0, key_lo: 36, key_hi: 84, transpose: -12, level: 0.8, ..PartRig::default() }],
         );
         verse.set_param(1, P_LEVEL, 0.65);
         let mut song = Song::new("Opener", vec![verse]);

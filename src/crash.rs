@@ -838,8 +838,7 @@ fn source_path(path: &str) -> Option<String> {
     Some(if published || std { format!("{krate}/{file}") } else { file.to_string() })
 }
 
-/// The engine commands noted since start, oldest first, as a report shows
-/// them (for the app's own crash notice and tests).
+/// The commands section of a report, for `ring`.
 #[cfg(test)]
 fn commands_text(ring: &Ring) -> String {
     let mut v = Vec::new();

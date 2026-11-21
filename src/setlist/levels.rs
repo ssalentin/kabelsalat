@@ -150,15 +150,40 @@ impl Setlist {
         pinned(&self.levels.buses, &bus).unwrap_or(if self.named_bus(bus) { Level::Song } else { Level::Show })
     }
 
-    /// A binding's level: its pin, else show for a mixer binding, else the
-    /// level of the rig its destination is in.
+    /// A binding's level: its pin, else show for a mixer binding or one on a
+    /// master or aux bus (`follows_no_rig`), else the level of its rig.
     pub fn binding_level(&self, b: Binding, target: CcTarget, graph: &Graph) -> Level {
         if let Some(l) = pinned(&self.levels.bindings, &b) {
             return l;
         }
-        match (target, graph.node(b.dest)) {
-            (CcTarget::Mix, _) | (_, None) => Level::Show,
-            (_, Some(n)) => self.rig_level(n.rig),
+        match graph.node(b.dest) {
+            Some(n) if target != CcTarget::Mix && !follows_no_rig(graph, b.dest) => self.rig_level(n.rig),
+            _ => Level::Show,
+        }
+    }
+
+    /// Does binding `b` move anything in the active part? The engine decides
+    /// the same from the gates (`Command::SetBindingLive` for pinned ones,
+    /// its zone rule for the others); the app's knob mirror asks this.
+    pub fn binding_works(&self, b: Binding, target: CcTarget, graph: &Graph) -> bool {
+        let zones = self.active_zones();
+        match pinned(&self.levels.bindings, &b) {
+            Some(level) => self.pinned_binding_live(b, level, graph, &zones),
+            None if target == CcTarget::Mix || follows_no_rig(graph, b.dest) => true,
+            None => graph.node(b.dest).map_or(true, |n| zones.get(n.rig as usize).is_none_or(|z| z.live)),
+        }
+    }
+
+    /// A pinned binding in the active part. At song level a binding on an
+    /// aux bus works while the bus takes signal, any other while its rig plays.
+    fn pinned_binding_live(&self, b: Binding, level: Level, graph: &Graph, zones: &[RigZone; MAX_RIGS]) -> bool {
+        match level {
+            Level::Song if graph.is_bus(b.dest) => {
+                let named = self.current().is_some_and(|(_, p, _)| p.buses.contains(&b.dest));
+                self.live_at(self.bus_level(b.dest), named)
+            }
+            Level::Song => graph.node(b.dest).map_or(true, |n| zones.get(n.rig as usize).is_none_or(|z| z.live)),
+            level => self.live_at(level, false),
         }
     }
 
@@ -219,18 +244,7 @@ impl Setlist {
             .map(|n| n.id)
             .collect();
         let zones = self.active_zones();
-        let bindings = self
-            .levels
-            .bindings
-            .iter()
-            .map(|p| {
-                let live = match p.level {
-                    Level::Song => graph.node(p.of.dest).map_or(true, |n| zones.get(n.rig as usize).is_none_or(|z| z.live)),
-                    level => self.live_at(level, false),
-                };
-                (p.of, live)
-            })
-            .collect();
+        let bindings = self.levels.bindings.iter().map(|p| (p.of, self.pinned_binding_live(p.of, p.level, graph, &zones))).collect();
         Gates { zones, closed_buses, bindings }
     }
 
@@ -265,6 +279,39 @@ impl Setlist {
         };
         self.sets.push(Set { id, name, skip: false });
         id
+    }
+
+    /// The rig a new song or part starts with: `preferred` (the rig in view),
+    /// else the first rig, at song level. While no rig is at song level yet
+    /// (a new setlist), the first of them that is not pinned. `None`: the
+    /// part starts empty, so a show-level rig is never pulled into a song,
+    /// and out of every other song, by accident.
+    pub fn default_part_rig(&self, preferred: u8, rigs: usize) -> Option<u8> {
+        let rigs = rigs.min(MAX_RIGS) as u8;
+        let order = || std::iter::once(preferred).chain(0..rigs).filter(move |&r| r < rigs);
+        if (0..rigs).any(|r| self.rig_level(r) == Level::Song) {
+            order().find(|&r| self.rig_level(r) == Level::Song)
+        } else {
+            order().find(|&r| pinned(&self.levels.rigs, &r).is_none())
+        }
+    }
+
+    /// After song `at` moved: inside another set's block it joins that set;
+    /// it stays in its own set while it still touches one of its songs, and
+    /// otherwise leaves it. Then every set is one block again.
+    pub(super) fn settle_moved_song(&mut self, at: usize) {
+        if self.sets.is_empty() || at >= self.songs.len() {
+            return;
+        }
+        let set_at = |i: Option<usize>| i.and_then(|i| self.songs.get(i)).and_then(|s| s.set);
+        let (prev, next) = (set_at(at.checked_sub(1)), set_at(Some(at + 1)));
+        let own = self.songs[at].set;
+        self.songs[at].set = match (prev, next) {
+            (Some(p), Some(n)) if p == n => Some(p),
+            _ if own.is_some() && (prev == own || next == own) => own,
+            _ => None,
+        };
+        self.group_sets();
     }
 
     /// Put song `song` into `set` (or into none), at the end of the set's
@@ -545,6 +592,13 @@ impl Setlist {
     /// `set_level`: pin one rig, bus or binding to show, song or a set.
     /// `bindings` lists the matrix's bindings, to refuse one that is not there.
     pub fn apply_set_level(&mut self, graph: &Graph, bindings: &[(Binding, CcTarget)], args: &Value) -> Result<String, String> {
+        let mut next = self.clone();
+        let msg = next.set_level_from(graph, bindings, args)?;
+        *self = next;
+        Ok(msg)
+    }
+
+    fn set_level_from(&mut self, graph: &Graph, bindings: &[(Binding, CcTarget)], args: &Value) -> Result<String, String> {
         let level = match args.get("level").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() {
             Some("show") => Level::Show,
             Some("song") => Level::Song,
@@ -582,7 +636,15 @@ impl Setlist {
     }
 
     /// `set_setlist_set`: make, rename, fill, skip, move or remove a set.
+    /// Nothing changes when any part of the call is refused.
     pub fn apply_setlist_set(&mut self, args: &Value) -> Result<String, String> {
+        let mut next = self.clone();
+        let msg = next.setlist_set_from(args)?;
+        *self = next;
+        Ok(msg)
+    }
+
+    fn setlist_set_from(&mut self, args: &Value) -> Result<String, String> {
         let id = match args.get("set") {
             Some(v) if !v.is_null() => self.find_set(v)?,
             _ => {
@@ -640,6 +702,11 @@ fn song_list(v: &Value) -> Result<Vec<usize>, String> {
             .collect(),
         _ => Err(bad()),
     }
+}
+
+/// A master or aux bus: a mix control that no rig's zone gates.
+fn follows_no_rig(graph: &Graph, node: NodeId) -> bool {
+    graph.is_bus(node) || graph.node(node).is_some_and(|n| matches!(n.kind, crate::control::NodeKind::MasterOut))
 }
 
 fn dedup_pins<K: PartialEq>(pins: &mut Vec<Pin<K>>) {
@@ -848,6 +915,56 @@ mod tests {
     }
 
     #[test]
+    fn a_new_part_never_pulls_a_show_level_rig_into_a_song() {
+        let mut sl = Setlist::default();
+        assert_eq!(sl.default_part_rig(0, 3), Some(0), "a new setlist starts with the rig in view");
+        sl.pin_rig(0, Level::Show);
+        assert_eq!(sl.default_part_rig(0, 3), Some(1), "a pinned show rig is skipped");
+        sl.levels.rigs.clear();
+        sl.songs.push(song("A", &[1]));
+        assert_eq!(sl.default_part_rig(0, 3), Some(1), "rig 0, at show level, stays out; a song-level rig is taken");
+        let mut all_show = Setlist::default();
+        (0..3).for_each(|r| all_show.pin_rig(r, Level::Show));
+        assert_eq!(all_show.default_part_rig(0, 3), None, "every rig at show level: the part starts empty");
+    }
+
+    #[test]
+    fn a_moved_song_joins_the_set_it_lands_in_and_sets_stay_blocks() {
+        let names = |sl: &Setlist| sl.songs.iter().map(|s| format!("{}{}", s.name, if s.set.is_some() { "*" } else { "" })).collect::<Vec<_>>().join(" ");
+        let mut sl = Setlist { songs: ["A", "B", "C"].iter().map(|n| song(n, &[1])).collect(), ..Setlist::default() };
+        let set = sl.add_set("One");
+        sl.set_members(set, &[0, 1]).unwrap();
+        assert!(sl.move_song(2, 1));
+        assert_eq!(names(&sl), "A* C* B*", "moved into the middle of a set, it joins it");
+        assert!(sl.move_song(1, 0));
+        assert_eq!(names(&sl), "C* A* B*", "at the block's edge it stays in its set");
+        assert_eq!(sl.move_set(set, false), None, "the set is one block: nothing to move past");
+        let mut sl = Setlist { songs: ["A", "B", "C"].iter().map(|n| song(n, &[1])).collect(), ..Setlist::default() };
+        let set = sl.add_set("One");
+        sl.set_members(set, &[0, 1]).unwrap();
+        assert!(sl.move_song(0, 2));
+        assert_eq!(names(&sl), "B* C A", "moved away from its set, it leaves it");
+    }
+
+    #[test]
+    fn a_binding_on_a_master_or_a_bus_follows_no_rig() {
+        let (g, bus) = three_rigs();
+        let master2 = g.nodes.iter().find(|n| n.rig == 2 && matches!(n.kind, NodeKind::MasterOut)).unwrap().id;
+        let keys2 = g.nodes.iter().find(|n| n.rig == 2 && matches!(n.kind, NodeKind::Keys)).unwrap().id;
+        let mut sl = Setlist { songs: vec![song("A", &[1]), song("B", &[2])], ..Setlist::default() };
+        at(&mut sl, 0);
+        let b = |dest| Binding { source: SourceId::Hardware(0), dest, cc: 7 };
+        assert_eq!(sl.binding_level(b(master2), CcTarget::Knob, &g), Level::Show, "the master volume is no rig's");
+        assert!(sl.binding_works(b(master2), CcTarget::Knob, &g), "it works while rig 2 is out of the song");
+        assert!(!sl.binding_works(b(keys2), CcTarget::Knob, &g), "a knob of rig 2 waits");
+        sl.pin_bus(bus, Level::Song);
+        sl.pin_binding(b(bus), Level::Song);
+        assert!(!sl.binding_works(b(bus), CcTarget::Knob, &g), "a song-level bus binding follows the bus, not the bus's rig");
+        sl.songs[0].parts[0].buses.push(bus);
+        assert!(sl.binding_works(b(bus), CcTarget::Knob, &g));
+    }
+
+    #[test]
     fn levels_and_sets_follow_a_rig_delete_and_a_renumbering() {
         let mut sl = Setlist { songs: vec![song("A", &[1, 2])], ..Setlist::default() };
         let set = sl.add_set("Encore");
@@ -895,6 +1012,8 @@ mod tests {
         let bindings = [(pedal, CcTarget::Knob)];
         let mut sl = Setlist { songs: vec![song("A", &[1]), song("B", &[2])], ..Setlist::default() };
         assert!(sl.apply_setlist_set(&json!({"songs": "0,1"})).is_err(), "a new set needs a name");
+        assert!(sl.apply_setlist_set(&json!({"name": "Encore", "songs": "99"})).is_err());
+        assert!(sl.sets.is_empty(), "a refused call leaves no half-made set behind");
         sl.apply_setlist_set(&json!({"name": "Acoustic", "songs": "[1]"})).unwrap();
         sl.apply_setlist_set(&json!({"set": "acoustic", "skip": true, "name": "Unplugged"})).unwrap();
         assert_eq!((sl.sets[0].name.as_str(), sl.sets[0].skip, sl.songs[1].set), ("Unplugged", true, Some(sl.sets[0].id)));

@@ -42,6 +42,16 @@ impl ShowGates {
         self.bus_gain = [NO_BUS; MAX_BUSES];
     }
 
+    /// A removed bus: its slots are free again.
+    pub fn forget_bus(&mut self, bus: NodeId) {
+        for b in self.closed_buses.iter_mut().filter(|b| **b == bus) {
+            *b = NodeId::MAX;
+        }
+        for g in self.bus_gain.iter_mut().filter(|g| g.0 == bus) {
+            *g = NO_BUS;
+        }
+    }
+
     pub fn set_bus(&mut self, bus: NodeId, live: bool) {
         let at = self.closed_buses.iter().position(|&b| b == bus);
         match (at, live) {
@@ -131,6 +141,21 @@ mod tests {
         let mut block = vec![1.0f32; 8];
         g.gate_bus_input(7, &mut block);
         assert_eq!(block, vec![1.0; 8]);
+    }
+
+    #[test]
+    fn a_removed_bus_frees_its_slots() {
+        let mut g = ShowGates::new();
+        for bus in 0..MAX_BUSES as NodeId {
+            g.set_bus(bus, false);
+            g.gate_bus_input(bus, &mut [1.0; 2]);
+        }
+        g.forget_bus(3);
+        g.set_bus(100, false);
+        let mut block = vec![1.0f32; 2];
+        g.gate_bus_input(100, &mut block);
+        g.gate_bus_input(100, &mut block);
+        assert_eq!(block, vec![0.0; 2], "the freed slot closes a new bus");
     }
 
     #[test]

@@ -50,6 +50,23 @@ impl DemoApp {
         }
     }
 
+    /// The gates the live part has now; `None` while no part is active.
+    pub(super) fn show_gates_now(&self) -> Option<crate::setlist::Gates> {
+        self.setlist.active.is_some().then(|| self.setlist.gates(&self.mirror_graph()))
+    }
+
+    /// The rig a new song or part starts with (`Setlist::default_part_rig`),
+    /// at its current fader level.
+    pub(super) fn default_part_rigs(&self) -> Vec<crate::setlist::PartRig> {
+        let n = self.rig_count();
+        let preferred = self.active_rig.min(n.saturating_sub(1)) as u8;
+        self.setlist
+            .default_part_rig(preferred, n)
+            .map(|rig| crate::setlist::PartRig { rig, level: self.rig_mix[rig as usize].vol, ..Default::default() })
+            .into_iter()
+            .collect()
+    }
+
     pub(super) fn level_of(&self, item: LevelItem) -> Level {
         match item {
             LevelItem::Rig(r) => self.setlist.rig_level(r),
@@ -135,12 +152,14 @@ impl DemoApp {
                 if self.setlist.sets.is_empty() {
                     ui.label(egui::RichText::new("No sets: every song stands on its own.").size(12.0).color(theme::INK_2));
                 }
-                let n_sets = self.setlist.sets.len();
-                for i in 0..n_sets {
+                for i in 0..self.setlist.sets.len() {
                     let (id, mut name, skip) = {
                         let s = &self.setlist.sets[i];
                         (s.id, s.name.clone(), s.skip)
                     };
+                    let members: Vec<usize> = (0..self.setlist.songs.len()).filter(|&j| self.setlist.songs[j].set == Some(id)).collect();
+                    let can_up = members.first().is_some_and(|&f| f > 0);
+                    let can_down = members.last().is_some_and(|&l| l + 1 < self.setlist.songs.len());
                     egui::Frame::new()
                         .fill(theme::DARK_PANEL_HI)
                         .stroke(Stroke::new(1.0, theme::HAIRLINE))
@@ -157,10 +176,10 @@ impl DemoApp {
                                     if theme::chip_button(ui, "×", false).on_hover_text("remove the set (its songs stay)").clicked() {
                                         edits.push(SetEdit::Remove(id));
                                     }
-                                    if i + 1 < n_sets && theme::chip_button(ui, "↓", false).on_hover_text("move the set down").clicked() {
+                                    if can_down && theme::chip_button(ui, "↓", false).on_hover_text("move the set down").clicked() {
                                         edits.push(SetEdit::Move(id, false));
                                     }
-                                    if i > 0 && theme::chip_button(ui, "↑", false).on_hover_text("move the set up").clicked() {
+                                    if can_up && theme::chip_button(ui, "↑", false).on_hover_text("move the set up").clicked() {
                                         edits.push(SetEdit::Move(id, true));
                                     }
                                     if theme::chip_button(ui, "Skip", skip).on_hover_text("stepping jumps over this set's songs").clicked() {
@@ -223,7 +242,6 @@ impl DemoApp {
                 }
             });
 
-        let mut regroup = false;
         for e in edits {
             match e {
                 SetEdit::Add => {
@@ -249,19 +267,14 @@ impl DemoApp {
                 }
                 SetEdit::Remove(id) => {
                     self.setlist.remove_set(id);
-                    regroup = true;
                 }
                 SetEdit::Member(id, song, on) => {
                     let new = self.setlist.assign_set(song, on.then_some(id));
                     if self.setlist_edit_song == Some(song) {
                         self.setlist_edit_song = new;
                     }
-                    regroup = true;
                 }
             }
-        }
-        if regroup && self.setlist.active.is_some() {
-            self.send_show_gates();
         }
     }
 
@@ -415,9 +428,10 @@ mod tests {
             let mut buf = vec![0.0f32; 64 * 2];
             engine.render(&mut buf, 2);
         };
+        let organ_master = app.units.iter().find(|u| u.rig == 2 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
         ten_songs(&mut app);
-        for (dest, cc) in [(piano, 11), (organ, 4)] {
-            let out = app.exec_tool("set_cc_map", &serde_json::json!({"node": dest, "source": "hw:0", "cc": cc, "knob": "LEVEL"}));
+        for (dest, cc, knob) in [(piano, 11, "LEVEL"), (organ, 4, "LEVEL"), (organ_master, 7, "VOLUME")] {
+            let out = app.exec_tool("set_cc_map", &serde_json::json!({"node": dest, "source": "hw:0", "cc": cc, "knob": knob}));
             assert!(!out.starts_with("error"), "{out}");
         }
         let v = tool(&mut app, "set_level", serde_json::json!({"node": piano, "cc": 11, "source": "hw:0", "level": "show"}));
@@ -428,14 +442,55 @@ mod tests {
             tool(&mut app, "select_setlist_part", serde_json::json!({"song": song}));
             pump(&mut drain, &mut engine, &mut ebus);
             engine.cc_log.clear();
-            for cc in [11, 4] {
+            for cc in [11, 4, 7] {
                 ebus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc, value: 90 });
             }
             pump(&mut drain, &mut engine, &mut ebus);
             let moved = |n: NodeId| engine.cc_log.iter().any(|e| e.0 == n);
             assert!(moved(piano), "song {}: the show-level pedal reaches the piano", song + 1);
+            assert!(moved(organ_master), "song {}: a master volume pedal is no rig's, whichever master it was learned on", song + 1);
             assert_eq!(moved(organ), song % 2 == 1, "song {}: the organ's pedal works only while the organ plays", song + 1);
         }
+    }
+
+    /// The knobs on screen follow a pedal exactly where the engine does.
+    #[test]
+    fn a_pedal_moves_the_knob_on_screen_only_where_the_engine_applies_it() {
+        let mut app = gig();
+        let organ = node(&app, "ORGAN");
+        ten_songs(&mut app);
+        app.exec_tool("set_cc_map", &serde_json::json!({"node": organ, "source": "hw:0", "cc": 4, "knob": "LEVEL"}));
+        let level = |app: &DemoApp| {
+            let u = app.units.iter().find(|u| u.node_id == organ).unwrap();
+            u.knobs[u.knob_index("LEVEL").unwrap()].display_value
+        };
+        tool(&mut app, "select_setlist_part", serde_json::json!({"song": 0}));
+        let before = level(&app);
+        app.apply_cc_to_knobs(SourceId::Hardware(0), 0, 4, 20, false);
+        assert_eq!(level(&app), before, "song 1 has no organ: the engine drops the pedal, the knob stays");
+        tool(&mut app, "select_setlist_part", serde_json::json!({"song": 1}));
+        app.apply_cc_to_knobs(SourceId::Hardware(0), 0, 4, 20, false);
+        assert!((level(&app) - 20.0 / 127.0).abs() < 1e-3, "song 2 plays the organ: the knob follows");
+    }
+
+    /// A new song never names a rig that is at show level by default, and an
+    /// edit to a song that is not playing reaches the live part at once.
+    #[test]
+    fn adding_and_editing_songs_keeps_the_show_level_vocals_and_resends_the_gates() {
+        let mut app = gig();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        ten_songs(&mut app);
+        app.active_rig = 0;
+        let v = tool(&mut app, "set_setlist_song", serde_json::json!({"name": "Encore"}));
+        assert_eq!(v["songs"][10]["parts"][0]["rigs"][0]["rig"], 1, "the vocals in view stay out of it: {v}");
+        assert_eq!(v["levels"]["rigs"][0]["level"], "show");
+        tool(&mut app, "select_setlist_part", serde_json::json!({"song": 2}));
+        drain.drain(|_| {});
+        tool(&mut app, "set_setlist_song", serde_json::json!({"song": 5, "parts": [{"name": "Main", "rigs": [{"rig": 0}]}]}));
+        let mut zones = None;
+        drain.drain(|c| if let Command::SetRigZones { zones: z } = c { zones = Some(z) });
+        assert_eq!(zones.map(|z| z[0].live), Some(false), "song 6 now uses the vocals: song 3, playing, drops them at once");
     }
 
     #[test]

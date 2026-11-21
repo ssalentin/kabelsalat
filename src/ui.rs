@@ -8253,6 +8253,15 @@ impl DemoApp {
 
     /// Execute `set_setlist_song` from the assistant or MCP.
     fn exec_setlist_song(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let gates_before = self.show_gates_now();
+        let out = self.exec_setlist_song_edit(args);
+        if self.show_gates_now() != gates_before {
+            self.send_show_gates();
+        }
+        out
+    }
+
+    fn exec_setlist_song_edit(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
         use crate::setlist::{Part, PartRig, Song};
         let n_rigs = self.rig_count();
         let graph = self.mirror_graph();
@@ -8350,9 +8359,7 @@ impl DemoApp {
             let parts = match parsed_parts {
                 Some(parts) => parts,
                 None => {
-                    let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
-                    let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
-                    let mut p = Part::new("Main", vec![pr]);
+                    let mut p = Part::new("Main", self.default_part_rigs());
                     p.params = self.capture_part_knobs(&p.rigs);
                     vec![p]
                 }
@@ -13553,13 +13560,20 @@ impl DemoApp {
         let kb_target_node = kb_target.map(|u| self.units[u].node_id);
         let mut mixer: Vec<(u32, MixControl, f64)> = Vec::new();
         let mut midi_ccs: Vec<(u32, u8, f32)> = Vec::new();
+        // A binding the engine does not apply in this part (#273) moves no
+        // on-screen control either, or the screen and the sound part ways.
+        let gated = self.setlist.active.is_some() && !crate::engine::cc_at_rest(cc, val);
+        let (setlist, graph) = (&self.setlist, &self.base_graph);
+        let works = |dest: u32, target: CcTarget| {
+            !gated || setlist.binding_works(crate::setlist::Binding { source: src, dest, cc }, target, graph)
+        };
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
             if let Some(rule_ch) = edit.channel {
                 if rule_ch != ch { continue; }
             }
             for m in &edit.cc_map {
-                if m.cc != cc { continue; }
+                if m.cc != cc || !works(*dest, m.target) { continue; }
                 if m.target == CcTarget::ChannelPressure {
                     continue;
                 }
@@ -17490,6 +17504,16 @@ impl DemoApp {
     }
 
     fn setlist_stage_in(&mut self, ui: &mut egui::Ui, sessions_dir: &std::path::Path) {
+        let gates_before = self.show_gates_now();
+        self.setlist_stage_body(ui, sessions_dir);
+        // An edit can move a rig or bus between levels, also from a song
+        // that is not playing: the live part takes it at once (#273).
+        if self.show_gates_now() != gates_before {
+            self.send_show_gates();
+        }
+    }
+
+    fn setlist_stage_body(&mut self, ui: &mut egui::Ui, sessions_dir: &std::path::Path) {
         use crate::setlist::{FootSwitchAction, Part, PartRig, Song};
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
@@ -18053,9 +18077,7 @@ impl DemoApp {
                 name
             };
             self.setlist_new_song_name.clear();
-            let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
-            let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
-            let mut part = Part::new("Main", vec![pr]);
+            let mut part = Part::new("Main", self.default_part_rigs());
             part.params = self.capture_part_knobs(&part.rigs);
             self.setlist.songs.push(Song::new(title, vec![part]));
             self.setlist_edit_song = Some(self.setlist.songs.len() - 1);
@@ -18087,9 +18109,7 @@ impl DemoApp {
                     raw
                 };
                 self.setlist_new_part_name.clear();
-                let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
-                let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
-                let mut part = Part::new(pname, vec![pr]);
+                let mut part = Part::new(pname, self.default_part_rigs());
                 part.params = self.capture_part_knobs(&part.rigs);
                 if let Some(song) = self.setlist.songs.get_mut(si) {
                     song.parts.push(part);

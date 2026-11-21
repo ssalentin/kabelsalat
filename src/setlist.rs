@@ -12,7 +12,7 @@
 //! touches: see [`levels`] (#273).
 
 mod levels;
-pub use levels::{part_buses, source_str, Binding, Level, Levels, Set, SetId};
+pub use levels::{part_buses, source_str, Binding, Gates, Level, Levels, Set, SetId};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -349,6 +349,7 @@ impl Setlist {
                 pos.song += 1;
             }
         }
+        self.settle_moved_song(to);
         true
     }
 

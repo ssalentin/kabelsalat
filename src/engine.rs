@@ -908,12 +908,17 @@ fn zone_of(zones: &[RigZone; 8], graph: &Graph, node: NodeId) -> RigZone {
 /// that is not live (#204), so leaving a song never leaves a pedal down, a
 /// note bent or a key pressed: note-off, sustain/sostenuto/soft pedal up,
 /// all-sound-off and all-notes-off, bend centre, pressure 0.
+/// A controller back at rest: all sound/notes off, or a pedal let up.
+pub(crate) fn cc_at_rest(cc: u8, value: u8) -> bool {
+    matches!(cc, 120 | 123) || (matches!(cc, 64 | 66 | 67) && value < 64)
+}
+
 fn at_rest(m: &MidiMsg) -> bool {
     use crate::matrix::{CHANNEL_AFTERTOUCH, CONTROL_CHANGE, PITCH_BEND, POLY_AFTERTOUCH};
     let [d1, d2] = m.data;
     match m.status {
         _ if m.is_note_off() => true,
-        CONTROL_CHANGE => matches!(d1, 120 | 123) || (matches!(d1, 64 | 66 | 67) && d2 < 64),
+        CONTROL_CHANGE => cc_at_rest(d1, d2),
         PITCH_BEND => m.pitch_bend_value() == 0,
         CHANNEL_AFTERTOUCH => d1 == 0,
         POLY_AFTERTOUCH => d2 == 0,
@@ -4158,6 +4163,7 @@ impl GraphEngine {
                 let before = self.sends.len();
                 self.sends.retain(|s| s.bus != id && s.from != SendSource::Node(id));
                 if self.sends.len() != before { self.mix_dirty = true; }
+                self.show_gates.forget_bus(id);
                 if self.bus_outs.iter().any(|o| o.bus == SendSource::Node(id)) {
                     self.bus_outs.retain(|o| o.bus != SendSource::Node(id));
                     self.assign_out_slots();
@@ -4687,8 +4693,10 @@ impl GraphEngine {
                     }
                     // A learned mixer control (above) always works; a rig that
                     // is not live takes no other CC unless it returns to rest,
-                    // or the show keeps the binding live.
-                    if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) && gate != Some(true) {
+                    // or the show keeps the binding live. A master's or an aux
+                    // bus's knob is a mix control no rig gates.
+                    let mix_unit = self.graph.is_bus(dest) || self.graph.node(dest).is_some_and(|n| matches!(n.kind, NodeKind::MasterOut));
+                    if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) && gate != Some(true) && !mix_unit {
                         continue;
                     }
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {

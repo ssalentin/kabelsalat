@@ -354,7 +354,10 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
             .ok_or("name is required when creating a song")?;
         let parts = match &args.parts {
             Some(ps) => parse_parts(ps)?,
-            None => vec![Part::new("Main", vec![PartRig::new(0)])],
+            None => {
+                let rigs = st.graph.nodes.iter().map(|n| n.rig as usize + 1).max().unwrap_or(1);
+                vec![Part::new("Main", st.setlist.default_part_rig(0, rigs).map(PartRig::new).into_iter().collect())]
+            }
         };
         let mut song = Song::new(name, parts);
         if let Some(Some(b)) = args.bpm {
@@ -726,7 +729,7 @@ struct SetLevelArgs {
     level: String,
     /// With level "set": the set's name or 0-based index.
     #[serde(skip_serializing_if = "Option::is_none")]
-    set: Option<String>,
+    set: Option<Value>,
     /// A rig (0-based).
     #[serde(skip_serializing_if = "Option::is_none")]
     rig: Option<u8>,
@@ -749,7 +752,7 @@ struct SetLevelArgs {
 struct SetSetlistSetArgs {
     /// The set to change (its name or 0-based index); omit to make a new set.
     #[serde(skip_serializing_if = "Option::is_none")]
-    set: Option<String>,
+    set: Option<Value>,
     /// The new set's name, or a new name for `set`.
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -4636,7 +4639,7 @@ impl McpServer {
     }
 
     /// Read the session's setlist (#204).
-    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level and stored knob count), the active song/part (null = all rigs open), and any learned foot-switch CCs.")]
+    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.")]
     fn get_setlist(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4647,7 +4650,7 @@ impl McpServer {
     }
 
     /// Add, update, reorder, or remove a song in the setlist (#204).
-    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?}]) and optional capture_knobs.")]
+    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs.")]
     fn set_setlist_song(&self, Parameters(args): Parameters<SetSetlistSongArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4656,6 +4659,12 @@ impl McpServer {
         }
         if let Err(e) = apply_setlist_song_headless(&mut st, &args) {
             return tool_err(e);
+        }
+        // An edit can move a rig or bus between levels (#273).
+        if st.setlist.active.is_some() {
+            if let Err(e) = send_show_gates(&mut st) {
+                return tool_err(e);
+            }
         }
         ok_json(setlist_json(&st))
     }
@@ -6012,7 +6021,7 @@ mod tests {
         assert_eq!((set["sets"][0]["name"].as_str(), set["sets"][0]["skip"].as_bool()), (Some("Encores"), Some(true)), "{set}");
         assert_eq!(set["songs"][1]["set"], json!("Encores"));
         let level = |rig: u8, level: &str, set: Option<&str>| server.set_level(Parameters(SetLevelArgs {
-            level: level.into(), set: set.map(Into::into), rig: Some(rig), bus: None, node: None, cc: None, source: None,
+            level: level.into(), set: set.map(|s| json!(s)), rig: Some(rig), bus: None, node: None, cc: None, source: None,
         }));
         let lv = tool_json(&level(0, "set", Some("Encores")));
         assert_eq!((lv["levels"]["rigs"][0]["level"].as_str(), lv["levels"]["rigs"][0]["pinned"].as_bool()), (Some("set"), Some(true)), "{lv}");

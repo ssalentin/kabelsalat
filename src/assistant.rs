@@ -816,7 +816,11 @@ fn system_prompt() -> String {
      do not use markdown headings.\n\
      SOUNDS: every instrument has its OWN sound library, and load_sound / list_sounds \
      work in the library of the rig's instrument: Surge has ~3000 patches (a new Surge \
-     plays its init patch), Dexed its DX7 cartridge voices, setBfree its organ \
+     plays its init patch), Dexed its DX7 cartridge voices (Dexed's factory default \
+     'Say Again.' is an octave-bouncing echo FX patch — whenever you add a Dexed / DX7 \
+     rig, ALWAYS load a playable DX7 voice with add_rig(sound=…) or load_sound, e.g. \
+     'rhodes', 'e.piano', 'brass' or whatever character fits, never leave it on the \
+     default), setBfree its organ \
      registrations (MIDI programmes), Vitalium its LV2 presets, YANES its chip presets. \
      When the user asks for an instrument or character (flute, warm pad, 808 bass, jazz \
      organ…), call load_sound(query, rig) (or add_rig with sound=…); list_sounds(query, \
@@ -1389,8 +1393,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_rig",
-            "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional sound query loaded into the new rig's instrument from its own library (e.g. 'flute' for Surge, 'bass' for YANES). Returns get_rigs.",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional sound query for the new rig's instrument, e.g. 'flute'"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
+            "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional sound query loaded into the new rig's instrument from its own library (e.g. 'flute' for Surge, 'rhodes' or 'e.piano' for Dexed, 'bass' for YANES). For Dexed, always pass a playable sound (or follow up with list_sounds/load_sound) — Dexed's factory default 'Say Again.' is an octave-bouncing echo FX patch. Returns get_rigs.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional sound query for the new rig's instrument, e.g. 'flute' for Surge, 'rhodes' or 'e.piano' for Dexed"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
         }},
         {"type":"function","function":{
             "name":"clone_rig",
@@ -3301,5 +3305,18 @@ mod tests {
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(raw["other"], json!(true), "preserves unrelated config fields");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dexed_prompt_and_add_rig_warn_against_default_fx_patch() {
+        let prompt = system_prompt();
+        assert!(prompt.contains("Say Again."), "system prompt should warn about Dexed's default patch");
+        assert!(prompt.contains("Dexed"), "system prompt should mention Dexed");
+        let tools_val = tools();
+        let add_rig = tools_val.as_array().unwrap().iter()
+            .find(|t| t["function"]["name"] == "add_rig")
+            .expect("add_rig tool exists");
+        let desc = add_rig["function"]["description"].as_str().unwrap();
+        assert!(desc.contains("Say Again."), "add_rig description should warn about Dexed's default patch: {desc}");
     }
 }

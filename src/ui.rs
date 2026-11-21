@@ -10815,6 +10815,9 @@ impl DemoApp {
                         Ok(sound) => format!(" Sound: {}.", sound.label()),
                         Err(e) => format!(" Sound not loaded: {e}."),
                     },
+                    None if args.get("plugin_id").and_then(|v| v.as_str()) == Some(DEXED_ID) => {
+                        " Note: Dexed's default patch 'Say Again.' is an octave-echo FX patch — call list_sounds/load_sound for a playable DX7 voice.".into()
+                    }
                     None => String::new(),
                 };
                 let nodes: Vec<u32> = self.units.iter()
@@ -11277,7 +11280,7 @@ impl DemoApp {
                 // Sound: exchange the instrument (patch) of THIS synth.
                 let browser = match plugin_id {
                     Some(SURGE_ID) => Some(("Init (Surge default)", "search sounds… e.g. flute, warm pad, bass", "sound_list")),
-                    Some(DEXED_ID) => Some(("Init (Dexed default)", "search DX7 sounds… e.g. piano, bass, brass", "dexed_sound_list")),
+                    Some(DEXED_ID) => Some(("Say Again. (Dexed default)", "search DX7 sounds… e.g. piano, bass, brass", "dexed_sound_list")),
                     _ => None,
                 };
                 if let (Some((init, hint, list_id)), Some(id)) = (browser, plugin_id) {
@@ -35377,6 +35380,20 @@ mod rig_switch_tests {
         let bad = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": "org.not.installed"}));
         assert!(bad.contains("no installed CLAP plugin"), "{bad}");
         assert_eq!(app.rig_count(), before + 1, "an unknown plugin adds nothing");
+    }
+
+    #[test]
+    fn add_rig_for_dexed_without_sound_warns_about_say_again_default() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_clap = vec![
+            ClapPluginInfo { id: DEXED_ID.into(), name: "Dexed".into(), vendor: "Digital Suburban".into(), features: vec!["instrument".into()] },
+            ClapPluginInfo { id: "org.example.synth".into(), name: "Example".into(), vendor: "V".into(), features: vec!["instrument".into()] },
+        ];
+        app.plugins_loaded = true;
+        let dexed = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": DEXED_ID, "name": "DX7"}));
+        assert!(dexed.contains("Say Again.") && dexed.contains("load_sound"), "{dexed}");
+        let other = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": "org.example.synth"}));
+        assert!(!other.contains("Say Again."), "{other}");
     }
 
     #[test]

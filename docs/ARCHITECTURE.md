@@ -200,6 +200,16 @@ agents are in [AGENTS.md](../AGENTS.md).
   The player decodes on its own thread; the engine owns its clock and reads the
   file at the song position (loop, tempo sync as varispeed, Number of Beats,
   Beat Offset, start at the next bar), so a synced loop cannot drift.
+- `retro.rs` — retrospective recording (#215): the last minutes of the master
+  and of each armed rig's stem. The audio thread writes every block straight
+  into lanes the recorder's writer thread allocated (relaxed atomic stores,
+  one position counter for all lanes, so a save's files line up), and swaps
+  in a new lane set only at a block start, handing the old one back through a
+  ring for the writer to free. A save copies the last frames out on the writer
+  thread and checks afterwards that the feed did not reach them meanwhile (it
+  announces each block's end before writing, like a seqlock); lanes hold 2 s
+  more than a save may take, so that check fails only when the copy stalls.
+  The length is the app setting `retro_minutes` (default 2, off below 3 GiB).
 - `meter.rs` — master loudness meter for the agent's `measure_mix`: momentary,
   short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
   gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono

@@ -867,6 +867,13 @@ struct SetRecordArmArgs {
     armed: Option<bool>,
 }
 
+/// Arguments for `record_save_last`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RecordSaveLastArgs {
+    /// How many seconds back to save (default: everything retrospective recording kept).
+    seconds: Option<f64>,
+}
+
 /// Arguments for `set_master_target`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetMasterTargetArgs {
@@ -4956,8 +4963,65 @@ impl McpServer {
         ok_json(json!({"recording": false}))
     }
 
+    /// Save the last minutes retrospective recording kept as a new take.
+    #[tool(name = "record_save_last", description = "Save what was just played, after the fact: retrospective recording keeps the last minutes of the master mix and of every armed rig's stem in memory, and this writes them as a new take folder under ~/Music/kabelsalat/, like a recording that had been running. seconds: how far back (default: everything kept, up to the length set in Settings → Audio). Returns the take folder once it is written.")]
+    fn record_save_last(&self, Parameters(args): Parameters<RecordSaveLastArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        let remote = matches!(st.backend, Backend::Remote);
+        let local = (!remote).then(|| {
+            let names: Vec<String> = st.rigs.lock().map(|s| s.rigs.iter().map(|r| r.name.clone()).collect()).unwrap_or_default();
+            st.record.set_rig_names(names);
+            st.record.clone()
+        });
+        drop(st);
+        let status = || -> Result<Value, String> {
+            match &local {
+                Some(r) => serde_json::to_value(r.snapshot()).map_err(|e| format!("record status: {e}")),
+                None => {
+                    let reply = bridge::request(&json!({"op": "query", "name": "get_record"})).map_err(|e| format!("{e:#}"))?;
+                    Ok(reply.get("data").cloned().unwrap_or(Value::Null))
+                }
+            }
+        };
+        let before = match status() {
+            Ok(s) => s["retro"]["last_folder"].clone(),
+            Err(e) => return tool_err(e),
+        };
+        let asked = match &local {
+            Some(r) => r.save_last(args.seconds),
+            None => match bridge::request(&json!({"op": "ui", "tool": "record_save_last", "args": {"seconds": args.seconds}})) {
+                Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => {
+                    let text = reply.get("data").and_then(Value::as_str).unwrap_or_default().to_string();
+                    match text.strip_prefix("not saved: ") {
+                        Some(e) => Err(e.to_string()),
+                        None => serde_json::from_str::<Value>(&text).ok().and_then(|v| v["seconds"].as_f64()).ok_or(text),
+                    }
+                }
+                Ok(reply) => Err(reply.get("error").and_then(Value::as_str).unwrap_or("ui tool failed").to_string()),
+                Err(e) => Err(format!("record_save_last needs the running app (attach): {e:#}")),
+            },
+        };
+        let seconds = match asked {
+            Ok(s) => s,
+            Err(e) => return tool_err(e),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let snap = loop {
+            match status() {
+                Ok(s) if s["retro"]["saving"] != json!(true) || std::time::Instant::now() >= deadline => break s,
+                Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return tool_err(e),
+            }
+        };
+        let folder = &snap["retro"]["last_folder"];
+        if folder.is_string() && *folder != before {
+            return ok_json(json!({"folder": folder, "seconds": seconds}));
+        }
+        tool_err(snap["error"].as_str().unwrap_or("the take was not written in 10 s").to_string())
+    }
+
     /// Recording status: path, folder, elapsed seconds, dropped frames, stems, armed targets.
-    #[tool(name = "record_status", description = "Get recording status: recording (bool), pending (bool), path, folder, seconds, dropped_frames, finalized, stems, armed_master, armed_rigs.")]
+    #[tool(name = "record_status", description = "Get recording status: recording (bool), pending (bool), path, folder, seconds, dropped_frames, finalized, stems, armed_master, armed_rigs, retro (retrospective recording: length_seconds, kept_seconds, saving, last_folder).")]
     fn record_status(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -5113,6 +5177,7 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
+    record.set_retro_seconds(crate::record::retro_minutes_setting() * 60);
     engine.set_recorder(recorder_tap);
     let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
     engine.set_listen_tap(listen_tap);
@@ -5150,6 +5215,7 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
+    record.set_retro_seconds(crate::record::retro_minutes_setting() * 60);
     engine.set_recorder(recorder_tap);
     let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
     engine.set_listen_tap(listen_tap);
@@ -6207,6 +6273,7 @@ mod tests {
             v.get("isError").and_then(Value::as_bool) == Some(true)
         };
         assert!(is_err(server.record_start()), "record_start must not claim success without a recorder");
+        assert!(is_err(server.record_save_last(Parameters(RecordSaveLastArgs { seconds: None }))), "nor record_save_last");
         let mut buf = vec![0.0f32; 480 * 2];
         let r = tool_json(&server.set_record_sync(Parameters(RecordSyncArgs { on: true })));
         assert_eq!(r, json!({"record_sync": true}));

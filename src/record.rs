@@ -23,7 +23,7 @@
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{JoinHandle, Thread};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,6 +108,19 @@ pub struct RecordStatus {
     /// What the next take records: the master's arm and one flag per rig.
     pub armed_master: bool,
     pub armed_rigs: Vec<bool>,
+    pub retro: RetroStatus,
+}
+
+/// Retrospective recording (#215): what `save_last` can save.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RetroStatus {
+    /// How far back a save reaches, as set (0 = off).
+    pub length_seconds: u32,
+    /// What a save would hold now.
+    pub kept_seconds: f64,
+    pub saving: bool,
+    /// The take folder of the last save.
+    pub last_folder: Option<String>,
 }
 
 /// State shared by the audio thread (tap), the writer thread, and the UI.
@@ -141,6 +154,16 @@ pub struct RecorderShared {
     /// thread); falls back to `rig-N` when a rig has no name.
     rig_names: Mutex<Vec<String>>,
     sample_rate: u32,
+    retro_clock: Arc<crate::retro::Clock>,
+    /// The retrospective length the writer keeps (seconds, 0 = off).
+    retro_secs: AtomicU32,
+    /// Frames a save asked for (0 = none, `u64::MAX` = everything kept).
+    retro_request: AtomicU64,
+    /// Saves asked for (counted after their request is stored), and the
+    /// count the writer had seen before it last took a request: a save asked
+    /// during another keeps `saving` on until its own take is written.
+    retro_asked: AtomicU64,
+    retro_done: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -154,6 +177,7 @@ struct WavStatus {
     takes: u64,
     /// Per-stem file state of the last/active take (writer-owned).
     stems: Vec<StemFileStatus>,
+    retro_last: Option<String>,
 }
 
 /// Writer-side per-stem state (`dropped_frames` lives in the shared atomics).
@@ -166,15 +190,15 @@ struct StemFileStatus {
 
 impl RecorderShared {
     pub fn new() -> Self {
-        Self::with_live(false, 48_000)
+        Self::with_live(false, 48_000, Arc::new(crate::retro::Clock::new()))
     }
 
-    /// A recorder attached to a real writer thread (used by `start`).
+    #[cfg(test)]
     fn live(sample_rate: u32) -> Self {
-        Self::with_live(true, sample_rate)
+        Self::with_live(true, sample_rate, Arc::new(crate::retro::Clock::new()))
     }
 
-    fn with_live(live: bool, sample_rate: u32) -> Self {
+    fn with_live(live: bool, sample_rate: u32, retro_clock: Arc<crate::retro::Clock>) -> Self {
         Self {
             live: AtomicBool::new(live),
             recording: AtomicBool::new(false),
@@ -192,6 +216,11 @@ impl RecorderShared {
             stem_tx: Mutex::new(None),
             rig_names: Mutex::new(Vec::new()),
             sample_rate,
+            retro_clock,
+            retro_secs: AtomicU32::new(0),
+            retro_request: AtomicU64::new(0),
+            retro_asked: AtomicU64::new(0),
+            retro_done: AtomicU64::new(0),
         }
     }
 
@@ -224,6 +253,61 @@ impl RecorderShared {
         for (a, r) in self.arm_rigs.iter().zip(rigs.iter()) {
             a.store(*r, Ordering::Relaxed);
         }
+        self.unpark_writer(); // the retrospective lanes follow the rig arms
+    }
+
+    fn armed_rig_mask(&self) -> u64 {
+        self.arm_rigs.iter().enumerate().fold(0, |m, (r, a)| if a.load(Ordering::Relaxed) { m | 1 << r } else { m })
+    }
+
+    /// Keep the last `secs` of the master and of every armed rig's stem
+    /// (0 = off). The writer allocates the ring; a new length starts it over.
+    pub fn set_retro_seconds(&self, secs: u32) {
+        self.retro_secs.store(secs, Ordering::Relaxed);
+        self.unpark_writer();
+    }
+
+    /// Save the last `secs` (None = everything kept) of the master and the
+    /// armed stems as a new take, written by the writer thread. Returns the
+    /// seconds the take will hold; a refusal also becomes the status error,
+    /// which the top bar shows beside REC.
+    pub fn save_last(&self, secs: Option<f64>) -> Result<f64, String> {
+        let (want, kept) = self.retro_request_of(secs).inspect_err(|e| {
+            if let Ok(mut s) = self.status.lock() {
+                s.error = Some(e.clone());
+            }
+        })?;
+        self.retro_request.store(want, Ordering::Release);
+        self.retro_asked.fetch_add(1, Ordering::Release);
+        self.unpark_writer();
+        Ok(kept.min(want) as f64 / self.sample_rate.max(1) as f64)
+    }
+
+    /// (frames asked for, frames kept) of a save that can run.
+    fn retro_request_of(&self, secs: Option<f64>) -> Result<(u64, u64), String> {
+        if !self.is_live() {
+            return Err("recording unavailable: no audio engine".into());
+        }
+        if self.is_recording() {
+            return Err("REC is recording: stop it first (its take has this audio already)".into());
+        }
+        if self.retro_secs.load(Ordering::Relaxed) == 0 {
+            return Err("retrospective recording is off (Settings → Audio → Keep the last)".into());
+        }
+        let sr = self.sample_rate.max(1) as f64;
+        let want = match secs {
+            Some(s) if s.is_finite() && s > 0.0 => (s * sr).round().max(1.0) as u64,
+            Some(s) => return Err(format!("seconds must be more than 0, not {s}")),
+            None => u64::MAX,
+        };
+        if !self.arm_master.load(Ordering::Relaxed) && self.armed_rig_mask() == 0 {
+            return Err("nothing is armed: arm the master or a rig".into());
+        }
+        let kept = self.retro_clock.kept_frames();
+        if kept == 0 {
+            return Err("nothing has been played since retrospective recording started".into());
+        }
+        Ok((want, kept))
     }
 
     /// Display names of the rig list, used for stem file names. Callers hold
@@ -287,14 +371,16 @@ impl RecorderShared {
 
     /// Assemble the current snapshot from the atomics + writer status.
     pub fn snapshot(&self) -> RecordStatus {
-        let (folder, path, seconds, finalized, error, limit_reached, takes, files) = self
+        // Before the status: a save the writer finished shows its folder.
+        let saving = self.retro_asked.load(Ordering::Acquire) > self.retro_done.load(Ordering::Acquire);
+        let (folder, path, seconds, finalized, error, limit_reached, takes, files, retro_last) = self
             .status
             .lock()
             .map(|s| (
                 s.folder.clone(), s.path.clone(), s.seconds, s.finalized,
-                s.error.clone(), s.limit_reached, s.takes, s.stems.clone(),
+                s.error.clone(), s.limit_reached, s.takes, s.stems.clone(), s.retro_last.clone(),
             ))
-            .unwrap_or((None, None, 0.0, false, None, false, 0, Vec::new()));
+            .unwrap_or((None, None, 0.0, false, None, false, 0, Vec::new(), None));
         let names = self.rig_names.lock().map(|n| n.clone()).unwrap_or_default();
         let stems: Vec<StemStatus> = files
             .iter()
@@ -322,6 +408,12 @@ impl RecorderShared {
             stems,
             armed_master: self.arm_master.load(Ordering::Relaxed),
             armed_rigs: self.arm_rigs.iter().map(|a| a.load(Ordering::Relaxed)).collect(),
+            retro: RetroStatus {
+                length_seconds: self.retro_secs.load(Ordering::Relaxed),
+                kept_seconds: self.retro_clock.kept_frames() as f64 / self.sample_rate.max(1) as f64,
+                saving,
+                last_folder: retro_last,
+            },
         }
     }
 }
@@ -337,6 +429,7 @@ pub struct RecorderTap {
     active_mask: u64,
     msg_tx: Producer<RecorderMsg>,
     shared: Arc<RecorderShared>,
+    retro: crate::retro::Feed,
 }
 
 impl RecorderTap {
@@ -428,6 +521,26 @@ impl RecorderTap {
         }
     }
 
+    /// The rack's rigs changed: every retrospective stem starts over. RT-safe.
+    pub fn retro_restart_stems(&self) {
+        self.retro.restart_stems();
+    }
+
+    /// Rig `rig`'s post-fader sum into its retrospective lane. RT-safe.
+    pub fn retro_rig(&mut self, rig: u8, data: &[f32]) {
+        self.retro.rig(rig, data);
+    }
+
+    /// The block's final output into the retrospective ring, once per block
+    /// after every `retro_rig`. RT-safe; wakes the writer only when the ring
+    /// gave a lane set back for it to free.
+    pub fn retro_block(&mut self, data: &[f32], ch: usize) {
+        self.retro.end_block(data, ch);
+        if self.retro.take_swapped() {
+            self.shared.unpark_writer();
+        }
+    }
+
     /// Push one block of interleaved stereo into rig `rig`'s stem ring. The
     /// buffer is the rig's post-fader sum (exactly what its MasterOut feeds
     /// the physical mix). A rig whose ring was never delivered counts the
@@ -477,6 +590,34 @@ pub fn record_dir() -> PathBuf {
     PathBuf::from(home).join("Music").join("kabelsalat")
 }
 
+const RETRO_MINUTES_FIELD: &str = "retro_minutes";
+
+/// The retrospective length the user chose, in minutes (0 = off). Unset, it
+/// is 2 minutes, or off on a machine with under 3 GiB of memory.
+pub fn retro_minutes_setting() -> u32 {
+    let max = crate::retro::MINUTES_CHOICES.iter().copied().max().unwrap_or(0) as u64;
+    crate::assistant::load_config_value(RETRO_MINUTES_FIELD)
+        .and_then(|v| v.as_u64())
+        .map(|m| m.min(max) as u32)
+        .unwrap_or_else(|| {
+            let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+            default_retro_minutes(mem_total_kib(&meminfo))
+        })
+}
+
+pub fn save_retro_minutes(minutes: u32) -> std::io::Result<()> {
+    crate::assistant::save_config_value(RETRO_MINUTES_FIELD, serde_json::json!(minutes))
+}
+
+fn default_retro_minutes(mem_kib: Option<u64>) -> u32 {
+    if mem_kib.is_some_and(|k| k >= 3 << 20) { 2 } else { 0 }
+}
+
+fn mem_total_kib(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
+    line.trim().strip_suffix("kB")?.trim().parse().ok()
+}
+
 /// Start the writer thread; return the engine tap and the shared status handle.
 pub fn start(dir: PathBuf, sample_rate: u32, channels: usize) -> (RecorderTap, Arc<RecorderShared>) {
     let cap = (sample_rate as usize) * 2 * 4; // ~4 s stereo headroom
@@ -489,7 +630,8 @@ fn start_with_capacity(
     channels: usize,
     cap: usize,
 ) -> (RecorderTap, Arc<RecorderShared>) {
-    let shared = Arc::new(RecorderShared::live(sample_rate));
+    let (retro, keeper, retro_clock) = crate::retro::channel(sample_rate);
+    let shared = Arc::new(RecorderShared::with_live(true, sample_rate, retro_clock));
     let (producer, consumer) = RingBuffer::new(cap.max(2));
     let (msg_tx, msg_rx) = RingBuffer::new(64);
     // Each rig delivers its stem ring once per recorder: arming every rig
@@ -501,7 +643,7 @@ fn start_with_capacity(
     let thread_shared = shared.clone();
     let handle = std::thread::Builder::new()
         .name("kabelsalat-recorder".into())
-        .spawn(move || writer_loop(msg_rx, consumer, dir, sample_rate, channels, thread_shared))
+        .spawn(move || writer_loop(msg_rx, consumer, keeper, dir, sample_rate, channels, thread_shared))
         .expect("spawn recorder thread");
     // Known before anyone can begin/stop: an unpark is never lost to a
     // writer that has not registered itself yet.
@@ -517,6 +659,7 @@ fn start_with_capacity(
             active_mask: 0,
             msg_tx,
             shared: shared.clone(),
+            retro,
         },
         shared,
     )
@@ -580,6 +723,7 @@ fn take_view(t: &Take, sample_rate: u32) -> TakeStatusView {
 fn writer_loop(
     mut msg: Consumer<RecorderMsg>,
     mut data: Consumer<f32>,
+    mut keeper: crate::retro::Keeper,
     dir: PathBuf,
     sample_rate: u32,
     channels: usize,
@@ -604,6 +748,20 @@ fn writer_loop(
                 }
             }
         }
+        // Allocating lanes and writing a save take this thread for as long as
+        // they need, and a running take's rings hold 4 s: both wait for it.
+        keeper.collect();
+        let asked = shared.retro_asked.load(Ordering::Acquire);
+        let want = shared.retro_request.swap(0, Ordering::AcqRel);
+        if take.is_none() {
+            keeper.reconcile(shared.retro_secs.load(Ordering::Relaxed), shared.armed_rig_mask());
+            if want > 0 {
+                save_retro(&keeper, want, &dir, sample_rate, &shared);
+            }
+        } else if want > 0 {
+            eprintln!("record: retrospective save refused while a take records");
+        }
+        shared.retro_done.store(asked, Ordering::Release);
         // Control messages next (in order), so a Start/Stop raced by teardown
         // is still honored before the shutdown check below ends the loop.
         while let Ok(m) = msg.pop() {
@@ -843,6 +1001,96 @@ fn begin_take(
     Some(Take { folder: folder_str, files })
 }
 
+/// Write the last `want` frames the retrospective ring kept, for every armed
+/// target, as one take folder, and show it as the last take.
+fn save_retro(keeper: &crate::retro::Keeper, want: u64, dir: &Path, sample_rate: u32, shared: &Arc<RecorderShared>) {
+    let master = shared.arm_master.load(Ordering::Relaxed);
+    let saved = keeper
+        .window(want, master, shared.armed_rig_mask())
+        .and_then(|w| write_retro_take(dir, sample_rate, &w, shared));
+    match saved {
+        Ok(view) => {
+            if let Ok(mut s) = shared.status.lock() {
+                s.retro_last = view.folder.clone();
+            }
+            shared.dropped_frames.store(0, Ordering::Relaxed);
+            for d in &shared.stem_dropped {
+                d.store(0, Ordering::Relaxed);
+            }
+            set_status(shared, view, true, None, false);
+        }
+        Err(e) => {
+            eprintln!("record: retrospective save failed: {e}");
+            if let Ok(mut s) = shared.status.lock() {
+                s.error = Some(e);
+            }
+        }
+    }
+}
+
+/// One take folder named after the moment its audio begins, `master.wav` and
+/// `<rig name>.wav`, each with its exact sample count (rule 45). The frames
+/// are read oldest first, a second at a time across every file, so a save
+/// needs little memory and stays ahead of the feed.
+fn write_retro_take(
+    dir: &Path,
+    sample_rate: u32,
+    w: &crate::retro::Window,
+    shared: &Arc<RecorderShared>,
+) -> Result<TakeStatusView, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create recording dir: {e}"))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let began = now - w.frames as f64 / sample_rate.max(1) as f64;
+    let folder = unique_dir(dir, &format!("kabelsalat-{}", timestamp_at(began as i64)))
+        .map_err(|e| format!("cannot create take folder: {e}"))?;
+    let names = shared.rig_names.lock().map(|n| n.clone()).unwrap_or_default();
+    let targets = w.targets();
+    let written = (|| -> Result<TakeStatusView, String> {
+        let io = |e: std::io::Error| format!("cannot write the take: {e}");
+        let mut files = Vec::new();
+        for t in &targets {
+            let name = match t {
+                None => "master".to_string(),
+                Some(rig) => {
+                    let fallback = format!("rig-{}", rig + 1);
+                    names.get(*rig as usize).map(|n| sanitize_file_name(n, &fallback)).unwrap_or(fallback)
+                }
+            };
+            let (f, path) = unique_path(&folder, &name).map_err(io)?;
+            let mut f = std::io::BufWriter::new(f);
+            write_wav_header(&mut f, sample_rate, 2, (w.frames * 2 * 4) as u32).map_err(io)?;
+            files.push((f, path));
+        }
+        let (mut buf, mut bytes) = (Vec::new(), Vec::new());
+        let end = w.start + w.frames;
+        let mut from = w.start;
+        while from < end {
+            let to = (from + sample_rate.max(1) as u64).min(end);
+            for (i, (f, _)) in files.iter_mut().enumerate() {
+                w.read(i, from, to, &mut buf)?;
+                samples_to_bytes(&buf, &mut bytes);
+                f.write_all(&bytes).map_err(io)?;
+            }
+            from = to;
+        }
+        let seconds = seconds(w.frames * 2, sample_rate, 2);
+        let mut path = None;
+        let mut stems = Vec::new();
+        for (t, (mut f, p)) in targets.iter().zip(files) {
+            f.flush().map_err(io)?;
+            match t {
+                None => path = Some(p),
+                Some(rig) => stems.push(StemFileStatus { rig: *rig, path: Some(p), seconds }),
+            }
+        }
+        let path = path.or_else(|| stems.first().and_then(|s| s.path.clone()));
+        Ok(TakeStatusView { folder: Some(folder.to_string_lossy().into_owned()), path, seconds, stems })
+    })();
+    written.inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&folder);
+    })
+}
+
 /// A file name a rig's display name becomes: control characters and path
 /// separators out, leading dots trimmed, at most 64 characters. Empty (or
 /// empty-after-cleaning) falls back to `fallback`.
@@ -1007,7 +1255,10 @@ fn parse_wav_header(bytes: &[u8]) -> Option<WavHeader> {
 /// Take names use LOCAL wall-clock time (the user reads them in a file
 /// manager); a 16:31 take named 15:31 looked like someone else's file.
 fn timestamp() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    timestamp_at(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
+}
+
+fn timestamp_at(secs: i64) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix(secs + local_utc_offset(secs));
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
@@ -1181,7 +1432,89 @@ pub fn run_test() -> anyhow::Result<()> {
         "record-test (solo): OK — rig A soloed: rig B's stem is {} samples of 0.0, the master equals the mixdown of rig A's stem sample for sample",
         solo.stems[1].len()
     );
+    let (secs, peak) = record_retro_take()?;
+    println!(
+        "record-test (retrospective): OK — a chord held 2 s before the save; the saved last {secs} s equal the last {secs} s rendered sample for sample \
+         through the file player's reader, peak {peak:.3}"
+    );
     Ok(())
+}
+
+/// `record-test` part 4 (#215): nothing is recording; a chord starts and
+/// sounds for 2 s, then "save the last 1.5 s" while it still sounds. The
+/// take must be the last 1.5 s the engine rendered, sample for sample.
+fn record_retro_take() -> anyhow::Result<(f64, f32)> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    use crate::engine::GraphEngine;
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+
+    const SR: f64 = 48000.0;
+    const BLOCK: usize = 480;
+    let (voice, _main) = ClapVoice::new(SR)?;
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let synth = g.add_node(
+        NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") },
+        name_bytes("SYNTH"),
+    );
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g, drain, SR, vec![(synth, voice)]);
+    let dir = std::env::temp_dir().join(format!("ksalat-retro-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let (tap, shared) = start(dir.clone(), SR as u32, 2);
+    engine.set_recorder(tap);
+    shared.set_retro_seconds(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while shared.retro_clock.keep_frames() == 0 {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "the writer did not allocate the ring");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let mut buf = [0.0f32; BLOCK * 2];
+    let mut heard: Vec<f32> = Vec::new();
+    for _ in 0..(SR as usize / BLOCK) {
+        engine.render(&mut buf, 2);
+        heard.extend_from_slice(&buf);
+    }
+    for &n in &[60u8, 64, 67] {
+        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys, channel: 0 });
+    }
+    for _ in 0..(2.0 * SR / BLOCK as f64) as usize {
+        engine.render(&mut buf, 2);
+        heard.extend_from_slice(&buf);
+    }
+    anyhow::ensure!(!shared.is_recording(), "nothing was recording");
+    let secs = shared.save_last(Some(1.5)).map_err(anyhow::Error::msg)?;
+    while shared.snapshot().retro.saving {
+        anyhow::ensure!(std::time::Instant::now() < deadline + std::time::Duration::from_secs(10), "the save was not written");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let status = shared.snapshot();
+    let folder = status.retro.last_folder.clone().ok_or_else(|| anyhow::anyhow!("no take: {:?}", status.error))?;
+    anyhow::ensure!(status.folder.as_deref() == Some(folder.as_str()), "the save is not shown as the last take");
+    let path = Path::new(&folder).join("master.wav");
+    let saved = crate::player::parse_wav(&mut std::fs::File::open(&path)?)
+        .map_err(|e| anyhow::anyhow!("the file player cannot read {}: {e}", path.display()))?
+        .data;
+    let n = (1.5 * SR) as usize * 2;
+    anyhow::ensure!(saved.len() == n, "{} samples saved, {n} expected", saved.len());
+    let tail = &heard[heard.len() - n..];
+    let differ = saved.iter().zip(tail).filter(|(a, b)| a != b).count();
+    anyhow::ensure!(differ == 0, "{differ} of {n} saved samples differ from what was rendered");
+    let peak = saved.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+    anyhow::ensure!(peak > 0.01, "the saved take is silent (peak {peak})");
+    drop(engine);
+    shared.shutdown();
+    if std::env::var("KABELSALAT_RECORD_KEEP").is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok((secs, peak))
 }
 
 /// The samples of one stems take (`record-test` parts 2 and 3).
@@ -1372,6 +1705,7 @@ mod tests {
             active_mask: MASK_MASTER,
             msg_tx,
             shared,
+            retro: crate::retro::channel(48_000).0,
         }
     }
 
@@ -2051,5 +2385,112 @@ mod tests {
         drop(engine);
         shared.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The app's own file reader (rule 54).
+    fn played_back(path: &Path) -> Vec<f32> {
+        crate::player::parse_wav(&mut std::fs::File::open(path).unwrap()).expect("the file player reads the take").data
+    }
+
+    /// #215: two rigs of clicks, rig B armed for its stem and panned, 6 s
+    /// played into a 3 s history (its lanes wrap). A normal take runs and is
+    /// stopped first; the save of the last 2 s then holds exactly the last
+    /// 2 s the engine rendered, and its stem is the take's stem at the same
+    /// frames.
+    #[test]
+    fn a_retrospective_save_is_what_was_heard_sample_for_sample() {
+        use crate::control::{merge_rigs, name_bytes, DspKind, NodeKind, PortKind, PortRef, Rig};
+        let rig_graph = || {
+            let mut g = Graph::default();
+            let click = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("CLICK"));
+            let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: click, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+            g
+        };
+        let merged = merge_rigs(&[Rig::new("Clicks", rig_graph(), None), Rig::new("Second", rig_graph(), None)]);
+        let clicks: Vec<u32> = merged.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Metronome))).map(|n| n.id).collect();
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(merged, drain, 48000.0, vec![]);
+        let dir = temp_dir("retro");
+        let (tap, shared) = start(dir.clone(), 48_000, 2);
+        shared.set_rig_names(vec!["Clicks".into(), "Second".into()]);
+        engine.set_recorder(tap);
+        assert!(shared.save_last(None).unwrap_err().contains("off"), "a save while it is off says so");
+
+        let mut buf = vec![0.0f32; 256 * 2];
+        shared.ensure_stem(1);
+        bus.send(Command::SetRecordArm { rig: Some(1), armed: true });
+        bus.send(Command::SetBpm { bpm: 240.0 });
+        bus.send(Command::SetRigMix { rig: 1, vol: Some(0.5), pan: Some(0.6), mute: None, solo: None });
+        for &c in &clicks {
+            bus.send(Command::SetNodePlaying { node: c, playing: true });
+        }
+        engine.render(&mut buf, 2);
+        shared.set_retro_seconds(3);
+        wait_until("the writer allocated the ring", || shared.retro_clock.keep_frames() > 0);
+        bus.send(Command::RecordStart);
+        let mut heard: Vec<f32> = Vec::new();
+        for _ in 0..(6 * 48000 / 256) {
+            engine.render(&mut buf, 2);
+            heard.extend_from_slice(&buf);
+        }
+        assert!(shared.save_last(None).unwrap_err().contains("REC is recording"), "a save never competes with a running take");
+        bus.send(Command::RecordStop);
+        engine.render(&mut buf, 2); // the stop applies before this block: in the history, not in the take
+        heard.extend_from_slice(&buf);
+        wait_until("the take was finalized", || shared.snapshot().takes == 1);
+        let take = PathBuf::from(shared.snapshot().folder.expect("the normal take"));
+        assert_eq!(shared.snapshot().retro.kept_seconds, 3.0, "6 s played, 3 s kept");
+        assert_eq!(shared.save_last(Some(2.0)), Ok(2.0));
+        wait_until("the save was written", || !shared.snapshot().retro.saving);
+
+        let status = shared.snapshot();
+        let retro = PathBuf::from(status.retro.last_folder.clone().expect("a retrospective take"));
+        assert_eq!(status.folder, status.retro.last_folder, "the save shows as the last take");
+        let master = played_back(&retro.join("master.wav"));
+        let stem = played_back(&retro.join("Second.wav"));
+        let n = 2 * 48000 * 2;
+        assert_eq!(master.len(), n);
+        assert!(master.iter().any(|&s| s.abs() > 0.05), "the clicks are in the take");
+        assert!(master == heard[heard.len() - n..], "the saved master is the last 2 s heard, sample for sample");
+        let take_stem = played_back(&take.join("Second.wav"));
+        let in_take = n - buf.len();
+        assert!(stem[..in_take] == take_stem[take_stem.len() - in_take..], "the saved stem is rig B's post-fader sum at the take's frames");
+        assert!(stem.chunks_exact(2).any(|f| f[1] > f[0] + 0.01), "the stem carries rig B's pan");
+        let bytes = std::fs::read(retro.join("master.wav")).unwrap();
+        let h = parse_wav_header(&bytes).unwrap();
+        assert_eq!((h.format, h.channels, h.bits, h.data_size as usize), (3, 2, 32, n * 4), "the header counts every sample (rule 45)");
+        let first = status.retro.last_folder.clone();
+        shared.save_last(Some(1.0)).unwrap();
+        shared.save_last(Some(0.5)).unwrap();
+        wait_until("both saves were written", || !shared.snapshot().retro.saving);
+        let last = PathBuf::from(shared.snapshot().retro.last_folder.expect("a take"));
+        assert_ne!(Some(last.to_string_lossy().into_owned()), first);
+        assert_eq!(played_back(&last.join("master.wav")).len(), 48000, "saving stays on until the second save's own take exists");
+        shared.set_arms(false, &[false; MAX_RIGS]);
+        let refused = shared.save_last(None).unwrap_err();
+        assert!(refused.contains("nothing is armed"));
+        assert_eq!(shared.snapshot().error, Some(refused), "a refusal shows beside REC");
+        drop(engine);
+        shared.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retrospective_recording_is_on_unless_the_machine_has_little_memory() {
+        // The first lines of this machine's /proc/meminfo (rule 63).
+        let meminfo = "MemTotal:       32011200 kB\nMemFree:         9828408 kB\nMemAvailable:   23780968 kB\n";
+        assert_eq!(mem_total_kib(meminfo), Some(32_011_200));
+        assert_eq!(default_retro_minutes(mem_total_kib(meminfo)), 2);
+        assert_eq!(default_retro_minutes(Some(2 << 20)), 0, "a 2 GiB machine keeps nothing");
+        assert_eq!(default_retro_minutes(None), 0);
     }
 }

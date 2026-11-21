@@ -295,6 +295,29 @@ impl LoadLevel {
     }
 }
 
+/// Per-unit CPU load band for the rack overlay (`F3`):
+/// normal `<= 15 %`, warm/amber `> 15 %`, hot/red `> 30 %` of one buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitLoadLevel {
+    Normal,
+    Warm,
+    Hot,
+}
+
+impl UnitLoadLevel {
+    pub fn of(percent: f64) -> Self {
+        // Tiny epsilon absorbs IEEE-754 noise on exact rational buffer shares
+        // (e.g. 800 µs of 256/48000 s = 15.000000000000002 %).
+        if percent > 30.0 + 1e-9 {
+            UnitLoadLevel::Hot
+        } else if percent > 15.0 + 1e-9 {
+            UnitLoadLevel::Warm
+        } else {
+            UnitLoadLevel::Normal
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +359,15 @@ mod tests {
         assert_eq!(LoadLevel::of(70.0), LoadLevel::High);
         assert_eq!(LoadLevel::of(90.0), LoadLevel::High);
         assert_eq!(LoadLevel::of(90.1), LoadLevel::Critical);
+    }
+
+    #[test]
+    fn unit_load_levels_split_at_15_and_30_percent() {
+        assert_eq!(UnitLoadLevel::of(0.0), UnitLoadLevel::Normal);
+        assert_eq!(UnitLoadLevel::of(15.0), UnitLoadLevel::Normal);
+        assert_eq!(UnitLoadLevel::of(15.01), UnitLoadLevel::Warm);
+        assert_eq!(UnitLoadLevel::of(30.0), UnitLoadLevel::Warm);
+        assert_eq!(UnitLoadLevel::of(30.01), UnitLoadLevel::Hot);
     }
 
     #[test]

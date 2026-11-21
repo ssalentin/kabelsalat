@@ -9,7 +9,7 @@
 //!
 //! RT discipline: all audio process callbacks are allocation- and lock-free.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_ulong, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -747,9 +747,9 @@ fn open_pipewire(
 // ===========================================================================
 
 const JACK_NO_START_SERVER: c_int = 0x01;
-const JACK_PORT_IS_INPUT: u64 = 0x01;
-const JACK_PORT_IS_OUTPUT: u64 = 0x02;
-const JACK_PORT_IS_PHYSICAL: u64 = 0x04;
+const JACK_PORT_IS_INPUT: c_ulong = 0x01;
+const JACK_PORT_IS_OUTPUT: c_ulong = 0x02;
+const JACK_PORT_IS_PHYSICAL: c_ulong = 0x04;
 const JACK_DEFAULT_AUDIO_TYPE: &CStr = c"32 bit float mono audio";
 
 /// Candidate `libjack.so.0` paths, including PipeWire's private JACK library
@@ -764,14 +764,14 @@ const JACK_LIB_CANDIDATES: &[&CStr] = &[
 ];
 
 struct JackApi {
-    client_open: unsafe extern "C" fn(*const c_char, c_int, *mut c_int) -> *mut c_void,
+    client_open: unsafe extern "C" fn(*const c_char, c_int, *mut c_int, ...) -> *mut c_void,
     client_close: unsafe extern "C" fn(*mut c_void) -> c_int,
     get_sample_rate: unsafe extern "C" fn(*mut c_void) -> u32,
     get_buffer_size: unsafe extern "C" fn(*mut c_void) -> u32,
-    port_register: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, u64, u64) -> *mut c_void,
+    port_register: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_ulong, c_ulong) -> *mut c_void,
     port_get_buffer: unsafe extern "C" fn(*mut c_void, u32) -> *mut c_void,
     port_name: unsafe extern "C" fn(*const c_void) -> *const c_char,
-    get_ports: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, u64) -> *mut *const c_char,
+    get_ports: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_ulong) -> *mut *const c_char,
     connect: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int,
     free: unsafe extern "C" fn(*mut c_void),
     set_process_callback: unsafe extern "C" fn(*mut c_void, extern "C" fn(u32, *mut c_void) -> c_int, *mut c_void) -> c_int,

@@ -5690,7 +5690,16 @@ impl DemoApp {
                     self.audio_backend = choice;
                     self.active_audio_backend = Some(active);
                     self.buffer_frames = host.buffer_frames;
-                    self.audio_backend_err = None;
+                    self.audio_backend_err = if (host.opened_sample_rate - self.sample_rate).abs() > 1.0 {
+                        Some(format!(
+                            "{} runs at {:.0} Hz while the engine started at {:.0} Hz — restart kabelsalat to match pitch",
+                            active.label(),
+                            host.opened_sample_rate,
+                            self.sample_rate,
+                        ))
+                    } else {
+                        None
+                    };
                     crate::bridge::set_active_audio_backend(Some(active));
                     crate::bridge::set_configured_buffer_frames(host.buffer_frames);
                     crate::engine_info::reset_for_buffer_change();
@@ -26560,8 +26569,7 @@ impl DemoApp {
             self.strip_palette_ui(&ctx);
             self.insert_picker_ui(&ctx, &mut edits);
         }
-        let (outputs, out_current) = self.audio_out.lock()
-            .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
+        let (outputs, out_current) = self.current_backend_outputs();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
@@ -27225,21 +27233,26 @@ impl DemoApp {
                 Some(w) => label_of(w),
                 None => "System default".to_string(),
             };
-            theme::Dropdown::new("dd_mixer_audio_output", &selected)
-                .width(144.0)
-                .popup_min_width(240.0)
-                .text_size(11.5)
-                .show_ui(ui, |menu| {
-                    if menu.item(out_wanted.is_none(), "System default") {
-                        *out_pick = Some(None);
-                    }
-                    for o in &outputs {
-                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
-                            *out_pick = Some(Some(o.raw.clone()));
+            if self.active_audio_backend == Some(crate::audio_backend::ActiveBackend::Jack) {
+                ui.label(egui::RichText::new("JACK patchbay").size(11.5).color(theme::CREAM_META))
+                    .on_hover_text("Route Kabelsalat:out_1 / out_2 in qpwgraph, Helvum, or qjackctl");
+            } else {
+                theme::Dropdown::new("dd_mixer_audio_output", &selected)
+                    .width(144.0)
+                    .popup_min_width(240.0)
+                    .text_size(11.5)
+                    .show_ui(ui, |menu| {
+                        if menu.item(out_wanted.is_none(), "System default") {
+                            *out_pick = Some(None);
                         }
-                    }
-                })
-                .on_hover_text("the sound card kabelsalat plays to");
+                        for o in &outputs {
+                            if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                                *out_pick = Some(Some(o.raw.clone()));
+                            }
+                        }
+                    })
+                    .on_hover_text("the sound card kabelsalat plays to");
+            }
             if let Some(c) = &out_current {
                 ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
             }
@@ -33428,6 +33441,7 @@ struct AudioStreamHost {
     device_label: String,
     startup_note: Option<String>,
     sample_rate: f64,
+    opened_sample_rate: f64,
     buffer_frames: u32,
 }
 
@@ -33450,6 +33464,7 @@ impl AudioStreamHost {
                 self.stream = Some(opened.stream);
                 self.active_backend = opened.backend;
                 self.device_label = opened.device_label;
+                self.opened_sample_rate = opened.sample_rate;
                 self.buffer_frames = opened.buffer_frames;
                 crate::bridge::set_active_audio_backend(Some(opened.backend));
                 Ok(self.buffer_frames)
@@ -33493,6 +33508,7 @@ impl AudioStreamHost {
                 self.backend_choice = choice;
                 self.active_backend = opened.backend;
                 self.device_label = opened.device_label;
+                self.opened_sample_rate = opened.sample_rate;
                 self.buffer_frames = opened.buffer_frames;
                 crate::bridge::set_active_audio_backend(Some(opened.backend));
                 Ok(opened.backend)
@@ -33533,6 +33549,7 @@ impl AudioStreamHost {
                 self.target_device = device;
                 self.active_backend = opened.backend;
                 self.device_label = opened.device_label;
+                self.opened_sample_rate = opened.sample_rate;
                 self.buffer_frames = opened.buffer_frames;
                 Ok(())
             }
@@ -33729,6 +33746,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         device_label: opened.device_label,
         startup_note,
         sample_rate: opened.sample_rate,
+        opened_sample_rate: opened.sample_rate,
         buffer_frames: active_buffer,
     };
     Ok(BuiltAudio {
@@ -46125,6 +46143,7 @@ mod engine_info_tests {
             device_label: opened.device_label,
             startup_note: None,
             sample_rate: opened.sample_rate,
+            opened_sample_rate: opened.sample_rate,
             buffer_frames: opened.buffer_frames,
         };
         let wait_frames = |want: u32| -> u32 {

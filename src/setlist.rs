@@ -246,12 +246,14 @@ pub struct Setlist {
     /// Devices are indices: a session names their ports (`hw_ports`, #227).
     #[serde(rename = "show_controls", skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<ShowControl>,
-    /// The foot switches of a session saved before #277, read only:
-    /// `normalize` moves them into `controls`.
+    /// The foot switches and program-change devices of a session saved before
+    /// #277, read only: `normalize` moves them into `controls`.
     #[serde(skip_serializing)]
     pub(crate) next_cc: Option<FootSwitch>,
     #[serde(skip_serializing)]
     pub(crate) prev_cc: Option<FootSwitch>,
+    #[serde(skip_serializing)]
+    pub(crate) program_devices: Vec<u32>,
     /// Sets in song order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<Set>,
@@ -267,6 +269,7 @@ impl Setlist {
             && self.controls.is_empty()
             && self.next_cc.is_none()
             && self.prev_cc.is_none()
+            && self.program_devices.is_empty()
             && self.sets.is_empty()
             && self.levels.is_empty()
     }
@@ -615,12 +618,15 @@ impl Setlist {
 
     /// One control per learned action and one per program device, at most
     /// as many as the engine's table has slots, in table order. A session
-    /// saved before #277 brings its foot switches.
+    /// saved before #277 brings its foot switches and program-change devices.
     fn normalize_controls(&mut self) {
         for (fs, action) in [(self.next_cc.take(), ShowAction::NextPart), (self.prev_cc.take(), ShowAction::PrevPart)] {
             if let Some(fs) = fs.filter(|_| self.control_of(action).is_none()) {
                 self.controls.push(ShowControl { device: None, channel: fs.channel, msg: ShowMsg::Cc(fs.cc), action });
             }
+        }
+        for d in std::mem::take(&mut self.program_devices) {
+            self.controls.push(ShowControl { device: Some(d), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
         }
         for c in &mut self.controls {
             c.channel = c.channel.map(|ch| ch & 0x0F);
@@ -857,15 +863,18 @@ mod tests {
         assert_eq!(sl.show_controls().iter().flatten().map(|c| c.action).collect::<Vec<_>>(), [ShowAction::Panic, ShowAction::Tuner, ShowAction::Record]);
     }
 
-    /// A session saved before #277 kept two foot switches beside the list.
+    /// A session saved before #277 kept two foot switches and a program_devices
+    /// list (#208) beside the controls.
     #[test]
     fn a_session_with_the_old_foot_switches_loads_them_as_controls() {
-        let mut sl: Setlist = serde_json::from_str(r#"{"next_cc":{"cc":80},"prev_cc":{"cc":209,"channel":3}}"#).unwrap();
+        let mut sl: Setlist = serde_json::from_str(r#"{"next_cc":{"cc":80},"prev_cc":{"cc":209,"channel":3},"program_devices":[2,1,2]}"#).unwrap();
+        assert!(!sl.is_empty());
         sl.normalize();
         assert_eq!(sl.control_of(ShowAction::NextPart), Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(80), action: ShowAction::NextPart }));
         assert_eq!(sl.control_of(ShowAction::PrevPart), Some(ShowControl { device: None, channel: Some(3), msg: ShowMsg::Cc(81), action: ShowAction::PrevPart }));
+        assert_eq!(sl.program_devices().collect::<Vec<_>>(), [1, 2]);
         let text = serde_json::to_string(&sl).unwrap();
-        assert!(!text.contains("next_cc") && text.contains(r#""msg":{"cc":80}"#), "{text}");
+        assert!(!text.contains("next_cc") && !text.contains("program_devices") && text.contains(r#""msg":{"cc":80}"#) && text.contains(r#""action":"song_of_program""#), "{text}");
     }
 
     #[test]

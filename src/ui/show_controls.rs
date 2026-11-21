@@ -61,8 +61,12 @@ impl DemoApp {
         if moved(ShowAction::Panic) > 0 {
             self.panicked();
         }
+        if moved(ShowAction::MasterMute) > 0 {
+            self.ui_master_mute_grace = -1.0;
+        }
         if moved(ShowAction::TapTempo) > 0 {
             self.tap_flash_t = 1.0;
+            self.ui_transport_grace = self.ui_time + 0.6;
         }
     }
 
@@ -75,43 +79,55 @@ impl DemoApp {
         devices: &[(u32, String, bool)],
     ) {
         let device_name = |d: u32| devices.iter().find(|r| r.0 == d).map_or_else(|| format!("Device {d}"), |r| r.1.clone());
+        let narrow = ui.available_width() < 300.0;
         theme::section_label(ui, "Show controls");
         ui.add_space(6.0);
         for action in ShowAction::LEARNED {
             let learning = *learn == Some(action);
             let control = setlist.control_of(action);
+            let (text, color) = match (learning, control) {
+                (true, _) => ("Press a control…".to_string(), theme::ACCENT),
+                (false, Some(c)) => {
+                    let what = crate::setlist::msg_label(c.msg);
+                    (c.device.map_or(what.clone(), |d| format!("{what} · {}", device_name(d))), theme::INK)
+                }
+                (false, None) => ("Unbound".to_string(), theme::INK_2),
+            };
             ui.horizontal(|ui| {
                 ui.set_min_height(ROW_H - 4.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    // Learn keeps its column whether or not there is a Clear.
-                    if control.is_some() {
+                    // Learn keeps its column whether or not there is a Clear; while
+                    // learning, Cancel replaces Learn and uses the room for the prompt.
+                    if control.is_some() && !learning {
                         if theme::chip_button(ui, "Clear", false).clicked() {
                             setlist.forget(action);
                         }
-                    } else {
+                    } else if !learning {
                         ui.add_space(theme::chip_button_width(ui, "Clear") + 4.0);
                     }
                     if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
                         *learn = if learning { None } else { Some(action) };
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.allocate_ui_with_layout(Vec2::new(ACTION_W, ROW_H - 4.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.set_min_width(ACTION_W);
+                        if narrow {
                             ui.add(egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
-                        });
-                        let (text, color) = match (learning, control) {
-                            (true, _) => ("Press a pedal, key or button…".to_string(), theme::ACCENT),
-                            (false, Some(c)) => {
-                                let what = crate::setlist::msg_label(c.msg);
-                                (c.device.map_or(what.clone(), |d| format!("{what} · {}", device_name(d))), theme::INK)
-                            }
-                            (false, None) => ("Unbound".to_string(), theme::INK_2),
-                        };
-                        ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(color)).truncate());
+                        } else {
+                            ui.allocate_ui_with_layout(Vec2::new(ACTION_W, ROW_H - 4.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.set_min_width(ACTION_W);
+                                ui.add(egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
+                            });
+                            ui.add(egui::Label::new(egui::RichText::new(&text).size(11.5).color(color)).truncate());
+                        }
                     });
                 });
             });
+            if narrow {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&text).size(11.0).color(color)).truncate());
+                });
+            }
         }
         ui.add_space(6.0);
         ui.label(egui::RichText::new(ShowAction::SongOfProgram.label()).size(12.0).color(theme::INK));
@@ -164,7 +180,12 @@ impl DemoApp {
             return;
         }
         let reading = self.tuner_reading();
-        let area = egui::Area::new(egui::Id::new("show_tuner")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 72.0));
+        let (anchor, offset) = if self.show_mode.is_some() {
+            (egui::Align2::RIGHT_TOP, Vec2::new(-48.0, 108.0))
+        } else {
+            (egui::Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
+        };
+        let area = egui::Area::new(egui::Id::new("show_tuner")).order(egui::Order::Foreground).anchor(anchor, offset);
         let closed = area
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(TUNER_SIZE, egui::Sense::click());
@@ -373,6 +394,10 @@ mod tests {
     fn a_show_controls_messages_move_no_key_and_no_knob_learn() {
         let mut s = Stage::new();
         s.app.show_learn = Some(ShowAction::NextPart);
+        // A CC release (val < 64) does not bind; the press (val >= 64) does.
+        s.midi(&[0xB0, 64, 0]);
+        assert_eq!(s.app.setlist.control_of(ShowAction::NextPart), None, "CC release does not bind");
+        assert_eq!(s.app.show_learn, Some(ShowAction::NextPart));
         s.midi(&[0x90, 36, 100]);
         assert_eq!(s.app.notes_down[36], 0, "the key a learn binds does not light");
         s.midi(&[0x80, 36, 0]);
@@ -380,6 +405,35 @@ mod tests {
         assert_eq!(s.app.notes_down[36], 0, "nor does its next press");
         s.midi(&[0x90, 37, 100]);
         assert_ne!(s.app.notes_down[37], 0, "another key plays as before");
+        // Binding a key while it is held still clears its keyboard-dock LED on release.
+        s.app.setlist.learn(ShowAction::Panic, Some(PEDAL), ShowMsg::Note(37));
+        s.tick();
+        s.midi(&[0x80, 37, 0]);
+        assert_eq!(s.app.notes_down[37], 0, "releasing the newly learned key clears its dock LED");
+    }
+
+    #[test]
+    fn master_mute_overrides_grace_and_tap_tempo_leaves_no_remote_agent_badge() {
+        let mut s = Stage::new();
+        s.app.setlist.learn(ShowAction::MasterMute, Some(PEDAL), ShowMsg::Cc(82));
+        s.app.setlist.learn(ShowAction::TapTempo, Some(PEDAL), ShowMsg::Cc(83));
+        s.tick();
+        // Inside the Mixer's 0.6 s mute grace window, a pedal toggle still syncs.
+        s.app.ui_master_mute_grace = s.app.ui_time + 0.6;
+        s.tap(&[0xB0, 82, 127]);
+        assert!(s.app.master_mute, "pedal mute syncs even during ui_master_mute_grace");
+        // Pedal tap tempo updates BPM without recording a remote agent edit.
+        s.app.agent_activity = AgentActivity::default();
+        for _ in 0..3 {
+            s.tap(&[0xB0, 83, 127]);
+            let mut buf = vec![0.0f32; 256 * 2];
+            for _ in 0..(48000 / 2 / 256) - 2 {
+                s.engine.render(&mut buf, 2);
+            }
+        }
+        s.tick();
+        assert!((s.app.bpm - 120.0).abs() <= 2.0, "tapped BPM adopted: {}", s.app.bpm);
+        assert!(s.app.agent_activity.log.is_empty(), "tap tempo does not fire a remote agent badge: {:?}", s.app.agent_activity.log);
     }
 
     fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
@@ -475,6 +529,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let gig = |tune: bool| {
             let mut app = DemoApp::new_with_sink(None);
+            app.hw_midi.devices.lock().unwrap().extend([
+                ("Launchkey Mini:Launchkey Mini MIDI 1 24:0".into(), true),
+                ("FCB1010:FCB1010 MIDI 1 32:0".into(), true),
+            ]);
+            app.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+            app.adopt_hw_devices();
             if tune {
                 tuning(&mut app);
             }
@@ -482,16 +542,17 @@ mod tests {
                 let parts = serde_json::json!([{"name": "Verse", "rigs": [{"rig": 0}]}, {"name": "Chorus", "rigs": [{"rig": 0}]}]);
                 app.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "bpm": bpm, "parts": parts.to_string()}));
             }
-            for (action, msg) in [
-                (ShowAction::NextPart, ShowMsg::Cc(80)),
-                (ShowAction::PrevPart, ShowMsg::Cc(81)),
-                (ShowAction::NextSong, ShowMsg::Note(36)),
-                (ShowAction::Panic, ShowMsg::Note(37)),
-                (ShowAction::Tuner, ShowMsg::Program(9)),
-                (ShowAction::Record, ShowMsg::Cc(85)),
+            for (action, dev, msg) in [
+                (ShowAction::NextPart, 1, ShowMsg::Cc(80)),
+                (ShowAction::PrevPart, 1, ShowMsg::Cc(81)),
+                (ShowAction::NextSong, 0, ShowMsg::Note(36)),
+                (ShowAction::Panic, 0, ShowMsg::Note(37)),
+                (ShowAction::Tuner, 1, ShowMsg::Program(9)),
+                (ShowAction::Record, 1, ShowMsg::Cc(85)),
             ] {
-                app.setlist.learn(action, Some(1), msg);
+                app.setlist.learn(action, Some(dev), msg);
             }
+            app.setlist.set_program_selects_song(1, true);
             app.select_setlist(0, 1).unwrap();
             app
         };

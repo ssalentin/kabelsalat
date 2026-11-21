@@ -32383,6 +32383,10 @@ impl DemoApp {
                 format!("{} off", note_name(ev.note))
             }));
             if self.show_control_msg(ev.source, 0, crate::show::ShowMsg::Note(ev.note & 0x7F), ev.velocity > 0.0) {
+                if ev.velocity == 0.0 {
+                    let bit = note_source_bit(ev.source);
+                    self.notes_down[(ev.note as usize).min(127)] &= !bit;
+                }
                 continue;
             }
             let semi = ev.note as usize;
@@ -32399,7 +32403,7 @@ impl DemoApp {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
             self.last_midi = Some(self.midi_event_text(src, &format!("CC{cc} {val}")));
-            if self.show_control_msg(src, ch, crate::show::ShowMsg::Cc(cc & 0x7F), true) {
+            if self.show_control_msg(src, ch, crate::show::ShowMsg::Cc(cc & 0x7F), val >= 64) {
                 continue;
             }
             let learned = self.feed_cc_learn(src, cc, val);
@@ -46773,7 +46777,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 41] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 42] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {
@@ -46879,6 +46883,22 @@ mod window_size_layout_tests {
                 a.stage_view = StageView::Setlist;
                 a.preshow.open = true;
                 a.preshow.report = Some(super::preshow::tests::a_report());
+            }),
+            ("setlist show controls", &|a| {
+                for name in ["Opener", "Ballad"] {
+                    a.exec_tool("set_setlist_song", &serde_json::json!({"name": name}));
+                }
+                a.hw_midi.devices.lock().unwrap().extend([
+                    ("Launchkey Mini:Launchkey Mini MIDI 1 24:0".into(), true),
+                    ("FCB1010:FCB1010 MIDI 1 32:0".into(), true),
+                ]);
+                a.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+                a.adopt_hw_devices();
+                a.setlist.learn(crate::show::ShowAction::NextPart, Some(1), crate::show::ShowMsg::Cc(80));
+                a.setlist.learn(crate::show::ShowAction::Panic, Some(0), crate::show::ShowMsg::Note(36));
+                a.setlist.set_program_selects_song(1, true);
+                a.show_learn = Some(crate::show::ShowAction::TapTempo);
+                a.stage_view = StageView::Setlist;
             }),
         ];
 }

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::control::{Command, RigZone, MAX_RIGS};
+use crate::engine::MAX_HW_DEVICES;
 use crate::matrix::SourceId;
 
 /// Devices whose program change can select the song (#208).
@@ -215,13 +216,14 @@ pub struct Show {
     controls: ShowControls,
     /// Per slot: the control is down (its last value was 64 or above).
     down: [bool; MAX_SHOW_CONTROLS],
-    /// Per MIDI channel, one bit per CC: the last value of it the instruments
-    /// got from hardware was 64 or above. A press heard before its control
-    /// was bound (the press a learn binds) gets its release through, so a
-    /// sustain pedal never stays down; one bound at rest passes nothing.
-    held_cc: [u128; 16],
+    /// Per hardware device and MIDI channel, one bit per CC: the last value of
+    /// it the instruments got from that device was 64 or above. A press heard
+    /// before its control was bound (the press a learn binds) gets its release
+    /// through, so a sustain pedal never stays down; one bound at rest passes
+    /// nothing, and another device holding the same CC never collides.
+    held_cc: [[u128; 16]; MAX_HW_DEVICES as usize],
     /// The same for notes: the instruments got its note-on and no note-off.
-    held_note: [u128; 16],
+    held_note: [[u128; 16]; MAX_HW_DEVICES as usize],
     parts: Option<ShowParts>,
     /// The active part, as an index into `parts`.
     part: Option<usize>,
@@ -232,14 +234,23 @@ pub struct Show {
 }
 
 impl Show {
-    /// Replace the table. A slot whose control changed starts down when the
-    /// instruments hold its press, so that press steps nothing.
+    /// Replace the table. A control that was already in the table keeps its
+    /// down state even if it moved to another slot; a newly bound control
+    /// starts down when the instruments hold its press, so that press steps
+    /// nothing.
     pub fn set_controls(&mut self, controls: ShowControls) {
+        let mut next_down = [false; MAX_SHOW_CONTROLS];
         for (i, c) in controls.iter().enumerate() {
-            if *c != self.controls[i] {
-                self.down[i] = c.is_some_and(|c| self.held_by_instruments(c));
+            if let Some(c) = *c {
+                next_down[i] = match self.controls.iter().position(|old| {
+                    old.is_some_and(|o| o.device == c.device && o.channel == c.channel && o.msg == c.msg)
+                }) {
+                    Some(old_i) => self.down[old_i],
+                    None => self.held_by_instruments(c),
+                };
             }
         }
+        self.down = next_down;
         self.controls = controls;
     }
 
@@ -250,9 +261,13 @@ impl Show {
             ShowMsg::Program(_) | ShowMsg::AnyProgram => return false,
         };
         let bit = 1u128 << (n & 0x7F);
-        match c.channel {
-            Some(ch) => held[(ch & 0x0F) as usize] & bit != 0,
-            None => held.iter().any(|h| h & bit != 0),
+        let ch_held = |dev_held: &[u128; 16]| match c.channel {
+            Some(ch) => dev_held[(ch & 0x0F) as usize] & bit != 0,
+            None => dev_held.iter().any(|h| h & bit != 0),
+        };
+        match c.device {
+            Some(d) => held.get(d as usize).is_some_and(ch_held),
+            None => held.iter().any(ch_held),
         }
     }
 
@@ -280,7 +295,13 @@ impl Show {
     /// controls are down and what the instruments hold.
     #[cfg(test)]
     pub fn edges(&self) -> String {
-        format!("{:?}|{:?}|{:?}|{:?}", self.controls, self.down, self.held_cc, self.held_note)
+        let nz = |h: &[[u128; 16]; MAX_HW_DEVICES as usize]| -> Vec<(usize, usize, u128)> {
+            h.iter()
+                .enumerate()
+                .flat_map(|(d, cs)| cs.iter().enumerate().filter(|&(_, &v)| v != 0).map(move |(c, &v)| (d, c, v)))
+                .collect()
+        };
+        format!("{:?}|{:?}|{:?}|{:?}", self.controls, self.down, nz(&self.held_cc), nz(&self.held_note))
     }
 
     /// A message from `source`, `value` its data byte: a CC's value, 127 for
@@ -288,7 +309,7 @@ impl Show {
     pub fn take(&mut self, source: SourceId, channel: u8, msg: ShowMsg, value: u8) -> Take {
         let SourceId::Hardware(device) = source else { return Take::Route };
         let slot = self.controls.iter().position(|c| c.is_some_and(|c| c.takes(device, channel, msg)));
-        if let Some(take) = self.edge(slot, channel, msg, value >= 64) {
+        if let Some(take) = self.edge(slot, device, channel, msg, value >= 64) {
             return take;
         }
         let Some(control) = slot.and_then(|i| self.controls[i]) else { return Take::Route };
@@ -308,21 +329,26 @@ impl Show {
     /// `Some` when it acts no further (no control, a release, a value held
     /// down), `None` on a press of control `slot`. A program change has no
     /// edge: every one is a press.
-    fn edge(&mut self, slot: Option<usize>, channel: u8, msg: ShowMsg, down: bool) -> Option<Take> {
+    fn edge(&mut self, slot: Option<usize>, device: u32, channel: u8, msg: ShowMsg, down: bool) -> Option<Take> {
         let (held, n) = match msg {
             ShowMsg::Cc(n) => (&mut self.held_cc, n),
             ShowMsg::Note(n) => (&mut self.held_note, n),
             ShowMsg::Program(_) | ShowMsg::AnyProgram => return None,
         };
-        let (held, bit) = (&mut held[(channel & 0x0F) as usize], 1u128 << (n & 0x7F));
+        let bit = 1u128 << (n & 0x7F);
+        let dev_held = held.get_mut(device as usize).map(|d| &mut d[(channel & 0x0F) as usize]);
         let Some(i) = slot else {
-            if down { *held |= bit } else { *held &= !bit }
+            if let Some(h) = dev_held {
+                if down { *h |= bit } else { *h &= !bit }
+            }
             return Some(Take::Route);
         };
         let pressed = down && !self.down[i];
         self.down[i] = down;
-        if !down && *held & bit != 0 {
-            *held &= !bit;
+        if !down && dev_held.as_deref().is_some_and(|h| *h & bit != 0) {
+            if let Some(h) = dev_held {
+                *h &= !bit;
+            }
             return Some(Take::Route);
         }
         (!pressed).then_some(Take::Consumed)
@@ -758,5 +784,42 @@ mod tests {
             assert_eq!(ShowAction::from_id(a.id()), Some(a));
             assert_eq!(serde_json::to_value(a).unwrap(), serde_json::json!(a.id()), "sessions and tools use one name");
         }
+    }
+
+    #[test]
+    fn another_device_holding_the_same_note_or_cc_neither_leaks_releases_nor_swallows_presses() {
+        let kb = SourceId::Hardware(0);
+        let pad = SourceId::Hardware(1);
+        let pad_note = ShowControl { device: Some(1), channel: None, msg: ShowMsg::Note(36), action: ShowAction::NextPart };
+        let pad_cc = ShowControl { device: Some(1), channel: None, msg: ShowMsg::Cc(64), action: ShowAction::MasterMute };
+        let mut s = show(&[]);
+        assert_eq!(s.take(kb, 0, ShowMsg::Note(36), 127), Take::Route, "keyboard holds C2");
+        assert_eq!(s.take(kb, 0, ShowMsg::Cc(64), 127), Take::Route, "keyboard holds sustain");
+        // Bind controller B's note 36 and CC 64 while keyboard A is holding both.
+        let mut t = NO_SHOW_CONTROLS;
+        t[0] = Some(pad_note);
+        t[1] = Some(pad_cc);
+        s.set_controls(t);
+        assert!(matches!(s.take(pad, 0, ShowMsg::Note(36), 127), Take::Part(_)), "controller B's first press is not swallowed");
+        assert_eq!(s.take(pad, 0, ShowMsg::Note(36), 0), Take::Consumed, "controller B's release never reaches keyboard A's instruments");
+        assert_eq!(s.take(pad, 0, ShowMsg::Cc(64), 127), Take::Act(ShowAction::MasterMute), "controller B's CC press is not swallowed");
+        assert_eq!(s.take(pad, 0, ShowMsg::Cc(64), 0), Take::Consumed, "controller B's CC release never lifts keyboard A's sustain");
+        assert_eq!(s.take(kb, 0, ShowMsg::Note(36), 0), Take::Route, "keyboard A's own release still reaches instruments");
+        assert_eq!(s.take(kb, 0, ShowMsg::Cc(64), 0), Take::Route, "keyboard A's own sustain-up still reaches instruments");
+    }
+
+    #[test]
+    fn shifting_slots_keeps_a_held_control_down() {
+        let mut s = show(&[PREV]);
+        assert!(matches!(cc(&mut s, 81, 127), Take::Part(_)));
+        // Adding NextPart ahead of PrevPart shifts PrevPart from slot 0 to slot 1.
+        let mut t = NO_SHOW_CONTROLS;
+        t[0] = Some(NEXT);
+        t[1] = Some(PREV);
+        s.set_controls(t);
+        assert_eq!(cc(&mut s, 81, 127), Take::Consumed, "still held after moving to slot 1: no second trigger");
+        assert_eq!(cc(&mut s, 81, 0), Take::Consumed);
+        assert_eq!(cc(&mut s, 80, 127), Take::Part(part(OFF, RigZone::OPEN)));
+        assert_eq!(cc(&mut s, 81, 127), Take::Part(part(RigZone::OPEN, OFF)), "after release, the next press steps back");
     }
 }

@@ -27,7 +27,7 @@ agents are in [AGENTS.md](../AGENTS.md).
   the lock-free `command_bus()` (rtrb).
 - `setlist.rs` — gig setlist model (#204): `Setlist`, `Song` (optional BPM and
   time signature), `Part` (per-rig `PartRig` key range, transpose, level,
-  velocity layer and floating split, and stored `ParamValue` knobs), `FootSwitch` CC bindings, stepping, validation and
+  velocity layer and floating split, and stored `ParamValue` knobs), `ShowControl` bindings, stepping, validation and
   node/rig remapping across rig edits. Persisted inside `Session`; switching
   parts sends `Command::SetRigZones` so the engine gates only new notes while
   held notes, releases, pedal-ups and effect tails finish uninterrupted.
@@ -58,7 +58,7 @@ agents are in [AGENTS.md](../AGENTS.md).
   skips that song's set, its level-aware zones from `Setlist::zones_of`) and
   the active part (`SetShowPart`), steps the part itself in the block the CC
   arrives in, as `next_part`/`prev_part` would, or jumps to song N+1's first
-  part on program change N from a device in `Setlist::program_devices` (#208:
+  part on program change N from a device in `Setlist::program_devices()` (#208:
   `ShowMsg::AnyProgram` + `ShowAction::SongOfProgram`; a control naming one
   program, `ShowMsg::Program(n)`, goes before it in the table), and publishes
   `GraphPub::show_part`/`show_steps`. The UI follows one frame later with

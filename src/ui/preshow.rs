@@ -297,22 +297,28 @@ pub(super) mod tests {
         }
     }
 
+    /// The real checks on a gig whose FM-1 is unplugged, whose lead rig
+    /// needs Odin 2 and whose opener's backing track is gone, on battery.
     pub(in crate::ui) fn a_report() -> Report {
-        let rows = crate::preshow::CHECKS
-            .iter()
-            .enumerate()
-            .map(|(i, c)| crate::preshow::Row {
-                id: c.id,
-                title: c.title,
-                status: [Status::Ok, Status::Problem, Status::Warning][i % 3],
-                text: if i == 1 {
-                    "The chosen output M Series Headphone + Monitor Out is not connected: plug it in, or choose another in Settings ▸ Audio.".into()
-                } else {
-                    format!("{} is fine for the show.", c.title)
-                },
-            })
-            .collect();
-        Report { session: "Friday gig".into(), songs: 3, rows, took_ms: 2400 }
+        use crate::preshow::tests::{clap, healthy, rig, show, ODIN};
+        let mut s = show();
+        rig(&mut s.graph, 3, clap(ODIN), "ODIN 2");
+        s.rig_names.push("Lead".into());
+        s.setlist.songs[0].name = "Opener".into();
+        let mut f = healthy(&s);
+        f.midi_ports = Some(vec![]);
+        f.files = vec![("/gig/intro.wav".into(), crate::preshow::FileFact::Missing)];
+        f.power = Some(crate::preshow::Power::Battery { percent: Some(64) });
+        f.probe.as_mut().unwrap().rigs[3].1 = 0.0;
+        Report::of(&s, &f, std::time::Duration::from_millis(2400))
+    }
+
+    /// A rack with the gig's songs, the second one live.
+    fn with_songs(app: &mut DemoApp) {
+        for name in ["Opener", "Ballad", "Encore"] {
+            app.exec_tool("set_setlist_song", &serde_json::json!({"name": name}));
+        }
+        app.exec_tool("select_setlist_part", &serde_json::json!({"song": 1}));
     }
 
     #[test]
@@ -371,7 +377,9 @@ pub(super) mod tests {
         let marks: Vec<(String, Color32)> =
             frame(&mut app, &ctx, Vec2::new(1280.0, 800.0)).into_iter().filter(|(t, _)| ["✓", "!", "✗"].contains(&t.as_str())).collect();
         assert_eq!(marks.len(), crate::preshow::CHECKS.len(), "{marks:?}");
-        assert!(marks.contains(&("✗".into(), theme::CLIP_BRIGHT)) && marks.contains(&("✓".into(), theme::LIVE_TEAL)), "{marks:?}");
+        for (mark, colour) in [("✗", theme::CLIP_BRIGHT), ("!", theme::ACCENT_BRIGHT), ("✓", theme::LIVE_TEAL)] {
+            assert!(marks.contains(&(mark.into(), colour)), "{mark} in its colour: {marks:?}");
+        }
         assert!(!app.preshow.running(), "a report on screen is not checked again by itself");
     }
 
@@ -479,6 +487,7 @@ pub(super) mod tests {
         // Rule 148: a fresh app per image.
         for size in [Vec2::new(1280.0, 800.0), Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0)] {
             let mut app = DemoApp::new_with_sink(None);
+            with_songs(&mut app);
             app.stage_view = StageView::Setlist;
             app.preshow.open = true;
             app.preshow.report = Some(a_report());

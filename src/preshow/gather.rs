@@ -201,20 +201,13 @@ pub fn check_package(path: &Path) -> anyhow::Result<Report> {
     Ok(Report::of(&session, &facts, t.elapsed()))
 }
 
-/// `kabelsalat preshow-check <package.ksalat> [--json]`: exit status 1 when
-/// a check found a problem.
+/// `kabelsalat preshow-check <package.ksalat>`: exit status 1 when a check
+/// found a problem. (Plugins print to stdout while they load, so the report
+/// is text; agents get JSON from the `preshow_check` tool.)
 pub fn run_cli(args: &[String]) -> anyhow::Result<()> {
-    let json = args.iter().any(|a| a == "--json");
-    let path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .ok_or_else(|| anyhow::anyhow!("usage: kabelsalat preshow-check <session.ksalat> [--json]"))?;
+    let path = args.first().ok_or_else(|| anyhow::anyhow!("usage: kabelsalat preshow-check <session.ksalat>"))?;
     let report = check_package(Path::new(path))?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report.json())?);
-    } else {
-        print!("{}", report.text());
-    }
+    print!("{}", report.text());
     if report.count(Status::Problem) > 0 {
         std::process::exit(1);
     }

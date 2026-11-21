@@ -6121,7 +6121,7 @@ mod tests {
         let chorus = &got["songs"][0]["parts"][1]["rigs"][0];
         assert_eq!((&chorus["vel_lo"], &chorus["vel_hi"], &chorus["vel_curve"], &chorus["float"]), (&json!(64), &json!(127), &json!("hard"), &json!(3)), "{chorus}");
         let bad = server.set_setlist_song(Parameters(SetSetlistSongArgs {
-            song: Some(0), name: None, bpm: None, time_signature: None,
+            song: Some(0), name: None, bpm: None, time_signature: None, backing: None,
             parts: Some(vec![SetlistPartArg {
                 name: "Solo".into(),
                 rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: None, key_hi: None, transpose: None, level: None, vel_lo: None, vel_hi: None, vel_curve: Some("loud".into()), float: None }]),

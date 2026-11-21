@@ -46419,6 +46419,10 @@ mod window_size_layout_tests {
                 a.set_show_mode(true);
             }),
             ("setlist pre-show check", &|a| {
+                for name in ["Opener", "Ballad", "Encore"] {
+                    a.exec_tool("set_setlist_song", &serde_json::json!({"name": name}));
+                }
+                a.exec_tool("select_setlist_part", &serde_json::json!({"song": 1}));
                 a.stage_view = StageView::Setlist;
                 a.preshow.open = true;
                 a.preshow.report = Some(super::preshow::tests::a_report());

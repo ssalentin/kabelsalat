@@ -417,7 +417,7 @@ fn plugins(s: &Session, f: &Facts) -> Outcome {
     if !problems.is_empty() {
         return Outcome::problem(problems.join(" "));
     }
-    let what = if hosted == 1 { "The plugin".to_string() } else { format!("All {hosted} plugins") };
+    let what = if hosted == 1 { "The plugin".to_string() } else { format!("The {hosted} plugins") };
     match f.probe {
         Some(_) => Outcome::ok(format!("{what} of the show {} installed and load{}.", if hosted == 1 { "is" } else { "are" }, if hosted == 1 { "s" } else { "" })),
         None => Outcome::ok(format!("{what} of the show {} installed.", if hosted == 1 { "is" } else { "are" })),
@@ -616,18 +616,18 @@ fn port_label(port: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::control::{name_bytes, ClapId, Graph, Lv2Uri, PortKind, PortRef};
     use crate::session::MidiSources;
     use crate::setlist::{Part, PartRig, Song};
 
     const SURGE: &str = crate::control::SURGE_PLUGIN_ID;
-    const ODIN: &str = "com.thewavewarden.odin2";
+    pub(crate) const ODIN: &str = "com.thewavewarden.odin2";
     const FM1: &str = "FM-1:FM-1 MIDI 1";
     const M2: &str = "alsa_output.usb-MOTU_M2_00HF-00.analog-stereo";
 
-    fn rig(g: &mut Graph, rig: u8, synth: NodeKind, name: &str) -> u32 {
+    pub(crate) fn rig(g: &mut Graph, rig: u8, synth: NodeKind, name: &str) -> u32 {
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let synth = g.add_node(synth, name_bytes(name));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
@@ -642,14 +642,14 @@ mod tests {
         synth
     }
 
-    fn clap(id: &str) -> NodeKind {
+    pub(crate) fn clap(id: &str) -> NodeKind {
         NodeKind::Clap { plugin_id: ClapId::new(id) }
     }
 
     /// Two Surge rigs, an organ rig, a 20-song setlist with a backing track
     /// in song 1, rig A bound to the FM-1, and the Odin unit the third song
     /// needs.
-    fn show() -> Session {
+    pub(crate) fn show() -> Session {
         let mut g = Graph::default();
         g.reserve(32, 32);
         let a = rig(&mut g, 0, clap(SURGE), "SURGE");
@@ -671,7 +671,7 @@ mod tests {
         s
     }
 
-    fn healthy(s: &Session) -> Facts {
+    pub(crate) fn healthy(s: &Session) -> Facts {
         Facts {
             midi_ports: Some(vec![FM1.into(), "MIDIMATE eX:MIDIMATE eX MIDI 1".into()]),
             outputs: Some(vec![OutputDevice { raw: M2.into(), name: "M2".into(), default: true }]),

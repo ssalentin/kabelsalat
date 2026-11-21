@@ -1675,7 +1675,7 @@ Learned so far (2026-11-15, UI polish pass):
     (`a_key_near_a_floating_split_plays_on_exactly_one_rig_after_a_part_edit_or_a_rig_that_did_not_hear`).
     Only a key a rig hears (its Keys cable and source filter) moves its edges
     (`a_keyboard_no_rig_of_a_floating_split_hears_does_not_move_it`).
-195. **A table that grows with the rig count is sized from
+199. **A table that grows with the rig count is sized from
     `control::MAX_RIGS`:** the limit was a literal 8 in about 120 places
     (#205), and two tables sized by other numbers broke first at 20 rigs:
     the recorder's stem delivery ring (16 wires) lost the stems of every rig

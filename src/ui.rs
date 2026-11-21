@@ -46984,10 +46984,13 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 17] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 20] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
+            ("twentyrigs", &|a| while a.rig_count() < 20 { a.edit_rigs(None) }),
+            ("twentyrigs-rail", &|a| { while a.rig_count() < 20 { a.edit_rigs(None) } a.nav_open = true }),
+            ("twentyrigs-mixer", &|a| { while a.rig_count() < 20 { a.edit_rigs(None) } a.stage_view = StageView::Mixer }),
             ("mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
             ("armed", &|a| {
                 a.load_multi_rig_demo();

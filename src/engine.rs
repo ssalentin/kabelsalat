@@ -4031,6 +4031,31 @@ impl GraphEngine {
         self.note_log.push((dest, 255, false)); // 255 = all-notes-off marker
     }
 
+    /// All notes off on every rig (#210), on every MIDI channel: pedals up
+    /// first, so a held sustain cannot keep a released note sounding, then
+    /// every note of each instrument, arp and MIDI-FX unit. Allocation-free.
+    fn panic(&mut self) {
+        for s in self.voices.iter_mut().filter(|s| s.node != NodeId::MAX) {
+            for ch in 0..16 {
+                s.voice.send_cc_rt(ch, 64, 0);
+                s.voice.send_cc_rt(ch, 123, 0);
+            }
+        }
+        for s in self.lv2.iter_mut().filter(|s| s.plugin.is_instrument()) {
+            for ch in 0..16 {
+                s.plugin.control_change_ch(64, 0, ch);
+                s.plugin.control_change_ch(123, 0, ch);
+            }
+        }
+        for i in 0..self.graph.nodes.len() {
+            let n = &self.graph.nodes[i];
+            if matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. } | NodeKind::Arp | NodeKind::MidiFx { .. }) {
+                let id = n.id;
+                self.release_all(id);
+            }
+        }
+    }
+
     /// Run `f` on the arp slot of `node` with the engine passable to its
     /// emit path. `self.arp` is moved out for the call (pointer swap, no
     /// allocation) so `deliver_arp_note` can borrow the engine freely.
@@ -5103,6 +5128,7 @@ impl GraphEngine {
             Command::DemoStop => {
                 self.stop_demo();
             }
+            Command::Panic => self.panic(),
             Command::SetMasterMute { muted } => {
                 if self.master_mute != muted {
                     self.master_mute = muted;
@@ -8519,6 +8545,33 @@ mod tests {
         e.note_log.clear();
         e.arp_test_step();
         assert!(!e.note_log.iter().any(|x| x.2), "nothing plays after the release: {:?}", e.note_log);
+    }
+
+    #[test]
+    fn panic_releases_every_rig_and_stops_the_arp_and_the_demo() {
+        let (mut e, mut bus) = split_engine(None, false);
+        let arp = add_arp(&mut e, &mut bus);
+        play(&mut e, &mut bus, on(60));
+        play(&mut e, &mut bus, on(64));
+        e.arp_test_step();
+        assert!(!e.arp_sounding(arp).is_empty(), "the arp plays the held keys");
+        play(&mut e, &mut bus, Command::DemoPlay { rig: 0, phrase: crate::demo::PhraseKind::Keys });
+        let graph_before = format!("{:?}", e.graph());
+        let log = play(&mut e, &mut bus, Command::Panic);
+        let instruments: Vec<u32> = e.graph().nodes.iter()
+            .filter(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }))
+            .map(|n| n.id)
+            .collect();
+        assert!(instruments.len() >= 2, "both rigs' synths: {instruments:?}");
+        for inst in &instruments {
+            assert!(log.contains(&(*inst, 255, false)), "instrument {inst} got all notes off: {log:?}");
+        }
+        assert!(e.arp_held(arp).is_empty() && e.arp_sounding(arp).is_empty(), "the arp lets go");
+        assert!(e.demo.is_none(), "the demo phrase stops");
+        e.note_log.clear();
+        e.arp_test_step();
+        assert!(!e.note_log.iter().any(|x| x.2), "nothing plays after a panic: {:?}", e.note_log);
+        assert_eq!(format!("{:?}", e.graph()), graph_before, "routing stays as it was");
     }
 
     /// GitHub #97, the audible half: a full pitch bend (+2 st at Surge's

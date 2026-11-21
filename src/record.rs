@@ -1003,7 +1003,7 @@ fn timestamp() -> String {
 }
 
 /// Seconds east of UTC for `secs` in the system time zone (0 if unknown).
-fn local_utc_offset(secs: i64) -> i64 {
+pub(crate) fn local_utc_offset(secs: i64) -> i64 {
     let t = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: localtime_r writes only into `tm`; both pointers are valid.

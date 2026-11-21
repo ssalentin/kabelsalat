@@ -797,6 +797,13 @@ struct SetSetlistFootswitchArgs {
     channel: Option<u8>,
 }
 
+/// Arguments for `set_show_mode`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetShowModeArgs {
+    /// true opens Show mode, false leaves it.
+    on: bool,
+}
+
 /// Arguments for `set_count_in`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetCountInArgs {
@@ -4652,6 +4659,31 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"playing": false}))
+    }
+
+    /// Open or leave Show mode, the locked stage screen (#210).
+    #[tool(name = "set_show_mode", description = "Open (on=true) or leave (on=false) Show mode in the running app: the locked full-window stage screen with the current song and part in large type, the next song, tempo, the master meter, one meter per live rig, a clock and a Panic button. While it is open no click or key edits the patch, the mix or the setlist; PageUp/PageDown and foot switches still step parts, and the user leaves by holding Esc. Returns what the screen shows.")]
+    fn set_show_mode(&self, Parameters(args): Parameters<SetShowModeArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_show_mode", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        tool_err("Show mode is a screen of the running app (connect with --attach)")
+    }
+
+    /// All notes off on every rig (#210).
+    #[tool(name = "panic", description = "All notes off on every rig (Command::Panic): every instrument, arp and MIDI effect releases its notes and pedals, and a demo phrase stops. Routing, the mix and the setlist stay as they are. Use it when notes hang.")]
+    fn panic(&self) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("panic", json!({}));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::Panic) {
+            return tool_err(e);
+        }
+        ok_json(json!({"panic": true}))
     }
 
     /// Read the session's setlist (#204).

@@ -380,17 +380,16 @@ impl Setlist {
 
     /// Step to part 0 of the next song.
     pub fn next_song(&mut self) -> Option<SetlistPos> {
-        let Some(pos) = self.active else {
-            return self.first_non_empty_pos().inspect(|&p| self.active = Some(p));
-        };
-        for si in (pos.song + 1)..self.songs.len() {
-            if self.playable(si) {
-                let next = SetlistPos { song: si, part: 0 };
-                self.active = Some(next);
-                return Some(next);
-            }
-        }
-        None
+        let next = SetlistPos { song: self.upcoming_song()?, part: 0 };
+        self.active = Some(next);
+        Some(next)
+    }
+
+    /// The song [`Self::next_song`] steps to: the first playable song after
+    /// the active one, or the first playable song when none is active.
+    pub fn upcoming_song(&self) -> Option<usize> {
+        let from = self.active.map_or(0, |p| p.song + 1);
+        (from..self.songs.len()).find(|&si| self.playable(si))
     }
 
     /// Step to part 0 of the previous song.
@@ -724,7 +723,9 @@ mod tests {
         assert_eq!(sl.prev_part(), Some(SetlistPos { song: 0, part: 1 }));
         assert_eq!(sl.prev_part(), Some(SetlistPos { song: 0, part: 0 }));
         assert_eq!(sl.prev_part(), None, "stops at the start");
+        assert_eq!(sl.upcoming_song(), Some(1));
         assert_eq!(sl.next_song(), Some(SetlistPos { song: 1, part: 0 }));
+        assert_eq!(sl.upcoming_song(), None, "the last song has none after it");
         assert_eq!(sl.prev_song(), Some(SetlistPos { song: 0, part: 0 }));
     }
 

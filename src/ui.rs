@@ -173,6 +173,7 @@ use crate::theme::{alpha, mix};
 
 mod console;
 mod levels;
+mod show_mode;
 use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -3165,7 +3166,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_keyboard_state", "set_keyboard_mode",
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
-    "play_demo", "stop_demo",
+    "play_demo", "stop_demo", "set_show_mode", "panic",
     "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch",
     "set_level", "set_setlist_set",
     "inspect_plugin", "set_param", "reset_params",
@@ -3196,6 +3197,8 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "set_device_instrument"
             | "play_demo"
             | "stop_demo"
+            | "set_show_mode"
+            | "panic"
     )
 }
 
@@ -3766,6 +3769,8 @@ struct DemoApp {
     setlist_import_open: bool,
     /// The Setlist view shows Sets & levels (#273) instead of the song editor.
     setlist_levels_open: bool,
+    /// The locked stage screen (#210), open over every view.
+    show_mode: Option<show_mode::ShowMode>,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
     /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
     /// node id like the session's strips (`remap_session` carries them).
@@ -4355,6 +4360,7 @@ impl DemoApp {
             setlist_new_part_name: String::new(),
             setlist_import_open: false,
             setlist_levels_open: false,
+            show_mode: None,
             strips: Vec::new(),
             sends: Vec::new(),
             bus_outs: Vec::new(),
@@ -6364,6 +6370,11 @@ impl DemoApp {
                 format!("Play demo → {}", self.rig_name(rig))
             }
             "stop_demo" => "Stop demo".into(),
+            "set_show_mode" => match args.get("on").and_then(|v| v.as_bool()) {
+                Some(false) => "Leave Show mode".into(),
+                _ => "Show mode".into(),
+            },
+            "panic" => "Panic: all notes off".into(),
             "set_octave" => {
                 let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4);
                 format!("Octave → C{oct}")
@@ -8976,6 +8987,19 @@ impl DemoApp {
                 }
                 self.agent_activity.record(origin, "Stop demo", vec![], now);
                 serde_json::json!({"playing": false}).to_string()
+            }
+            "set_show_mode" => match args.get("on").and_then(|v| v.as_bool()) {
+                Some(on) => {
+                    self.set_show_mode(on);
+                    self.agent_activity.record(origin, if on { "Show mode on" } else { "Show mode off" }, vec![], now);
+                    self.show_mode_json().to_string()
+                }
+                None => "error: give on=true to open Show mode or on=false to leave it".into(),
+            },
+            "panic" => {
+                self.panic();
+                self.agent_activity.record(origin, "Panic: all notes off", vec![], now);
+                serde_json::json!({"panic": true}).to_string()
             }
             "set_octave" => {
                 let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4).clamp(1, 7) as u8;
@@ -17594,6 +17618,7 @@ impl DemoApp {
         let mut remove_part: Option<(usize, usize)> = None;
         let mut capture_knobs_for: Option<(usize, usize)> = None;
         let mut active_part_dirty = false;
+        let mut enter_show = false;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
@@ -17606,6 +17631,12 @@ impl DemoApp {
                     ui.add_space(10.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        if theme::primary_button(ui, "Show mode")
+                            .on_hover_text("the locked stage screen: song, next song, levels and Panic · hold Esc to leave")
+                            .clicked()
+                        {
+                            enter_show = true;
+                        }
                         if theme::chip_button(ui, "Sets & levels", self.setlist_levels_open)
                             .on_hover_text("group songs into sets; choose what stays through the whole show")
                             .clicked()
@@ -18191,6 +18222,9 @@ impl DemoApp {
                     part.params = knobs;
                 }
             }
+        }
+        if enter_show {
+            self.set_show_mode(true);
         }
         if let Some(act) = step_action {
             let _ = self.step_setlist(act);
@@ -31800,6 +31834,11 @@ impl DemoApp {
             eprintln!("ui scale: first-frame ppp={:.2} native={native:?}", ctx.pixels_per_point());
         }
 
+        // Show mode (#210) locks the screen: no key, click or drop below this
+        // line reaches the patch, the mix or the setlist.
+        if self.show_mode.is_some() {
+            return self.show_frame(ui);
+        }
         if self.flip_requested {
             self.flip_requested = false;
             self.on_tab();
@@ -31893,6 +31932,71 @@ impl DemoApp {
                 }
             }
         }
+        self.frame_feeds(&ctx);
+
+        let rect = ui.available_rect_before_wrap();
+        let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
+        self.fps += (1.0 / dt - self.fps) * 0.05;
+
+        self.sync_main_knobs();
+        self.sync_midi_knobs();
+        self.sync_aeolus_faces();
+        self.layout(rect);
+        if let Some(node) = self.nav_pan_target.take() {
+            let old_pan = self.rack_pan;
+            self.pan_rack_to_unit(node);
+            self.xf.center += self.rack_pan - old_pan;
+        }
+        if self.mixer_flash.is_some_and(|(_, exp)| self.ui_time >= exp) {
+            self.mixer_flash = None;
+        }
+        self.fit_plugin_knobs();
+        if !typing(&ctx) {
+            self.handle_input(&ctx, rect);
+        }
+        self.update(dt);
+
+        self.publish_patch();
+        self.publish_pins();
+        self.refresh_knob_readouts();
+
+        self.tessellate();
+        if !(self.dock == DockView::Keyboard && self.kb_expanded) {
+            if self.stage_view != StageView::Rack {
+                self.back_controls_rect = Rect::NOTHING;
+            }
+            match self.stage_view {
+                StageView::Rack => self.draw(ui),
+                StageView::Matrix => self.matrix_stage(ui),
+                StageView::Mixer => self.mixer_stage(ui),
+                StageView::Setlist => self.setlist_stage(ui),
+                StageView::Sessions => self.sessions_stage(ui),
+                StageView::Plugins => self.plugins_stage(ui),
+                StageView::Settings => self.settings_stage(ui),
+            }
+        } else {
+            self.back_controls_rect = Rect::NOTHING;
+        }
+        self.knob_menu_ui(&ctx);
+        self.scale_menu_ui(&ctx);
+        self.cable_menu_ui(&ctx);
+        self.unit_menu_ui(&ctx);
+        self.jack_tooltip_ui(&ctx);
+        self.engine_info_ui(&ctx);
+        self.session_popover_ui(&ctx);
+        self.nav_rig_menu_ui(&ctx);
+        self.delete_rig_modal(&ctx);
+        self.rename_rig_modal(&ctx);
+        self.save_rig_modal(&ctx);
+        self.load_rig_modal(&ctx);
+        self.param_editor_window(&ctx);
+
+        self.frame_end(&ctx);
+    }
+
+    /// What every frame serves, whatever the screen shows: agents, the
+    /// engine's publications, plugins, scans and hardware MIDI.
+    fn frame_feeds(&mut self, ctx: &egui::Context) {
         // Before the assistant and remote edits: a part they pick this frame
         // wins over a foot-switch step the engine took before it.
         self.follow_show();
@@ -31963,63 +32067,10 @@ impl DemoApp {
             let learned = self.feed_cc_learn(src, cc, val);
             self.apply_cc_to_knobs(src, ch, cc, val, learned);
         }
+    }
 
-        let rect = ui.available_rect_before_wrap();
-        let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
-        self.fps += (1.0 / dt - self.fps) * 0.05;
-
-        self.sync_main_knobs();
-        self.sync_midi_knobs();
-        self.sync_aeolus_faces();
-        self.layout(rect);
-        if let Some(node) = self.nav_pan_target.take() {
-            let old_pan = self.rack_pan;
-            self.pan_rack_to_unit(node);
-            self.xf.center += self.rack_pan - old_pan;
-        }
-        if self.mixer_flash.is_some_and(|(_, exp)| self.ui_time >= exp) {
-            self.mixer_flash = None;
-        }
-        self.fit_plugin_knobs();
-        if !typing(&ctx) {
-            self.handle_input(&ctx, rect);
-        }
-        self.update(dt);
-
-        self.publish_patch();
-        self.publish_pins();
-        self.refresh_knob_readouts();
-
-        self.tessellate();
-        if !(self.dock == DockView::Keyboard && self.kb_expanded) {
-            if self.stage_view != StageView::Rack {
-                self.back_controls_rect = Rect::NOTHING;
-            }
-            match self.stage_view {
-                StageView::Rack => self.draw(ui),
-                StageView::Matrix => self.matrix_stage(ui),
-                StageView::Mixer => self.mixer_stage(ui),
-                StageView::Setlist => self.setlist_stage(ui),
-                StageView::Sessions => self.sessions_stage(ui),
-                StageView::Plugins => self.plugins_stage(ui),
-                StageView::Settings => self.settings_stage(ui),
-            }
-        } else {
-            self.back_controls_rect = Rect::NOTHING;
-        }
-        self.knob_menu_ui(&ctx);
-        self.scale_menu_ui(&ctx);
-        self.cable_menu_ui(&ctx);
-        self.unit_menu_ui(&ctx);
-        self.jack_tooltip_ui(&ctx);
-        self.engine_info_ui(&ctx);
-        self.session_popover_ui(&ctx);
-        self.nav_rig_menu_ui(&ctx);
-        self.delete_rig_modal(&ctx);
-        self.rename_rig_modal(&ctx);
-        self.save_rig_modal(&ctx);
-        self.load_rig_modal(&ctx);
-        self.param_editor_window(&ctx);
+    /// Repaint pacing and the input method, last in every frame.
+    fn frame_end(&mut self, ctx: &egui::Context) {
         // After every view and dialog of the frame, so their setlist edits
         // reach the engine before the next foot-switch press can.
         self.publish_show();
@@ -32042,7 +32093,6 @@ impl DemoApp {
             ctx.output_mut(|o| o.ime = None);
         }
     }
-
 }
 
 impl eframe::App for DemoApp {

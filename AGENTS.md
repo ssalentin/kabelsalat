@@ -1609,3 +1609,12 @@ Learned so far (2026-11-15, UI polish pass):
     primary press on the widget), and their test asserts the note after the
     press frame alone (`a_drum_pad_sounds_when_it_is_pressed`).
 
+194. **Rig solo is exclusive, and the rule lives in the engine:** the strip's
+    S button and `SetRigMix` each set only their own rig's flag, so several
+    rigs could be soloed at once (#256). `GraphEngine::set_rig_mix` calls
+    `RigMix::solo_only` on `solo: Some(true)`, so every caller (UI, CC, agent,
+    MCP, CLI) gets it; the UI's local edits apply the same helper to the
+    mirror before the engine's echo
+    (`soloing_a_rig_unsolos_every_other_rig`,
+    `a_rig_solo_unsolos_the_other_rigs_in_the_mixer`). Source-strip solo
+    (`SetStripMix`) still stacks within a rig.

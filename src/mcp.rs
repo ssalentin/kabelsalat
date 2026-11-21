@@ -915,7 +915,7 @@ struct SetRigMixArgs {
     pan: Option<f32>,
     /// Mute (omit to keep).
     mute: Option<bool>,
-    /// Solo — mutes every non-solo rig (omit to keep).
+    /// Solo — exclusive: clears every other rig's solo and mutes them (omit to keep).
     solo: Option<bool>,
 }
 
@@ -2975,7 +2975,7 @@ impl McpServer {
     }
 
     /// Per-rig mixer (the overview strip's vol/pan/mute/solo).
-    #[tool(name = "set_rig_mix", description = "Per-rig mixer (Command::SetRigMix): rig index (0-based, see get_rigs), vol 0..1, pan -1..1, mute, solo. Omitted fields keep their value. Solo mutes every non-solo rig. Applied at the rig's master when summing to the output; resets on graph loads.")]
+    #[tool(name = "set_rig_mix", description = "Per-rig mixer (Command::SetRigMix): rig index (0-based, see get_rigs), vol 0..1, pan -1..1, mute, solo. Omitted fields keep their value. Solo is exclusive: soloing a rig un-solos every other rig and mutes them. Applied at the rig's master when summing to the output; resets on graph loads.")]
     fn set_rig_mix(&self, Parameters(args): Parameters<SetRigMixArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::SetRigMix { rig: args.rig, vol: args.vol, pan: args.pan, mute: args.mute, solo: args.solo }) {

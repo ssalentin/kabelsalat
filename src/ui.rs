@@ -8507,6 +8507,7 @@ impl DemoApp {
                 if let Some(v) = args.get("pan").and_then(|v| v.as_f64()) { m.pan = v.clamp(-1.0, 1.0) as f32; }
                 if let Some(v) = args.get("mute").and_then(|v| v.as_bool()) { m.mute = v; }
                 if let Some(v) = args.get("solo").and_then(|v| v.as_bool()) { m.solo = v; }
+                if m.solo { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(7)); }
                 self.send_rig_mix(rig);
                 if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 let m = self.rig_mix[rig.min(7)];
@@ -11296,6 +11297,7 @@ impl DemoApp {
             if let Some(p) = e.pan { m.pan = p; }
             if let Some(b) = e.mute { m.mute = b; }
             if let Some(b) = e.solo { m.solo = b; }
+            if e.solo == Some(true) { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(7)); }
             if resend { self.send_rig_mix(rig); }
         } else if ctl.fits(false).is_ok() && self.units.iter().any(|u| u.node_id == node) {
             self.with_strip_row(node, |row| {
@@ -24157,7 +24159,7 @@ impl DemoApp {
                     .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
                 let sr = ui.add(sb);
                 self.mixer_learn_ui(ui, &sr, sr.rect, solo_dest);
-                if sr.on_hover_text("solo this rig · right-click: MIDI learn").clicked() { m.solo = !m.solo; }
+                if sr.on_hover_text("solo this rig (un-solos the others) · right-click: MIDI learn").clicked() { m.solo = !m.solo; }
                 let rb = egui::Button::new(egui::RichText::new("R").size(11.0)
                         .color(if armed { theme::ON_ACCENT } else { theme::CREAM_MID }))
                     .fill(if armed { theme::ACCENT_DEEP } else { theme::DARK_PANEL_HI })
@@ -24178,6 +24180,7 @@ impl DemoApp {
             m.vol = vol;
             self.ui_mix_grace[rig.min(7)] = self.ui_time + 0.6;
             self.rig_mix[rig.min(7)] = m;
+            if m.solo { crate::engine::RigMix::solo_only(&mut self.rig_mix, rig.min(7)); }
             self.send_rig_mix(rig);
         }
     }
@@ -30753,6 +30756,33 @@ mod rig_switch_tests {
         assert_eq!(RuleEdit { key_lo: 0, key_hi: 59, ..base.clone() }.cell_code(), "keys");
         assert_eq!(RuleEdit { vel_lo: 40, ..base.clone() }.cell_code(), "vel");
         assert_eq!(RuleEdit { enabled: false, transpose: 12, ..base }.cell_code(), "off", "a muted rule says so first");
+    }
+
+    /// A remote solo of rig B shows rig A un-soloed in the mixer, and the
+    /// UI's own solo edits (strip button, CC, agent tool) apply the same
+    /// exclusive rule to the mirror before the engine answers.
+    #[test]
+    fn a_rig_solo_unsolos_the_other_rigs_in_the_mixer() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        let (mut ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        app.graph_pub = Some(pub_.clone());
+        let mut buf = vec![0.0f32; 64 * 2];
+        ebus.send(Command::SetRigMix { rig: 0, vol: None, pan: None, mute: None, solo: Some(true) });
+        engine.render(&mut buf, 2);
+        app.sync_from_engine();
+        assert!(app.rig_mix[0].solo && !app.rig_mix[1].solo);
+        ebus.send(Command::SetRigMix { rig: 1, vol: None, pan: None, mute: None, solo: Some(true) });
+        engine.render(&mut buf, 2);
+        app.sync_from_engine();
+        assert!(!app.rig_mix[0].solo, "rig A no longer shows soloed");
+        assert!(app.rig_mix[1].solo, "rig B shows soloed");
+        // The agent tool edits the mirror itself: same rule, no engine needed.
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "solo": true}));
+        assert!(app.rig_mix[0].solo && !app.rig_mix[1].solo, "the agent's solo of rig A un-solos rig B");
     }
 
     #[test]

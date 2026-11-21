@@ -12,6 +12,15 @@ agents are in [AGENTS.md](../AGENTS.md).
 
 ## Module map (src/)
 
+- `audio_backend.rs` — runtime-selectable audio output backends (#349): native
+  PipeWire (`dlopen("libpipewire-0.3.so.0")`, creating a routable `kabelsalat`
+  PipeWire node directly without `pipewire-alsa`), JACK / `pipewire-jack`
+  (`dlopen("libjack.so.0")` and PipeWire's private `pipewire-0.3/jack/libjack.so.0`
+  paths, registering `Kabelsalat:out_1`/`out_2` and auto-connecting to physical
+  playback ports), and ALSA (`cpal`, with direct ALSA PCM selection). Default
+  `Auto` tries PipeWire → JACK → ALSA; persisted in `config.json` (`audio_backend`),
+  overridable via `KABELSALAT_AUDIO_BACKEND`, switchable live in Settings → Audio
+  and via `set_audio_backend`.
 - `control.rs` — the typed control plane: `Command` (one API for UI, assistant,
   CLI and MCP), `Graph`/`Node`/`Edge` (nodes carry their `rig`), `Rig`,
   `RigSnapshot`, `RigZone` (`Command::SetRigZones`), `merge_rigs`/`split_rigs`,

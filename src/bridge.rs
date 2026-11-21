@@ -101,6 +101,16 @@ pub const BUFFER_FRAMES: u32 = 256;
 pub const BUFFER_SIZE_CHOICES: &[u32] = &[64, 128, 256, 512, 1024, 2048];
 /// Configured output buffer size in frames (updated when the user picks a new size).
 pub static CONFIGURED_BUFFER_FRAMES: AtomicU32 = AtomicU32::new(BUFFER_FRAMES);
+/// Active audio backend (0 = none, 1 = PipeWire, 2 = JACK, 3 = ALSA).
+pub static ACTIVE_AUDIO_BACKEND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn active_audio_backend() -> Option<crate::audio_backend::ActiveBackend> {
+    crate::audio_backend::ActiveBackend::from_u8(ACTIVE_AUDIO_BACKEND.load(Ordering::Relaxed))
+}
+
+pub fn set_active_audio_backend(backend: Option<crate::audio_backend::ActiveBackend>) {
+    ACTIVE_AUDIO_BACKEND.store(backend.map_or(0, |b| b.to_u8()), Ordering::Relaxed);
+}
 
 pub fn valid_buffer_frames(frames: u32) -> bool {
     BUFFER_SIZE_CHOICES.contains(&frames)

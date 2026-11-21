@@ -716,8 +716,9 @@ measures a played note's pitch, brightness and aliasing.
 
 ## 8. Build phases (history)
 
-The phases the project was built in. The current roadmap lives in
-[GitHub issues and milestones](https://github.com/ssalentin/kabelsalat/milestones).
+The phases the project was built in. The current roadmap is the pinned issue
+[Roadmap to v1.0](https://github.com/ssalentin/kabelsalat/issues/272), with one
+[milestone](https://github.com/ssalentin/kabelsalat/milestones) per version.
 
 ### P0 — Spike (3–5 days) · go/no-go gate
 - cpal duplex through PipeWire, no xruns over 5 min; latency numbers

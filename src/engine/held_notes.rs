@@ -106,6 +106,9 @@ enum Step {
     Pedal(bool),
     /// A setlist switch to `setlist_switch(n)`.
     Song(u8),
+    /// The foot switches' device's key `PAD` down or up (#277): a note a
+    /// show control may be learned for while it is held.
+    Pad(bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +162,9 @@ enum Edit {
     Switch(u8),
     /// A program change from the foot switches' device: selects song N+1.
     Program(u8),
+    /// The show controls with (true) or without the `PAD` key learned for
+    /// the next part (#277).
+    LearnPad(bool),
 }
 
 /// Which scenario a search runs: the plain rack, the arp (#90), the rack
@@ -229,6 +235,8 @@ const OFF: RigZone = RigZone { live: false, ..RigZone::OPEN };
 /// The foot-switch scenario's switches (#261): next and previous part.
 const NEXT_CC: u8 = 80;
 const PREV_CC: u8 = 81;
+/// A key of the foot switches' device that a show control is learned for.
+const PAD: u8 = 72;
 
 /// The songs of the zones scenario, as (rig 0, rig 1): live flips both ways,
 /// a key range per rig, and transposes that move while notes are held. The
@@ -281,8 +289,9 @@ const ZONE_EDITS: [Edit; 11] = [
 ];
 
 /// Edits of the foot-switch scenario: both switches, a song picked in the UI
-/// meanwhile, and the matrix transpose and split the zone transpose stacks on.
-const SWITCH_EDITS: [Edit; 10] = [
+/// meanwhile, the matrix transpose and split the zone transpose stacks on,
+/// and a key learned as a show control and forgotten again.
+const SWITCH_EDITS: [Edit; 12] = [
     Edit::Switch(NEXT_CC),
     Edit::Switch(PREV_CC),
     Edit::Program(3),
@@ -293,6 +302,8 @@ const SWITCH_EDITS: [Edit; 10] = [
     Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
     Edit::Split(Some(60)),
     Edit::Split(None),
+    Edit::LearnPad(true),
+    Edit::LearnPad(false),
 ];
 
 /// Edits of the layers scenario (#276): its songs, the plain one, and the
@@ -377,7 +388,7 @@ impl Edit {
             Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
             Edit::Source { .. } => Kind::Source,
             Edit::DemoPlay(_) | Edit::DemoStop => Kind::Demo,
-            Edit::Zones(_) | Edit::Layers(_) | Edit::Switch(_) | Edit::Program(_) => Kind::Zone,
+            Edit::Zones(_) | Edit::Layers(_) | Edit::Switch(_) | Edit::Program(_) | Edit::LearnPad(_) => Kind::Zone,
             Edit::Bypass(..) => Kind::Bypass,
         }
     }
@@ -471,6 +482,7 @@ impl Edit {
             Edit::Bypass(node, bypass) => Command::SetStripBypass { node, bypass },
             Edit::Switch(cc) => switch(cc, 127),
             Edit::Program(program) => Command::Program { source: SourceId::Hardware(0), channel: 0, program },
+            Edit::LearnPad(pad) => Command::SetShowControls { controls: show_controls(pad) },
         }
     }
 }
@@ -479,15 +491,23 @@ fn switch(cc: u8, value: u8) -> Command {
     Command::Cc { source: SourceId::Hardware(0), channel: 0, cc, value }
 }
 
-/// The foot-switch scenario's setlist in the engine: `SONGS` as parts, and
-/// `NEXT_CC` / `PREV_CC` as the foot switches that step through them.
-fn show_commands() -> [Command; 2] {
+/// The foot switches `NEXT_CC` / `PREV_CC`, the device's program changes
+/// selecting songs and, with `pad`, the key `PAD` stepping to the next part.
+fn show_controls(pad: bool) -> crate::show::ShowControls {
     use crate::show::{ShowAction, ShowControl, ShowMsg};
     let control = |cc, action| Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action });
     let mut controls = crate::show::NO_SHOW_CONTROLS;
     controls[0] = control(NEXT_CC, ShowAction::NextPart);
     controls[1] = control(PREV_CC, ShowAction::PrevPart);
-    controls[2] = Some(ShowControl { device: Some(0), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
+    controls[2] = pad.then_some(ShowControl { device: Some(0), channel: None, msg: ShowMsg::Note(PAD), action: ShowAction::NextPart });
+    controls[3] = Some(ShowControl { device: Some(0), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
+    controls
+}
+
+/// The foot-switch scenario's setlist in the engine: `SONGS` as parts, and
+/// the show controls that step through them, the pad not learned yet.
+fn show_commands() -> [Command; 2] {
+    let controls = show_controls(false);
     let parts = SONGS.iter().enumerate().map(|(song, rigs)| {
         let mut zones = [RigZone::OPEN; crate::control::MAX_RIGS];
         zones[..2].copy_from_slice(rigs);
@@ -564,8 +584,8 @@ fn pedal_setlist() -> Setlist {
     ];
     let mut sl = Setlist::default();
     sl.songs = songs.into_iter().enumerate().map(|(i, rigs)| Song::new(format!("Song {}", i + 1), vec![Part::new("Main", rigs)])).collect();
-    sl.next_cc = Some(crate::setlist::FootSwitch { cc: NEXT_CC, channel: None });
-    sl.prev_cc = Some(crate::setlist::FootSwitch { cc: PREV_CC, channel: None });
+    sl.learn(crate::show::ShowAction::NextPart, None, crate::show::ShowMsg::Cc(NEXT_CC));
+    sl.learn(crate::show::ShowAction::PrevPart, None, crate::show::ShowMsg::Cc(PREV_CC));
     sl
 }
 
@@ -680,6 +700,7 @@ impl Run {
         match step {
             Step::On(k) | Step::Soft(k) => !self.held.contains_key(&k),
             Step::Off(k) => self.held.contains_key(&k),
+            Step::Pad(down) => self.held.contains_key(&PAD) != down,
             Step::Edit(Edit::AddArp) => !self.arp_added,
             Step::Pedal(down) => down != self.pedal,
             Step::Edit(_) | Step::Tick | Step::Song(_) => true,
@@ -696,6 +717,8 @@ impl Run {
             Step::Edit(e) => (Some(e.command(self.scn)), None),
             Step::Pedal(down) => (Some(sustain(down)), None),
             Step::Tick | Step::Song(_) => (None, None),
+            Step::Pad(true) => (Some(Command::NoteOn { note: PAD, velocity: 0.8, source: SourceId::Hardware(0), channel: 0 }), Some(PAD)),
+            Step::Pad(false) => (Some(Command::NoteOff { note: PAD, source: SourceId::Hardware(0), channel: 0 }), Some(PAD)),
         };
         self.engine.note_log.clear();
         self.engine.cc_passthrough_log.clear();
@@ -737,6 +760,11 @@ impl Run {
             }
             self.sounding.retain(|s| !released(&s));
         }
+        let step = match step {
+            Step::Pad(true) => Step::On(PAD),
+            Step::Pad(false) => Step::Off(PAD),
+            other => other,
+        };
         match step {
             Step::On(k) | Step::Soft(k) => {
                 self.held.insert(k, BTreeSet::new());
@@ -803,6 +831,7 @@ impl Run {
                 }
                 Vec::new()
             }
+            Step::Pad(_) => unreachable!("a pad step plays as its key"),
         }
     }
 
@@ -823,8 +852,8 @@ impl Run {
         // switches are tapped (never left down) and the step counter only grows.
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!(
-            "{routing}|{fx:?}|{bypassed:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}|{:?}|{:?}",
-            self.held, self.sounding, self.arp_added, self.engine.rig_zones, self.engine.show.part(), self.engine.zone_hands,
+            "{routing}|{fx:?}|{bypassed:?}|{:?}|{:?}|{arps:?}|{demo:?}|{}|{:?}|{:?}|{:?}|{}",
+            self.held, self.sounding, self.arp_added, self.engine.rig_zones, self.engine.show.part(), self.engine.zone_hands, self.engine.show.edges(),
         )
         .hash(&mut h);
         (self.pedal, &self.pedal_at, &self.sustained).hash(&mut h);
@@ -876,6 +905,10 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::Bypass(node, on)) => format!("SetStripBypass node {node} = {on}"),
         Step::Edit(Edit::Switch(cc)) => format!("Tap foot switch CC {cc}"),
         Step::Edit(Edit::Program(n)) => format!("Program change {n} from the foot switches' device"),
+        Step::Edit(Edit::LearnPad(true)) => format!("Learn key {PAD} of the foot switches' device for Next part"),
+        Step::Edit(Edit::LearnPad(false)) => format!("Forget key {PAD} as a show control"),
+        Step::Pad(true) => format!("NoteOn {PAD} from the foot switches' device"),
+        Step::Pad(false) => format!("NoteOff {PAD} from the foot switches' device"),
         Step::Tick => "Tick (time passes)".to_string(),
         Step::Pedal(down) => format!("Sustain pedal {}", if down { "down" } else { "up" }),
         Step::Song(n) => format!("Setlist switch {:?}", setlist_switch(n)),
@@ -983,7 +1016,7 @@ pub(super) fn explore_arp_bypass(max_states: usize) -> Report {
 pub(super) fn explore_foot_switch(max_states: usize) -> Report {
     let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
     alphabet.extend(SWITCH_EDITS.iter().map(|&e| Step::Edit(e)));
-    alphabet.push(Step::Edit(Edit::LoadStart));
+    alphabet.extend([Step::Pad(true), Step::Pad(false), Step::Edit(Edit::LoadStart)]);
     explore_with(&alphabet, max_states, Scenario::FootSwitch)
 }
 
@@ -1002,6 +1035,7 @@ fn explore_with(alphabet: &[Step], max_states: usize, scn: Scenario) -> Report {
             }
             let kinds = match step {
                 Step::Off(k) => here.held[&k].clone(),
+                Step::Pad(false) => here.held[&PAD].clone(),
                 _ => BTreeSet::new(),
             };
             let mut next = replay(&path, scn);

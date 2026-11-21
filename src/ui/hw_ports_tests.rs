@@ -209,22 +209,28 @@ fn a_device_missing_at_load_keeps_its_rules_in_a_place_of_its_own() {
     assert!(matches!(cc[..], [SourceId::Hardware(d)] if d >= crate::engine::MAX_HW_DEVICES), "{cc:?}");
 }
 
-/// The device whose program change selects the song (#208) is saved by
-/// its port: in another scan order it is still that device, and while it
-/// is not plugged in it never becomes another one.
+/// The device whose program change selects the song (#208) and the device
+/// a show action was learned from (#277) are saved by their ports: in
+/// another scan order each is still that device, and while it is not
+/// plugged in it never becomes another one.
 #[test]
 fn a_program_change_device_follows_its_port_into_another_scan_order() {
+    use crate::show::{ShowAction, ShowMsg};
     let (mut app, _) = opened(&session_of(&[rig("Synth", surge(), "SURGE")]), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
     app.setlist.set_program_selects_song(1, true);
+    app.setlist.learn(ShowAction::Panic, Some(1), ShowMsg::Note(36));
     let loaded = saved_and_loaded(&mut app, "hw-ports-program");
     assert_eq!(loaded.hw_ports().get(&1).map(String::as_str), Some(U6_PORT));
+    let panic_device = |app: &DemoApp| app.setlist.control_of(ShowAction::Panic).and_then(|c| c.device);
 
     let (app, _) = opened(&loaded, &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
-    assert_eq!(app.setlist.program_devices, [0], "the U6MIDI Pro, device 0 now");
+    assert_eq!(app.setlist.program_devices().collect::<Vec<_>>(), [0], "the U6MIDI Pro, device 0 now");
+    assert_eq!(panic_device(&app), Some(0), "the pad that panics is the U6MIDI Pro's too");
     let (app, _) = opened(&loaded, &[(FM1_PORT, "24:0")]);
     let u6 = index_of(&app, U6_PORT);
     assert_ne!(u6, 0);
-    assert_eq!(app.setlist.program_devices, [u6], "unplugged, never the FM-1");
+    assert_eq!(app.setlist.program_devices().collect::<Vec<_>>(), [u6], "unplugged, never the FM-1");
+    assert_eq!(panic_device(&app), Some(u6));
 }
 
 /// "Add song from session" takes a session's rigs, not its setlist: a
@@ -239,7 +245,7 @@ fn an_imported_song_lists_no_device_only_its_sessions_program_change_named() {
     gig.add_song_from_session_in(&DemoApp::sessions_dir(), "hw-ports-program-import", None).unwrap();
     let listed: Vec<&str> = gig.hw_devices.iter().map(|n| midi_port_key(n)).collect();
     assert_eq!(listed, [FM1_PORT], "no unplugged U6MIDI Pro row");
-    assert!(gig.setlist.program_devices.is_empty());
+    assert_eq!(gig.setlist.program_devices().count(), 0);
 }
 
 /// A file from before #227 names no ports: its indices load as they are.

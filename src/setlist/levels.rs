@@ -278,6 +278,31 @@ impl Setlist {
             .collect()
     }
 
+    /// The active part's stored CLAP plugin knobs whose unit is in a song-level rig (#275).
+    pub fn recalled_plugin_params(&self, graph: &Graph) -> Vec<ParamValue> {
+        let Some((_, part, _)) = self.current() else { return Vec::new() };
+        part.plugin_params
+            .iter()
+            .filter(|p| graph.node(p.node).is_some_and(|n| self.rig_level(n.rig) == Level::Song))
+            .copied()
+            .collect()
+    }
+
+    /// The active part's stored effect-chain bypasses whose effect is in a song-level rig (#275).
+    pub fn recalled_fx(&self, graph: &Graph) -> Vec<super::FxBypass> {
+        let Some((_, part, _)) = self.current() else { return Vec::new() };
+        part.fx
+            .iter()
+            .filter(|f| graph.node(f.node).is_some_and(|n| self.rig_level(n.rig) == Level::Song))
+            .copied()
+            .collect()
+    }
+
+    /// Whether rig `rig` has an explicit level pin (Show, Set or Song).
+    pub(super) fn rig_pinned(&self, rig: u8) -> Option<Level> {
+        pinned(&self.levels.rigs, &rig)
+    }
+
     /// True when stepping jumps over song `song` (its set is skipped).
     pub fn song_skipped(&self, song: usize) -> bool {
         self.set_of(song).is_some_and(|s| s.skip)

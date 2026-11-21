@@ -66,6 +66,8 @@ const SURGE_B: u32 = 3;
 const ARP: u32 = 4;
 /// The MIDI-FX unit (built-in transposer) of the MIDI-FX scenarios.
 const FX: u32 = 4;
+/// The audio effect node on rig 0 in the shared-instrument scenario (#275).
+const SHARED_FX: u32 = 3;
 /// Marks a note the arp generated (no key owns it).
 const GENERATED: u8 = 255;
 /// Played keys: either side of the C4 split point, and both ≥ 48.
@@ -109,6 +111,8 @@ enum Step {
     /// The foot switches' device's key `PAD` down or up (#277): a note a
     /// show control may be learned for while it is held.
     Pad(bool),
+    /// A shared-instrument setlist switch to `shared_switch(n)` (#275).
+    SharedSong(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +185,7 @@ enum Scenario {
     Bypass,
     FootSwitch,
     Pedal,
+    Shared,
 }
 
 /// C# major pentatonic: B (59) snaps down to A#, C (60) up to C#. Two keys
@@ -575,13 +580,82 @@ fn start_graph_two_rigs() -> Graph {
     g
 }
 
+/// Keys(0) → Surge A(1) → Delay(3) → Master(2): one hosted instrument shared
+/// across every song in the setlist (#275).
+fn start_graph_shared() -> Graph {
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let clap = NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") };
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let a = g.add_node(clap, name_bytes("SURGE A"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+    let fx = g.add_node(NodeKind::Dsp(crate::control::DspKind::Delay), name_bytes("DELAY"));
+    assert_eq!((keys, a, master, fx), (KEYS, SURGE_A, 2, SHARED_FX));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: a, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: a, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    g
+}
+
 fn start_graph_for(scn: Scenario) -> Graph {
     match scn {
         Scenario::RoutingWithStrip | Scenario::Fx | Scenario::Bypass => start_graph_with_strip(),
         Scenario::Routing | Scenario::Arp | Scenario::Demo => start_graph(),
         Scenario::Zones | Scenario::FootSwitch | Scenario::Layers | Scenario::Pedal => start_graph_two_rigs(),
+        Scenario::Shared => start_graph_shared(),
     }
 }
+
+/// Five songs sharing rig 0 (`SURGE_A`, 1 hosted instance) with different key
+/// splits, transposes, velocity layers, pans, levels and effect bypasses (#275).
+fn shared_setlist() -> Setlist {
+    let specs: [(PartRig, bool); 5] = [
+        (PartRig { rig: 0, level: 0.8, pan: Some(-0.5), ..PartRig::default() }, false),
+        (PartRig { rig: 0, key_lo: 60, key_hi: 127, level: 0.6, pan: Some(0.5), ..PartRig::default() }, true),
+        (PartRig { rig: 0, key_lo: 0, key_hi: 59, vel_hi: 63, float: 2, level: 0.7, pan: Some(0.0), ..PartRig::default() }, false),
+        (PartRig { rig: 0, transpose: 12, level: 0.8, pan: Some(-0.2), ..PartRig::default() }, true),
+        (PartRig { rig: 0, transpose: -12, level: 0.9, pan: Some(0.2), ..PartRig::default() }, false),
+    ];
+    let mut sl = Setlist::default();
+    for (i, (pr, bypass)) in specs.into_iter().enumerate() {
+        let mut p = Part::new("Main", vec![pr]);
+        p.set_fx(SHARED_FX, bypass);
+        sl.songs.push(Song::new(format!("Shared {}", i + 1), vec![p]));
+    }
+    sl.next_cc = Some(crate::setlist::FootSwitch { cc: NEXT_CC, channel: None });
+    sl.prev_cc = Some(crate::setlist::FootSwitch { cc: PREV_CC, channel: None });
+    sl
+}
+
+fn shared_switch(n: u8) -> &'static [Command] {
+    static SWITCHES: std::sync::OnceLock<Vec<Vec<Command>>> = std::sync::OnceLock::new();
+    &SWITCHES.get_or_init(|| {
+        let graph = start_graph_shared();
+        let mut sl = shared_setlist();
+        let switch = |sl: &Setlist| {
+            let mut cmds = sl.gates(&graph).commands();
+            cmds.push(Command::SetShowPart { part: sl.active_index() });
+            for pr in sl.recalled_rigs() {
+                cmds.push(Command::SetRigMix { rig: pr.rig, vol: Some(pr.level), pan: pr.pan, mute: Some(false), solo: Some(false) });
+            }
+            for fx in sl.recalled_fx(&graph) {
+                cmds.push(Command::SetStripBypass { node: fx.node, bypass: fx.bypass });
+            }
+            cmds
+        };
+        let mut out: Vec<Vec<Command>> = (0..sl.songs.len())
+            .map(|i| {
+                sl.select(i, 0);
+                switch(&sl)
+            })
+            .collect();
+        sl.active = None;
+        out.push(switch(&sl));
+        out
+    })[n as usize]
+}
+
+const SHARED_SWITCHES: u8 = 6;
 
 /// The pedal scenario's setlist: both rigs; A; B; A below 60 and B from 60
 /// up, +12; A +2. The foot switches are `NEXT_CC` and `PREV_CC`.
@@ -686,6 +760,11 @@ impl Run {
             engine.apply(Command::SetShowControls { controls: sl.show_controls() });
             engine.apply(Command::SetShowParts { parts: crate::show::ShowParts::new(sl.show_parts()) });
         }
+        if scn == Scenario::Shared {
+            let sl = shared_setlist();
+            engine.apply(Command::SetShowControls { controls: sl.show_controls() });
+            engine.apply(Command::SetShowParts { parts: crate::show::ShowParts::new(sl.show_parts()) });
+        }
         engine.note_log.clear();
         Run {
             engine,
@@ -714,7 +793,7 @@ impl Run {
             Step::Pad(down) => self.held.contains_key(&PAD) != down,
             Step::Edit(Edit::AddArp) => !self.arp_added,
             Step::Pedal(down) => down != self.pedal,
-            Step::Edit(_) | Step::Tick | Step::Song(_) => true,
+            Step::Edit(_) | Step::Tick | Step::Song(_) | Step::SharedSong(_) => true,
         }
     }
 
@@ -727,7 +806,7 @@ impl Run {
             Step::Off(k) => (Some(Command::NoteOff { note: k, source: SourceId::Keys, channel: 0 }), Some(k)),
             Step::Edit(e) => (Some(e.command(self.scn)), None),
             Step::Pedal(down) => (Some(sustain(down)), None),
-            Step::Tick | Step::Song(_) => (None, None),
+            Step::Tick | Step::Song(_) | Step::SharedSong(_) => (None, None),
             Step::Pad(true) => (Some(Command::NoteOn { note: PAD, velocity: 0.8, source: SourceId::Hardware(0), channel: 0 }), Some(PAD)),
             Step::Pad(false) => (Some(Command::NoteOff { note: PAD, source: SourceId::Hardware(0), channel: 0 }), Some(PAD)),
         };
@@ -737,6 +816,11 @@ impl Run {
             (Some(cmd), _) => self.engine.apply(cmd),
             (None, Step::Song(n)) => {
                 for cmd in setlist_switch(n) {
+                    self.engine.apply(cmd.clone());
+                }
+            }
+            (None, Step::SharedSong(n)) => {
+                for cmd in shared_switch(n) {
                     self.engine.apply(cmd.clone());
                 }
             }
@@ -781,7 +865,7 @@ impl Run {
                 self.held.insert(k, BTreeSet::new());
                 Vec::new()
             }
-            Step::Off(k) if self.scn == Scenario::Pedal => {
+            Step::Off(k) if self.scn == Scenario::Pedal || self.scn == Scenario::Shared => {
                 self.held.remove(&k);
                 if self.held.is_empty() && !self.pedal { self.all_sounding() } else { Vec::new() }
             }
@@ -789,7 +873,7 @@ impl Run {
                 self.pedal = down;
                 if self.held.is_empty() && !down { self.all_sounding() } else { Vec::new() }
             }
-            Step::Song(_) => {
+            Step::Song(_) | Step::SharedSong(_) => {
                 for kinds in self.held.values_mut() {
                     kinds.insert(Kind::Zone);
                 }
@@ -923,6 +1007,7 @@ fn describe(step: Step) -> String {
         Step::Tick => "Tick (time passes)".to_string(),
         Step::Pedal(down) => format!("Sustain pedal {}", if down { "down" } else { "up" }),
         Step::Song(n) => format!("Setlist switch {:?}", setlist_switch(n)),
+        Step::SharedSong(n) => format!("Shared setlist switch {:?}", shared_switch(n)),
     }
 }
 
@@ -1004,6 +1089,16 @@ pub(super) fn explore_pedal(max_states: usize) -> Report {
     alphabet.extend([Step::Edit(Edit::Switch(NEXT_CC)), Step::Edit(Edit::Switch(PREV_CC))]);
     alphabet.push(Step::Edit(Edit::LoadStart));
     explore_with(&alphabet, max_states, Scenario::Pedal)
+}
+
+/// Setlist switches across songs sharing ONE hosted instrument (#275).
+pub(super) fn explore_shared(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Soft(k), Step::Off(k)]).collect();
+    alphabet.extend([Step::Pedal(true), Step::Pedal(false)]);
+    alphabet.extend((0..SHARED_SWITCHES).map(Step::SharedSong));
+    alphabet.extend([Step::Edit(Edit::Switch(NEXT_CC)), Step::Edit(Edit::Switch(PREV_CC))]);
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::Shared)
 }
 
 /// Unit bypass toggles on an instrument and a MIDI strip (#305).
@@ -1261,4 +1356,34 @@ fn held_notes_are_released_across_unit_bypass() {
         assert!(report.stuck.is_empty(), "stuck notes across unit bypass ({what}) (traces above)");
         assert!(report.complete, "state bound hit before fixpoint: the bypass ({what}) alphabet's state space grew");
     }
+}
+
+#[test]
+fn held_notes_are_released_across_shared_instrument_song_switches() {
+    // Switching between two songs that share one hosted instrument (changing
+    // split, pan, level and effect bypass with the same transpose) must KEEP
+    // held notes sounding until released, and never leave a note stuck.
+    let mut run = Run::new(Scenario::Shared);
+    run.step(Step::SharedSong(0));
+    run.step(Step::On(59));
+    assert!(run.sounding.contains(&(SURGE_A, 59, 59)), "key 59 sounds in Song 1");
+    run.step(Step::SharedSong(1));
+    assert!(
+        run.sounding.contains(&(SURGE_A, 59, 59)),
+        "key 59 keeps sounding across the shared-instrument switch into Song 2 (even though Song 2's split is 60..=127)"
+    );
+    assert!(run.step(Step::Off(59)).is_empty(), "releasing key 59 in Song 2 silences it cleanly");
+    assert!(run.all_sounding().is_empty());
+
+    let report = explore_shared(100_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (shared): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes across shared-instrument switches (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the shared alphabet's state space grew");
 }

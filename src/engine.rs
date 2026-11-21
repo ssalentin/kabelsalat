@@ -475,6 +475,8 @@ struct DspSlot {
     kind: DspKind,
     proc: Box<dyn Processor>,
     buf: Vec<f32>,
+    /// Dry/wet bypass crossfade (1 = active, 0 = bypassed, 5 ms ramp, #275).
+    wet: gain_ramp::GainRamp,
     /// Per-instrument transport (metronome; the file-player node joins via
     /// `NodeKind::supports_transport`). Engine-owned plain state, set only by
     /// commands drained at block boundaries — the render path reads it with
@@ -544,6 +546,7 @@ fn dsp_slot(node: &crate::control::Node, kind: &DspKind, sample_rate: f64) -> Ds
         kind: kind.clone(),
         proc: build_processor(kind, sample_rate),
         buf: vec![0.0; 8192 * 2],
+        wet: gain_ramp::GainRamp::UNITY,
         transport,
     }
 }
@@ -2919,6 +2922,7 @@ impl GraphEngine {
     /// taps of this pass (None for a bus's own chain, which cannot send).
     fn run_effects(&mut self, bus: &mut [f32], frames: usize, solo_rigs: &[bool; MAX_RIGS], mut taps: Option<&mut BusTaps>) {
         let n2 = frames * 2;
+        let ramp = (gain_ramp::RAMP_S * self.sample_rate) as u32;
         let n_dsp = self.dsp.len();
         let n_lv2 = self.lv2.len();
         let n_fx = n_dsp + n_lv2 + self.voices.len();
@@ -2929,12 +2933,18 @@ impl GraphEngine {
             self.sum_audio_into(node, &mut bus[..n2]);
             // Bypass (#74): the slot passes its summed input through
             // unchanged; its knobs keep their values for when it returns.
+            // Built-in DSP slots crossfade dry↔wet over 5 ms (#275) so a
+            // per-part effect-chain switch never clicks under a held note.
             let bypassed = strip_bypassed(&self.strips, node);
             if f < n_dsp {
                 let d = &mut self.dsp[f];
+                d.wet.set(if bypassed { (0.0, 0.0) } else { (1.0, 1.0) }, ramp);
                 d.buf[..n2].copy_from_slice(&bus[..n2]);
-                if !bypassed {
+                if !d.wet.is_silent() {
                     d.proc.process(&mut d.buf[..n2], frames);
+                    if !d.wet.is_unity() {
+                        d.wet.mix_dry_wet(&bus[..n2], &mut d.buf[..n2]);
+                    }
                 }
             } else if f < n_dsp + n_lv2 {
                 let slot = &mut self.lv2[f - n_dsp];

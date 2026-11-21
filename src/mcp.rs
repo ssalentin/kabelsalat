@@ -242,12 +242,25 @@ fn setlist_json(st: &State) -> Value {
                 "key_hi": r.key_hi,
                 "transpose": r.transpose,
                 "level": r.level,
+                "pan": r.pan,
                 "vel_lo": r.vel_lo,
                 "vel_hi": r.vel_hi,
                 "vel_curve": r.curve.as_str(),
                 "float": r.float,
             })).collect();
-            json!({ "index": pi, "name": p.name, "rigs": rigs, "buses": p.buses, "params_count": p.params.len() })
+            let fx: Vec<Value> = p.fx.iter().map(|f| json!({
+                "node": f.node,
+                "bypass": f.bypass,
+            })).collect();
+            json!({
+                "index": pi,
+                "name": p.name,
+                "rigs": rigs,
+                "fx": fx,
+                "buses": p.buses,
+                "params_count": p.params.len(),
+                "plugin_params_count": p.plugin_params.len(),
+            })
         }).collect();
         json!({
             "index": si,
@@ -267,12 +280,14 @@ fn setlist_json(st: &State) -> Value {
     }));
     let bus_name = |n: NodeId| st.graph.node(n).map_or_else(String::new, |x| name_str(&x.name).to_string());
     let show = sl.show_json(&st.graph, &headless_bindings(st), bus_name);
+    let instances = sl.show_instances(&st.graph).to_json(|r| format!("Rig {}", crate::control::rig_letter(r)));
     json!({
         "songs": songs,
         "active": active,
         "show_controls": headless_show_controls(sl),
         "sets": show["sets"],
         "levels": show["levels"],
+        "instances": instances,
     })
 }
 
@@ -309,18 +324,30 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
                     if (r.rig as usize) >= crate::control::MAX_RIGS {
                         return Err(format!("rig {} is out of range (0..{})", r.rig, crate::control::MAX_RIGS));
                     }
+                    if let Some(pan) = r.pan {
+                        if !pan.is_finite() || !(-1.0..=1.0).contains(&pan) {
+                            return Err(format!("pan must be in -1..=1, got {pan}"));
+                        }
+                    }
                     let mut pr = PartRig {
                         rig: r.rig,
                         key_lo: r.key_lo.unwrap_or(0).min(127),
                         key_hi: r.key_hi.unwrap_or(127).min(127),
                         transpose: r.transpose.unwrap_or(0).clamp(-48, 48),
                         level: r.level.unwrap_or(1.0).clamp(0.0, 1.0),
+                        pan: r.pan,
                         ..PartRig::default()
                     };
                     let num = |v: Option<u8>| v.map(u64::from);
                     pr.set_layer(num(r.vel_lo), num(r.vel_hi), r.vel_curve.as_deref(), num(r.float))?;
                     part.set_rig(pr);
                 }
+            }
+            for f in p.fx.iter().flatten() {
+                if graph.node(f.node).is_none() {
+                    return Err(format!("node {} is not in the patch", f.node));
+                }
+                part.set_fx(f.node, f.bypass);
             }
             out.push(part);
         }
@@ -694,6 +721,8 @@ struct SetlistPartRigArg {
     transpose: Option<i8>,
     /// Rig mixer level (0.0..=1.0, default 1.0).
     level: Option<f32>,
+    /// Optional rig mixer pan (-1.0 L ..= 1.0 R) recalled on switch.
+    pan: Option<f32>,
     /// Lowest struck velocity that plays this rig (0..=127, default 0): a velocity layer.
     vel_lo: Option<u8>,
     /// Highest struck velocity that plays this rig (0..=127, default 127).
@@ -704,6 +733,13 @@ struct SetlistPartRigArg {
     float: Option<u8>,
 }
 
+/// One audio effect's bypass state inside a `set_setlist_song` part (#275).
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetlistPartFxArg {
+    node: NodeId,
+    bypass: bool,
+}
+
 /// One part inside `set_setlist_song`.
 #[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 struct SetlistPartArg {
@@ -711,9 +747,11 @@ struct SetlistPartArg {
     name: String,
     /// Live rigs in this part.
     rigs: Option<Vec<SetlistPartRigArg>>,
+    /// Audio effect bypasses for this part's effect chain.
+    fx: Option<Vec<SetlistPartFxArg>>,
     /// Aux bus node ids that take signal in this part while at song level.
     buses: Option<Vec<NodeId>>,
-    /// Snapshot the current knob values of those rigs into this part.
+    /// Snapshot the current knob values and effect bypasses of those rigs into this part.
     capture_knobs: Option<bool>,
 }
 
@@ -765,6 +803,8 @@ struct AddSongFromSessionArgs {
     session: String,
     /// Optional song name (defaults to the session name).
     name: Option<String>,
+    /// Share matching hosted instruments (same plugin + saved preset); default true.
+    share: Option<bool>,
 }
 
 /// Arguments for `set_level`.
@@ -4748,7 +4788,7 @@ impl McpServer {
     }
 
     /// Read the session's setlist (#204).
-    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), buses and stored knob count), the active song/part (null = all rigs open), the show controls (as get_show_controls), the sets, and the level (show, set or song) of every rig, aux bus and CC binding.")]
+    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, pan, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), effect-chain bypasses (fx), buses and stored knob counts), the active song/part (null = all rigs open), the show controls (as get_show_controls), the sets, the level (show, set or song) of every rig, aux bus and CC binding, and instances (how many instrument instances the show really hosts and which rigs are shared vs separate presets).")]
     fn get_setlist(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4759,7 +4799,7 @@ impl McpServer {
     }
 
     /// Add, update, reorder, or remove a song in the setlist (#204).
-    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional backing: absolute path of a WAV backing track the file player starts when the song is selected (null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?, vel_lo?, vel_hi?, vel_curve?, float?}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs. vel_lo/vel_hi make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60), vel_curve is linear | soft | hard, float (0..12 keys) lets the key range's edges follow the hand that plays across them (a floating split).")]
+    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional backing: absolute path of a WAV backing track the file player starts when the song is selected (null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?, pan?, vel_lo?, vel_hi?, vel_curve?, float?}]), optional fx ([{node, bypass}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs. vel_lo/vel_hi make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60), vel_curve is linear | soft | hard, float (0..12 keys) lets the key range's edges follow the hand that plays across them (a floating split).")]
     fn set_setlist_song(&self, Parameters(args): Parameters<SetSetlistSongArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4850,14 +4890,17 @@ impl McpServer {
             }
             // Only song-level rigs are recalled (#273).
             for pr in st.setlist.recalled_rigs() {
-                let _ = send_cmd(&mut st, Command::SetRigMix { rig: pr.rig, vol: Some(pr.level), pan: None, mute: None, solo: None });
+                let _ = send_cmd(&mut st, Command::SetRigMix { rig: pr.rig, vol: Some(pr.level), pan: pr.pan, mute: None, solo: None });
+            }
+            for fx in st.setlist.recalled_fx(&st.graph) {
+                let _ = send_cmd(&mut st, Command::SetStripBypass { node: fx.node, bypass: fx.bypass });
             }
         }
         ok_json(setlist_json(&st))
     }
 
-    /// Import a saved session's rigs into the current gig as a new setlist song (#204).
-    #[tool(name = "add_song_from_session", description = "Import a saved session's rigs into the current gig (up to the gig's rig limit) and append a new song in the setlist pointing at those imported rigs. session = saved session name from list_sessions; optional name overrides the song title.")]
+    /// Import a saved session's rigs into the current gig as a new setlist song (#204, #275).
+    #[tool(name = "add_song_from_session", description = "Import a saved session as a new song in the setlist. By default (share=true), any rig whose instrument plugin(s) and saved preset/state match an already-hosted rig shares that one instance (merging extra effects with per-part bypasses) instead of loading a duplicate; a different preset or share=false hosts a separate instance. session = saved session name from list_sessions; optional name overrides the song title.")]
     fn add_song_from_session(&self, Parameters(args): Parameters<AddSongFromSessionArgs>) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -6191,16 +6234,18 @@ mod tests {
             parts: Some(vec![
                 SetlistPartArg {
                     name: "Verse".into(),
-                    rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9), vel_lo: None, vel_hi: None, vel_curve: None, float: None }]),
+                    rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9), pan: Some(-0.25), vel_lo: None, vel_hi: None, vel_curve: None, float: None }]),
+                    fx: None,
                     buses: None,
                     capture_knobs: None,
                 },
                 SetlistPartArg {
                     name: "Chorus".into(),
                     rigs: Some(vec![SetlistPartRigArg {
-                        rig: 1, key_lo: Some(48), key_hi: Some(96), transpose: Some(12), level: Some(0.8),
+                        rig: 1, key_lo: Some(48), key_hi: Some(96), transpose: Some(12), level: Some(0.8), pan: Some(0.25),
                         vel_lo: Some(64), vel_hi: None, vel_curve: Some("hard".into()), float: Some(3),
                     }]),
+                    fx: None,
                     buses: None,
                     capture_knobs: None,
                 },
@@ -6254,7 +6299,8 @@ mod tests {
             song: Some(0), name: None, bpm: None, time_signature: None, backing: None,
             parts: Some(vec![SetlistPartArg {
                 name: "Solo".into(),
-                rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: None, key_hi: None, transpose: None, level: None, vel_lo: None, vel_hi: None, vel_curve: Some("loud".into()), float: None }]),
+                rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: None, key_hi: None, transpose: None, level: None, pan: None, vel_lo: None, vel_hi: None, vel_curve: Some("loud".into()), float: None }]),
+                fx: None,
                 buses: None,
                 capture_knobs: None,
             }]),

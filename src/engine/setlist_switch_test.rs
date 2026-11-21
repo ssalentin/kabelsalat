@@ -496,9 +496,249 @@ pub fn run() -> anyhow::Result<()> {
     let tail = caught(&Tail::across(&c, c.tail_switch).checks());
     check(part >= 2 && song >= 2 && tail >= 1, format!("the checks see the drop-out: {part} of 3 fail at the part switch, {song} of 3 at the song switch, {tail} of 2 on the tail"));
 
+    // #275: two songs sharing ONE hosted Surge XT instance (different level,
+    // pan, key split, LEVEL knob and effect-chain bypasses).
+    println!("shared instrument (#275): two songs on ONE Surge XT instance (pan -0.4 -> +0.4, split C4..G9, Delay/Reverb bypass swap):");
+    for via in [Via::App, Via::FootSwitch] {
+        let st = shared_take(block, via, &sine)?;
+        check_shared_take(&st, &mut check);
+    }
+    let shared_ctrl = dropped_out_shared(&shared_take(block, Via::App, &sine)?);
+    let shared_caught = caught(&shared_held_checks(&shared_ctrl));
+    check(shared_caught >= 2, format!("shared-instrument control sees the drop-out: {shared_caught} of 3 fail"));
+
     anyhow::ensure!(failures.is_empty(), "setlist-switch-test: {} check(s) failed: {}", failures.len(), failures.join("; "));
     println!("setlist-switch-test: OK — held notes and tails ring through every switch, the first new note is within {BUDGET_MS} ms");
     Ok(())
+}
+
+/// One hosted Surge XT instance (rig 0) with Delay + Reverb shared between two
+/// songs with different level, pan, split, P_LEVEL and effect-chain bypasses.
+struct SharedTake {
+    block: usize,
+    via: Via,
+    hosted: usize,
+    out: Vec<f32>,
+    switch: (usize, usize),
+    release: usize,
+    gated_note: usize,
+    allowed_note: usize,
+}
+
+fn recall_shared(sl: &Setlist, graph: &Graph, zones: bool) -> Vec<Command> {
+    let mut out: Vec<Command> = sl
+        .gates(graph)
+        .commands()
+        .into_iter()
+        .filter(|c| zones || !matches!(c, Command::SetRigZones { .. }))
+        .collect();
+    if zones {
+        out.push(Command::SetShowPart { part: sl.active_index() });
+    }
+    if let Some(bpm) = sl.current().and_then(|(s, _, _)| s.bpm) {
+        out.push(Command::SetBpm { bpm });
+    }
+    out.extend(sl.recalled_rigs().iter().map(|r| Command::SetRigMix {
+        rig: r.rig,
+        vol: Some(r.level),
+        pan: r.pan,
+        mute: Some(false),
+        solo: Some(false),
+    }));
+    out.extend(sl.recalled_fx(graph).iter().map(|f| Command::SetStripBypass { node: f.node, bypass: f.bypass }));
+    out.extend(sl.recalled_params(graph).iter().map(|p| Command::SetParam { node: p.node, param: p.param, value: p.value }));
+    out
+}
+
+fn shared_take(block: usize, via: Via, sine: &[u8]) -> anyhow::Result<SharedTake> {
+    let (va, mut ma) = ClapVoice::new(SR)?;
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let piano = g.add_node(NodeKind::Clap { plugin_id: ClapId::new("Surge XT") }, name_bytes("PIANO"));
+    let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+    let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    for (id, (from, to, kind)) in [
+        (keys, piano, PortKind::Midi),
+        (piano, delay, PortKind::Audio),
+        (delay, verb, PortKind::Audio),
+        (verb, master, PortKind::Audio),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        g.connect_with_id(id as u32 + 1, PortRef { node: from, port: 0 }, PortRef { node: to, port: 0 }, kind);
+    }
+
+    let mut ballad_part = Part::new(
+        "Main",
+        vec![PartRig { rig: 0, key_lo: 0, key_hi: 127, level: 0.4, pan: Some(-0.4), ..PartRig::default() }],
+    );
+    ballad_part.set_param(piano, super::P_LEVEL, 0.85);
+    ballad_part.set_fx(delay, true);
+    ballad_part.set_fx(verb, false);
+    let mut anthem_part = Part::new(
+        "Main",
+        vec![PartRig { rig: 0, key_lo: 60, key_hi: 127, level: 0.6, pan: Some(0.4), ..PartRig::default() }],
+    );
+    anthem_part.set_param(piano, super::P_LEVEL, 0.7);
+    anthem_part.set_fx(delay, false);
+    anthem_part.set_fx(verb, true);
+    let mut sl = Setlist {
+        songs: vec![Song::new("Ballad", vec![ballad_part]), Song::new("Anthem", vec![anthem_part])],
+        next_cc: Some(FootSwitch { cc: NEXT_CC, channel: None }),
+        ..Setlist::default()
+    };
+    sl.normalize();
+    let hosted = sl.show_instances(&g).hosted;
+
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g.clone(), drain, SR, vec![(piano, va)]);
+    ma.load_state(sine)?;
+    for c in [
+        Command::SetShowControls { controls: sl.show_controls() },
+        Command::SetShowParts { parts: crate::show::ShowParts::new(sl.show_parts()) },
+    ] {
+        assert!(bus.send(c));
+    }
+    let mut buf = vec![0.0f32; block * 2];
+    let mut out = Vec::new();
+    let mut render_blocks = |engine: &mut GraphEngine, out: &mut Vec<f32>, n: usize| {
+        for _ in 0..n {
+            engine.render(&mut buf, 2);
+            out.extend_from_slice(&buf);
+        }
+    };
+    let blocks_for = |secs: f64| (secs * SR / block as f64).ceil() as usize;
+    // Warm-up so Surge applies Init Sine.
+    render_blocks(&mut engine, &mut out, blocks_for(0.25));
+
+    // Select Song 1 (Ballad), hold [55, 60, 64] (55 is below Song 2's C4 split).
+    sl.select(0, 0);
+    for c in recall_shared(&sl, &g, true) {
+        assert!(bus.send(c));
+    }
+    render_blocks(&mut engine, &mut out, 2);
+    for note in [55u8, 60, 64] {
+        assert!(bus.send(on(note)));
+    }
+    render_blocks(&mut engine, &mut out, blocks_for(1.0));
+
+    // Switch to Song 2 (Anthem) on the SAME Surge instance while holding [55, 60, 64].
+    sl.next_part();
+    let press = |value| Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: NEXT_CC, value };
+    let switch = match via {
+        Via::App => {
+            for c in recall_shared(&sl, &g, true) {
+                assert!(bus.send(c));
+            }
+            let at = out.len() / 2;
+            render_blocks(&mut engine, &mut out, 1);
+            (at, at)
+        }
+        Via::FootSwitch => {
+            assert!(bus.send(press(127)));
+            let at = out.len() / 2;
+            render_blocks(&mut engine, &mut out, 1);
+            assert!(bus.send(press(0)));
+            render_blocks(&mut engine, &mut out, blocks_for(UI_FRAME_S));
+            for c in recall_shared(&sl, &g, false) {
+                assert!(bus.send(c));
+            }
+            let recalled = out.len() / 2;
+            render_blocks(&mut engine, &mut out, 1);
+            (at, recalled)
+        }
+    };
+    render_blocks(&mut engine, &mut out, blocks_for(1.0));
+
+    // Release all three held notes (including 55 below the new split) and let tails decay.
+    for note in [55u8, 60, 64] {
+        assert!(bus.send(off(note)));
+    }
+    let release = out.len() / 2;
+    render_blocks(&mut engine, &mut out, blocks_for(3.0));
+
+    // A NEW note below Song 2's split (55) must stay silent.
+    let gated_note = out.len() / 2;
+    assert!(bus.send(on(55)));
+    render_blocks(&mut engine, &mut out, blocks_for(0.25));
+    assert!(bus.send(off(55)));
+    render_blocks(&mut engine, &mut out, blocks_for(0.1));
+
+    // A NEW note inside Song 2's split (72) must sound promptly.
+    let allowed_note = out.len() / 2;
+    assert!(bus.send(on(FIRST_NOTE)));
+    render_blocks(&mut engine, &mut out, blocks_for(0.25));
+    assert!(bus.send(off(FIRST_NOTE)));
+    render_blocks(&mut engine, &mut out, blocks_for(0.25));
+
+    drop(ma);
+    Ok(SharedTake { block, via, hosted, out, switch, release, gated_note, allowed_note })
+}
+
+fn dropped_out_shared(t: &SharedTake) -> SharedTake {
+    let mut out = t.out.clone();
+    let s0 = t.switch.0;
+    for f in out[s0 * 2..(s0 + t.block) * 2].chunks_exact_mut(2) {
+        f[0] = 0.0;
+        f[1] = 0.0;
+    }
+    SharedTake { out, ..*t }
+}
+
+fn shared_held_checks(t: &SharedTake) -> [(bool, String); 3] {
+    let (s0, recalled) = t.switch;
+    let landed = recalled + t.block.max(ms(super::gain_ramp::RAMP_S * 1000.0) + 1);
+    let ch_before = |c| channel(&t.out, c, s0 - ms(300.0), s0);
+    let ch_after = |c| channel(&t.out, c, s0, s0 + ms(300.0));
+    let still_before = longest_still_run(&ch_before(0)).max(longest_still_run(&ch_before(1)));
+    let still_after = longest_still_run(&ch_after(0)).max(longest_still_run(&ch_after(1)));
+    let click = max_d2(&channel(&t.out, 0, s0 - ms(1.0), landed + ms(1.0)))
+        .max(max_d2(&channel(&t.out, 1, s0 - ms(1.0), landed + ms(1.0))));
+    let natural = max_d2(&ch_before(0)[..ch_before(0).len() - ms(1.0)])
+        .max(max_d2(&ch_before(1)[..ch_before(1).len() - ms(1.0)]));
+    let l_before = rms(&ch_before(0));
+    let r_before = rms(&ch_before(1));
+    let l_after = rms(&channel(&t.out, 0, s0 + ms(700.0), s0 + ms(1000.0)));
+    let r_after = rms(&channel(&t.out, 1, s0 + ms(700.0), s0 + ms(1000.0)));
+    let pan_flipped = l_before > r_before * 1.15 && r_after > l_after * 1.15;
+    [
+        (
+            still_after <= still_before + 1,
+            format!("{:?}: no silence on shared instrument: longest still run {still_after} after, {still_before} before", t.via),
+        ),
+        (
+            click <= 8.0 * natural,
+            format!("{:?}: no click across pan/level/FX switch: max d2 {click:.5}, natural {natural:.5}", t.via),
+        ),
+        (
+            pan_flipped,
+            format!("{:?}: pan shifted left→right across the shared switch (before L/R {:.3}/{:.3}, after {:.3}/{:.3})", t.via, l_before, r_before, l_after, r_after),
+        ),
+    ]
+}
+
+fn check_shared_take(t: &SharedTake, check: &mut Check) {
+    check(t.hosted == 1, format!("{:?}: 2 songs host {} instrument instance (expected 1)", t.via, t.hosted));
+    for (ok, what) in shared_held_checks(t) {
+        check(ok, what);
+    }
+    let after_release = peak(&channel(&t.out, 0, t.release + ms(2800.0), t.release + ms(3000.0)))
+        .max(peak(&channel(&t.out, 1, t.release + ms(2800.0), t.release + ms(3000.0))));
+    check(after_release < 1e-3, format!("{:?}: held chord (incl. note below new split) releases cleanly: peak {after_release:.6}", t.via));
+    let gated_peak = peak(&channel(&t.out, 0, t.gated_note, t.gated_note + ms(200.0)))
+        .max(peak(&channel(&t.out, 1, t.gated_note, t.gated_note + ms(200.0))));
+    check(gated_peak < 1e-3, format!("{:?}: new note below Song 2's C4 split is gated (peak {gated_peak:.6})", t.via));
+    let allowed = channel(&t.out, 1, t.allowed_note, t.allowed_note + ms(200.0));
+    let top = peak(&allowed);
+    let onset_frames = (top > 1e-3).then(|| allowed.iter().position(|v| v.abs() >= 0.01 * top)).flatten();
+    let onset_ms = onset_frames.map(|f| f as f64 / SR * 1000.0);
+    check(
+        onset_ms.is_some_and(|m| m <= ONSET_MAX_MS),
+        format!("{:?}: new note above Song 2's split starts promptly ({:?} ms)", t.via, onset_ms),
+    );
 }
 
 #[cfg(test)]

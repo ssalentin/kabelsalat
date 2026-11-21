@@ -202,6 +202,76 @@ pub fn save_buffer_frames(frames: u32) -> std::io::Result<()> {
     save_buffer_frames_to(&config_path(), frames)
 }
 
+/// Cable visual opacity bounds (`0.3..=1.0`, default `1.0`).
+pub const MIN_CABLE_OPACITY: f32 = 0.3;
+pub const MAX_CABLE_OPACITY: f32 = 1.0;
+pub const DEFAULT_CABLE_OPACITY: f32 = 1.0;
+
+/// Cable tension bounds (`0.0..=1.0`, default `0.5`).
+pub const MIN_CABLE_TENSION: f32 = crate::rope::MIN_TENSION;
+pub const MAX_CABLE_TENSION: f32 = crate::rope::MAX_TENSION;
+pub const DEFAULT_CABLE_TENSION: f32 = crate::rope::DEFAULT_TENSION;
+
+pub fn clamp_cable_opacity(opacity: f32) -> f32 {
+    if opacity.is_finite() { opacity.clamp(MIN_CABLE_OPACITY, MAX_CABLE_OPACITY) } else { DEFAULT_CABLE_OPACITY }
+}
+
+pub fn clamp_cable_tension(tension: f32) -> f32 {
+    if tension.is_finite() { tension.clamp(MIN_CABLE_TENSION, MAX_CABLE_TENSION) } else { DEFAULT_CABLE_TENSION }
+}
+
+/// Load persisted `cable_opacity` from `path` (default `1.0`, clamped to `0.3..=1.0`).
+pub fn load_cable_opacity_from(path: &std::path::Path) -> f32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("cable_opacity").and_then(Value::as_f64))
+        .map(|v| clamp_cable_opacity(v as f32))
+        .unwrap_or(DEFAULT_CABLE_OPACITY)
+}
+
+pub fn save_cable_opacity_to(path: &std::path::Path, opacity: f32) -> std::io::Result<()> {
+    let clamped = (clamp_cable_opacity(opacity) * 100.0).round() / 100.0;
+    save_config_values_to(path, &[("cable_opacity", json!(clamped))])
+}
+
+/// Persisted `cable_opacity` in config.json (default `1.0`, test-safe under cfg(test), rule 37).
+pub fn load_cable_opacity() -> f32 {
+    if cfg!(test) { return DEFAULT_CABLE_OPACITY; }
+    load_cable_opacity_from(&config_path())
+}
+
+pub fn save_cable_opacity(opacity: f32) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_cable_opacity_to(&config_path(), opacity)
+}
+
+/// Load persisted `cable_tension` from `path` (default `0.5`, clamped to `0.0..=1.0`).
+pub fn load_cable_tension_from(path: &std::path::Path) -> f32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("cable_tension").and_then(Value::as_f64))
+        .map(|v| clamp_cable_tension(v as f32))
+        .unwrap_or(DEFAULT_CABLE_TENSION)
+}
+
+pub fn save_cable_tension_to(path: &std::path::Path, tension: f32) -> std::io::Result<()> {
+    let clamped = (clamp_cable_tension(tension) * 100.0).round() / 100.0;
+    save_config_values_to(path, &[("cable_tension", json!(clamped))])
+}
+
+/// Persisted `cable_tension` in config.json (default `0.5`, test-safe under cfg(test), rule 37).
+pub fn load_cable_tension() -> f32 {
+    if cfg!(test) { return DEFAULT_CABLE_TENSION; }
+    load_cable_tension_from(&config_path())
+}
+
+pub fn save_cable_tension(tension: f32) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_cable_tension_to(&config_path(), tension)
+}
+
 #[derive(Clone)]
 pub struct ChatLine {
     pub role: String,
@@ -3074,6 +3144,36 @@ mod tests {
         // Invalid config values fall back to default.
         std::fs::write(&p, r#"{"audio_buffer_frames": 300}"#).unwrap();
         assert_eq!(load_buffer_frames_from(&p), crate::bridge::BUFFER_FRAMES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cable_opacity_and_tension_persist_and_clamp_in_config() {
+        let dir = std::env::temp_dir().join(format!("ksalat-cable-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+
+        assert!((load_cable_opacity_from(&p) - DEFAULT_CABLE_OPACITY).abs() < 1e-6);
+        assert!((load_cable_tension_from(&p) - DEFAULT_CABLE_TENSION).abs() < 1e-6);
+
+        save_cable_opacity_to(&p, 0.65).unwrap();
+        save_cable_tension_to(&p, 0.85).unwrap();
+        assert!((load_cable_opacity_from(&p) - 0.65).abs() < 1e-3);
+        assert!((load_cable_tension_from(&p) - 0.85).abs() < 1e-3);
+
+        // Out-of-range values are clamped on both save and load.
+        save_cable_opacity_to(&p, 0.05).unwrap();
+        save_cable_tension_to(&p, 1.8).unwrap();
+        assert!((load_cable_opacity_from(&p) - MIN_CABLE_OPACITY).abs() < 1e-3);
+        assert!((load_cable_tension_from(&p) - MAX_CABLE_TENSION).abs() < 1e-3);
+
+        std::fs::write(&p, r#"{"cable_opacity": 0.1, "cable_tension": -0.4, "other": true}"#).unwrap();
+        assert!((load_cable_opacity_from(&p) - MIN_CABLE_OPACITY).abs() < 1e-6);
+        assert!((load_cable_tension_from(&p) - MIN_CABLE_TENSION).abs() < 1e-6);
+        save_cable_opacity_to(&p, 0.75).unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(raw["other"], json!(true), "preserves unrelated config fields");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

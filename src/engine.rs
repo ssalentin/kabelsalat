@@ -1357,7 +1357,7 @@ pub struct GraphEngine {
     /// Test-only delivery log: (dest, note, on) for every gated note event
     /// (incl. split-change releases), so routing is observable without voices.
     #[cfg(test)]
-    note_log: Vec<(NodeId, u8, bool)>,
+    pub(crate) note_log: Vec<(NodeId, u8, bool)>,
     #[cfg(test)]
     pub(crate) cc_log: Vec<(NodeId, ParamId, f64)>,
     #[cfg(test)]

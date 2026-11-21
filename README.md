@@ -98,9 +98,16 @@ rack (Esc or DOCK brings it back), and the instrument moves as you play:
 ### Patch with real cables
 Press **Tab** to turn the rack around and patch on the back. Drag from jack to
 jack to connect, drag a plug to move it, pull it off to unplug. The cables
-sag and swing, and light up when signal flows through them.
+sag and swing, and light up when signal flows through them. Hover any jack to
+trace its connected cables (dimming unrelated routes) and read a live port
+tooltip with connections and signal level (dBFS for audio, active/recent notes
+for MIDI). Right-click any cable or occupied jack to cycle its jacket color
+within its family palette (warm for audio, cool for MIDI) or unplug every
+cable on that jack. Dial **Cable opacity** and **Cable tension** from the
+bottom-right controls on the back panel or under **Settings → Display** to tame
+dense racks without losing cable physics.
 
-<p align="center"><img src="docs/shots/back.png" width="85%" alt="The back of the rack: MIDI and audio cables between Keys, Surge, Delay and Master"/></p>
+<p align="center"><img src="docs/shots/back.png" width="85%" alt="The back of the rack: hovering Surge A OUT traces its audio cables while dimming unrelated routes, shows a live dBFS port tooltip, and exposes opacity and tension sliders"/></p>
 
 ### Run several rigs at once
 **+ Rig** adds an independent setup with its own synth and output — for example

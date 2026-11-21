@@ -542,7 +542,7 @@ pub type NoteSink = Box<dyn FnMut(NoteEvent) + Send>;
 // Model
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PortKind { Midi, Audio }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1466,6 +1466,103 @@ struct ScaleMenu {
     pos: Pos2,
 }
 
+/// Target of the back-panel right-click menu (#303).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CableMenuTarget {
+    Cable(u32),
+    Jack { unit: usize, jack: usize },
+}
+
+/// Back-panel right-click context menu for cycling family-safe jacket colors
+/// or unplugging cables on a jack (#303).
+#[derive(Clone, Copy)]
+struct CableMenu {
+    target: CableMenuTarget,
+    pos: Pos2,
+}
+
+/// Content of the back-panel hovered-jack tooltip (#303).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JackTooltip {
+    port_title: String,
+    kind_badge: String,
+    kind: PortKind,
+    connections: Vec<String>,
+    signal: String,
+    signal_live: bool,
+}
+
+/// Flat Hurricane horizontal slider (never takes keyboard focus — rule 12).
+/// Double-click resets to `default`. Returns `(changed, committed)` where
+/// `committed` fires once on drag end, discrete click, or reset so callers
+/// persist to config without spamming disk writes.
+fn hurricane_slider(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    default: f32,
+    width: f32,
+    height: f32,
+) -> (bool, bool) {
+    ui.push_id(id, |ui| {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        let lo = *range.start();
+        let hi = *range.end();
+        let span = (hi - lo).max(1e-6);
+        let mut changed = false;
+        let mut committed = false;
+        let pad = 4.0;
+        let track_l = rect.left() + pad;
+        let track_r = (rect.right() - pad).max(track_l + 1.0);
+        let track_w = track_r - track_l;
+
+        if resp.double_clicked() {
+            if (*value - default).abs() > 1e-4 {
+                *value = default;
+                changed = true;
+            }
+            committed = true;
+        } else if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = ((pos.x - track_l) / track_w).clamp(0.0, 1.0);
+                let next = (lo + t * span).clamp(lo, hi);
+                if (next - *value).abs() > 1e-4 {
+                    *value = next;
+                    changed = true;
+                }
+                if resp.clicked() && !resp.dragged() {
+                    committed = true;
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            committed = true;
+        }
+
+        if ui.is_rect_visible(rect) {
+            let hot = resp.hovered() || resp.dragged();
+            if hot {
+                ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            let frac = ((*value - lo) / span).clamp(0.0, 1.0);
+            let cy = rect.center().y;
+            let track = Rect::from_min_max(Pos2::new(track_l, cy - 2.0), Pos2::new(track_r, cy + 2.0));
+            let fill_x = track_l + track_w * frac;
+            let filled = Rect::from_min_max(Pos2::new(track_l, cy - 2.0), Pos2::new(fill_x, cy + 2.0));
+            let painter = ui.painter();
+            painter.rect_filled(track, 1.5, theme::METER_TRACK);
+            let fill_col = if resp.dragged() { theme::ACCENT } else if hot { theme::CREAM } else { theme::CREAM_META };
+            if filled.width() > 0.5 {
+                painter.rect_filled(filled, 1.5, fill_col);
+            }
+            let thumb = Rect::from_center_size(Pos2::new(fill_x, cy), Vec2::new(4.0, (height - 8.0).clamp(8.0, 14.0)));
+            painter.rect_filled(thumb, 1.0, if resp.dragged() { theme::ON_ACCENT } else { theme::CREAM });
+        }
+        (changed, committed)
+    }).inner
+}
+
 /// One bit per note source for `notes_down`: the computer keyboard, each
 /// hardware device (indices past 29 share a bit), everything else.
 fn note_source_bit(src: SourceId) -> u32 {
@@ -2290,6 +2387,12 @@ struct Cable {
     pulses: [Pulse; MAX_PULSES],
     level: f32,
     env: f32,
+    /// Smoothed linear audio peak (0..=∞) for dBFS port tooltip readouts (#303).
+    peak_lin: f32,
+    /// Most recent MIDI note `(note, velocity_u8)` sent along this cable (#303).
+    last_note: Option<(u8, u8)>,
+    /// `ui_time` of the last MIDI event on this cable (`< 0.0` = none yet).
+    last_midi_at: f32,
     phase: f32,
     /// Audio only: countdown to the next level-driven traveling pulse.
     audio_tick: f32,
@@ -2315,7 +2418,8 @@ impl Cable {
             pts: [Pos2::ZERO; MAX_SAMPLES], lut: [0.0; MAX_SAMPLES],
             n: 0, total_len: 0.0,
             pulses: [dead; MAX_PULSES],
-            level: 0.0, env: 0.0, phase: (seed % 628) as f32 / 100.0, audio_tick: 0.0,
+            level: 0.0, env: 0.0, peak_lin: 0.0, last_note: None, last_midi_at: -1.0,
+            phase: (seed % 628) as f32 / 100.0, audio_tick: 0.0,
             age: 0.0, draw_in: 1.0, dying: -1.0, detach_dst: true,
             next_event: 0.0, pat_idx: 0, rng: seed | 1,
         }
@@ -2548,6 +2652,8 @@ enum SettingsAction {
     SaveKey(String),
     RemoveKey,
     ToggleReduceMotion,
+    SetCableOpacity(f32),
+    SetCableTension(f32),
     ToggleAutosave,
     SetCountIn(bool, u8),
     SetTimeSig(crate::transport::TimeSig),
@@ -3371,6 +3477,17 @@ struct DemoApp {
     demo_agent_hold: bool,
     /// Disables rack animations (`ui_reduce_motion` in config.json).
     reduce_motion: bool,
+    /// Back-panel cable visual opacity (`0.3..=1.0`, `cable_opacity` in config.json, #303).
+    cable_opacity: f32,
+    /// Back-panel cable tension (`0.0..=1.0`, `cable_tension` in config.json, #303).
+    cable_tension: f32,
+    /// Back-panel right-click menu for cable/jack recolor & unplug-all (#303).
+    cable_menu: Option<CableMenu>,
+    cable_menu_rect: Rect,
+    /// Last frame's compact back-panel opacity/tension control bar rect.
+    back_controls_rect: Rect,
+    /// User-chosen jacket colors per cable id (validated against family palette).
+    cable_colors: std::collections::HashMap<u32, Color32>,
     fading_units: Vec<FadingUnit>,
     fading_cables: Vec<FadingCable>,
     /// Last frame's dock panel rect (tests + keyboard hit-testing).
@@ -3979,6 +4096,12 @@ impl DemoApp {
             system_ime: system_ime_wanted(std::env::var_os("KABELSALAT_IME").as_deref()),
             demo_agent_hold: false,
             reduce_motion: crate::assistant::load_reduce_motion(),
+            cable_opacity: crate::assistant::load_cable_opacity(),
+            cable_tension: crate::assistant::load_cable_tension(),
+            cable_menu: None,
+            cable_menu_rect: Rect::NOTHING,
+            back_controls_rect: Rect::NOTHING,
+            cable_colors: std::collections::HashMap::new(),
             fading_units: Vec::new(),
             fading_cables: Vec::new(),
             dock_rect: Rect::NOTHING,
@@ -4655,7 +4778,7 @@ impl DemoApp {
             "perform: drag knobs · play on the keyboard (V) · Space starts/stops · Tab flips the rack to patch",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_back_g = Some(layout(
-            "patch: drag jack to jack · drag a plug to another jack to move it · tug off to unplug · Tab flips back",
+            "patch: drag jack to jack · hover jack to trace · right-click cable or jack for color/unplug · Tab flips back",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_wire_g = Some(layout(
             "now click a highlighted jack to connect · esc or right-click cancels",
@@ -4962,10 +5085,15 @@ impl DemoApp {
         let ls = self.units[src].node_id.saturating_sub(base) as usize;
         let ld = self.units[dst].node_id.saturating_sub(base) as usize;
         let key = ls * 7 + ld * 13 + src_port * 3 + dst_port;
-        let color = match kind {
-            PortKind::Audio => theme::CABLE_AUDIO_PALETTE[key % theme::CABLE_AUDIO_PALETTE.len()],
-            PortKind::Midi => theme::CABLE_MIDI_PALETTE[key % theme::CABLE_MIDI_PALETTE.len()],
-        };
+        let color = self
+            .cable_colors
+            .get(&id)
+            .copied()
+            .filter(|c| Self::cable_family_palette(kind).contains(c))
+            .unwrap_or_else(|| match kind {
+                PortKind::Audio => theme::CABLE_AUDIO_PALETTE[key % theme::CABLE_AUDIO_PALETTE.len()],
+                PortKind::Midi => theme::CABLE_MIDI_PALETTE[key % theme::CABLE_MIDI_PALETTE.len()],
+            });
         let mut c = Cable::new(id, src, src_port, dst, dst_port, kind, color, 0, id * 7919 + 13);
         c.next_event = self.time + 0.2 + rng01(&mut c.rng) as f64 * 0.4;
         self.units[src].led = 1.0;
@@ -4976,9 +5104,10 @@ impl DemoApp {
     fn unplug_cable(&mut self, idx: usize, detach_dst: bool) {
         let c = &mut self.cables[idx];
         if c.dying < 0.0 {
+            let cid = c.id;
             // The patch is real: tell the engine to drop this route.
             if let Some(bus) = &self.bus {
-                let _ = bus.lock().unwrap().send(Command::Disconnect(c.id));
+                let _ = bus.lock().unwrap().send(Command::Disconnect(cid));
             }
             c.dying = 0.0;
             c.detach_dst = detach_dst;
@@ -4988,6 +5117,120 @@ impl DemoApp {
             if let Some(r) = &mut c.rope {
                 r.kick_all(Vec2::new(drift, -160.0), |t| if detach_dst { t } else { 1.0 - t });
             }
+            self.cable_colors.remove(&cid);
+        }
+    }
+
+    /// Strict Hurricane family palette (AGENTS.md rule 3: warm for audio, cool
+    /// for MIDI — families are never mixed).
+    fn cable_family_palette(kind: PortKind) -> &'static [Color32] {
+        match kind {
+            PortKind::Audio => &theme::CABLE_AUDIO_PALETTE,
+            PortKind::Midi => &theme::CABLE_MIDI_PALETTE,
+        }
+    }
+
+    /// Next jacket color strictly within `kind`'s family palette.
+    fn next_family_color(kind: PortKind, current: Color32) -> Color32 {
+        let pal = Self::cable_family_palette(kind);
+        let idx = pal.iter().position(|&c| c == current).map_or(0, |i| (i + 1) % pal.len());
+        pal[idx]
+    }
+
+    /// All living cable indices connected to jack `(unit, dir, port)`.
+    fn cables_on_jack(&self, unit: usize, dir: Dir, port: usize) -> Vec<usize> {
+        self.cables
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, c)| {
+                if c.dying >= 0.0 { return None; }
+                let attached = if dir == Dir::In {
+                    c.dst == unit && c.dst_port == port
+                } else {
+                    c.src == unit && c.src_port == port
+                };
+                attached.then_some(ci)
+            })
+            .collect()
+    }
+
+    /// Assign a jacket color to cable `cable_id`, refusing any color outside its
+    /// family palette (AGENTS.md rule 3).
+    fn set_cable_color(&mut self, cable_id: u32, color: Color32) -> bool {
+        let Some(ci) = self.live_cable(cable_id) else { return false };
+        let kind = self.cables[ci].kind;
+        if !Self::cable_family_palette(kind).contains(&color) {
+            return false;
+        }
+        self.cables[ci].color = color;
+        self.cable_colors.insert(cable_id, color);
+        true
+    }
+
+    /// Cycle cable `cable_id`'s jacket color strictly within its family palette.
+    fn cycle_cable_color(&mut self, cable_id: u32) -> Option<Color32> {
+        let ci = self.live_cable(cable_id)?;
+        let next = Self::next_family_color(self.cables[ci].kind, self.cables[ci].color);
+        self.set_cable_color(cable_id, next).then_some(next)
+    }
+
+    /// Cycle the jacket color of every living cable on `(unit, jack)` strictly
+    /// within its family palette.
+    fn cycle_jack_cable_colors(&mut self, unit: usize, jack: usize) -> usize {
+        let Some(j) = self.units.get(unit).and_then(|u| u.jacks.get(jack)) else { return 0 };
+        let ids: Vec<u32> = self.cables_on_jack(unit, j.dir, j.port).into_iter().map(|ci| self.cables[ci].id).collect();
+        let mut count = 0;
+        for id in ids {
+            if self.cycle_cable_color(id).is_some() { count += 1; }
+        }
+        count
+    }
+
+    /// Set every living cable on `(unit, jack)` to `color` if it belongs to that
+    /// jack's family palette.
+    fn set_jack_cable_colors(&mut self, unit: usize, jack: usize, color: Color32) -> usize {
+        let Some(j) = self.units.get(unit).and_then(|u| u.jacks.get(jack)) else { return 0 };
+        let ids: Vec<u32> = self.cables_on_jack(unit, j.dir, j.port).into_iter().map(|ci| self.cables[ci].id).collect();
+        let mut count = 0;
+        for id in ids {
+            if self.set_cable_color(id, color) { count += 1; }
+        }
+        count
+    }
+
+    /// Unplug every living cable connected to `(unit, jack)`. Each cable goes
+    /// through `unplug_cable` → `Command::Disconnect`, so the engine releases
+    /// held notes before dropping any MIDI path (AGENTS.md rule 41).
+    fn unplug_all_on_jack(&mut self, unit: usize, jack: usize) -> usize {
+        let Some((dir, port)) = self.units.get(unit).and_then(|u| u.jacks.get(jack)).map(|j| (j.dir, j.port)) else {
+            return 0;
+        };
+        let ids: Vec<u32> = self.cables_on_jack(unit, dir, port).into_iter().map(|ci| self.cables[ci].id).collect();
+        let detach_dst = dir == Dir::In;
+        let mut count = 0;
+        for id in ids {
+            if let Some(ci) = self.live_cable(id) {
+                if self.selected == Some(id) { self.selected = None; }
+                self.unplug_cable(ci, detach_dst);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn set_cable_opacity(&mut self, opacity: f32, persist: bool) {
+        let clamped = crate::assistant::clamp_cable_opacity(opacity);
+        self.cable_opacity = clamped;
+        if persist {
+            let _ = crate::assistant::save_cable_opacity(clamped);
+        }
+    }
+
+    fn set_cable_tension(&mut self, tension: f32, persist: bool) {
+        let clamped = crate::assistant::clamp_cable_tension(tension);
+        self.cable_tension = clamped;
+        if persist {
+            let _ = crate::assistant::save_cable_tension(clamped);
         }
     }
 
@@ -18908,6 +19151,59 @@ impl DemoApp {
         Self::settings_row(ui, "UI scale", "Follows the display the window is on; override with KABELSALAT_UI_SCALE.", |ui| {
             ui.label(egui::RichText::new(format!("{scale:.2}×")).font(theme::medium_font(13.5)).color(theme::INK));
         });
+        Self::settings_gap(ui);
+        let mut opacity = self.cable_opacity;
+        Self::settings_row(
+            ui,
+            "Cable opacity",
+            "Visibility of patch cables on the back of the rack (30–100%). Hovered or selected cables stay opaque. Double-click to reset.",
+            |ui| {
+                // Right-to-left: percentage readout on the right, slider to its left.
+                ui.label(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).font(theme::medium_font(12.5)).color(theme::INK));
+                ui.add_space(6.0);
+                let (changed, committed) = hurricane_slider(
+                    ui,
+                    "settings_cable_opacity",
+                    &mut opacity,
+                    crate::assistant::MIN_CABLE_OPACITY..=crate::assistant::MAX_CABLE_OPACITY,
+                    crate::assistant::DEFAULT_CABLE_OPACITY,
+                    120.0,
+                    22.0,
+                );
+                if changed || committed {
+                    self.cable_opacity = crate::assistant::clamp_cable_opacity(opacity);
+                    if committed {
+                        actions.push(SettingsAction::SetCableOpacity(self.cable_opacity));
+                    }
+                }
+            },
+        );
+        Self::settings_gap(ui);
+        let mut tension = self.cable_tension;
+        Self::settings_row(
+            ui,
+            "Cable tension",
+            "How tightly patch cables hang between jacks, from loose studio sag to neat taut runs. Double-click to reset.",
+            |ui| {
+                ui.label(egui::RichText::new(format!("{:.0}%", tension * 100.0)).font(theme::medium_font(12.5)).color(theme::INK));
+                ui.add_space(6.0);
+                let (changed, committed) = hurricane_slider(
+                    ui,
+                    "settings_cable_tension",
+                    &mut tension,
+                    crate::assistant::MIN_CABLE_TENSION..=crate::assistant::MAX_CABLE_TENSION,
+                    crate::assistant::DEFAULT_CABLE_TENSION,
+                    120.0,
+                    22.0,
+                );
+                if changed || committed {
+                    self.cable_tension = crate::assistant::clamp_cable_tension(tension);
+                    if committed {
+                        actions.push(SettingsAction::SetCableTension(self.cable_tension));
+                    }
+                }
+            },
+        );
     }
 
     fn settings_models_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
@@ -19137,6 +19433,14 @@ impl DemoApp {
                 self.reduce_motion = !self.reduce_motion;
                 let _ = crate::assistant::save_reduce_motion(self.reduce_motion);
                 self.settings_msg = if self.reduce_motion { "Reduce motion enabled".into() } else { "Reduce motion disabled".into() };
+            }
+            SettingsAction::SetCableOpacity(v) => {
+                self.set_cable_opacity(v, true);
+                self.settings_msg = format!("Cable opacity set to {:.0}%", self.cable_opacity * 100.0);
+            }
+            SettingsAction::SetCableTension(v) => {
+                self.set_cable_tension(v, true);
+                self.settings_msg = format!("Cable tension set to {:.0}%", self.cable_tension * 100.0);
             }
             SettingsAction::ToggleAutosave => {
                 self.autosave.enabled = !self.autosave.enabled;
@@ -21951,10 +22255,17 @@ impl DemoApp {
         // A split keyboard sends each note out ONE jack (LOW below the point,
         // HIGH at/above) — only that jack's cables pulse, like the engine.
         let port = split_port(self.units.get(ki).and_then(|u| u.split), semitone.min(127) as u8) as usize;
+        let note_u8 = semitone.min(127) as u8;
+        let vel_u8 = (amp.clamp(0.0, 1.0) * 127.0).round() as u8;
+        let now = self.ui_time;
         for ci in 0..self.cables.len() {
             let c = &mut self.cables[ci];
             if c.src == ki && c.src_port == port && c.kind == PortKind::Midi && c.dying < 0.0 {
                 c.spawn_pulse(0.0, amp);
+                if amp > 0.0 {
+                    c.last_note = Some((note_u8, vel_u8));
+                }
+                c.last_midi_at = now;
             }
         }
         if !send { return; }
@@ -23387,11 +23698,12 @@ impl DemoApp {
                 let side = if (mid_x - self.rack_w / 2.0).abs() < 26.0 {
                     if c.id % 2 == 0 { 1.0 } else { -1.0 }
                 } else if mid_x < self.rack_w / 2.0 { -1.0 } else { 1.0 };
-                c.rope = Some(Rope::new(ea, eb, side));
+                c.rope = Some(Rope::new_with_tension(ea, eb, side, self.cable_tension));
             }
             let breathe = if c.kind == PortKind::Audio { 1.0 + 0.04 * c.level } else { 1.0 };
+            let tension = self.cable_tension;
             if let Some(rope) = &mut c.rope {
-                for _ in 0..rope_steps { rope.step(a, b, breathe, bounds); }
+                for _ in 0..rope_steps { rope.step_with_tension(a, b, breathe, tension, bounds); }
             }
 
             // No simulated band: pulses are fired ONLY by real key presses
@@ -23415,7 +23727,15 @@ impl DemoApp {
                 // The engine's real per-edge level feeds the envelope; the
                 // attack/decay smoothing below stays UI-side.
                 if let (Some(l), true) = (&edge_levels, c.dying < 0.0) {
-                    c.env = c.env.max(edge_display_level(l.load(c.id)));
+                    let peak = l.load(c.id);
+                    c.env = c.env.max(edge_display_level(peak));
+                    if peak >= c.peak_lin {
+                        c.peak_lin = peak;
+                    } else {
+                        c.peak_lin *= (-dt / 0.25).exp();
+                    }
+                } else {
+                    c.peak_lin *= (-dt / 0.25).exp();
                 }
                 c.env *= (-dt / 0.32).exp();
                 c.level += (c.env - c.level) * (1.0 - (-dt / 0.05).exp());
@@ -23470,9 +23790,10 @@ impl DemoApp {
         if self.pending.is_some() {
             let (pu, pj) = { let p = self.pending.as_ref().unwrap(); (p.unit, p.jack) };
             let origin = self.jack_pos(pu, pj);
+            let tension = self.cable_tension;
             let p = self.pending.as_mut().unwrap();
             let (a, b) = if p.dir == Dir::Out { (origin, p.cursor) } else { (p.cursor, origin) };
-            for _ in 0..rope_steps { p.rope.step(Some(a), Some(b), 1.0, bounds); }
+            for _ in 0..rope_steps { p.rope.step_with_tension(Some(a), Some(b), 1.0, tension, bounds); }
         }
     }
 
@@ -23782,6 +24103,7 @@ impl DemoApp {
                 }
                 else if self.knob_menu.is_some() { self.knob_menu = None; }
                 else if self.scale_menu.is_some() { self.scale_menu = None; }
+                else if self.cable_menu.is_some() { self.cable_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.setlist_footswitch_learn.is_some() { self.setlist_footswitch_learn = None; }
@@ -23854,6 +24176,7 @@ impl DemoApp {
         if (self.engine_info_open && self.engine_info_rect.contains(s))
             || (self.session_popover_open && self.session_popover_rect.contains(s))
             || (self.nav_rig_menu.is_some() && self.nav_rig_menu_rect.contains(s))
+            || (self.stage_view == StageView::Rack && self.side == Side::Back && self.back_controls_rect.contains(s))
         {
             self.hover = Some(Hit::Background);
             return;
@@ -23938,6 +24261,24 @@ impl DemoApp {
                 }
             } else {
                 self.knob_menu = None;
+                self.scale_menu = None;
+                match self.hit_test(s) {
+                    Hit::Cable(id, _) if self.live_cable(id).is_some() => {
+                        self.cable_menu = Some(CableMenu { target: CableMenuTarget::Cable(id), pos: s });
+                    }
+                    Hit::Jack { unit, jack } => {
+                        let has_cables = self.units.get(unit)
+                            .and_then(|u| u.jacks.get(jack))
+                            .is_some_and(|j| !self.cables_on_jack(unit, j.dir, j.port).is_empty());
+                        self.cable_menu = has_cables.then_some(CableMenu {
+                            target: CableMenuTarget::Jack { unit, jack },
+                            pos: s,
+                        });
+                    }
+                    _ => {
+                        self.cable_menu = None;
+                    }
+                }
             }
         }
 
@@ -23958,6 +24299,15 @@ impl DemoApp {
         }
         if pressed && self.scale_menu.is_some() {
             self.scale_menu = None;
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        if self.cable_menu.is_some() && self.cable_menu_rect.contains(s) {
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        if pressed && self.cable_menu.is_some() {
+            self.cable_menu = None;
             self.hover = Some(Hit::Background);
             return;
         }
@@ -24335,7 +24685,7 @@ impl DemoApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
-        let painter = ui.painter();
+        let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
 
         // The rack IS the reference's single inverted hero panel (§4.2):
@@ -24357,8 +24707,79 @@ impl DemoApp {
         }
 
         self.draw_pan_bars(&painter);
+        if self.side == Side::Back && !self.flipping && !self.show_help && rect.width() >= 680.0 {
+            self.draw_back_controls(ui, rect);
+        } else {
+            self.back_controls_rect = Rect::NOTHING;
+        }
         self.draw_hint(&painter, rect);
         if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// Compact inline opacity & tension strip in the bottom-right margin of the
+    /// back panel (#303). Sits on the hint row outside the rack chassis so it
+    /// never crosses cables or units.
+    fn draw_back_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let bar_w = 342.0_f32.min((rect.width() - 32.0).max(200.0));
+        let bar_h = 24.0;
+        let bar_rect = Rect::from_min_size(
+            Pos2::new(rect.right() - 16.0 - bar_w, rect.bottom() - bar_h - 6.0),
+            Vec2::new(bar_w, bar_h),
+        );
+        self.back_controls_rect = bar_rect;
+        let p = ui.painter();
+        p.rect_filled(bar_rect, 2.0, theme::PAPER_SINK);
+        p.rect_stroke(bar_rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+
+        let inner = bar_rect.shrink2(Vec2::new(8.0, 2.0));
+        let mut opacity = self.cable_opacity;
+        let mut tension = self.cable_tension;
+        let mut op_changed = false;
+        let mut op_commit = false;
+        let mut tn_changed = false;
+        let mut tn_commit = false;
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                theme::tracked_label(ui, "OPACITY", 9.0, 0.12, theme::INK_2);
+                let (c, k) = hurricane_slider(
+                    ui,
+                    "back_cable_opacity",
+                    &mut opacity,
+                    crate::assistant::MIN_CABLE_OPACITY..=crate::assistant::MAX_CABLE_OPACITY,
+                    crate::assistant::DEFAULT_CABLE_OPACITY,
+                    66.0,
+                    18.0,
+                );
+                op_changed = c;
+                op_commit = k;
+                ui.label(egui::RichText::new(format!("{:.0}%", opacity * 100.0)).font(FontId::monospace(10.5)).color(theme::CREAM_META));
+                ui.add_space(4.0);
+                let sep = ui.allocate_exact_size(egui::vec2(1.0, 12.0), egui::Sense::hover()).0;
+                ui.painter().rect_filled(sep, 0.0, theme::HAIRLINE);
+                ui.add_space(4.0);
+                theme::tracked_label(ui, "TENSION", 9.0, 0.12, theme::INK_2);
+                let (c, k) = hurricane_slider(
+                    ui,
+                    "back_cable_tension",
+                    &mut tension,
+                    crate::assistant::MIN_CABLE_TENSION..=crate::assistant::MAX_CABLE_TENSION,
+                    crate::assistant::DEFAULT_CABLE_TENSION,
+                    66.0,
+                    18.0,
+                );
+                tn_changed = c;
+                tn_commit = k;
+                ui.label(egui::RichText::new(format!("{:.0}%", tension * 100.0)).font(FontId::monospace(10.5)).color(theme::CREAM_META));
+            });
+        });
+        if op_changed || op_commit {
+            self.set_cable_opacity(opacity, op_commit);
+        }
+        if tn_changed || tn_commit {
+            self.set_cable_tension(tension, tn_commit);
+        }
     }
 
     /// Hairline pan indicators when the rack overflows the stage: a thumb
@@ -27637,43 +28058,12 @@ impl DemoApp {
             painter.rect_filled(xf.rect(strip), 1.0, strip_col);
         }
 
-        // Selection path highlight set.
-        let mut hl = [false; MAX_CABLES];
-        let mut has_sel = false;
-        if let Some(sel) = self.selected {
-            if let Some(idx) = self.cables.iter().position(|c| c.id == sel && c.dying < 0.0) {
-                has_sel = true;
-                hl[idx] = true;
-                let mut stack = [0usize; MAX_CABLES];
-                let mut sp = 1;
-                stack[0] = idx;
-                while sp > 0 {
-                    sp -= 1;
-                    let n = self.cables[stack[sp]].src;
-                    for j in 0..self.cables.len() {
-                        if !hl[j] && self.cables[j].dst == n && self.cables[j].dying < 0.0 {
-                            hl[j] = true; stack[sp] = j; sp += 1;
-                        }
-                    }
-                }
-                sp = 1;
-                stack[0] = idx;
-                while sp > 0 {
-                    sp -= 1;
-                    let n = self.cables[stack[sp]].dst;
-                    for j in 0..self.cables.len() {
-                        if !hl[j] && self.cables[j].src == n && self.cables[j].dying < 0.0 {
-                            hl[j] = true; stack[sp] = j; sp += 1;
-                        }
-                    }
-                }
-            }
-        }
+        let (hl, has_focus, is_selection) = self.back_cable_highlights();
 
-        self.draw_cables(painter, &hl, has_sel);
-        self.draw_jacks(painter);
+        self.draw_cables(painter, &hl, has_focus, is_selection);
+        self.draw_jacks(painter, &hl, has_focus, is_selection);
         self.draw_plugs(painter);
-        self.draw_pulses(painter, &hl, has_sel);
+        self.draw_pulses(painter, &hl, has_focus);
         self.draw_pending(painter);
 
         // Paint order fix (§4.4): unit titles + jack labels LAST, so cables
@@ -27702,11 +28092,71 @@ impl DemoApp {
         self.draw_fading_units(painter);
     }
 
-    fn cable_alpha(c: &Cable, has_sel: bool, highlighted: bool) -> f32 {
-        let mut a = 1.0;
+    /// Compute back-panel cable highlights (`(hl, has_focus, is_selection)`):
+    /// 1. Click-selected cable (`self.selected`): highlights its full upstream
+    ///    and downstream signal path (`is_selection = true`).
+    /// 2. Hovered occupied jack (`Hit::Jack`) when no cable is selected:
+    ///    highlights every living cable connected to that jack (`is_selection = false`)
+    ///    and dims unrelated cables (#303).
+    fn back_cable_highlights(&self) -> ([bool; MAX_CABLES], bool, bool) {
+        let mut hl = [false; MAX_CABLES];
+        if let Some(sel) = self.selected {
+            if let Some(idx) = self.cables.iter().position(|c| c.id == sel && c.dying < 0.0) {
+                hl[idx] = true;
+                let mut stack = [0usize; MAX_CABLES];
+                let mut sp = 1;
+                stack[0] = idx;
+                while sp > 0 {
+                    sp -= 1;
+                    let n = self.cables[stack[sp]].src;
+                    for j in 0..self.cables.len() {
+                        if !hl[j] && self.cables[j].dst == n && self.cables[j].dying < 0.0 {
+                            hl[j] = true; stack[sp] = j; sp += 1;
+                        }
+                    }
+                }
+                sp = 1;
+                stack[0] = idx;
+                while sp > 0 {
+                    sp -= 1;
+                    let n = self.cables[stack[sp]].dst;
+                    for j in 0..self.cables.len() {
+                        if !hl[j] && self.cables[j].src == n && self.cables[j].dying < 0.0 {
+                            hl[j] = true; stack[sp] = j; sp += 1;
+                        }
+                    }
+                }
+                return (hl, true, true);
+            }
+        }
+        if self.pending.is_none() && matches!(self.drag, Drag::None) {
+            if let Some(Hit::Jack { unit, jack }) = self.hover {
+                if let Some(j) = self.units.get(unit).and_then(|u| u.jacks.get(jack)) {
+                    let mut any = false;
+                    for ci in self.cables_on_jack(unit, j.dir, j.port) {
+                        if ci < MAX_CABLES && self.visible(self.cables[ci].src) && self.visible(self.cables[ci].dst) {
+                            hl[ci] = true;
+                            any = true;
+                        }
+                    }
+                    if any {
+                        return (hl, true, false);
+                    }
+                }
+            }
+        }
+        (hl, false, false)
+    }
+
+    fn cable_alpha(c: &Cable, has_focus: bool, highlighted: bool, cable_opacity: f32) -> f32 {
+        let mut a = if has_focus && highlighted {
+            1.0
+        } else {
+            crate::assistant::clamp_cable_opacity(cable_opacity)
+        };
         if c.age < 0.18 { a *= c.age / 0.18; }
         if c.dying >= 0.0 { a *= (1.0 - c.dying / 0.55).clamp(0.0, 1.0); }
-        if has_sel && !highlighted { a *= 0.28; }
+        if has_focus && !highlighted { a *= 0.28; }
         a
     }
 
@@ -27729,17 +28179,17 @@ impl DemoApp {
         col
     }
 
-    fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
+    fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_focus: bool, is_selection: bool) {
         let xf = &self.xf;
         let volume = self.master_idx()
             .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.75) * 0.85)
             .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
-            let a = Self::cable_alpha(c, has_sel, hl[ci]);
-            if a <= 0.01 { continue; }
             let hovered = matches!(self.hover, Some(Hit::Cable(id, _)) if id == c.id);
             let grabbed = matches!(self.drag, Drag::Cable { id, .. } if id == c.id);
+            let a = Self::cable_alpha(c, has_focus, hl[ci] || (!has_focus && (hovered || grabbed)), self.cable_opacity);
+            if a <= 0.01 { continue; }
             let level = if c.kind == PortKind::Audio {
                 ((c.level + 0.05 + 0.035 * (self.ui_time * 1.4 + c.phase).sin()) * volume).clamp(0.0, 1.0)
             } else { 0.0 };
@@ -27768,10 +28218,15 @@ impl DemoApp {
 
             // One flat stroke per cable, round caps (§4.10). Selection = the
             // accent color swap + dimming the rest (cable_alpha) — no glow,
-            // no centerline.
-            if has_sel && hl[ci] {
-                col = theme::ACCENT;
-                width += 0.5;
+            // no centerline. Hover-to-trace keeps family jacket color, full
+            // opacity, and thicker stroke while dimming unrelated cables.
+            if has_focus && hl[ci] {
+                if is_selection {
+                    col = theme::ACCENT;
+                    width += 0.5;
+                } else {
+                    width += 0.8;
+                }
             } else if edge_at > 0.01 {
                 painter.add(cable_shape(width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
                 col = mix(col, theme::AGENT_COLOR, edge_at * 0.85);
@@ -27787,7 +28242,7 @@ impl DemoApp {
         }
     }
 
-    fn draw_jacks(&self, painter: &egui::Painter) {
+    fn draw_jacks(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_focus: bool, is_selection: bool) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
             if !self.visible(ui) { continue; }
@@ -27795,23 +28250,37 @@ impl DemoApp {
                 let c = self.jack_pos(ui, ji);
                 let kind = u.kind(j.dir, j.port);
                 let hovered = matches!(self.hover, Some(Hit::Jack { unit, jack }) if unit == ui && jack == ji);
+                let traced_end = has_focus && self.cables.iter().enumerate().any(|(ci, cb)| {
+                    ci < MAX_CABLES
+                        && hl[ci]
+                        && cb.dying < 0.0
+                        && ((j.dir == Dir::Out && cb.src == ui && cb.src_port == j.port)
+                            || (j.dir == Dir::In && cb.dst == ui && cb.dst_port == j.port))
+                });
                 let compat = self.compatible(ui, ji);
                 // Flat socket (§4.12): DARK_PANEL fill + 1.2px hairline.
                 let socket = Rect::from_center_size(c.to_pos2(), Vec2::splat(24.0));
                 painter.rect_filled(xf.rect(socket), 2.0, CHASSIS);
-                painter.rect_stroke(xf.rect(socket), 2.0, Stroke::new(1.2, BORDER), egui::StrokeKind::Inside);
+                let sock_stroke = if hovered || traced_end {
+                    let ring_col = if is_selection && traced_end { theme::ACCENT } else { kind.color() };
+                    Stroke::new(1.5, alpha(ring_col, if hovered { 0.9 } else { 0.65 }))
+                } else {
+                    Stroke::new(1.2, BORDER)
+                };
+                painter.rect_stroke(xf.rect(socket), 2.0, sock_stroke, egui::StrokeKind::Inside);
                 if compat {
                     // Compatible drop-target ring: the accent, ±1.5px pulse.
                     let pulse = 1.5 * (self.ui_time * 7.0).sin();
                     self.ell(painter, c, 15.0 + pulse, Color32::TRANSPARENT, Stroke::new(1.8, alpha(theme::ACCENT, 0.65)));
                 }
-                if hovered || compat {
-                    self.ell(painter, c, 16.0, alpha(kind.color(), 0.16), Stroke::NONE);
+                if hovered || compat || traced_end {
+                    let disc_a = if hovered || compat { 0.16 } else { 0.10 };
+                    self.ell(painter, c, 16.0, alpha(kind.color(), disc_a), Stroke::NONE);
                 }
                 self.ell(painter, c, 6.5, Color32::from_rgb(0x10, 0x10, 0x10),
                     Stroke::new(1.4, if hovered { mix(RING, WHITE, 0.35) } else { RING }));
                 // Center terminal: audio round, MIDI square (§3 separability).
-                let ta = alpha(kind.color(), if compat || hovered { 1.0 } else { 0.8 });
+                let ta = alpha(kind.color(), if compat || hovered || traced_end { 1.0 } else { 0.8 });
                 match kind {
                     PortKind::Audio => self.ell(painter, c, 2.5, ta, Stroke::NONE),
                     PortKind::Midi => {
@@ -27841,7 +28310,7 @@ impl DemoApp {
         for (ci, c) in self.cables.iter().enumerate() {
             if c.dying >= 0.0 { continue; }
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
-            let a = Self::cable_alpha(c, false, true);
+            let a = Self::cable_alpha(c, false, true, 1.0);
             for end in [Dir::Out, Dir::In] {
                 let plug_a = if end == Dir::In && c.draw_in < 1.0 {
                     a * ((c.draw_in - 0.55) / 0.45).clamp(0.0, 1.0)
@@ -27882,11 +28351,11 @@ impl DemoApp {
         }
     }
 
-    fn draw_pulses(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
+    fn draw_pulses(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_focus: bool) {
         let xf = &self.xf;
         for (ci, c) in self.cables.iter().enumerate() {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
-            let a = Self::cable_alpha(c, has_sel, hl[ci]);
+            let a = Self::cable_alpha(c, has_focus, hl[ci], self.cable_opacity);
             if a <= 0.02 { continue; }
             // Single flat dot (§4.11): cable color mixed 0.5 toward cream-
             // white. No glow ellipse, no trail bezier — motion = information.
@@ -27944,17 +28413,351 @@ impl DemoApp {
             painter.galley(pos, ng, theme::AGENT_TEXT);
             return;
         }
-        let hint_right = pos.x + g.size().x;
-        painter.galley(pos, g.clone(), theme::INK_2);
+        let hint_limit = if self.back_controls_rect.is_positive() {
+            self.back_controls_rect.left() - 12.0
+        } else {
+            rect.right() - 16.0
+        };
+        let hint_clip = Rect::from_min_max(Pos2::new(pos.x, pos.y - 4.0), Pos2::new(hint_limit.max(pos.x), pos.y + 22.0));
+        let hint_right = (pos.x + g.size().x).min(hint_clip.right());
+        painter.with_clip_rect(hint_clip).galley(pos, g.clone(), theme::INK_2);
         // Info line fallback (narrow window): right-aligned on the hint row,
-        // clipped so it never runs into the hint text.
-        if self.info_in_hint && !self.stats_line.is_empty() {
+        // clipped so it never runs into the hint text or back controls.
+        if self.info_in_hint && !self.stats_line.is_empty() && !self.back_controls_rect.is_positive() {
             let ig = painter.layout_no_wrap(self.stats_line.clone(), FontId::monospace(11.0), theme::INK_2);
             let clip = Rect::from_min_max(Pos2::new(hint_right + 24.0, pos.y - 4.0), Pos2::new(rect.right() - 16.0, pos.y + 20.0));
             if clip.width() > 60.0 {
                 let x = (rect.right() - 16.0 - ig.size().x).max(clip.left());
                 painter.with_clip_rect(clip).galley(Pos2::new(x, pos.y + 1.0), ig, theme::INK_2);
             }
+        }
+    }
+
+    /// Build tooltip data for jack `(unit, jack)` on the back panel (#303).
+    fn jack_tooltip_info(&self, unit: usize, jack: usize) -> Option<JackTooltip> {
+        let u = self.units.get(unit)?;
+        let j = u.jacks.get(jack)?;
+        let kind = u.kind(j.dir, j.port);
+        let dir_word = match j.dir { Dir::Out => "OUT", Dir::In => "IN" };
+        let kind_word = match kind { PortKind::Audio => "AUDIO", PortKind::Midi => "MIDI" };
+        let port_title = format!("{} · {}", sentence_case(&u.name), j.label);
+        let kind_badge = format!("{kind_word} {dir_word}");
+
+        let connected = self.cables_on_jack(unit, j.dir, j.port);
+        let mut connections = Vec::with_capacity(connected.len());
+        for &ci in &connected {
+            let c = &self.cables[ci];
+            let (other_u, other_dir, other_port, prefix) = if j.dir == Dir::Out {
+                (c.dst, Dir::In, c.dst_port, "to")
+            } else {
+                (c.src, Dir::Out, c.src_port, "from")
+            };
+            if let Some(ou) = self.units.get(other_u) {
+                let olabel = ou
+                    .jack_index(other_dir, other_port)
+                    .and_then(|ji| ou.jacks.get(ji))
+                    .map_or("PORT", |oj| oj.label);
+                connections.push(format!("{prefix} {} · {olabel}", sentence_case(&ou.name)));
+            }
+        }
+
+        let (signal, signal_live) = match kind {
+            PortKind::Audio => {
+                let mut peak_lin = 0.0f32;
+                let mut max_level = 0.0f32;
+                for &ci in &connected {
+                    let c = &self.cables[ci];
+                    if let Some(el) = &self.edge_levels {
+                        peak_lin = peak_lin.max(el.load(c.id));
+                    }
+                    peak_lin = peak_lin.max(c.peak_lin);
+                    max_level = max_level.max(c.level);
+                }
+                if peak_lin > 1e-4 {
+                    let db = (20.0 * peak_lin.log10()).clamp(-80.0, 12.0);
+                    (format!("{db:.1} dBFS"), true)
+                } else if self.edge_levels.is_none() && max_level > 0.005 {
+                    let db = (max_level * 48.0 - 48.0).clamp(-48.0, 0.0);
+                    (format!("{db:.1} dBFS"), true)
+                } else if connected.is_empty() {
+                    ("-inf dBFS · unconnected".into(), false)
+                } else {
+                    ("-inf dBFS · silent".into(), false)
+                }
+            }
+            PortKind::Midi => {
+                let mut held: Vec<String> = Vec::new();
+                let on_keys_path = matches!(u.node_kind, UnitKind::Keys)
+                    || connected.iter().any(|&ci| matches!(self.units.get(self.cables[ci].src).map(|s| &s.node_kind), Some(UnitKind::Keys)));
+                if on_keys_path {
+                    for (n, &bits) in self.notes_down.iter().enumerate() {
+                        if bits != 0 {
+                            held.push(note_name(n as u8));
+                            if held.len() >= 4 { break; }
+                        }
+                    }
+                }
+                let pulses_active = connected.iter().any(|&ci| self.cables[ci].pulses.iter().any(|p| p.active));
+                let mut latest_at = -1.0f32;
+                let mut latest_note: Option<(u8, u8)> = None;
+                for &ci in &connected {
+                    let c = &self.cables[ci];
+                    if c.last_midi_at > latest_at {
+                        latest_at = c.last_midi_at;
+                        latest_note = c.last_note;
+                    }
+                }
+                if !held.is_empty() {
+                    (format!("Active · {}", held.join(", ")), true)
+                } else if pulses_active {
+                    match latest_note {
+                        Some((n, v)) => (format!("Active · {} v{v}", note_name(n)), true),
+                        None => ("Active · MIDI".into(), true),
+                    }
+                } else if let Some((n, v)) = latest_note {
+                    let recent = latest_at >= 0.0 && (self.ui_time - latest_at) < 3.0;
+                    if recent {
+                        (format!("Recent · {} v{v}", note_name(n)), true)
+                    } else {
+                        (format!("Idle · last {} v{v}", note_name(n)), false)
+                    }
+                } else if connected.is_empty() {
+                    ("Idle · unconnected".into(), false)
+                } else {
+                    ("Idle · no MIDI".into(), false)
+                }
+            }
+        };
+
+        Some(JackTooltip { port_title, kind_badge, kind, connections, signal, signal_live })
+    }
+
+    /// Hurricane-styled hovered-jack tooltip on the back panel (#303).
+    fn jack_tooltip_ui(&self, ctx: &egui::Context) {
+        if self.stage_view != StageView::Rack
+            || self.side != Side::Back
+            || self.flipping
+            || !matches!(self.drag, Drag::None)
+            || self.cable_menu.is_some()
+            || self.show_help
+            || (self.dock == DockView::Keyboard && self.kb_expanded)
+        {
+            return;
+        }
+        let Some(Hit::Jack { unit, jack }) = self.hover else { return };
+        let Some(info) = self.jack_tooltip_info(unit, jack) else { return };
+        let anchor = self.xf.p(self.jack_pos(unit, jack)) + Vec2::new(18.0, -10.0);
+        let family_col = info.kind.color();
+        let constrain = if self.stage_rect.is_positive() { self.stage_rect } else { ctx.content_rect() };
+        egui::Area::new(egui::Id::unique("jack_port_tooltip"))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .fixed_pos(anchor)
+            .constrain_to(constrain)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::PAPER_SINK)
+                    .stroke(Stroke::new(1.0, theme::MUTED))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin { left: 12, right: 10, top: 8, bottom: 8 })
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(168.0);
+                        ui.set_max_width(260.0);
+                        let resp = ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(&info.port_title).font(theme::medium_font(12.5)).color(theme::CREAM));
+                                ui.add_space(6.0);
+                                theme::tracked_label(ui, &info.kind_badge, 9.0, 0.12, family_col);
+                            });
+                            if info.connections.is_empty() {
+                                ui.label(egui::RichText::new("Not connected").size(11.0).color(theme::CREAM_DIM));
+                            } else {
+                                for conn in &info.connections {
+                                    ui.label(egui::RichText::new(conn).size(11.5).color(theme::CREAM_META));
+                                }
+                            }
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let (dot_r, _) = ui.allocate_exact_size(egui::vec2(7.0, 11.0), egui::Sense::hover());
+                                let dot_col = if info.signal_live { theme::LIVE_TEAL } else { theme::CREAM_DIM };
+                                match info.kind {
+                                    PortKind::Audio => { ui.painter().circle_filled(dot_r.center(), 3.0, dot_col); }
+                                    PortKind::Midi => {
+                                        ui.painter().rect_filled(
+                                            Rect::from_center_size(dot_r.center(), Vec2::splat(5.5)), 0.5, dot_col,
+                                        );
+                                    }
+                                }
+                                ui.label(egui::RichText::new(&info.signal)
+                                    .font(FontId::monospace(11.0))
+                                    .color(if info.signal_live { theme::CREAM } else { theme::CREAM_DIM }));
+                            });
+                        });
+                        // Left editorial family accent bar.
+                        let r = resp.response.rect;
+                        let bar = Rect::from_min_max(
+                            Pos2::new(r.left() - 8.0, r.top() + 1.0),
+                            Pos2::new(r.left() - 6.0, r.bottom() - 1.0),
+                        );
+                        ui.painter().rect_filled(bar, 1.0, family_col);
+                    });
+            });
+    }
+
+    /// Right-click context menu on a cable or occupied jack (#303):
+    /// cycle/pick jacket color strictly within the Hurricane family palette
+    /// (`CABLE_AUDIO_PALETTE` / `CABLE_MIDI_PALETTE`) or unplug cable(s).
+    fn cable_menu_ui(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.cable_menu else {
+            self.cable_menu_rect = Rect::NOTHING;
+            return;
+        };
+        let close = |app: &mut Self| {
+            app.cable_menu = None;
+            app.cable_menu_rect = Rect::NOTHING;
+        };
+        if self.stage_view != StageView::Rack || self.side != Side::Back || self.flipping {
+            return close(self);
+        }
+        let (title, subtitle, kind, current_color, cable_count) = match menu.target {
+            CableMenuTarget::Cable(id) => {
+                let Some(ci) = self.live_cable(id) else { return close(self) };
+                let c = &self.cables[ci];
+                let src_u = &self.units[c.src];
+                let dst_u = &self.units[c.dst];
+                let sp = src_u.jack_index(Dir::Out, c.src_port).and_then(|ji| src_u.jacks.get(ji)).map_or("OUT", |j| j.label);
+                let dp = dst_u.jack_index(Dir::In, c.dst_port).and_then(|ji| dst_u.jacks.get(ji)).map_or("IN", |j| j.label);
+                let title = format!("{} ({sp}) to {} ({dp})", sentence_case(&src_u.name), sentence_case(&dst_u.name));
+                let sub = match c.kind { PortKind::Audio => "AUDIO CABLE", PortKind::Midi => "MIDI CABLE" }.to_string();
+                (title, sub, c.kind, c.color, 1usize)
+            }
+            CableMenuTarget::Jack { unit, jack } => {
+                let Some(u) = self.units.get(unit) else { return close(self) };
+                let Some(j) = u.jacks.get(jack) else { return close(self) };
+                let connected = self.cables_on_jack(unit, j.dir, j.port);
+                if connected.is_empty() { return close(self); }
+                let kind = u.kind(j.dir, j.port);
+                let title = format!("{} · {}", sentence_case(&u.name), j.label);
+                let noun = if connected.len() == 1 { "CABLE" } else { "CABLES" };
+                let kword = match kind { PortKind::Audio => "AUDIO", PortKind::Midi => "MIDI" };
+                let sub = format!("{} {kword} {noun}", connected.len());
+                let cur = self.cables[*connected.last().unwrap()].color;
+                (title, sub, kind, cur, connected.len())
+            }
+        };
+
+        let palette = Self::cable_family_palette(kind);
+        let mut pick_color: Option<Color32> = None;
+        let mut cycle_color = false;
+        let mut unplug = false;
+
+        let area = egui::Area::new(egui::Id::unique("cable_context_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(130),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(184.0);
+                        ui.label(egui::RichText::new(&title).font(theme::medium_font(12.5)).color(theme::INK));
+                        theme::tracked_label(ui, &subtitle, 9.0, 0.12, kind.color());
+                        ui.add_space(8.0);
+                        theme::tracked_label(ui, "JACKET COLOR", 9.0, 0.12, theme::INK_2);
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            for &swatch in palette {
+                                let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                                let active = swatch == current_color;
+                                match kind {
+                                    PortKind::Audio => {
+                                        ui.painter().circle_filled(r.center(), 7.5, swatch);
+                                        if active || resp.hovered() {
+                                            ui.painter().circle_stroke(
+                                                r.center(),
+                                                10.0,
+                                                Stroke::new(1.5, if active { theme::ACCENT } else { theme::CREAM }),
+                                            );
+                                        }
+                                    }
+                                    PortKind::Midi => {
+                                        let sq = Rect::from_center_size(r.center(), Vec2::splat(13.0));
+                                        ui.painter().rect_filled(sq, 1.5, swatch);
+                                        if active || resp.hovered() {
+                                            ui.painter().rect_stroke(
+                                                Rect::from_center_size(r.center(), Vec2::splat(18.0)),
+                                                2.0,
+                                                Stroke::new(1.5, if active { theme::ACCENT } else { theme::CREAM }),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                        }
+                                    }
+                                }
+                                if resp.clicked() {
+                                    pick_color = Some(swatch);
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        if theme::chip_button(ui, "Cycle jacket color", false).clicked() {
+                            cycle_color = true;
+                        }
+                        ui.add_space(4.0);
+                        let unplug_label = match menu.target {
+                            CableMenuTarget::Cable(_) => "Unplug cable".to_string(),
+                            CableMenuTarget::Jack { .. } if cable_count > 1 => format!("Unplug all ({cable_count})"),
+                            CableMenuTarget::Jack { .. } => "Unplug cable".to_string(),
+                        };
+                        if theme::danger_button(ui, &unplug_label, false).clicked() {
+                            unplug = true;
+                        }
+                    });
+            });
+        self.cable_menu_rect = area.response.rect;
+
+        if let Some(col) = pick_color {
+            match menu.target {
+                CableMenuTarget::Cable(id) => { self.set_cable_color(id, col); }
+                CableMenuTarget::Jack { unit, jack } => { self.set_jack_cable_colors(unit, jack, col); }
+            }
+            close(self);
+        } else if cycle_color {
+            match menu.target {
+                CableMenuTarget::Cable(id) => { self.cycle_cable_color(id); }
+                CableMenuTarget::Jack { unit, jack } => { self.cycle_jack_cable_colors(unit, jack); }
+            }
+            // Keep menu open so repeated clicks cycle cleanly through the family palette.
+        } else if unplug {
+            match menu.target {
+                CableMenuTarget::Cable(id) => {
+                    if let Some(ci) = self.live_cable(id) {
+                        if self.selected == Some(id) { self.selected = None; }
+                        self.unplug_cable(ci, true);
+                    }
+                }
+                CableMenuTarget::Jack { unit, jack } => {
+                    self.unplug_all_on_jack(unit, jack);
+                }
+            }
+            close(self);
         }
     }
 
@@ -28821,6 +29624,9 @@ impl DemoApp {
 
         self.tessellate();
         if !(self.dock == DockView::Keyboard && self.kb_expanded) {
+            if self.stage_view != StageView::Rack {
+                self.back_controls_rect = Rect::NOTHING;
+            }
             match self.stage_view {
                 StageView::Rack => self.draw(ui),
                 StageView::Matrix => self.matrix_stage(ui),
@@ -28830,9 +29636,13 @@ impl DemoApp {
                 StageView::Plugins => self.plugins_stage(ui),
                 StageView::Settings => self.settings_stage(ui),
             }
+        } else {
+            self.back_controls_rect = Rect::NOTHING;
         }
         self.knob_menu_ui(&ctx);
         self.scale_menu_ui(&ctx);
+        self.cable_menu_ui(&ctx);
+        self.jack_tooltip_ui(&ctx);
         self.engine_info_ui(&ctx);
         self.session_popover_ui(&ctx);
         self.nav_rig_menu_ui(&ctx);
@@ -43256,15 +44066,32 @@ mod offline_shots {
     /// `app` must not have run a frame before: it keeps galleys laid out in
     /// that frame's font atlas, and this fresh context draws them as glyph soup.
     pub(super) fn shot(app: &mut DemoApp, size: Vec2, path: &std::path::Path) {
+        shot_with_pointer(app, size, None, path);
+    }
+
+    /// Like [`shot`], optionally holding the pointer at a screen position
+    /// computed after the first layout frame (so hover states and tooltips
+    /// render through the real input path).
+    pub(super) fn shot_with_pointer(
+        app: &mut DemoApp,
+        size: Vec2,
+        pointer_fn: Option<&dyn Fn(&DemoApp) -> Pos2>,
+        path: &std::path::Path,
+    ) {
         let ctx = egui::Context::default();
         // The real app's faces (Noto + symbol fallbacks), not egui's defaults.
         theme::install_fonts(&ctx);
         let mut tex = Textures::default();
         let mut last = None;
-        for i in 0..5 {
+        for i in 0..8 {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
-            raw.time = Some(i as f64);
+            raw.time = Some(i as f64 * 0.05);
+            if i >= 2 {
+                if let Some(f) = pointer_fn {
+                    raw.events.push(egui::Event::PointerMoved(f(app)));
+                }
+            }
             eframe::App::raw_input_hook(app, &ctx, &mut raw);
             let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
             tex.apply(&out.textures_delta);
@@ -44436,5 +45263,386 @@ mod navigator_tests {
         let set_cut: serde_json::Value = serde_json::from_str(&app.exec_tool("set_param", &serde_json::json!({"node": lv2_node, "name": "cutoff", "text": "2.5 kHz"}))).unwrap();
         assert_eq!(set_cut["ok"], true);
         assert_eq!(set_cut["text"], "2500.0 Hz");
+    }
+}
+
+/// Issue #303: back-panel cable ergonomics — hover-to-trace, live port
+/// tooltips, cable opacity & tension controls, and family-safe right-click
+/// recoloring / unplug-all.
+#[cfg(test)]
+mod cable_ergonomics_tests {
+    use super::*;
+    use crate::control::command_bus;
+
+    const SIZE: Vec2 = Vec2::new(1280.0, 800.0);
+
+    fn run_frame_events(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>, dt_step: f64) -> Vec<String> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, SIZE));
+        raw.time = Some(dt_step);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        let mut texts = Vec::new();
+        fn collect_shape(sh: &egui::Shape, out: &mut Vec<String>) {
+            match sh {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => {
+                    for child in v {
+                        collect_shape(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for s in &out.shapes {
+            collect_shape(&s.shape, &mut texts);
+        }
+        out.textures_delta.clear(); // rule 11
+        texts
+    }
+
+    fn back_demo_app() -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        app.side = Side::Back;
+        let ctx = egui::Context::default();
+        for i in 0..4 {
+            run_frame_events(&mut app, &ctx, vec![], i as f64 * 0.05);
+        }
+        (app, ctx)
+    }
+
+    fn jack_pos_screen(app: &DemoApp, unit: usize, jack: usize) -> Pos2 {
+        app.xf.p(app.jack_pos(unit, jack))
+    }
+
+    fn right_click(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            },
+        ]
+    }
+
+    fn find_surge_out(app: &DemoApp) -> (usize, usize) {
+        let ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).expect("Surge unit");
+        let ji = app.units[ui].jack_index(Dir::Out, 0).expect("Surge OUT jack");
+        (ui, ji)
+    }
+
+    fn find_keys_out(app: &DemoApp) -> (usize, usize) {
+        let ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Keys)).expect("Keys unit");
+        let ji = app.units[ui].jack_index(Dir::Out, 0).expect("Keys MIDI OUT jack");
+        (ui, ji)
+    }
+
+    fn find_empty_jack(app: &DemoApp) -> (usize, usize) {
+        for (ui, u) in app.units.iter().enumerate() {
+            if !app.visible(ui) { continue; }
+            for (ji, j) in u.jacks.iter().enumerate() {
+                if app.cables_on_jack(ui, j.dir, j.port).is_empty() {
+                    return (ui, ji);
+                }
+            }
+        }
+        panic!("expected at least one empty jack in demo patch");
+    }
+
+    #[test]
+    fn hover_to_trace_highlights_jack_cables_without_disrupting_selection() {
+        let (mut app, ctx) = back_demo_app();
+        let (surge_u, surge_out_j) = find_surge_out(&app);
+        let surge_cables = app.cables_on_jack(surge_u, Dir::Out, 0);
+        assert!(!surge_cables.is_empty(), "Surge OUT is wired in demo patch");
+        let midi_ci = app.cables.iter().position(|c| c.kind == PortKind::Midi && c.dying < 0.0).expect("MIDI cable");
+        assert!(!surge_cables.contains(&midi_ci));
+
+        // 1. Hovering Surge OUT traces its cables and dims unrelated ones.
+        let p = jack_pos_screen(&app, surge_u, surge_out_j);
+        run_frame_events(&mut app, &ctx, vec![egui::Event::PointerMoved(p)], 1.0);
+        assert!(matches!(app.hover, Some(Hit::Jack { unit, jack }) if unit == surge_u && jack == surge_out_j));
+        let (hl, has_focus, is_sel) = app.back_cable_highlights();
+        assert!(has_focus && !is_sel, "hover-to-trace active without selection");
+        for &ci in &surge_cables {
+            assert!(hl[ci], "connected cable {ci} is highlighted");
+            assert!((DemoApp::cable_alpha(&app.cables[ci], has_focus, hl[ci], 0.5) - 1.0).abs() < 1e-3);
+        }
+        assert!(!hl[midi_ci], "unrelated MIDI cable is not highlighted");
+        assert!((DemoApp::cable_alpha(&app.cables[midi_ci], has_focus, hl[midi_ci], 1.0) - 0.28).abs() < 1e-3);
+
+        // 2. Moving pointer away restores full visibility.
+        run_frame_events(&mut app, &ctx, vec![egui::Event::PointerMoved(Pos2::new(10.0, 750.0))], 1.1);
+        let (_, has_focus_bg, _) = app.back_cable_highlights();
+        assert!(!has_focus_bg, "moving away restores full visibility");
+
+        // 3. Hovering an empty jack does not dim cables.
+        let (empty_u, empty_j) = find_empty_jack(&app);
+        let ep = jack_pos_screen(&app, empty_u, empty_j);
+        run_frame_events(&mut app, &ctx, vec![egui::Event::PointerMoved(ep)], 1.2);
+        let (_, has_focus_empty, _) = app.back_cable_highlights();
+        assert!(!has_focus_empty, "empty jack hover must not dim cables");
+
+        // 4. Click-to-select path highlighting is not disrupted by hovering a jack.
+        app.selected = Some(app.cables[midi_ci].id);
+        run_frame_events(&mut app, &ctx, vec![egui::Event::PointerMoved(p)], 1.3);
+        let (hl_sel, has_focus_sel, is_selection) = app.back_cable_highlights();
+        assert!(has_focus_sel && is_selection, "selection takes precedence over jack hover");
+        assert!(hl_sel[midi_ci], "selected cable remains highlighted");
+    }
+
+    #[test]
+    fn port_tooltip_reports_connections_and_live_audio_and_midi_signals() {
+        let (mut app, ctx) = back_demo_app();
+        let levels = Arc::new(crate::engine::EdgeLevels::new());
+        app.edge_levels = Some(levels.clone());
+
+        let (surge_u, surge_out_j) = find_surge_out(&app);
+        let audio_ci = app.cables_on_jack(surge_u, Dir::Out, 0)[0];
+        let audio_id = app.cables[audio_ci].id;
+
+        // Audio silent first.
+        let tip_silent = app.jack_tooltip_info(surge_u, surge_out_j).expect("audio tooltip");
+        assert_eq!(tip_silent.kind, PortKind::Audio);
+        assert_eq!(tip_silent.kind_badge, "AUDIO OUT");
+        assert!(!tip_silent.connections.is_empty() && tip_silent.connections.iter().all(|s| s.starts_with("to ")));
+        assert!(!tip_silent.signal_live && tip_silent.signal.contains("dBFS"), "{}", tip_silent.signal);
+
+        // Publish -6.0 dBFS peak (linear 0.5) on the audio cable.
+        levels.store(audio_id, 0.5);
+        let p = jack_pos_screen(&app, surge_u, surge_out_j);
+        let _ = run_frame_events(&mut app, &ctx, vec![egui::Event::PointerMoved(p)], 1.0);
+        // Second frame: egui::Area completes its initial sizing pass before painting.
+        let texts = run_frame_events(&mut app, &ctx, vec![egui::Event::PointerMoved(p)], 1.05);
+        let tip_live = app.jack_tooltip_info(surge_u, surge_out_j).expect("live audio tooltip");
+        assert!(tip_live.signal_live, "live audio signal flag");
+        assert!(tip_live.signal.contains("-6.0 dBFS"), "expected -6.0 dBFS, got {}", tip_live.signal);
+        assert!(texts.iter().any(|t| t.contains("-6.0 dBFS")), "tooltip renders live dBFS: {texts:?}");
+
+        // MIDI jack tooltip: idle → active held note → recent after release.
+        let (keys_u, keys_out_j) = find_keys_out(&app);
+        let tip_idle = app.jack_tooltip_info(keys_u, keys_out_j).expect("midi tooltip");
+        assert_eq!(tip_idle.kind, PortKind::Midi);
+        assert_eq!(tip_idle.kind_badge, "MIDI OUT");
+        assert!(!tip_idle.signal_live);
+
+        app.fire_keys_with(60, 0.8, false);
+        let tip_held = app.jack_tooltip_info(keys_u, keys_out_j).expect("held midi tooltip");
+        assert!(tip_held.signal_live && tip_held.signal.contains("C4"), "held note readout: {}", tip_held.signal);
+
+        app.fire_keys_with(60, 0.0, false);
+        // Clear pulses so we test the Recent readout after note-off.
+        for c in &mut app.cables {
+            for p in &mut c.pulses { p.active = false; }
+        }
+        let tip_recent = app.jack_tooltip_info(keys_u, keys_out_j).expect("recent midi tooltip");
+        assert!(tip_recent.signal.contains("C4"), "recent note readout: {}", tip_recent.signal);
+    }
+
+    #[test]
+    fn cable_opacity_tension_back_controls_and_settings_display() {
+        let (mut app, ctx) = back_demo_app();
+        // Compact back-panel controls are visible on Side::Back and cleared on Front.
+        assert!(app.back_controls_rect.is_positive(), "back controls shown on Side::Back");
+        app.side = Side::Front;
+        run_frame_events(&mut app, &ctx, vec![], 1.0);
+        assert!(!app.back_controls_rect.is_positive(), "back controls hidden on Side::Front");
+
+        // Opacity clamping & alpha effect.
+        app.side = Side::Back;
+        app.set_cable_opacity(0.05, false);
+        assert!((app.cable_opacity - crate::assistant::MIN_CABLE_OPACITY).abs() < 1e-6);
+        app.set_cable_opacity(0.45, false);
+        let c = &app.cables[0];
+        assert!((DemoApp::cable_alpha(c, false, false, app.cable_opacity) - 0.45).abs() < 1e-3);
+        assert!((DemoApp::cable_alpha(c, true, true, app.cable_opacity) - 1.0).abs() < 1e-3);
+        assert!((DemoApp::cable_alpha(c, true, false, app.cable_opacity) - 0.45 * 0.28).abs() < 1e-3);
+
+        // Tension updates live rope sag monotonically while keeping ropes finite.
+        // Measure on Surge A's outgoing cable (top row, well above the rack floor).
+        let measure_sag = |tension: f32| -> f32 {
+            let (mut a, c) = back_demo_app();
+            a.set_cable_tension(tension, false);
+            for i in 0..80 {
+                run_frame_events(&mut a, &c, vec![], 1.0 + i as f64 * 0.02);
+            }
+            assert!(a.cables.iter().all(|cb| cb.rope.as_ref().map_or(true, |r| r.is_finite())));
+            let (su, _) = find_surge_out(&a);
+            let ci = a.cables_on_jack(su, Dir::Out, 0)[0];
+            let cb = &a.cables[ci];
+            cb.pts[..cb.n].iter().map(|p| p.y).fold(f32::MIN, f32::max)
+        };
+        let sag_loose = measure_sag(0.0);
+        let sag_default = measure_sag(0.5);
+        let sag_taut = measure_sag(1.0);
+        assert!(sag_loose > sag_default + 5.0, "loose {sag_loose} > default {sag_default}");
+        assert!(sag_default > sag_taut + 10.0, "default {sag_default} > taut {sag_taut}");
+
+        // Settings -> Display renders Cable opacity and Cable tension cleanly.
+        app.stage_view = StageView::Settings;
+        app.settings_page = SettingsPage::Display;
+        let texts = run_frame_events(&mut app, &ctx, vec![], 2.0);
+        assert!(texts.iter().any(|t| t == "Cable opacity"), "missing Cable opacity: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Cable tension"), "missing Cable tension: {texts:?}");
+    }
+
+    #[test]
+    fn right_click_menu_cycles_family_safe_colors_and_unplugs_all_releasing_held_notes() {
+        let (mut app, ctx) = back_demo_app();
+        let audio_ci = app.cables.iter().position(|c| c.kind == PortKind::Audio && c.dying < 0.0).expect("audio cable");
+        let midi_ci = app.cables.iter().position(|c| c.kind == PortKind::Midi && c.dying < 0.0).expect("midi cable");
+        let audio_id = app.cables[audio_ci].id;
+        let midi_id = app.cables[midi_ci].id;
+
+        // Audio recoloring stays strictly within CABLE_AUDIO_PALETTE and rejects MIDI colors.
+        let mut seen_audio = Vec::new();
+        for _ in 0..theme::CABLE_AUDIO_PALETTE.len() {
+            let col = app.cycle_cable_color(audio_id).expect("cycle audio color");
+            assert!(theme::CABLE_AUDIO_PALETTE.contains(&col), "audio jacket must stay warm: {col:?}");
+            assert!(!theme::CABLE_MIDI_PALETTE.contains(&col));
+            seen_audio.push(col);
+        }
+        assert_eq!(seen_audio.len(), theme::CABLE_AUDIO_PALETTE.len());
+        let before = app.cables[app.live_cable(audio_id).unwrap()].color;
+        assert!(!app.set_cable_color(audio_id, theme::MIDI_BLUE), "cross-family color rejected");
+        assert_eq!(app.cables[app.live_cable(audio_id).unwrap()].color, before);
+
+        // MIDI recoloring stays strictly within CABLE_MIDI_PALETTE and rejects audio colors.
+        for _ in 0..theme::CABLE_MIDI_PALETTE.len() {
+            let col = app.cycle_cable_color(midi_id).expect("cycle midi color");
+            assert!(theme::CABLE_MIDI_PALETTE.contains(&col), "MIDI jacket must stay cool: {col:?}");
+            assert!(!theme::CABLE_AUDIO_PALETTE.contains(&col));
+        }
+        let before_m = app.cables[app.live_cable(midi_id).unwrap()].color;
+        assert!(!app.set_cable_color(midi_id, theme::CABLE_AMBER), "cross-family color rejected");
+        assert_eq!(app.cables[app.live_cable(midi_id).unwrap()].color, before_m);
+
+        // Right-clicking an occupied jack opens CableMenuTarget::Jack; empty jack does not.
+        let (empty_u, empty_j) = find_empty_jack(&app);
+        let ep = jack_pos_screen(&app, empty_u, empty_j);
+        run_frame_events(&mut app, &ctx, right_click(ep), 1.0);
+        assert!(app.cable_menu.is_none(), "empty jack right-click opens no menu");
+
+        let (surge_u, surge_out_j) = find_surge_out(&app);
+        let surge_count = app.cables_on_jack(surge_u, Dir::Out, 0).len();
+        assert!(surge_count >= 1);
+        let sp = jack_pos_screen(&app, surge_u, surge_out_j);
+        let _ = run_frame_events(&mut app, &ctx, right_click(sp), 1.1);
+        let texts = run_frame_events(&mut app, &ctx, vec![egui::Event::PointerMoved(sp)], 1.15);
+        assert!(matches!(app.cable_menu.map(|m| m.target), Some(CableMenuTarget::Jack { unit, jack }) if unit == surge_u && jack == surge_out_j));
+        assert!(texts.iter().any(|t| t == "Cycle jacket color"), "menu shows Cycle jacket color: {texts:?}");
+
+        // Cycling on the jack keeps every attached cable inside the audio family.
+        assert_eq!(app.cycle_jack_cable_colors(surge_u, surge_out_j), surge_count);
+        for ci in app.cables_on_jack(surge_u, Dir::Out, 0) {
+            assert!(theme::CABLE_AUDIO_PALETTE.contains(&app.cables[ci].color));
+        }
+
+        // Unplug all on Surge OUT removes every cable attached to that jack.
+        assert_eq!(app.unplug_all_on_jack(surge_u, surge_out_j), surge_count);
+        assert!(app.cables_on_jack(surge_u, Dir::Out, 0).is_empty(), "all cables on Surge OUT unplugged");
+
+        // Rule 41: unplugging all on Keys MIDI OUT sends Disconnect and releases held notes on the engine.
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let surge_node = app.units[surge_u].node_id;
+        // Sound a held note on Surge through the Keys → Surge MIDI cable.
+        ebus.send(Command::NoteOn { source: SourceId::Keys, note: 60, velocity: 0.85, channel: 0 });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let notes_before = engine.note_log.len();
+        assert!(engine.note_log.iter().any(|&(n, note, on)| n == surge_node && note == 60 && on),
+            "note-on reached Surge: {:?}", engine.note_log);
+
+        let (keys_u, keys_out_j) = find_keys_out(&app);
+        let unplugged = app.unplug_all_on_jack(keys_u, keys_out_j);
+        assert!(unplugged >= 1, "unplugged Keys MIDI cable(s)");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::Disconnect(id) if *id == midi_id)), "Disconnect sent: {cmds:?}");
+        for c in cmds { ebus.send(c); }
+        engine.render(&mut buf, 2);
+        assert!(
+            engine.note_log[notes_before..].iter().any(|&(n, _, on)| n == surge_node && !on),
+            "engine released held note on unplug-all (rule 41): {:?}",
+            &engine.note_log[notes_before..]
+        );
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat cable_ergonomics_shots -- --ignored"]
+    fn cable_ergonomics_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Default back panel (opacity 100%, tension 50%) with compact controls.
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.side = Side::Back;
+            super::offline_shots::shot(&mut app, SIZE, &dir.join("back-default.png"));
+        }
+
+        // 2. Hover-to-trace + live audio port tooltip on Surge OUT (-6.0 dBFS).
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.side = Side::Back;
+            let levels = Arc::new(crate::engine::EdgeLevels::new());
+            for c in &app.cables {
+                if c.kind == PortKind::Audio {
+                    levels.store(c.id, 0.5);
+                }
+            }
+            app.edge_levels = Some(levels);
+            super::offline_shots::shot_with_pointer(
+                &mut app,
+                SIZE,
+                Some(&|a| {
+                    let (u, j) = find_surge_out(a);
+                    jack_pos_screen(a, u, j)
+                }),
+                &dir.join("back-hover-trace-tooltip.png"),
+            );
+        }
+
+        // 3. Lowered cable opacity (45%) + higher tension (95%) taut cables.
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.side = Side::Back;
+            app.set_cable_opacity(0.45, false);
+            app.set_cable_tension(0.95, false);
+            super::offline_shots::shot(&mut app, SIZE, &dir.join("back-opacity-tension.png"));
+        }
+
+        // 4. Right-click context menu on Surge OUT jack.
+        {
+            let (probe, _) = back_demo_app();
+            let (su, sj) = find_surge_out(&probe);
+            let menu_pos = jack_pos_screen(&probe, su, sj);
+            let mut app = DemoApp::new_with_sink(None);
+            app.side = Side::Back;
+            app.cable_menu = Some(CableMenu { target: CableMenuTarget::Jack { unit: su, jack: sj }, pos: menu_pos });
+            super::offline_shots::shot(&mut app, SIZE, &dir.join("back-context-menu.png"));
+        }
+
+        // 5. Settings -> Display showing Cable opacity & Cable tension sliders.
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.stage_view = StageView::Settings;
+            app.settings_page = SettingsPage::Display;
+            app.set_cable_opacity(0.75, false);
+            app.set_cable_tension(0.65, false);
+            super::offline_shots::shot(&mut app, SIZE, &dir.join("settings-display-cables.png"));
+        }
     }
 }

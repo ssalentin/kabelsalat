@@ -422,12 +422,13 @@ fn rescan_hw_midi(
     }
 }
 
-/// A hardware pitch bend or aftertouch as the engine command it becomes.
-/// Wind controllers send breath as channel pressure, which is 2 bytes on
-/// the wire.
+/// A hardware pitch bend, aftertouch or program change as the engine
+/// command it becomes. Wind controllers send breath as channel pressure,
+/// which is 2 bytes on the wire, like a program change.
 fn hw_expression(dev: u32, msg: &[u8]) -> Option<Command> {
     let (source, channel) = (SourceId::Hardware(dev), *msg.first()? & 0x0F);
     match msg.first()? & 0xF0 {
+        0xC0 => Some(Command::Program { source, channel, program: *msg.get(1)? & 0x7F }),
         0xD0 => Some(Command::Pressure { source, channel, note: None, value: *msg.get(1)? & 0x7F }),
         0xA0 => Some(Command::Pressure { source, channel, note: Some(*msg.get(1)? & 0x7F), value: *msg.get(2)? & 0x7F }),
         0xE0 => {
@@ -1164,7 +1165,7 @@ fn hw_indices_in_use(rules: &[SavedRule], rig_devices: &[Option<u32>]) -> std::c
 }
 
 /// `s` with every hardware device index it holds (matrix rule sources, rig
-/// devices, binding levels) moved through `map` (#227). What is left is in this run's
+/// devices, binding levels, program-change devices) moved through `map` (#227). What is left is in this run's
 /// indices, so its table of port names goes.
 fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndexMap) {
     let rules: Option<Vec<SavedRule>> = s.matrix().and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1188,6 +1189,7 @@ fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndex
     for p in &mut s.setlist.levels.bindings {
         if let SourceId::Hardware(d) = &mut p.of.source { *d = map.get(*d); }
     }
+    for d in &mut s.setlist.program_devices { *d = map.get(*d); }
     s.set_hw_ports(Default::default());
 }
 
@@ -7771,9 +7773,11 @@ impl DemoApp {
         }
         s.rig_devices = self.rig_snapshot.lock().map(|sn| sn.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
         while s.rig_devices.last() == Some(&None) { s.rig_devices.pop(); }
-        // Rules and rig devices hold device indices, places in this run's
-        // scan only, so the session names the devices it depends on.
-        s.set_hw_ports(self.hw_ports_in_use(&rules, &s.rig_devices));
+        // Rules, rig devices and the devices whose program change selects
+        // the song (#208) hold device indices, places in this run's scan
+        // only, so the session names the devices it depends on.
+        let devices: Vec<Option<u32>> = s.rig_devices.iter().copied().chain(self.setlist.program_devices.iter().map(|&d| Some(d))).collect();
+        s.set_hw_ports(self.hw_ports_in_use(&rules, &devices));
         // Each synth's input selection (#124). The device goes by its port
         // name: its index is only its place in this run's scan (rule 58).
         for row in self.voice_rows() {
@@ -8444,7 +8448,12 @@ impl DemoApp {
                 Self::MAX_RIGS
             ));
         }
-        let map = self.hw_index_map(imported.hw_ports());
+        // The import takes the session's rigs, not its setlist: a device only
+        // its program-change choice (#208) names gets no row here.
+        let rules: Vec<SavedRule> = imported.matrix().and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+        let used = hw_indices_in_use(&rules, &imported.rig_devices);
+        let ports = imported.hw_ports().iter().filter(|(d, _)| used.contains(d)).map(|(&d, p)| (d, p.clone())).collect();
+        let map = self.hw_index_map(&ports);
         map_session_hw(&mut imported, &map);
         let cur = self.capture_session("Import")
             .map_err(|e| format!("Could not capture current rack: {e}"))?;
@@ -17617,6 +17626,10 @@ impl DemoApp {
         let song_sets: Vec<Option<(String, bool)>> = (0..self.setlist.songs.len())
             .map(|si| self.setlist.set_of(si).map(|s| (s.name.clone(), s.skip)))
             .collect();
+        // Hardware devices whose program change can select the song (#208).
+        let program_rows: Vec<(u32, String, bool)> = (0..self.hw_devices.len() as u32)
+            .map(|d| (d, self.hw_device_label(d), self.hw_live.get(d as usize).copied().unwrap_or(true)))
+            .collect();
 
         // Keep selected song index valid.
         if self.setlist.songs.is_empty() {
@@ -17714,6 +17727,9 @@ impl DemoApp {
                                  move_song: &mut Option<(usize, usize)>,
                                  remove_song: &mut Option<usize>,
                                  jump_to: &mut Option<(usize, usize)>| {
+                    const PROGRAM_ROW_H: f32 = 28.0;
+                    // Device rows the songs list leaves room for; more scroll.
+                    const PROGRAM_ROWS_SHOWN: usize = 3;
                     theme::section_label(ui, "Songs");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -17766,7 +17782,8 @@ impl DemoApp {
                     }
                     ui.add_space(10.0);
 
-                    let list_h = (avail_h - 210.0).max(80.0);
+                    let program_h = 40.0 + PROGRAM_ROW_H * program_rows.len().clamp(1, PROGRAM_ROWS_SHOWN) as f32;
+                    let list_h = (avail_h - 210.0 - program_h).max(80.0);
                     egui::ScrollArea::vertical()
                         .id_salt("setlist_songs_scroll")
                         .min_scrolled_height(list_h.min(80.0))
@@ -17830,41 +17847,82 @@ impl DemoApp {
                             }
                         });
 
+                    // Foot switches and program change scroll together in
+                    // what the column has left, so a short window never cuts
+                    // them off (rule 27).
                     ui.add_space(10.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(8.0);
-                    theme::section_label(ui, "Foot-switch CC");
-                    ui.add_space(6.0);
-                    for (label, action, binding) in [
-                        ("Next part", FootSwitchAction::Next, setlist.next_cc),
-                        ("Prev part", FootSwitchAction::Prev, setlist.prev_cc),
-                    ] {
-                        let learning = *learn == Some(action);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
-                            let txt = if learning {
-                                "Press pedal…".to_string()
-                            } else if let Some(fs) = binding {
-                                format!("CC {}", fs.cc)
-                            } else {
-                                "Unbound".to_string()
-                            };
-                            ui.label(egui::RichText::new(txt).size(11.5).monospace().color(if learning { theme::ACCENT } else { theme::INK_2 }));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                if binding.is_some() && theme::chip_button(ui, "Clear", false).clicked() {
-                                    match action {
-                                        FootSwitchAction::Next => setlist.next_cc = None,
-                                        FootSwitchAction::Prev => setlist.prev_cc = None,
-                                    }
-                                }
-                                if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
-                                    *learn = if learning { None } else { Some(action) };
-                                }
-                            });
+                    let rest = ui.available_height().max(0.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("setlist_controls_scroll")
+                        .min_scrolled_height(rest)
+                        .max_height(rest)
+                        .show(ui, |ui| {
+                            Self::stage_hairline(ui);
+                            ui.add_space(8.0);
+                            theme::section_label(ui, "Foot-switch CC");
+                            ui.add_space(6.0);
+                            for (label, action, binding) in [
+                                ("Next part", FootSwitchAction::Next, setlist.next_cc),
+                                ("Prev part", FootSwitchAction::Prev, setlist.prev_cc),
+                            ] {
+                                let learning = *learn == Some(action);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
+                                    let txt = if learning {
+                                        "Press pedal…".to_string()
+                                    } else if let Some(fs) = binding {
+                                        format!("CC {}", fs.cc)
+                                    } else {
+                                        "Unbound".to_string()
+                                    };
+                                    ui.label(egui::RichText::new(txt).size(11.5).monospace().color(if learning { theme::ACCENT } else { theme::INK_2 }));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        if binding.is_some() && theme::chip_button(ui, "Clear", false).clicked() {
+                                            match action {
+                                                FootSwitchAction::Next => setlist.next_cc = None,
+                                                FootSwitchAction::Prev => setlist.prev_cc = None,
+                                            }
+                                        }
+                                        if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
+                                            *learn = if learning { None } else { Some(action) };
+                                        }
+                                    });
+                                });
+                                ui.add_space(4.0);
+                            }
+
+                            ui.add_space(6.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(8.0);
+                            theme::section_label(ui, "Program change picks the song");
+                            ui.add_space(6.0);
+                            if program_rows.is_empty() {
+                                ui.label(egui::RichText::new("Plug in a MIDI device to pick songs with its program buttons.").size(11.5).color(theme::INK_2));
+                            }
+                            for (d, name, live) in &program_rows {
+                                let on = setlist.program_selects_song(*d);
+                                let full = !on && setlist.program_devices.len() >= crate::setlist::MAX_PROGRAM_DEVICES;
+                                ui.horizontal(|ui| {
+                                    ui.set_min_height(PROGRAM_ROW_H - 4.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let hint = if full {
+                                            format!("At most {} devices pick songs", crate::setlist::MAX_PROGRAM_DEVICES)
+                                        } else {
+                                            "Program N selects song N+1; this device's program changes no longer reach its instruments".to_string()
+                                        };
+                                        let chip = ui.add_enabled_ui(!full, |ui| theme::chip_button(ui, if on { "On" } else { "Off" }, on)).inner;
+                                        if chip.on_hover_text(hint).clicked() {
+                                            setlist.set_program_selects_song(*d, !on);
+                                        }
+                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            let color = if *live { theme::INK } else { theme::INK_2 };
+                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(color)).truncate());
+                                        });
+                                    });
+                                });
+                            }
                         });
-                        ui.add_space(4.0);
-                    }
                 };
 
                 let draw_right = |ui: &mut egui::Ui,
@@ -40120,6 +40178,8 @@ mod ui_polish_agent_tests {
         assert!(matches!(super::hw_expression(2, &[0xA0, 60, 70]), Some(Command::Pressure { note: Some(60), value: 70, .. })));
         assert!(matches!(super::hw_expression(2, &[0xE0, 0x7F, 0x5F]), Some(Command::PitchBend { value: 4095, .. })));
         assert!(super::hw_expression(2, &[0xA0, 60]).is_none(), "a truncated message is dropped");
+        assert!(matches!(super::hw_expression(2, &[0xC3, 5]), Some(Command::Program { source, channel: 3, program: 5 }) if source == hw), "a program change is 2 bytes");
+        assert!(super::hw_expression(2, &[0xC3]).is_none());
         assert!(super::hw_expression(2, &[0x90, 60, 100]).is_none(), "notes take their own path");
     }
 
@@ -47902,6 +47962,153 @@ mod navigator_tests {
             "its zones do not: the engine set them, and may be past them already"
         );
         assert_eq!(app.rig_zones, app.setlist.active_zones());
+    }
+
+    /// #208: program change N from the device chosen for it, as its raw
+    /// bytes arrive, selects song N+1 in the engine and the app follows;
+    /// another device's program change selects nothing.
+    #[test]
+    fn a_program_change_from_the_chosen_device_selects_the_song_in_the_engine_and_the_app_follows() {
+        let (mut app, _) = two_rigs_with_inserts(false);
+        let (tx, drain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let bus = Arc::new(Mutex::new(tx));
+        app.bus = Some(bus.clone());
+        app.graph_pub = Some(pub_.clone());
+        for (name, rig) in [("Opener", 0), ("Ballad", 1)] {
+            let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+                "name": name,
+                "parts": [{"name": "Verse", "rigs": [{"rig": rig}]}, {"name": "Outro", "rigs": [{"rig": 0}, {"rig": 1}]}]
+            }));
+        }
+        app.setlist.set_program_selects_song(2, true);
+        app.select_setlist(0, 1).unwrap();
+        app.publish_show();
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let mut send_raw = |dev: u32, bytes: &[u8]| {
+            assert!(bus.lock().unwrap().send(super::hw_expression(dev, bytes).expect("a program change")));
+            engine.render(&mut buf, 2);
+        };
+
+        send_raw(2, &[0xC4, 1]);
+        let ballad = app.setlist.zones_of(&app.setlist.songs[1], &app.setlist.songs[1].parts[0]);
+        assert_eq!(pub_.lock().unwrap().zones, ballad, "the engine plays song 2 before any frame ran");
+        app.sync_from_engine();
+        app.follow_show();
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "the app follows to song 2's first part");
+
+        send_raw(0, &[0xC0, 0]);
+        send_raw(2, &[0xC0, 9]);
+        app.sync_from_engine();
+        app.follow_show();
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "neither another device's program nor one with no song moves it");
+    }
+
+    /// The texts a frame paints where they can be seen: inside their clip.
+    fn visible_texts(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(s: &egui::Shape, clip: Rect, acc: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => {
+                    let rect = t.galley.rect.translate(t.pos.to_vec2());
+                    if clip.expand(0.5).contains_rect(rect) {
+                        acc.push((t.galley.text().to_string(), rect));
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, clip, acc)),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        for cs in run_frame_at(app, ctx, size, events) {
+            walk(&cs.shape, cs.clip_rect, &mut acc);
+        }
+        acc
+    }
+
+    /// A device's name in the Setlist sheet and the chip beside it that
+    /// turns its program change into a song select (#208), where visible.
+    fn program_row(texts: &[(String, Rect)], device: &str) -> Option<(Rect, String, Rect)> {
+        let name = texts.iter().find(|(t, _)| t == device)?.1;
+        let (label, chip) = texts.iter().find(|(t, r)| (t == "On" || t == "Off") && (r.center().y - name.center().y).abs() < 6.0)?;
+        Some((name, label.clone(), *chip))
+    }
+
+    #[test]
+    fn every_devices_program_change_chip_in_the_setlist_sheet_can_be_reached_and_clicked() {
+        use super::rig_switch_tests::{list_midi_ports, FM1_PORT, U6_PORT};
+        // More devices than the songs list leaves room for: the rest scroll.
+        let devices = [
+            ("M-Wave FM-1", FM1_PORT),
+            ("U6MIDI Pro", U6_PORT),
+            ("nanoPAD2", "nanoPAD2:nanoPAD2 MIDI 1"),
+            ("FCB1010", "FCB1010:FCB1010 MIDI 1"),
+            ("Nord Stage 4", "Nord Stage 4:Nord Stage 4 MIDI 1"),
+            ("TC-Helicon", "TC-Helicon:TC-Helicon MIDI 1"),
+        ];
+        for dock in [DockView::None, DockView::Keyboard, DockView::Assistant] {
+            for size in super::window_size_layout_tests::SIZES.map(|(w, h)| Vec2::new(w, h)) {
+                let (mut app, _) = two_rigs_with_inserts(false);
+                list_midi_ports(&mut app, &devices.map(|(_, port)| (port, "24:0")));
+                app.dock = dock;
+                app.stage_view = StageView::Setlist;
+                let ctx = egui::Context::default();
+                for _ in 0..3 {
+                    run_frame_at(&mut app, &ctx, size, vec![]);
+                }
+                let texts = visible_texts(&mut app, &ctx, size, vec![]);
+                // A dock in a short window leaves the column no room below the
+                // songs list; the foot switches above these rows go first.
+                let Some(over) = texts.iter().find(|(t, _)| t == "Next part").map(|t| t.1.center()) else {
+                    assert_ne!(dock, DockView::None, "{size:?}: the foot switches show");
+                    continue;
+                };
+                for (d, (name, _)) in devices.iter().enumerate() {
+                    let mut row = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name);
+                    for _ in 0..10 {
+                        if row.is_some() {
+                            break;
+                        }
+                        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -40.0),
+                            phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown, modifiers: Modifiers::NONE };
+                        run_frame_at(&mut app, &ctx, size, vec![egui::Event::PointerMoved(over), wheel]);
+                        row = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name);
+                    }
+                    let (name_rect, label, chip) = row.unwrap_or_else(|| panic!("{dock:?} {size:?}: {name}'s row scrolls into view"));
+                    assert_eq!(label, "Off");
+                    assert!(chip.left() > name_rect.right() && chip.right() <= size.x, "{dock:?} {size:?}: the chip {chip:?} beside {name_rect:?}");
+                    click_at(&mut app, &ctx, size, chip.center());
+                    assert!(app.setlist.program_selects_song(d as u32), "{dock:?} {size:?}: a click turns {name} on");
+                    let shown = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name).map(|r| r.1);
+                    assert_eq!(shown.as_deref(), Some("On"), "{dock:?} {size:?}");
+                }
+                let controls = app.setlist.show_controls();
+                assert!((0..devices.len() as u32).all(|d| controls.iter().flatten().any(|c| c.device == Some(d) && c.action == crate::show::ShowAction::SongOfProgram)));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat program_change_shots -- --ignored"]
+    fn program_change_shots() {
+        use super::rig_switch_tests::{list_midi_ports, FM1_PORT, U6_PORT};
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Rule 148: a fresh app per image.
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(781.0, 950.0)] {
+            let (mut app, _) = two_rigs_with_inserts(false);
+            list_midi_ports(&mut app, &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+            for (name, rig) in [("Opener", 0), ("Ballad", 1), ("Closer", 0)] {
+                let _ = app.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "parts": [{"name": "Main", "rigs": [{"rig": rig}]}]}));
+            }
+            app.setlist.next_cc = Some(crate::setlist::FootSwitch { cc: 64, channel: None });
+            app.setlist.set_program_selects_song(1, true);
+            app.select_setlist(1, 0).unwrap();
+            app.stage_view = StageView::Setlist;
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("setlist-program-{}x{}.png", size.x, size.y)));
+        }
     }
 
     #[test]

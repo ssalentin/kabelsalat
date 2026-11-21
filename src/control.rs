@@ -1266,6 +1266,15 @@ pub enum Command {
         note: Option<u8>,
         value: u8,
     },
+    /// Incoming MIDI program change (0xC0, 2 bytes) routed through the
+    /// matrix like [`Command::PitchBend`], unless a show control takes it
+    /// (#208: it selects a song). [`Command::ProgramChange`] is the one an
+    /// app sends to a single node.
+    Program {
+        source: SourceId,
+        channel: u8,
+        program: u8,
+    },
     /// Add/replace (`Some(param)`) or remove (`None`) one CC→param binding on
     /// the matrix rule `(source, dest)`. Fixed-size for the RT command bus.
     MatrixCcMap {
@@ -1477,6 +1486,7 @@ impl Command {
             | Command::Cc { .. }
             | Command::PitchBend { .. }
             | Command::Pressure { .. }
+            | Command::Program { .. }
             | Command::MatrixCcMap { .. }
             | Command::SetSystemAudio { .. }
             | Command::SetAudioIn { .. }

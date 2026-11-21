@@ -3021,6 +3021,20 @@ impl GraphEngine {
     /// A pitch bend or aftertouch is a channel message like a CC: routed
     /// through the matrix and passed on to the instruments, which bend or
     /// press what they play; no binding applies to it.
+    /// A show control takes the message (#261): true when it was consumed,
+    /// the part it stepped to already playing.
+    fn show_takes(&mut self, source: SourceId, channel: u8, msg: crate::show::ShowMsg, value: u8) -> bool {
+        match self.show.take(source, channel, msg, value) {
+            crate::show::Take::Route => false,
+            crate::show::Take::Consumed => true,
+            crate::show::Take::Part(zones) => {
+                self.set_rig_zones(zones);
+                self.mix_dirty = true;
+                true
+            }
+        }
+    }
+
     fn pass_to_instruments(&mut self, source: SourceId, msg: MidiMsg) {
         self.matrix.route_into(source, msg, &mut self.route_out);
         for i in 0..self.route_out.len() {
@@ -4748,14 +4762,8 @@ impl GraphEngine {
                 self.publish_graph();
             }
             Command::Cc { source, channel, cc, value } => {
-                match self.show.take(source, channel, crate::show::ShowMsg::Cc(cc), value) {
-                    crate::show::Take::Route => {}
-                    crate::show::Take::Consumed => return,
-                    crate::show::Take::Part(zones) => {
-                        self.set_rig_zones(zones);
-                        self.mix_dirty = true;
-                        return;
-                    }
+                if self.show_takes(source, channel, crate::show::ShowMsg::Cc(cc), value) {
+                    return;
                 }
                 let msg = MidiMsg::cc(channel, cc, value);
                 self.matrix.route_into(source, msg, &mut self.route_out);
@@ -4927,6 +4935,12 @@ impl GraphEngine {
                     Some(n) => MidiMsg::poly_aftertouch(channel, n, value),
                 };
                 self.pass_to_instruments(source, msg);
+            }
+            Command::Program { source, channel, program } => {
+                let program = program & 0x7F;
+                if !self.show_takes(source, channel, crate::show::ShowMsg::Program(program), 0) {
+                    self.pass_to_instruments(source, MidiMsg::program_change(channel, program));
+                }
             }
             Command::MatrixCcMap { source, dest, cc, param, target, scale } => {
                 let changed = match param {
@@ -8484,10 +8498,16 @@ mod tests {
     /// A foot switch on the pedal's CC `cc` that steps to the next part, and
     /// the setlist's two parts: rig A alone, then rig B alone. Part 0 plays.
     fn foot_switch(e: &mut super::GraphEngine, bus: &mut crate::control::CommandBus, cc: u8) {
-        use crate::control::RigZone;
         use crate::show::{ShowAction, ShowControl, ShowMsg};
+        show_setlist(e, bus, ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action: ShowAction::NextPart });
+    }
+
+    /// `control` as the one show control, and the setlist's two songs of
+    /// one part each: rig A alone, then rig B alone. Song 0 plays.
+    fn show_setlist(e: &mut super::GraphEngine, bus: &mut crate::control::CommandBus, control: crate::show::ShowControl) {
+        use crate::control::RigZone;
         let mut controls = crate::show::NO_SHOW_CONTROLS;
-        controls[0] = Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action: ShowAction::NextPart });
+        controls[0] = Some(control);
         let part = |a: RigZone, b: RigZone| {
             let mut z = [RigZone::OPEN; crate::control::MAX_RIGS];
             z[0] = a;
@@ -8537,6 +8557,34 @@ mod tests {
         assert!(passed(&mut e, &mut bus, cc(127)).is_empty(), "the press holds no sustain");
         assert!(!e.rig_zones[0].live && e.rig_zones[1].live, "it stepped");
         assert!(passed(&mut e, &mut bus, cc(0)).is_empty(), "and its release lifts none");
+    }
+
+    /// #208: program change N from the device chosen for it selects song
+    /// N+1 in the block it arrives in and reaches no instrument; another
+    /// device's program change reaches the instruments as before.
+    #[test]
+    fn a_program_change_from_the_chosen_device_selects_the_song_and_another_devices_reaches_its_instruments() {
+        use crate::control::RigZone;
+        use crate::show::{ShowAction, ShowControl, ShowMsg};
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let b = synth_of(&e, 1);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        e.set_graph_pub(pub_.clone());
+        show_setlist(&mut e, &mut bus, ShowControl { device: Some(1), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
+        let program = |source: SourceId, program: u8| Command::Program { source, channel: 5, program };
+
+        e.cc_passthrough_log.clear();
+        bus.send(program(PEDAL, 1));
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(b, 60, true)], "the first note after program 1 plays song 2");
+        assert!(e.cc_passthrough_log.is_empty(), "the program change reached no instrument: {:?}", e.cc_passthrough_log);
+        assert_eq!(pub_.lock().unwrap().show_part, Some(1), "the song it selected is published");
+        play(&mut e, &mut bus, off(60));
+        assert!(passed(&mut e, &mut bus, program(PEDAL, 7)).is_empty(), "a program with no song reaches no instrument");
+        assert_eq!(e.rig_zones[..2], [OFF, RigZone::OPEN], "and selects nothing");
+        assert_eq!(passed(&mut e, &mut bus, program(SourceId::Hardware(0), 0)), vec![(b, 0, 0)], "the keyboard's program change reaches the live rig");
+        assert_eq!(e.rig_zones[..2], [OFF, RigZone::OPEN], "and moves no song");
+        assert!(passed(&mut e, &mut bus, program(PEDAL, 0)).is_empty());
+        assert_eq!(e.rig_zones[..2], [RigZone::OPEN, OFF], "program 0 selects song 1");
     }
 
     #[test]

@@ -23,6 +23,10 @@ use crate::session::ParamValue;
 use crate::show::{ShowAction, ShowControl, ShowControls, ShowMsg, ShowPart, NO_SHOW_CONTROLS};
 use crate::transport::TimeSig;
 
+/// Devices whose program change can select the song (#208): the show
+/// table's slots after the two foot switches.
+pub const MAX_PROGRAM_DEVICES: usize = crate::show::MAX_SHOW_CONTROLS - 2;
+
 pub use crate::control::MAX_RIGS;
 
 /// Which rig is played in a [`Part`], and how.
@@ -250,6 +254,10 @@ pub struct Setlist {
     pub next_cc: Option<FootSwitch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_cc: Option<FootSwitch>,
+    /// Hardware devices whose program change N selects song N+1 (#208),
+    /// as device indices: a session names their ports (`hw_ports`, #227).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub program_devices: Vec<u32>,
     /// Sets in song order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<Set>,
@@ -261,7 +269,12 @@ impl Setlist {
     /// True when the setlist holds nothing at all (so older/plain sessions
     /// omit the `"setlist"` field in `session.json`).
     pub fn is_empty(&self) -> bool {
-        self.songs.is_empty() && self.next_cc.is_none() && self.prev_cc.is_none() && self.sets.is_empty() && self.levels.is_empty()
+        self.songs.is_empty()
+            && self.next_cc.is_none()
+            && self.prev_cc.is_none()
+            && self.program_devices.is_empty()
+            && self.sets.is_empty()
+            && self.levels.is_empty()
     }
 
     /// The currently active `(song, part)` if any.
@@ -304,14 +317,33 @@ impl Setlist {
         None
     }
 
-    /// The foot switches as the engine's show controls (#261).
+    /// The foot switches (#261) and the devices whose program change selects
+    /// the song (#208) as the engine's show controls.
     pub fn show_controls(&self) -> ShowControls {
+        let foot = [(self.next_cc, ShowAction::NextPart), (self.prev_cc, ShowAction::PrevPart)]
+            .map(|(fs, action)| fs.map(|fs| ShowControl { device: None, channel: fs.channel, msg: ShowMsg::Cc(fs.cc), action }));
+        let songs = self.program_devices.iter().map(|&d| {
+            Some(ShowControl { device: Some(d), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram })
+        });
         let mut t = NO_SHOW_CONTROLS;
-        let bound = [(self.next_cc, ShowAction::NextPart), (self.prev_cc, ShowAction::PrevPart)];
-        for (slot, (fs, action)) in t.iter_mut().zip(bound) {
-            *slot = fs.map(|fs| ShowControl { device: None, channel: fs.channel, msg: ShowMsg::Cc(fs.cc), action });
+        for (slot, c) in t.iter_mut().zip(foot.into_iter().chain(songs)) {
+            *slot = c;
         }
         t
+    }
+
+    /// Whether device `d`'s program change selects the song (#208).
+    pub fn program_selects_song(&self, d: u32) -> bool {
+        self.program_devices.contains(&d)
+    }
+
+    /// Past `MAX_PROGRAM_DEVICES`, turning one on does nothing.
+    pub fn set_program_selects_song(&mut self, d: u32, on: bool) {
+        self.program_devices.retain(|&x| x != d);
+        if on && self.program_devices.len() < MAX_PROGRAM_DEVICES {
+            self.program_devices.push(d);
+            self.program_devices.sort_unstable();
+        }
     }
 
     /// Select `(song, part)` if it exists.
@@ -559,6 +591,9 @@ impl Setlist {
             fs.cc &= 0x7F;
             fs.channel = fs.channel.map(|c| c & 0x0F);
         }
+        self.program_devices.sort_unstable();
+        self.program_devices.dedup();
+        self.program_devices.truncate(MAX_PROGRAM_DEVICES);
         self.normalize_levels();
         self.clamp_active();
     }
@@ -705,6 +740,39 @@ mod tests {
         s2.bpm = Some(74.0);
         s2.time_sig = Some(TimeSig::normalized(3, 4));
         Setlist { songs: vec![s1, s2], ..Setlist::default() }
+    }
+
+    /// #208: each device chosen for it becomes a control that takes every
+    /// program change from that device; the foot switches keep their slots.
+    #[test]
+    fn devices_chosen_for_program_changes_become_song_select_controls_and_are_saved() {
+        let mut sl = sample_setlist();
+        sl.prev_cc = Some(FootSwitch { cc: 81, channel: None });
+        sl.set_program_selects_song(4, true);
+        sl.set_program_selects_song(1, true);
+        sl.set_program_selects_song(4, true);
+        assert_eq!(sl.program_devices, [1, 4]);
+        let song_select = |d| Some(ShowControl { device: Some(d), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
+        let t = sl.show_controls();
+        assert_eq!(t[0], None, "no next switch");
+        assert!(t[1].is_some_and(|c| c.msg == ShowMsg::Cc(81)));
+        assert_eq!(t[2..5], [song_select(1), song_select(4), None]);
+
+        let text = serde_json::to_string(&sl).unwrap();
+        assert!(text.contains(r#""program_devices":[1,4]"#), "{text}");
+        assert_eq!(serde_json::from_str::<Setlist>(&text).unwrap(), sl);
+        sl.set_program_selects_song(1, false);
+        sl.set_program_selects_song(4, false);
+        assert!(!serde_json::to_string(&sl).unwrap().contains("program_devices"), "nothing chosen, nothing saved");
+        let only = Setlist { program_devices: vec![0], ..Setlist::default() };
+        assert!(!only.is_empty(), "a setlist that only chose a device is saved");
+
+        for d in 0..16 {
+            sl.set_program_selects_song(d, true);
+        }
+        assert_eq!(sl.program_devices.len(), MAX_PROGRAM_DEVICES, "no more devices than the table has slots");
+        let t = sl.show_controls();
+        assert!(sl.program_devices.iter().all(|&d| t.contains(&song_select(d))), "every device that shows On selects songs");
     }
 
     #[test]

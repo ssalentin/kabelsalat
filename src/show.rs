@@ -1,7 +1,8 @@
 //! Show controls (#261): hardware MIDI messages the engine takes for a show
 //! action instead of passing them to the instruments, and the setlist parts
 //! the engine steps through itself, so a foot switch changes the zones in
-//! the block its CC arrives in.
+//! the block its CC arrives in, and a program change selects a song in the
+//! block it arrives in (#208).
 //!
 //! The UI sends the table (`Command::SetShowControls`), every part
 //! (`SetShowParts`) and the active part (`SetShowPart`); the engine publishes
@@ -24,6 +25,12 @@ pub const MAX_SHOW_CONTROLS: usize = 16;
 pub enum ShowMsg {
     /// A control change by number. It acts when it rises to 64 or above.
     Cc(u8),
+    /// A program change by number. Each one acts: it has no release.
+    Program(u8),
+    /// Every program change. Only a control listens for this; a message is
+    /// always `Program(n)`. The first control in the table that takes a
+    /// message wins, so one naming its program goes before this.
+    AnyProgram,
 }
 
 /// What a show control does.
@@ -31,6 +38,9 @@ pub enum ShowMsg {
 pub enum ShowAction {
     NextPart,
     PrevPart,
+    /// Program change N selects the first part of song N+1 (#208), also of
+    /// a song stepping skips. A program with no song, or a CC, selects nothing.
+    SongOfProgram,
 }
 
 /// A MIDI message from a device, consumed by an action.
@@ -50,7 +60,7 @@ pub const NO_SHOW_CONTROLS: ShowControls = [None; MAX_SHOW_CONTROLS];
 
 impl ShowControl {
     fn takes(&self, device: u32, channel: u8, msg: ShowMsg) -> bool {
-        self.msg == msg
+        (self.msg == msg || self.msg == ShowMsg::AnyProgram && matches!(msg, ShowMsg::Program(_)))
             && self.device.is_none_or(|d| d == device)
             && self.channel.is_none_or(|c| c == channel & 0x0F)
     }
@@ -134,7 +144,7 @@ impl Show {
     }
 
     fn held_by_instruments(&self, c: ShowControl) -> bool {
-        let ShowMsg::Cc(cc) = c.msg;
+        let ShowMsg::Cc(cc) = c.msg else { return false };
         let bit = 1u128 << (cc & 0x7F);
         match c.channel {
             Some(ch) => self.held[(ch & 0x0F) as usize] & bit != 0,
@@ -158,30 +168,59 @@ impl Show {
         self.steps
     }
 
-    /// A message from `source`, `value` its data byte (a CC's value).
+    /// A message from `source`, `value` its data byte (a CC's value; a
+    /// program change has none).
     pub fn take(&mut self, source: SourceId, channel: u8, msg: ShowMsg, value: u8) -> Take {
         let SourceId::Hardware(device) = source else { return Take::Route };
-        let ShowMsg::Cc(cc) = msg;
+        let slot = self.controls.iter().position(|c| c.is_some_and(|c| c.takes(device, channel, msg)));
+        if let ShowMsg::Cc(cc) = msg {
+            if let Some(take) = self.cc_edge(slot, channel, cc, value) {
+                return take;
+            }
+        }
+        let Some(control) = slot.and_then(|i| self.controls[i]) else { return Take::Route };
+        match (control.action, msg) {
+            (ShowAction::NextPart, _) => self.step(true),
+            (ShowAction::PrevPart, _) => self.step(false),
+            (ShowAction::SongOfProgram, ShowMsg::Program(n)) => self.select_song(n as usize),
+            (ShowAction::SongOfProgram, _) => Take::Consumed,
+        }
+    }
+
+    /// What a CC's value does before its control acts: `Some` when it acts
+    /// no further (no control, a release, a value held down), `None` on a
+    /// press of control `slot`.
+    fn cc_edge(&mut self, slot: Option<usize>, channel: u8, cc: u8, value: u8) -> Option<Take> {
         let (held, bit) = (&mut self.held[(channel & 0x0F) as usize], 1u128 << (cc & 0x7F));
         let down = value >= 64;
-        let Some(i) = self.controls.iter().position(|c| c.is_some_and(|c| c.takes(device, channel, msg))) else {
+        let Some(i) = slot else {
             if down { *held |= bit } else { *held &= !bit }
-            return Take::Route;
+            return Some(Take::Route);
         };
         let pressed = down && !self.down[i];
         self.down[i] = down;
         if !down && *held & bit != 0 {
             *held &= !bit;
-            return Take::Route;
+            return Some(Take::Route);
         }
-        if !pressed {
-            return Take::Consumed;
-        }
-        match self.controls[i].map(|c| c.action) {
-            Some(ShowAction::NextPart) => self.step(true),
-            Some(ShowAction::PrevPart) => self.step(false),
+        (!pressed).then_some(Take::Consumed)
+    }
+
+    /// The first part of song `song`; a song without one selects nothing.
+    fn select_song(&mut self, song: usize) -> Take {
+        let parts = self.parts.as_ref().map_or(&[][..], |p| &p.0[..]);
+        match parts.iter().position(|p| p.song == song) {
+            Some(to) => self.go(to),
             None => Take::Consumed,
         }
+    }
+
+    fn go(&mut self, to: usize) -> Take {
+        let parts = self.parts.as_ref().map_or(&[][..], |p| &p.0[..]);
+        let Some(part) = parts.get(to) else { return Take::Consumed };
+        self.part = Some(to);
+        self.steps += 1;
+        Take::Part(part.zones)
     }
 
     /// One part on, as `Setlist::next_part`/`prev_part` step: inside the
@@ -202,10 +241,10 @@ impl Show {
                 _ => (0..p).rev().find(playable),
             },
         };
-        let Some(to) = to else { return Take::Consumed };
-        self.part = Some(to);
-        self.steps += 1;
-        Take::Part(parts[to].zones)
+        match to {
+            Some(to) => self.go(to),
+            None => Take::Consumed,
+        }
     }
 }
 
@@ -434,6 +473,41 @@ mod tests {
         for forward in [true, true, false, false] {
             tap(&mut engine, &mut sl, forward);
         }
+    }
+
+    const SONG_SELECT: ShowControl = ShowControl { device: Some(2), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram };
+
+    fn program(s: &mut Show, source: SourceId, n: u8) -> Take {
+        s.take(source, 0, ShowMsg::Program(n), 0)
+    }
+
+    #[test]
+    fn a_program_change_selects_the_first_part_of_its_song_and_one_with_no_song_is_still_consumed() {
+        let mut s = show(&[SONG_SELECT]);
+        let zones = |n: u8| part(RigZone { transpose: n as i8, ..RigZone::OPEN }, OFF);
+        // Song 0 has two parts, song 1 one in a skipped set, song 2 none, song 3 one.
+        let parts = [(0, false, 0), (0, false, 1), (1, true, 2), (3, false, 3)];
+        s.set_parts(ShowParts::new(parts.iter().map(|&(song, skip, z)| ShowPart { song, skip, zones: zones(z) }).collect()));
+        assert_eq!(program(&mut s, PEDAL, 3), Take::Part(zones(3)), "program 3 is song 4");
+        assert_eq!(program(&mut s, PEDAL, 0), Take::Part(zones(0)), "program 0 is song 1, at its first part");
+        assert_eq!(program(&mut s, PEDAL, 0), Take::Part(zones(0)), "each program change acts: it has no release");
+        assert_eq!(program(&mut s, PEDAL, 1), Take::Part(zones(2)), "a song stepping skips is still selected");
+        assert_eq!((s.part(), s.steps()), (Some(2), 4));
+        assert_eq!(program(&mut s, PEDAL, 2), Take::Consumed, "a song without parts selects nothing");
+        assert_eq!(program(&mut s, PEDAL, 9), Take::Consumed, "nor does a program with no song");
+        assert_eq!(s.part(), Some(2));
+        assert_eq!(program(&mut s, SourceId::Hardware(1), 0), Take::Route, "another device's program change reaches its instruments");
+        assert_eq!(program(&mut s, SourceId::Keys, 0), Take::Route, "so does the computer keyboard's");
+        assert_eq!(s.take(PEDAL, 0, ShowMsg::Cc(0), 127), Take::Route, "the device's CCs are not program changes");
+    }
+
+    #[test]
+    fn a_control_naming_its_program_goes_before_every_program() {
+        let five = ShowControl { device: None, channel: None, msg: ShowMsg::Program(5), action: ShowAction::NextPart };
+        let mut s = show(&[five, SONG_SELECT]);
+        assert_eq!(program(&mut s, PEDAL, 1), Take::Part(part(OFF, RigZone::OPEN)), "program 1 selects song 2");
+        assert_eq!(program(&mut s, PEDAL, 5), Take::Part(part(RigZone::OPEN, RigZone::OPEN)), "program 5 steps to the next part");
+        assert_eq!(program(&mut s, SourceId::Hardware(1), 5), Take::Consumed, "on any device, here at the last part");
     }
 
     #[test]

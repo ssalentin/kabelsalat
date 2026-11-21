@@ -366,23 +366,29 @@ struct DisconnectArgs {
 }
 
 /// Arguments for `set_param`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SetParamArgs {
     /// Target node id.
     node: NodeId,
-    /// Parameter id from `list_params` (optional if `name` is given).
+    /// Parameter id from `list_params` (optional when `name` is provided).
     #[serde(default)]
     param: Option<u32>,
-    /// Parameter name, main control name, or face knob label from `list_params`
-    /// (optional if `param` is given).
+    /// Parameter name, main control name, face knob label, or musical alias
+    /// (e.g. "cutoff", "time", "pingpong", "8'", "leslie").
     #[serde(default, alias = "knob")]
     name: Option<String>,
-    /// New value in plain units (`min..max` from `list_params`).
+    /// Optional CLAP module filter when matching by `name` (requires `--attach` for CLAP).
+    #[serde(default)]
+    module: Option<String>,
+    /// New value in plain/native units (`min..max` from `list_params`, or 0..1 for built-in DSP).
     #[serde(default)]
     value: Option<f64>,
-    /// New value normalized `0..1` across `min..max` (alternative to `value`).
+    /// New value normalized `0..1` across `min..max` (alternative to `value`/`text`).
     #[serde(default)]
     normalized: Option<f64>,
+    /// Musical text value (e.g. "300 ms", "1.2 kHz", "+4 dB", "Ping-Pong", "FAST", "6/8", "40%").
+    #[serde(default)]
+    text: Option<String>,
     /// On CLAP nodes: `"plugin"` (default, internal synth/FX parameter) or
     /// `"knob"` (rack LEVEL knob).
     #[serde(default)]
@@ -877,11 +883,41 @@ struct ListCcMapsArgs {
 }
 
 /// Arguments for `list_params`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ListParamsArgs {
     /// Node id to inspect.
     node: NodeId,
     /// Optional case-insensitive filter words.
+    query: Option<String>,
+    /// Optional CLAP module filter (e.g. "Filter", "Osc", "AEG", "FX").
+    module: Option<String>,
+    /// Return only parameters currently differing from their default.
+    only_modified: Option<bool>,
+    /// Include discrete option labels for stepped/enum parameters.
+    include_options: Option<bool>,
+    /// Max parameters to return (default 50, max 200).
+    limit: Option<usize>,
+}
+
+/// Arguments for `inspect_plugin`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct InspectPluginArgs {
+    /// Plugin name, CLAP id, LV2 URI, built-in DSP kind, or catalog id.
+    query: Option<String>,
+    /// Optional format filter: "all" | "builtin" | "clap" | "lv2" | "catalog".
+    format: Option<String>,
+    /// Optional live rack node id to inspect its active plugin and configuration.
+    node: Option<NodeId>,
+}
+
+/// Arguments for `reset_params`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ResetParamsArgs {
+    /// Target node id.
+    node: NodeId,
+    /// Optional CLAP module filter.
+    module: Option<String>,
+    /// Optional name filter words.
     query: Option<String>,
 }
 
@@ -2063,7 +2099,7 @@ impl McpServer {
     }
 
     /// Directly edit an internal synth/FX parameter or rack knob.
-    #[tool(name = "set_param", description = "Directly edit a node's internal parameter or rack knob live (for CLAP synths/FX like Starbreath or Surge XT, LV2 plugins, built-in DSP, Master, Arp, Audio In, or MIDI FX). Call list_params(node, query) first to discover parameter ids, names, and min..max ranges. Pass param (id) or name (parameter name, main control name, or face knob label), and value (plain units in min..max) or normalized (0..1). On CLAP nodes, target defaults to 'plugin' (internal parameters, requires --attach); pass target='knob' or name='LEVEL' for the rack LEVEL knob.")]
+    #[tool(name = "set_param", description = "Directly edit a node's internal parameter or rack knob live (CLAP synths/FX like Starbreath or Surge XT, LV2 plugins, setBfree organ, built-in DSP, Master, Arp, Audio In, or MIDI FX). Identify by param (id) or name (+ optional module for CLAP), using musical text (e.g. '300 ms', '1.2 kHz', '+4 dB', 'Ping-Pong', 'FAST', '6/8'), native value (min..max from list_params), or normalized (0..1). On CLAP nodes, target defaults to 'plugin' (requires --attach); pass target='knob' or name='LEVEL' for the rack LEVEL knob.")]
     fn set_param(&self, Parameters(args): Parameters<SetParamArgs>) -> Result<CallToolResult, McpError> {
         let remote = {
             let st = self.state.lock().unwrap();
@@ -2073,17 +2109,24 @@ impl McpServer {
             let mut payload = json!({ "node": args.node });
             if let Some(p) = args.param { payload["param"] = json!(p); }
             if let Some(n) = args.name { payload["name"] = json!(n); }
+            if let Some(m) = args.module { payload["module"] = json!(m); }
             if let Some(v) = args.value { payload["value"] = json!(v); }
             if let Some(n) = args.normalized { payload["normalized"] = json!(n); }
+            if let Some(t) = args.text { payload["text"] = json!(t); }
             if let Some(t) = args.target { payload["target"] = json!(t); }
             return Self::ui_bridge_tool("set_param", payload);
         }
         let mut st = self.state.lock().unwrap();
-        let Some(node_kind) = st.graph.node(args.node).map(|n| n.kind.clone()) else {
+        let Some(node) = st.graph.node(args.node).cloned() else {
             return tool_err(format!("node {} does not exist", args.node));
         };
-        if args.value.is_none() && args.normalized.is_none() {
-            return tool_err("set_param needs 'value' or 'normalized'");
+        let name_q = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let text_q = args.text.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if args.param.is_none() && name_q.is_none() {
+            return tool_err("set_param needs 'param' (id) or 'name'");
+        }
+        if args.value.is_none() && args.normalized.is_none() && text_q.is_none() {
+            return tool_err("set_param needs 'text', 'value', or 'normalized'");
         }
         if let Some(v) = args.value {
             if !v.is_finite() { return tool_err("'value' must be finite"); }
@@ -2091,54 +2134,179 @@ impl McpServer {
         if let Some(n) = args.normalized {
             if !n.is_finite() { return tool_err("'normalized' must be finite"); }
         }
-        let is_clap = matches!(node_kind, NodeKind::Clap { .. });
-        let target_is_knob = args.target.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("knob"));
-        let param = if let Some(ref name) = args.name {
-            match Self::resolve_headless_knob(&node_kind, name) {
-                Ok((p, crate::matrix::CcTarget::Knob)) => p,
-                // A pedal or wheel name ("swell") is a MIDI CC the keys send, not a parameter.
-                Ok(_) | Err(_) if is_clap => {
-                    return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+        if let Some(t) = args.target.as_deref() {
+            match crate::matrix::CcTarget::parse(Some(t)) {
+                Ok(crate::matrix::CcTarget::Mix) => return tool_err("set_param does not edit mixer strips — use set_rig_mix or set_strip_mix"),
+                Ok(crate::matrix::CcTarget::MidiCc | crate::matrix::CcTarget::ChannelPressure) => {
+                    return tool_err("set_param sets parameters, not MIDI messages — map a controller with set_cc_map");
                 }
-                Ok((cc, _)) => {
-                    return tool_err(format!("'{name}' is MIDI CC {cc}, not a parameter — map a controller to it with set_cc_map"));
-                }
+                Ok(_) => {}
                 Err(e) => return tool_err(e),
             }
-        } else if let Some(p) = args.param {
-            if is_clap && !target_is_knob && p != crate::engine::P_LEVEL {
-                return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+        }
+        // Reject MIDI CC pedal/wheel names like "swell" as parameter ids.
+        if let Some(n) = name_q {
+            if let Ok((cc, crate::matrix::CcTarget::MidiCc)) = Self::resolve_headless_knob(&node.kind, n) {
+                return tool_err(format!("'{n}' is MIDI CC {cc}, not a parameter — map a controller to it with set_cc_map"));
             }
-            p
-        } else {
-            return tool_err("set_param needs 'param' or 'name'");
-        };
-        let value = match &node_kind {
-            NodeKind::Lv2 { uri }
-            | NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }
-                if crate::organ::index(param).is_none() =>
-            {
-                if let Some(n) = args.normalized {
-                    n.clamp(0.0, 1.0)
+        }
+
+        let target_is_knob = args.target.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("knob"));
+        let (param_id, param_name, send_val, display_val, display_text) = match &node.kind {
+            NodeKind::Dsp(dk) => {
+                let specs = crate::dsp::dsp_param_specs(dk);
+                let spec = if let Some(pid) = args.param {
+                    specs.iter().find(|s| s.engine_param == pid)
                 } else {
-                    let v = args.value.unwrap();
-                    if let Some(c) = crate::lv2::control_descs_for_uri(uri.as_str())
-                        .into_iter()
-                        .find(|c| c.index as u32 == param)
-                    {
-                        let span = (c.max - c.min) as f64;
-                        if span.abs() > 1e-12 { ((v - c.min as f64) / span).clamp(0.0, 1.0) } else { 0.0 }
-                    } else {
-                        v.clamp(0.0, 1.0)
+                    name_q.and_then(|n| crate::dsp::find_dsp_param(dk, n))
+                };
+                let Some(spec) = spec else {
+                    return tool_err(format!("unknown DSP parameter on node {}", args.node));
+                };
+                let norm = if let Some(t) = text_q {
+                    let Some(v) = crate::dsp::parse_dsp_text_value(dk, spec.native_param, t) else {
+                        return tool_err(format!("could not parse '{t}' for {}", spec.label));
+                    };
+                    v
+                } else {
+                    args.normalized.or(args.value).unwrap().clamp(0.0, 1.0) as f32
+                };
+                let txt = crate::dsp::format_dsp_value(dk, spec.native_param, norm);
+                (spec.engine_param, spec.label.to_string(), norm as f64, norm as f64, txt)
+            }
+            nk if crate::organ::is_organ(nk) => {
+                let spec = if let Some(pid) = args.param {
+                    crate::organ::param_specs().iter().find(|s| s.param == pid)
+                } else {
+                    name_q.and_then(crate::organ::find_param)
+                };
+                let Some(spec) = spec else {
+                    if let Some(cc) = name_q.and_then(crate::matrix::parse_midi_cc_name) {
+                        return tool_err(format!("'{}' is MIDI CC {cc}, not a parameter — map a controller to it with set_cc_map", name_q.unwrap_or("")));
                     }
+                    return tool_err("unknown setBfree organ control");
+                };
+                let norm = if let Some(t) = text_q {
+                    let Some(v) = crate::organ::parse_text_value(spec.param, t) else {
+                        return tool_err(format!("could not parse '{t}' for {}", spec.name));
+                    };
+                    v
+                } else if let Some(n) = args.normalized {
+                    n.clamp(0.0, 1.0) as f32
+                } else {
+                    let raw = args.value.unwrap() as f32;
+                    if spec.param < crate::organ::P_BASE + crate::organ::DRAWBARS as u32 && raw > 1.0 {
+                        crate::organ::drawbar_value(raw.round().clamp(0.0, 8.0) as u8)
+                    } else {
+                        raw.clamp(0.0, 1.0)
+                    }
+                };
+                let txt = crate::organ::format_value(spec.param, norm);
+                (spec.param, spec.name.to_string(), norm as f64, norm as f64, txt)
+            }
+            NodeKind::Lv2 { uri } | NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } } => {
+                let infos = crate::lv2::control_infos_blocking(uri.as_str());
+                let found = if let Some(pid) = args.param {
+                    infos.iter().find(|i| i.index as u32 == pid)
+                } else if let Some(n) = name_q {
+                    let q = n.to_lowercase();
+                    infos.iter().find(|i| i.name.to_lowercase() == q || i.symbol.to_lowercase() == q)
+                        .or_else(|| infos.iter().find(|i| i.name.to_lowercase().contains(&q) || i.symbol.to_lowercase().contains(&q)))
+                } else {
+                    None
+                };
+                if let Some(info) = found {
+                    let native = if let Some(t) = text_q {
+                        let Some(v) = crate::lv2::parse_lv2_control_text(info, t) else {
+                            return tool_err(format!("could not parse '{t}' for LV2 control '{}'", info.name));
+                        };
+                        v
+                    } else if let Some(n) = args.normalized {
+                        crate::lv2::lv2_norm_to_native(info, n as f32)
+                    } else {
+                        (args.value.unwrap() as f32).clamp(info.min, info.max)
+                    };
+                    let norm = crate::lv2::lv2_native_to_norm(info, native);
+                    let txt = crate::lv2::format_lv2_control_value(info, native);
+                    (info.index as u32, info.name.clone(), norm as f64, native as f64, txt)
+                } else if let Some(n) = name_q {
+                    match Self::resolve_headless_knob(&node.kind, n) {
+                        Ok((pid, crate::matrix::CcTarget::Knob)) => {
+                            let mc = crate::lv2::main_controls_blocking(uri.as_str()).controls.into_iter().find(|c| c.id == pid);
+                            let (norm, disp) = if let Some(c) = mc {
+                                let span = c.max - c.min;
+                                if let Some(nv) = args.normalized {
+                                    let nc = nv.clamp(0.0, 1.0);
+                                    (nc, c.min + nc * span)
+                                } else {
+                                    let p = args.value.unwrap().clamp(c.min, c.max);
+                                    let nc = if span.abs() > 1e-12 { ((p - c.min) / span).clamp(0.0, 1.0) } else { 0.0 };
+                                    (nc, p)
+                                }
+                            } else {
+                                let v = args.normalized.or(args.value).unwrap_or(0.5).clamp(0.0, 1.0);
+                                (v, v)
+                            };
+                            (pid, n.to_string(), norm, disp, format!("{disp:.3}"))
+                        }
+                        _ => return tool_err(format!("LV2 parameter '{n}' not found")),
+                    }
+                } else if let Some(pid) = args.param {
+                    let norm = args.normalized.or(args.value).unwrap_or(0.5).clamp(0.0, 1.0);
+                    (pid, format!("param {pid}"), norm, norm, format!("{norm:.3}"))
+                } else {
+                    return tool_err("LV2 parameter not found");
                 }
             }
-            _ => args.normalized.or(args.value).unwrap(),
+            NodeKind::MasterOut => {
+                let (pid, pname) = match (args.param, name_q.map(|s| s.to_lowercase())) {
+                    (Some(crate::engine::P_VOL), _) => (crate::engine::P_VOL, "Volume"),
+                    (None, Some(ref s)) if s.contains("vol") => (crate::engine::P_VOL, "Volume"),
+                    (Some(crate::engine::P_WARM), _) => (crate::engine::P_WARM, "Warmth"),
+                    (None, Some(ref s)) if s.contains("warm") => (crate::engine::P_WARM, "Warmth"),
+                    _ => return tool_err("Master Out parameters are Volume (3) and Warmth (4)"),
+                };
+                let norm = args.normalized.or(args.value).unwrap_or(0.8).clamp(0.0, 1.0);
+                (pid, pname.to_string(), norm, norm, format!("{:.0}%", norm * 100.0))
+            }
+            NodeKind::Clap { .. } => {
+                if (args.param == Some(crate::engine::P_LEVEL) && (target_is_knob || args.target.is_none()))
+                    || name_q.is_some_and(|n| n.eq_ignore_ascii_case("level"))
+                {
+                    let norm = args.normalized.or(args.value).unwrap_or(1.0).clamp(0.0, 1.0);
+                    (crate::engine::P_LEVEL, "LEVEL".into(), norm, norm, format!("{:.0}%", norm * 100.0))
+                } else {
+                    return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+                }
+            }
+            _ => {
+                let pid = if let Some(p) = args.param {
+                    p
+                } else if let Some(n) = name_q {
+                    match Self::resolve_headless_knob(&node.kind, n) {
+                        Ok((p, crate::matrix::CcTarget::Knob)) => p,
+                        Ok((cc, _)) => return tool_err(format!("'{n}' is MIDI CC {cc}, not a parameter — map a controller to it with set_cc_map")),
+                        Err(e) => return tool_err(e),
+                    }
+                } else {
+                    return tool_err("set_param needs 'param' or 'name'");
+                };
+                let v = args.normalized.or(args.value).unwrap_or(0.5);
+                (pid, format!("param {pid}"), v, v, format!("{v:.3}"))
+            }
         };
-        if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param, value }) {
+
+        if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: param_id, value: send_val }) {
             return tool_err(e);
         }
-        ok_json(json!({"node": args.node, "param": param, "value": value}))
+        ok_json(json!({
+            "ok": true,
+            "node": args.node,
+            "param": param_id,
+            "name": param_name,
+            "value": display_val,
+            "text": display_text,
+        }))
     }
 
     /// Per-rig input selection.
@@ -2861,67 +3029,142 @@ impl McpServer {
         ok_json(json!({"cc_maps": entries}))
     }
 
-    /// List bindable parameter ids and names for a node.
-    #[tool(name = "list_params", description = "List a node's parameters for set_param / set_cc_map / learn_cc. main_controls comes first: the few parameters the plugin's designer marked as most important (page, name, id, value, text, min, max, and the face knob showing it). Prefer them, and pass a main control's name as name=<name> to set_param or knob=<name> to set_cc_map. params is the full internal parameter list (id, name, value, text, min, max, default, stepped), filtered by query. CLAP plugin params require --attach to the running GUI app.")]
+    /// List bindable/editable parameter ids, names, values, ranges and options for a node.
+    #[tool(name = "list_params", description = "Inspect a node's parameters for set_param / set_cc_map / learn_cc with values, musical text, defaults, min..max ranges, units, and stepped options. main_controls comes first. Supports filtering by query, module (CLAP), only_modified, include_options, and limit. CLAP plugin params require --attach to the running GUI app.")]
     fn list_params(&self, Parameters(args): Parameters<ListParamsArgs>) -> Result<CallToolResult, McpError> {
         let remote = {
             let st = self.state.lock().unwrap();
             matches!(st.backend, Backend::Remote)
         };
         if remote {
-            return Self::ui_bridge_tool("list_params", json!({"node": args.node, "query": args.query}));
+            return Self::ui_bridge_tool("list_params", json!({
+                "node": args.node,
+                "query": args.query,
+                "module": args.module,
+                "only_modified": args.only_modified,
+                "include_options": args.include_options,
+                "limit": args.limit,
+            }));
         }
         let st = self.state.lock().unwrap();
         let Some(n) = st.graph.node(args.node) else {
             return tool_err(format!("node {} does not exist", args.node));
         };
-        let choices: Vec<(u32, String)> = match &n.kind {
-            NodeKind::Dsp(dk) => crate::engine::dsp_param_choices(dk)
-                .iter()
-                .map(|&(id, name)| (id, name.to_string()))
-                .collect(),
-            NodeKind::Lv2 { uri } => crate::lv2::control_descs_for_uri(uri.as_str())
-                .into_iter()
-                .map(|c| (c.index as u32, c.name))
-                .collect(),
-            NodeKind::MasterOut => vec![(3, "Volume".into()), (4, "Warmth".into())],
-            NodeKind::AudioIn { .. } => vec![(crate::engine::P_AUDIO_IN_GAIN, "Gain".into()), (crate::engine::P_AUDIO_IN_MONITOR, "Monitor".into())],
+        let q = args.query.unwrap_or_default().to_lowercase();
+        let words: Vec<&str> = q.split_whitespace().collect();
+        let limit = args.limit.map(|l| l.clamp(1, 200)).unwrap_or(50);
+
+        let (total, params): (usize, Vec<Value>) = match &n.kind {
+            NodeKind::Dsp(dk) => {
+                let specs = crate::dsp::dsp_param_specs(dk);
+                let list: Vec<Value> = specs
+                    .iter()
+                    .filter(|s| {
+                        if words.is_empty() { return true; }
+                        let hay = format!("{} {} {} {}", s.label, s.name, s.description, s.unit).to_lowercase();
+                        words.iter().all(|w| hay.contains(w))
+                    })
+                    .take(limit)
+                    .map(|s| json!({
+                        "id": s.engine_param,
+                        "key": s.name,
+                        "name": s.label,
+                        "value": s.default,
+                        "text": crate::dsp::format_dsp_value(dk, s.native_param, s.default),
+                        "default": s.default,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "unit": s.unit,
+                        "range": s.range,
+                        "description": s.description,
+                    }))
+                    .collect();
+                (specs.len(), list)
+            }
+            nk if crate::organ::is_organ(nk) => {
+                let specs = crate::organ::param_specs();
+                let list: Vec<Value> = specs
+                    .iter()
+                    .filter(|s| {
+                        if words.is_empty() { return true; }
+                        let hay = format!("{} {} {}", s.name, s.range, s.description).to_lowercase();
+                        words.iter().all(|w| hay.contains(w))
+                    })
+                    .take(limit)
+                    .map(|s| json!({
+                        "id": s.param,
+                        "name": s.name,
+                        "value": s.default,
+                        "text": crate::organ::format_value(s.param, s.default),
+                        "default": s.default,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "stepped": s.stepped,
+                        "range": s.range,
+                        "description": s.description,
+                    }))
+                    .collect();
+                (specs.len(), list)
+            }
+            NodeKind::Lv2 { uri } | NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } } => {
+                let infos = crate::lv2::control_infos_blocking(uri.as_str());
+                let list: Vec<Value> = infos
+                    .iter()
+                    .filter(|i| {
+                        if words.is_empty() { return true; }
+                        let hay = format!("{} {} {}", i.name, i.symbol, i.unit).to_lowercase();
+                        words.iter().all(|w| hay.contains(w))
+                    })
+                    .take(limit)
+                    .map(|i| json!({
+                        "id": i.index as u32,
+                        "symbol": i.symbol,
+                        "name": i.name,
+                        "value": i.default,
+                        "text": crate::lv2::format_lv2_control_value(i, i.default),
+                        "default": i.default,
+                        "min": i.min,
+                        "max": i.max,
+                        "unit": i.unit,
+                        "toggled": i.toggled,
+                        "integer": i.integer,
+                        "logarithmic": i.logarithmic,
+                        "options": i.scale_points.iter().map(|sp| json!({"value": sp.value, "label": sp.label})).collect::<Vec<_>>(),
+                    }))
+                    .collect();
+                (infos.len(), list)
+            }
             NodeKind::Clap { .. } => {
                 return tool_err("CLAP parameter listing needs the running app (kabelsalat mcp --attach)");
             }
-            NodeKind::SystemAudio => vec![(crate::engine::P_SYSTEM_GAIN, "Gain".into())],
-            // The arp's stepped knobs, spelled out so a model can pick one
-            // by name headless (the running app answers the same via
-            // ui_bridge_tool("list_params")).
-            NodeKind::Arp => vec![
-                (crate::arp::P_ARP_MODE, "Mode (up/down/up-down/chord/random)".into()),
-                (crate::arp::P_ARP_RATE, "Rate (1/4|1/8|1/8T|1/16|1/16T|1/32)".into()),
-                (crate::arp::P_ARP_OCTAVE, "Octaves (1-4)".into()),
-                (crate::arp::P_ARP_GATE, "Gate".into()),
-                (crate::arp::P_ARP_SWING, "Swing".into()),
-                (crate::arp::P_ARP_CHORD, "Chord (maj|min|sus2|sus4|7|maj7|min7|power)".into()),
-            ],
-            NodeKind::Keys => Vec::new(),
-            NodeKind::MidiFx { plugin } => match plugin {
-                crate::control::MidiFxPlugin::Builtin { .. } => vec![(crate::engine::P_MIDIFX_SEMI, "Transpose".into())],
-                crate::control::MidiFxPlugin::Lv2 { uri } => crate::lv2::control_descs_for_uri(uri.as_str())
+            other => {
+                let choices: Vec<(u32, String)> = match other {
+                    NodeKind::MasterOut => vec![(3, "Volume".into()), (4, "Warmth".into())],
+                    NodeKind::AudioIn { .. } => vec![(crate::engine::P_AUDIO_IN_GAIN, "Gain".into()), (crate::engine::P_AUDIO_IN_MONITOR, "Monitor".into())],
+                    NodeKind::SystemAudio => vec![(crate::engine::P_SYSTEM_GAIN, "Gain".into())],
+                    NodeKind::Arp => vec![
+                        (crate::arp::P_ARP_MODE, "Mode (up/down/up-down/chord/random)".into()),
+                        (crate::arp::P_ARP_RATE, "Rate (1/4|1/8|1/8T|1/16|1/16T|1/32)".into()),
+                        (crate::arp::P_ARP_OCTAVE, "Octaves (1-4)".into()),
+                        (crate::arp::P_ARP_GATE, "Gate".into()),
+                        (crate::arp::P_ARP_SWING, "Swing".into()),
+                        (crate::arp::P_ARP_CHORD, "Chord (maj|min|sus2|sus4|7|maj7|min7|power)".into()),
+                    ],
+                    NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { .. } } => {
+                        vec![(crate::engine::P_MIDIFX_SEMI, "Transpose".into())]
+                    }
+                    _ => Vec::new(),
+                };
+                let tot = choices.len();
+                let list: Vec<Value> = choices
                     .into_iter()
-                    .map(|c| (c.index as u32, c.name))
-                    .collect(),
-            },
+                    .filter(|(_, name)| words.iter().all(|w| name.to_lowercase().contains(w)))
+                    .take(limit)
+                    .map(|(id, name)| json!({"id": id, "name": name}))
+                    .collect();
+                (tot, list)
+            }
         };
-        let q = args.query.unwrap_or_default().to_lowercase();
-        let words: Vec<&str> = q.split_whitespace().collect();
-        let total = choices.len();
-        let params: Vec<Value> = choices
-            .into_iter()
-            .filter(|(_, name)| {
-                let low = name.to_lowercase();
-                words.iter().all(|w| low.contains(w))
-            })
-            .take(50)
-            .map(|(id, name)| json!({"id": id, "name": name}))
-            .collect();
         let mut knobs: Vec<Value> = crate::engine::knob_specs(&n.kind)
             .iter()
             .filter_map(|k| k.param.map(|p| json!({"label": k.label, "param": p, "target": "knob"})))
@@ -2955,6 +3198,168 @@ impl McpServer {
             "params": params,
             "knobs": knobs,
         }))
+    }
+
+    /// Deep technical and musical inspection of any plugin (built-in DSP, CLAP, LV2, catalog, or live node).
+    #[tool(name = "inspect_plugin", description = "Inspect any plugin's architecture, musical role, modules, and parameter specifications (ranges, defaults, units, scale points). Pass `query` (plugin name/id/URI/DSP kind) or `node` (live rack node id).")]
+    fn inspect_plugin(&self, Parameters(args): Parameters<InspectPluginArgs>) -> Result<CallToolResult, McpError> {
+        let remote = {
+            let st = self.state.lock().unwrap();
+            matches!(st.backend, Backend::Remote)
+        };
+        if remote {
+            return Self::ui_bridge_tool("inspect_plugin", json!({
+                "query": args.query,
+                "format": args.format,
+                "node": args.node,
+            }));
+        }
+        if let Some(node) = args.node {
+            return self.list_params(Parameters(ListParamsArgs {
+                node,
+                query: args.query,
+                include_options: Some(true),
+                limit: Some(80),
+                ..Default::default()
+            }));
+        }
+        let format = args.format.unwrap_or_else(|| "all".into()).to_ascii_lowercase();
+        let query = args.query.unwrap_or_default();
+        let q_low = query.trim().to_ascii_lowercase();
+        let words: Vec<&str> = q_low.split_whitespace().collect();
+        if words.is_empty() {
+            let builtins: Vec<Value> = crate::dsp::dsp_catalog()
+                .iter()
+                .map(|s| json!({"kind": s.kind, "name": s.name, "category": s.category, "summary": s.summary, "param_count": s.params.len()}))
+                .collect();
+            let catalog: Vec<Value> = crate::catalog::CATALOG
+                .iter()
+                .map(|c| json!({"id": c.id, "name": c.name, "format": c.format.label(), "description": c.description}))
+                .collect();
+            return ok_json(json!({"builtin_dsp": builtins, "catalog": catalog}));
+        }
+        let mut matches: Vec<Value> = Vec::new();
+        if matches!(format.as_str(), "all" | "builtin") {
+            let exact = crate::dsp::dsp_kind_from_str(&query);
+            for spec in crate::dsp::dsp_catalog() {
+                let hay = format!("{} {} {} {}", spec.kind, spec.name, spec.category, spec.summary).to_lowercase();
+                if exact.as_ref().is_some_and(|dk| crate::dsp::dsp_spec(dk).kind == spec.kind)
+                    || words.iter().all(|w| hay.contains(w))
+                {
+                    matches.push(json!({
+                        "format": "builtin",
+                        "kind": spec.kind,
+                        "name": spec.name,
+                        "category": spec.category,
+                        "summary": spec.summary,
+                        "latency_ms": spec.latency_ms,
+                        "params": spec.params.iter().map(|p| json!({
+                            "id": p.engine_param, "key": p.name, "name": p.label,
+                            "unit": p.unit, "range": p.range, "default": p.default, "description": p.description,
+                        })).collect::<Vec<_>>(),
+                    }));
+                }
+            }
+        }
+        if matches!(format.as_str(), "all" | "catalog" | "clap" | "lv2") {
+            for c in crate::catalog::CATALOG {
+                let hay = format!("{} {} {} {} {} {}", c.id, c.name, c.description, c.about, c.clap_id.unwrap_or(""), c.lv2_uris.join(" ")).to_lowercase();
+                if words.iter().all(|w| hay.contains(w)) {
+                    let mut entry = json!({
+                        "format": "catalog",
+                        "plugin_format": c.format.label(),
+                        "id": c.id,
+                        "name": c.name,
+                        "description": c.description,
+                        "about": c.about,
+                        "clap_id": c.clap_id,
+                        "lv2_uris": c.lv2_uris,
+                    });
+                    if c.lv2_uris.contains(&crate::organ::B_SYNTH) {
+                        entry["params"] = Value::Array(
+                            crate::organ::param_specs().iter().map(|p| json!({
+                                "id": p.param, "name": p.name, "range": p.range, "default": p.default, "stepped": p.stepped,
+                            })).collect()
+                        );
+                    }
+                    matches.push(entry);
+                }
+            }
+        }
+        ok_json(json!({"query": query, "count": matches.len(), "matches": matches}))
+    }
+
+    /// Reset all or filtered parameters of a node back to defaults.
+    #[tool(name = "reset_params", description = "Reset all or matching (`module`/`query`) parameters of a node back to their defaults.")]
+    fn reset_params(&self, Parameters(args): Parameters<ResetParamsArgs>) -> Result<CallToolResult, McpError> {
+        let remote = {
+            let st = self.state.lock().unwrap();
+            matches!(st.backend, Backend::Remote)
+        };
+        if remote {
+            return Self::ui_bridge_tool("reset_params", json!({
+                "node": args.node,
+                "module": args.module,
+                "query": args.query,
+            }));
+        }
+        let mut st = self.state.lock().unwrap();
+        let Some(node) = st.graph.node(args.node).cloned() else {
+            return tool_err(format!("node {} does not exist", args.node));
+        };
+        let q = args.query.unwrap_or_default().to_lowercase();
+        let words: Vec<&str> = q.split_whitespace().collect();
+        let mut reset_names = Vec::new();
+        match &node.kind {
+            NodeKind::Dsp(dk) => {
+                for spec in crate::dsp::dsp_param_specs(dk) {
+                    if !words.is_empty() && !words.iter().all(|w| format!("{} {}", spec.label, spec.name).to_lowercase().contains(w)) {
+                        continue;
+                    }
+                    if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: spec.engine_param, value: spec.default as f64 }) {
+                        return tool_err(e);
+                    }
+                    reset_names.push(spec.label.to_string());
+                }
+            }
+            nk if crate::organ::is_organ(nk) => {
+                for spec in crate::organ::param_specs() {
+                    if !words.is_empty() && !words.iter().all(|w| spec.name.to_lowercase().contains(w)) {
+                        continue;
+                    }
+                    if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: spec.param, value: spec.default as f64 }) {
+                        return tool_err(e);
+                    }
+                    reset_names.push(spec.name.to_string());
+                }
+            }
+            NodeKind::Lv2 { uri } | NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } } => {
+                for info in crate::lv2::control_infos_blocking(uri.as_str()) {
+                    if !words.is_empty() && !words.iter().all(|w| format!("{} {}", info.name, info.symbol).to_lowercase().contains(w)) {
+                        continue;
+                    }
+                    let def_norm = crate::lv2::lv2_native_to_norm(&info, info.default) as f64;
+                    if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: info.index as u32, value: def_norm }) {
+                        return tool_err(e);
+                    }
+                    reset_names.push(info.name);
+                }
+            }
+            NodeKind::MasterOut => {
+                for &(pid, pname, def) in &[(crate::engine::P_VOL, "Volume", 0.8), (crate::engine::P_WARM, "Warmth", 0.25)] {
+                    if !words.is_empty() && !words.iter().all(|w| pname.to_lowercase().contains(w)) { continue; }
+                    if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: pid, value: def }) {
+                        return tool_err(e);
+                    }
+                    reset_names.push(pname.to_string());
+                }
+            }
+            NodeKind::Clap { .. } => {
+                return tool_err("CLAP parameter reset needs the running app (kabelsalat mcp --attach)");
+            }
+            _ => return tool_err("this node has no resettable parameters"),
+        }
+        ok_json(json!({"ok": true, "node": args.node, "reset_count": reset_names.len(), "params": reset_names}))
     }
 
     /// Arm MIDI-learn in the running GUI app.
@@ -4625,7 +5030,7 @@ mod tests {
 
         let (server, _engine) = local_server();
         // Demo node 2 = DELAY A: knobs TIME + MIX.
-        let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None })));
+        let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None, ..Default::default() })));
         let labels: Vec<&str> = out["knobs"].as_array().unwrap().iter().map(|k| k["label"].as_str().unwrap()).collect();
         assert_eq!(labels, ["TIME", "MIX"], "{out}");
         assert_eq!(out["knobs"][0]["target"], json!("knob"));
@@ -4661,7 +5066,7 @@ mod tests {
             st.graph.add_node(kind.clone(), name_bytes("Synth"))
         };
         engine.render(&mut vec![0.0f32; 64 * 2], 64);
-        let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node, query: None })));
+        let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node, query: None, ..Default::default() })));
         assert_eq!(out["main_controls_source"], json!("designation"), "{out}");
         assert_eq!(out["main_controls"][0]["name"], json!("Filter Cutoff"));
         assert_eq!(out["main_controls"][0]["id"], json!(7));
@@ -4676,7 +5081,7 @@ mod tests {
         assert_eq!(swell["isError"], json!(true), "{swell}");
         assert!(swell.to_string().contains("MIDI CC 11") && swell.to_string().contains("set_cc_map"), "{swell}");
         // A node without a plugin has none, and says so with an empty list.
-        let delay = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None })));
+        let delay = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None, ..Default::default() })));
         assert_eq!(delay["main_controls"], json!([]));
         assert_eq!(delay["main_controls_source"], Value::Null);
     }
@@ -5040,7 +5445,7 @@ mod tests {
             .collect();
         assert!(all_bindings.iter().any(|b| b["cc"] == json!(74) && b["target"] == json!("plugin")));
         assert!(all_bindings.iter().any(|b| b["cc"] == json!(7) && b["target"] == json!("knob") && b["range"] == json!([0.0, 0.6])));
-        let dsp = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: Some("mix".into()) })));
+        let dsp = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: Some("mix".into()), ..Default::default() })));
         assert_eq!(dsp["params"][0]["name"], json!("Mix"));
         engine.render(&mut buf, 2);
         let cleared = tool_json(&server.clear_cc_map(Parameters(ClearCcMapArgs {
@@ -5409,5 +5814,43 @@ mod tests {
         assert_eq!(stopped["playing"], json!(false));
         engine.render(&mut buf, 2);
         assert_eq!(engine.demo_pub(), None);
+    }
+
+    #[test]
+    fn mcp_inspect_set_and_reset_params_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+
+        let insp = tool_json(&server.inspect_plugin(Parameters(InspectPluginArgs {
+            query: Some("eq3".into()),
+            format: Some("builtin".into()),
+            node: None,
+        })));
+        assert_eq!(insp["matches"][0]["kind"], json!("eq3"));
+        assert_eq!(insp["matches"][0]["params"].as_array().unwrap().len(), 7);
+
+        let lp = tool_json(&server.list_params(Parameters(ListParamsArgs {
+            node: 2,
+            ..Default::default()
+        })));
+        assert_eq!(lp["total"], json!(5));
+
+        let set = tool_json(&server.set_param(Parameters(SetParamArgs {
+            node: 2,
+            name: Some("pingpong".into()),
+            text: Some("Ping-Pong".into()),
+            ..Default::default()
+        })));
+        assert_eq!(set["ok"], json!(true));
+        assert_eq!(set["param"], json!(3));
+        assert_eq!(set["text"], json!("Ping-Pong"));
+
+        let reset = tool_json(&server.reset_params(Parameters(ResetParamsArgs {
+            node: 2,
+            ..Default::default()
+        })));
+        assert_eq!(reset["ok"], json!(true));
+        assert_eq!(reset["reset_count"], json!(5));
+        engine.render(&mut buf, 2);
     }
 }

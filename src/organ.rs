@@ -103,6 +103,117 @@ pub fn step_name(param: ParamId, v: f32) -> Option<&'static str> {
     }
 }
 
+/// Metadata for one setBfree organ control (drawbars, Leslie, percussion, drive, reverb).
+#[derive(Clone, Copy, Debug)]
+pub struct OrganParamSpec {
+    pub param: ParamId,
+    pub name: &'static str,
+    pub default: f32,
+    pub stepped: bool,
+    pub range: &'static str,
+    pub description: &'static str,
+}
+
+const ORGAN_SPECS: &[OrganParamSpec] = &[
+    OrganParamSpec { param: P_BASE,     name: "Drawbar 16'",  default: 1.0, stepped: true,  range: "0..8", description: "Sub-octave 16' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 1, name: "Drawbar 5⅓'",  default: 1.0, stepped: true,  range: "0..8", description: "Sub-fifth 5⅓' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 2, name: "Drawbar 8'",   default: 1.0, stepped: true,  range: "0..8", description: "Fundamental 8' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 3, name: "Drawbar 4'",   default: 0.0, stepped: true,  range: "0..8", description: "Octave 4' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 4, name: "Drawbar 2⅔'",  default: 0.0, stepped: true,  range: "0..8", description: "Twelfth 2⅔' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 5, name: "Drawbar 2'",   default: 0.0, stepped: true,  range: "0..8", description: "Fifteenth 2' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 6, name: "Drawbar 1⅗'",  default: 0.0, stepped: true,  range: "0..8", description: "Tierce 1⅗' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 7, name: "Drawbar 1⅓'",  default: 0.0, stepped: true,  range: "0..8", description: "Larigot 1⅓' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_BASE + 8, name: "Drawbar 1'",   default: 0.0, stepped: true,  range: "0..8", description: "Sifflöte 1' drawbar (position 0..8)." },
+    OrganParamSpec { param: P_LESLIE,   name: "Leslie",       default: 0.5, stepped: true,  range: "STOP | SLOW | FAST", description: "Rotary speaker speed." },
+    OrganParamSpec { param: P_PERC,     name: "Percussion",   default: 0.0, stepped: true,  range: "OFF | ON | SOFT", description: "Harmonic percussion attack." },
+    OrganParamSpec { param: P_DRIVE,    name: "Drive",        default: 0.0, stepped: false, range: "0..100% (0 = off)", description: "Tube preamp overdrive character." },
+    OrganParamSpec { param: P_REVERB,   name: "Reverb",       default: 0.0, stepped: false, range: "0..100%", description: "Built-in spring/room reverb mix." },
+];
+
+pub fn param_specs() -> &'static [OrganParamSpec] {
+    ORGAN_SPECS
+}
+
+/// Match an organ control by name, footage (`"16'"`, `"8'"`, `"5 1/3"`, `"drawbar 3"`), or alias.
+pub fn find_param(query: &str) -> Option<&'static OrganParamSpec> {
+    let q = query.trim().to_ascii_lowercase();
+    if let Some(s) = ORGAN_SPECS.iter().find(|s| s.name.to_ascii_lowercase() == q) {
+        return Some(s);
+    }
+    if q.contains("leslie") || q.contains("rotary") {
+        return Some(&ORGAN_SPECS[9]);
+    }
+    if q.contains("perc") {
+        return Some(&ORGAN_SPECS[10]);
+    }
+    if q.contains("drive") || q.contains("overdrive") || q.contains("grit") {
+        return Some(&ORGAN_SPECS[11]);
+    }
+    if q.contains("reverb") || q.contains("verb") {
+        return Some(&ORGAN_SPECS[12]);
+    }
+    // Footage aliases (ASCII fractions and prime-stripped).
+    let ascii_footages = ["16", "5 1/3", "8", "4", "2 2/3", "2", "1 3/5", "1 1/3", "1"];
+    let cleaned = q.replace("drawbar", "").replace('\'', "").trim().to_string();
+    for (i, (&f, &af)) in FOOTAGES.iter().zip(ascii_footages.iter()).enumerate() {
+        let fl = f.trim_end_matches('\'');
+        if cleaned == fl || cleaned == af || q == f.to_ascii_lowercase() || q == format!("drawbar {}", i + 1) || q == format!("db{}", i + 1) {
+            return Some(&ORGAN_SPECS[i]);
+        }
+    }
+    ORGAN_SPECS.iter().find(|s| s.name.to_ascii_lowercase().contains(&q))
+}
+
+/// Human-readable display of a setBfree organ parameter value (0..1).
+pub fn format_value(param: ParamId, norm: f32) -> String {
+    if param >= P_BASE && param < P_BASE + DRAWBARS as ParamId {
+        return format!("{}/8", drawbar_position(norm));
+    }
+    if let Some(s) = step_name(param, norm) {
+        return s.to_string();
+    }
+    if param == P_DRIVE && norm <= 0.001 {
+        return "Off".into();
+    }
+    format!("{:.0}%", norm.clamp(0.0, 1.0) * 100.0)
+}
+
+/// Parse a musical value for a setBfree organ control (`"8"`, `"6/8"`, `"fast"`, `"slow"`,
+/// `"stop"`, `"on"`, `"soft"`, `"off"`, `"40%"`, or `0..1` normalized).
+pub fn parse_text_value(param: ParamId, text: &str) -> Option<f32> {
+    let lower = text.trim().to_ascii_lowercase();
+    if param >= P_BASE && param < P_BASE + DRAWBARS as ParamId {
+        let head = lower.split('/').next().unwrap_or(&lower).trim();
+        if let Ok(n) = head.parse::<f32>() {
+            if lower.contains('/') || n > 1.0 || (n == 1.0 && !lower.contains('.')) {
+                return Some(drawbar_value(n.round().clamp(0.0, 8.0) as u8));
+            }
+            return Some(n.clamp(0.0, 1.0));
+        }
+        return None;
+    }
+    match param {
+        P_LESLIE => {
+            if lower.contains("stop") || lower == "off" || lower == "brake" { return Some(0.0); }
+            if lower.contains("slow") || lower == "chorale" { return Some(0.5); }
+            if lower.contains("fast") || lower == "tremolo" { return Some(1.0); }
+        }
+        P_PERC => {
+            if lower == "off" || lower == "none" { return Some(0.0); }
+            if lower == "on" || lower == "normal" { return Some(0.5); }
+            if lower == "soft" { return Some(1.0); }
+        }
+        P_DRIVE => {
+            if lower == "off" { return Some(0.0); }
+        }
+        _ => {}
+    }
+    if let Some(pct) = lower.strip_suffix('%') {
+        return pct.trim().parse::<f32>().ok().map(|p| (p / 100.0).clamp(0.0, 1.0));
+    }
+    lower.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0))
+}
+
 /// The upper drawbars a MIDI programme (0-based, as sent) sets, from the
 /// programme file setBfree loads at start (display number = programme + 1).
 /// `None` when the programme sets no drawbars or the file is missing.
@@ -213,5 +324,28 @@ mod tests {
         assert_eq!(upper_drawbars(r#"  DrawbarsUpper = 88-8000-000"#), Some([8, 8, 8, 0, 0, 0, 0, 0, 0]));
         let t = parse_pgm(real);
         assert_eq!(t, vec![(1, [8, 8, 8, 0, 0, 0, 0, 0, 0]), (2, [7, 5, 8, 7, 5, 7, 2, 0, 0]), (5, [8, 8, 8, 0, 0, 0, 0, 0, 0])]);
+    }
+
+    #[test]
+    fn organ_param_specs_format_and_parse_musical_text() {
+        assert_eq!(param_specs().len(), PARAMS);
+        assert_eq!(find_param("16'").map(|s| s.param), Some(drawbar_param(0)));
+        assert_eq!(find_param("5 1/3").map(|s| s.param), Some(drawbar_param(1)));
+        assert_eq!(find_param("drawbar 3").map(|s| s.param), Some(drawbar_param(2)));
+        assert_eq!(find_param("rotary").map(|s| s.param), Some(P_LESLIE));
+        assert_eq!(find_param("perc").map(|s| s.param), Some(P_PERC));
+        assert_eq!(find_param("overdrive").map(|s| s.param), Some(P_DRIVE));
+
+        assert_eq!(parse_text_value(drawbar_param(0), "6"), Some(drawbar_value(6)));
+        assert_eq!(parse_text_value(drawbar_param(0), "8/8"), Some(1.0));
+        assert_eq!(format_value(drawbar_param(0), drawbar_value(6)), "6/8");
+
+        assert_eq!(parse_text_value(P_LESLIE, "fast"), Some(1.0));
+        assert_eq!(format_value(P_LESLIE, 1.0), "FAST");
+        assert_eq!(parse_text_value(P_PERC, "soft"), Some(1.0));
+        assert_eq!(format_value(P_PERC, 1.0), "SOFT");
+        assert_eq!(parse_text_value(P_DRIVE, "40%"), Some(0.4));
+        assert_eq!(format_value(P_DRIVE, 0.0), "Off");
+        assert_eq!(format_value(P_DRIVE, 0.4), "40%");
     }
 }

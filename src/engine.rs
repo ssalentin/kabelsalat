@@ -48,18 +48,27 @@ pub const P_AUDIO_IN_MONITOR: ParamId = 65;
 
 /// Translate an engine param id to a processor's native param id for a kind.
 /// Returns None if the knob doesn't apply to this kind.
-fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
+///
+/// Preserves existing front-panel / template param IDs while exposing every
+/// remaining native parameter so the assistant and MCP can configure all
+/// built-in DSP controls completely.
+pub(crate) fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
     match kind {
-        // dsp::Delay native params: 0=time, 1=feedback, 2=mix, 4=damping.
+        // dsp::Delay native params: 0=time, 1=feedback, 2=mix, 3=pingpong, 4=damping.
         DspKind::Delay => match p {
-            P_TIME => Some(0),
-            P_MIX => Some(2),
+            0 => Some(1),      // feedback
+            P_TIME => Some(0), // time (1)
+            P_MIX => Some(2),  // mix (2)
+            3 => Some(3),      // pingpong
+            4 => Some(4),      // damping
             _ => None,
         },
-        // Generic knob maps for the other built-in nodes (template defaults).
+        // dsp::Reverb native params: 0=size, 1=damping, 2=mix, 3=width.
         DspKind::Reverb => match p {
             0 => Some(2), // mix
-            1 => Some(0), // feedback / size
+            1 => Some(0), // size
+            2 => Some(1), // damping
+            3 => Some(3), // width
             _ => None,
         },
         DspKind::Gain => match p {
@@ -69,16 +78,30 @@ fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
         DspKind::Filter => match p {
             0 => Some(0), // cutoff
             1 => Some(1), // resonance
+            2 => Some(2), // mode (LP / HP / DJ)
             _ => None,
         },
+        // dsp::Eq3 native: 0=low_gain, 1=mid_gain, 2=high_gain, 3..5=freqs, 6=mid_q.
         DspKind::Eq3 => match p {
-            0 => Some(0),
-            1 => Some(2),
+            0 => Some(0), // low_gain
+            1 => Some(2), // high_gain (front-panel knob 1)
+            2 => Some(1), // mid_gain
+            3 => Some(3), // low_freq
+            4 => Some(4), // mid_freq
+            5 => Some(5), // high_freq
+            6 => Some(6), // mid_q
             _ => None,
         },
-        DspKind::Limiter | DspKind::Saturation => match p {
-            0 => Some(0),
-            1 => Some(1),
+        DspKind::Limiter => match p {
+            0 => Some(0), // ceiling
+            1 => Some(1), // drive
+            2 => Some(2), // release
+            _ => None,
+        },
+        DspKind::Saturation => match p {
+            0 => Some(0), // drive
+            1 => Some(1), // mix
+            2 => Some(2), // output
             _ => None,
         },
         DspKind::Pan => match p {
@@ -3194,6 +3217,15 @@ impl GraphEngine {
     }
 
     fn apply_dsp_or_master_param(&mut self, node: NodeId, param: ParamId, v: f32) -> bool {
+        // Dispatch DSP nodes first so DSP params 3/4 (Delay pingpong/damping,
+        // Reverb width, Eq3 freqs) never collide with MasterOut's P_VOL/P_WARM.
+        if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
+            if let Some(native) = dsp_native_param(&s.kind, param) {
+                s.proc.set_param(native, v);
+                return true;
+            }
+            return false;
+        }
         match param {
             P_VOL => {
                 self.master_vol = v;
@@ -3203,15 +3235,7 @@ impl GraphEngine {
                 self.master_warm = v;
                 true
             }
-            _ => {
-                if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
-                    if let Some(native) = dsp_native_param(&s.kind, param) {
-                        s.proc.set_param(native, v);
-                        return true;
-                    }
-                }
-                false
-            }
+            _ => false,
         }
     }
 
@@ -6741,6 +6765,35 @@ mod tests {
                 assert_eq!(spec.param, Some(id), "{dk:?} '{name}'");
             }
         }
+    }
+
+    #[test]
+    fn dsp_native_param_exposes_all_params_without_hijacking_master() {
+        use crate::control::DspKind;
+        // Delay exposes all 5 native params, including 3 (pingpong) and 4 (damping),
+        // without colliding with P_VOL (3) / P_WARM (4) on MasterOut.
+        assert_eq!(super::dsp_native_param(&DspKind::Delay, 1), Some(0)); // time
+        assert_eq!(super::dsp_native_param(&DspKind::Delay, 0), Some(1)); // feedback
+        assert_eq!(super::dsp_native_param(&DspKind::Delay, 2), Some(2)); // mix
+        assert_eq!(super::dsp_native_param(&DspKind::Delay, 3), Some(3)); // pingpong
+        assert_eq!(super::dsp_native_param(&DspKind::Delay, 4), Some(4)); // damping
+        assert_eq!(super::dsp_native_param(&DspKind::Reverb, 3), Some(3)); // width
+        assert_eq!(super::dsp_native_param(&DspKind::Eq3, 6), Some(6)); // mid_q
+
+        let mut g = crate::control::Graph::default();
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let mut buf = vec![0.0f32; 64 * 2];
+        let orig_vol = engine.master_vol;
+        let orig_warm = engine.master_warm;
+        bus.send(Command::SetParam { node: delay, param: 3, value: 1.0 });
+        bus.send(Command::SetParam { node: delay, param: 4, value: 0.7 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.master_vol, orig_vol, "DSP param 3 must not alter master volume");
+        assert_eq!(engine.master_warm, orig_warm, "DSP param 4 must not alter master warmth");
     }
 
     /// Two metronomes: M1 wired to the master (audible), M2 unwired. Returns

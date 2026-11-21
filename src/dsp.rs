@@ -1048,6 +1048,713 @@ impl Processor for Reverb {
 }
 
 // ---------------------------------------------------------------------------
+// Introspection catalog & musical value formatting/parsing (main-thread)
+// ---------------------------------------------------------------------------
+
+/// Metadata for one built-in DSP parameter (used by assistant/UI/MCP).
+#[derive(Clone, Copy, Debug)]
+pub struct DspParamSpec {
+    /// Parameter ID accepted by `Command::SetParam`.
+    pub engine_param: u32,
+    /// Native parameter ID inside `Processor::set_param`.
+    pub native_param: u32,
+    /// Canonical lowercase name (e.g. `"cutoff"`, `"pingpong"`).
+    pub name: &'static str,
+    /// Short human-friendly label.
+    pub label: &'static str,
+    /// Physical unit (`"dB"`, `"Hz"`, `"ms"`, `"%"`, `"Q"`, `"mode"`, ...).
+    pub unit: &'static str,
+    /// Range summary in physical units.
+    pub range: &'static str,
+    /// Default normalized value (0..1).
+    pub default: f32,
+    /// Concise musical description of what the parameter does.
+    pub description: &'static str,
+}
+
+/// Metadata for a built-in DSP node kind.
+#[derive(Clone, Copy, Debug)]
+pub struct DspNodeSpec {
+    pub kind: &'static str,
+    pub name: &'static str,
+    pub category: &'static str,
+    pub summary: &'static str,
+    pub latency_ms: f32,
+    pub params: &'static [DspParamSpec],
+}
+
+const GAIN_PARAMS: &[DspParamSpec] = &[DspParamSpec {
+    engine_param: 0,
+    native_param: 0,
+    name: "gain",
+    label: "Gain",
+    unit: "dB",
+    range: "-inf..+12 dB (0 = mute, 0.5 = 0 dB unity, 1.0 = +12 dB; quadratic taper)",
+    default: 0.5,
+    description: "Stereo level trim with quadratic taper for fine control around unity.",
+}];
+
+const PAN_PARAMS: &[DspParamSpec] = &[DspParamSpec {
+    engine_param: 0,
+    native_param: 0,
+    name: "pan",
+    label: "Pan",
+    unit: "pan",
+    range: "0.0 = hard left, 0.5 = center (-3 dB/side), 1.0 = hard right",
+    default: 0.5,
+    description: "Constant-power stereo panner.",
+}];
+
+const EQ3_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 0,
+        native_param: 0,
+        name: "low_gain",
+        label: "Low Gain",
+        unit: "dB",
+        range: "-18..+18 dB (0.5 = 0 dB)",
+        default: 0.5,
+        description: "Low-shelf boost or cut.",
+    },
+    DspParamSpec {
+        engine_param: 2,
+        native_param: 1,
+        name: "mid_gain",
+        label: "Mid Gain",
+        unit: "dB",
+        range: "-18..+18 dB (0.5 = 0 dB)",
+        default: 0.5,
+        description: "Peaking mid-band boost or cut.",
+    },
+    DspParamSpec {
+        engine_param: 1,
+        native_param: 2,
+        name: "high_gain",
+        label: "High Gain",
+        unit: "dB",
+        range: "-18..+18 dB (0.5 = 0 dB)",
+        default: 0.5,
+        description: "High-shelf boost or cut.",
+    },
+    DspParamSpec {
+        engine_param: 3,
+        native_param: 3,
+        name: "low_freq",
+        label: "Low Freq",
+        unit: "Hz",
+        range: "30..300 Hz (log, default 100 Hz)",
+        default: 0.5228787,
+        description: "Low-shelf corner frequency.",
+    },
+    DspParamSpec {
+        engine_param: 4,
+        native_param: 4,
+        name: "mid_freq",
+        label: "Mid Freq",
+        unit: "Hz",
+        range: "200..8000 Hz (log, default 1000 Hz)",
+        default: 0.436207,
+        description: "Peaking mid-band center frequency.",
+    },
+    DspParamSpec {
+        engine_param: 5,
+        native_param: 5,
+        name: "high_freq",
+        label: "High Freq",
+        unit: "Hz",
+        range: "2000..16000 Hz (log, default 8000 Hz)",
+        default: 0.6666667,
+        description: "High-shelf corner frequency.",
+    },
+    DspParamSpec {
+        engine_param: 6,
+        native_param: 6,
+        name: "mid_q",
+        label: "Mid Q",
+        unit: "Q",
+        range: "0.3..5.0 (log, default 0.707)",
+        default: 0.30464,
+        description: "Bandwidth/sharpness of the peaking mid band.",
+    },
+];
+
+const FILTER_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 0,
+        native_param: 0,
+        name: "cutoff",
+        label: "Cutoff",
+        unit: "Hz",
+        range: "20..20000 Hz (log); in DJ mode bipolar: 0.5 = open, <0.5 = HP, >0.5 = LP",
+        default: 1.0,
+        description: "Filter cutoff frequency (12 dB/oct Cytomic state-variable filter).",
+    },
+    DspParamSpec {
+        engine_param: 1,
+        native_param: 1,
+        name: "resonance",
+        label: "Resonance",
+        unit: "Q",
+        range: "Q 0.5..16 (exponential; 0 = damped, 1 = near self-oscillation)",
+        default: 0.0,
+        description: "Resonant peak at the cutoff frequency.",
+    },
+    DspParamSpec {
+        engine_param: 2,
+        native_param: 2,
+        name: "mode",
+        label: "Mode",
+        unit: "mode",
+        range: "0..0.33 = Lowpass, 0.33..0.67 = Highpass, 0.67..1.0 = DJ Combo",
+        default: 0.0,
+        description: "Filter response: Lowpass (0.0), Highpass (0.5), or bipolar DJ Combo (1.0).",
+    },
+];
+
+const LIMITER_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 0,
+        native_param: 0,
+        name: "ceiling",
+        label: "Ceiling",
+        unit: "dB",
+        range: "-12..0 dBFS (1.0 = 0 dBFS)",
+        default: 1.0,
+        description: "Maximum output peak ceiling.",
+    },
+    DspParamSpec {
+        engine_param: 1,
+        native_param: 1,
+        name: "drive",
+        label: "Drive",
+        unit: "dB",
+        range: "0..+24 dB input gain",
+        default: 0.0,
+        description: "Input gain pushing signal into the lookahead peak limiter.",
+    },
+    DspParamSpec {
+        engine_param: 2,
+        native_param: 2,
+        name: "release",
+        label: "Release",
+        unit: "ms",
+        range: "10..500 ms (log, default ~40 ms)",
+        default: 0.3543,
+        description: "Gain-reduction recovery time.",
+    },
+];
+
+const SATURATION_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 0,
+        native_param: 0,
+        name: "drive",
+        label: "Drive",
+        unit: "x",
+        range: "1x..40x exponential tanh drive (0 = clean/gentle)",
+        default: 0.0,
+        description: "Input drive into odd-symmetric tanh soft clipper.",
+    },
+    DspParamSpec {
+        engine_param: 1,
+        native_param: 1,
+        name: "mix",
+        label: "Mix",
+        unit: "%",
+        range: "0..100% dry/wet blend",
+        default: 1.0,
+        description: "Dry/wet blend between clean and saturated signal.",
+    },
+    DspParamSpec {
+        engine_param: 2,
+        native_param: 2,
+        name: "output",
+        label: "Output",
+        unit: "x",
+        range: "0..2x linear output trim (0.5 = unity)",
+        default: 0.5,
+        description: "Post-saturation output level trim.",
+    },
+];
+
+const DELAY_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 1,
+        native_param: 0,
+        name: "time",
+        label: "Time",
+        unit: "ms",
+        range: "50..2000 ms (log, default 300 ms)",
+        default: 0.4856,
+        description: "Delay time with fractional interpolation and smooth live glide.",
+    },
+    DspParamSpec {
+        engine_param: 0,
+        native_param: 1,
+        name: "feedback",
+        label: "Feedback",
+        unit: "%",
+        range: "0..95% (capped below self-oscillation)",
+        default: 0.35,
+        description: "Amount of delayed signal fed back for repeating echoes.",
+    },
+    DspParamSpec {
+        engine_param: 2,
+        native_param: 2,
+        name: "mix",
+        label: "Mix",
+        unit: "%",
+        range: "0..100% dry/wet",
+        default: 0.5,
+        description: "Balance between dry input and delayed echoes.",
+    },
+    DspParamSpec {
+        engine_param: 3,
+        native_param: 3,
+        name: "pingpong",
+        label: "Ping-Pong",
+        unit: "mode",
+        range: "<0.5 = Stereo, >=0.5 = Cross-channel Ping-Pong",
+        default: 0.0,
+        description: "Cross-feeds L/R delay lines so echoes bounce left and right.",
+    },
+    DspParamSpec {
+        engine_param: 4,
+        native_param: 4,
+        name: "damping",
+        label: "Damping",
+        unit: "Hz",
+        range: "20 kHz (0, bright) .. 500 Hz (1, dark tape/analog echoes)",
+        default: 0.0,
+        description: "Feedback lowpass filter that darkens each successive echo.",
+    },
+];
+
+const REVERB_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 1,
+        native_param: 0,
+        name: "size",
+        label: "Size",
+        unit: "%",
+        range: "0..100% (comb feedback 0.70..0.98; larger = longer tail)",
+        default: 0.5,
+        description: "Room size and decay tail length.",
+    },
+    DspParamSpec {
+        engine_param: 2,
+        native_param: 1,
+        name: "damping",
+        label: "Damping",
+        unit: "%",
+        range: "0..100% (0 = bright hall, 1 = warm/dark damped room)",
+        default: 0.5,
+        description: "High-frequency absorption inside the reverb tank.",
+    },
+    DspParamSpec {
+        engine_param: 0,
+        native_param: 2,
+        name: "mix",
+        label: "Mix",
+        unit: "%",
+        range: "0..100% dry/wet",
+        default: 0.3,
+        description: "Dry/wet reverb blend.",
+    },
+    DspParamSpec {
+        engine_param: 3,
+        native_param: 3,
+        name: "width",
+        label: "Width",
+        unit: "%",
+        range: "0% = mono wet tail, 100% = full stereo spread",
+        default: 1.0,
+        description: "Stereo width of the reverberant field.",
+    },
+];
+
+const METRONOME_PARAMS: &[DspParamSpec] = &[];
+
+const BUS_PARAMS: &[DspParamSpec] = &[DspParamSpec {
+    engine_param: 0,
+    native_param: 0,
+    name: "level",
+    label: "Level",
+    unit: "dB",
+    range: "-inf..+12 dB (0 = mute, 0.5 = 0 dB unity, 1.0 = +12 dB)",
+    default: 0.5,
+    description: "Aux bus return level into Master.",
+}];
+
+const DSP_CATALOG: &[DspNodeSpec] = &[
+    DspNodeSpec {
+        kind: "gain",
+        name: "Gain",
+        category: "Utility",
+        summary: "Stereo level control (mute to +12 dB, quadratic taper).",
+        latency_ms: 0.0,
+        params: GAIN_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "pan",
+        name: "Pan",
+        category: "Utility",
+        summary: "Constant-power stereo panner.",
+        latency_ms: 0.0,
+        params: PAN_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "eq3",
+        name: "3-Band EQ",
+        category: "EQ & Filter",
+        summary: "Low shelf + peaking mid (with sweepable freq & Q) + high shelf.",
+        latency_ms: 0.0,
+        params: EQ3_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "filter",
+        name: "Filter",
+        category: "EQ & Filter",
+        summary: "Resonant 12 dB/oct TPT state-variable filter (LP, HP, or bipolar DJ combo).",
+        latency_ms: 0.0,
+        params: FILTER_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "limiter",
+        name: "Limiter",
+        category: "Dynamics",
+        summary: "5 ms lookahead peak limiter with drive, ceiling, and release.",
+        latency_ms: 5.0,
+        params: LIMITER_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "saturation",
+        name: "Saturation",
+        category: "Drive & Amp",
+        summary: "Warm odd-symmetric tanh soft waveshaper with drive, wet/dry mix, and output trim.",
+        latency_ms: 0.0,
+        params: SATURATION_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "delay",
+        name: "Delay",
+        category: "Delay & Reverb",
+        summary: "Stereo / ping-pong delay (50..2000 ms) with feedback and analog-style damping.",
+        latency_ms: 0.0,
+        params: DELAY_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "reverb",
+        name: "Reverb",
+        category: "Delay & Reverb",
+        summary: "Freeverb-style Schroeder tank (8 combs + 4 allpasses) with size, damping, mix, width.",
+        latency_ms: 0.0,
+        params: REVERB_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "metronome",
+        name: "Metronome",
+        category: "Rhythm",
+        summary: "Transport-driven click generator (controlled by transport_play/stop and set_bpm).",
+        latency_ms: 0.0,
+        params: METRONOME_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "bus",
+        name: "Aux Bus",
+        category: "Mix & Gain",
+        summary: "Send/return aux bus summing sends before its insert chain and return level.",
+        latency_ms: 0.0,
+        params: BUS_PARAMS,
+    },
+];
+
+pub fn dsp_catalog() -> &'static [DspNodeSpec] {
+    DSP_CATALOG
+}
+
+pub fn dsp_spec(kind: &DspKind) -> &'static DspNodeSpec {
+    let idx = match kind {
+        DspKind::Gain => 0,
+        DspKind::Pan => 1,
+        DspKind::Eq3 => 2,
+        DspKind::Filter => 3,
+        DspKind::Limiter => 4,
+        DspKind::Saturation => 5,
+        DspKind::Delay => 6,
+        DspKind::Reverb => 7,
+        DspKind::Metronome => 8,
+        DspKind::Bus => 9,
+    };
+    &DSP_CATALOG[idx]
+}
+
+pub fn dsp_param_specs(kind: &DspKind) -> &'static [DspParamSpec] {
+    dsp_spec(kind).params
+}
+
+pub fn dsp_kind_from_str(s: &str) -> Option<DspKind> {
+    let clean = s.trim().to_ascii_lowercase();
+    let clean = clean.strip_prefix("builtin.").unwrap_or(&clean);
+    match clean {
+        "gain" | "level" => Some(DspKind::Gain),
+        "pan" | "panner" => Some(DspKind::Pan),
+        "eq3" | "eq" | "eq 3" | "3-band eq" => Some(DspKind::Eq3),
+        "filter" | "svf" => Some(DspKind::Filter),
+        "limiter" | "limit" => Some(DspKind::Limiter),
+        "saturation" | "sat" | "drive" => Some(DspKind::Saturation),
+        "delay" | "echo" => Some(DspKind::Delay),
+        "reverb" | "verb" => Some(DspKind::Reverb),
+        "metronome" | "metro" | "click" => Some(DspKind::Metronome),
+        "bus" | "aux" | "aux bus" => Some(DspKind::Bus),
+        _ => None,
+    }
+}
+
+/// Find a built-in DSP parameter by canonical name, label, or common musical alias.
+pub fn find_dsp_param(kind: &DspKind, query: &str) -> Option<&'static DspParamSpec> {
+    let q = query.trim().to_ascii_lowercase();
+    let specs = dsp_param_specs(kind);
+    if let Some(s) = specs
+        .iter()
+        .find(|s| s.name == q || s.label.to_ascii_lowercase() == q)
+    {
+        return Some(s);
+    }
+    let canonical = match q.as_str() {
+        "vol" | "volume" | "level" => Some(if matches!(kind, DspKind::Bus) { "level" } else { "gain" }),
+        "wet" | "dry_wet" | "dry/wet" | "blend" => Some("mix"),
+        "fb" | "fdbk" | "repeats" | "regen" => Some("feedback"),
+        "ping_pong" | "ping-pong" | "pp" => Some("pingpong"),
+        "damp" | "tone" => Some("damping"),
+        "room" | "decay" | "tail" => Some("size"),
+        "stereo" | "spread" => Some("width"),
+        "freq" | "frequency" | "cut" => Some("cutoff"),
+        "reso" | "res" | "q" => Some("resonance"),
+        "type" => Some("mode"),
+        "ceil" | "threshold" => Some("ceiling"),
+        "rel" => Some("release"),
+        "trim" | "out" | "output_trim" => Some("output"),
+        "low" | "bass" => Some("low_gain"),
+        "mid" | "mids" => Some("mid_gain"),
+        "high" | "treble" | "air" => Some("high_gain"),
+        _ => None,
+    };
+    if let Some(c) = canonical {
+        if let Some(s) = specs.iter().find(|s| s.name == c) {
+            return Some(s);
+        }
+    }
+    specs
+        .iter()
+        .find(|s| s.name.contains(&q) || s.label.to_ascii_lowercase().contains(&q))
+}
+
+fn fmt_hz(hz: f32) -> String {
+    if hz >= 1000.0 {
+        format!("{:.2} kHz", hz / 1000.0)
+    } else {
+        format!("{:.0} Hz", hz)
+    }
+}
+
+/// Format a normalized 0..1 DSP parameter value into human-readable musical units.
+pub fn format_dsp_value(kind: &DspKind, native_param: u32, norm: f32) -> String {
+    format_dsp_value_with_mode(kind, native_param, norm, 0.0)
+}
+
+/// Like [`format_dsp_value`], passing `mode_norm` for `Filter` so DJ-mode cutoff formats accurately.
+pub fn format_dsp_value_with_mode(
+    kind: &DspKind,
+    native_param: u32,
+    norm: f32,
+    mode_norm: f32,
+) -> String {
+    let v = clamp01(norm);
+    match (kind, native_param) {
+        (DspKind::Gain | DspKind::Bus, 0) => {
+            let amp = (2.0 * v) * (2.0 * v);
+            if amp < 1e-6 {
+                "-inf dB (mute)".into()
+            } else {
+                format!("{:+.1} dB ({:.2}x)", 20.0 * amp.log10(), amp)
+            }
+        }
+        (DspKind::Pan, 0) => {
+            if (v - 0.5).abs() < 0.02 {
+                "Center".into()
+            } else if v < 0.5 {
+                format!("{:.0}% L", (0.5 - v) * 200.0)
+            } else {
+                format!("{:.0}% R", (v - 0.5) * 200.0)
+            }
+        }
+        (DspKind::Eq3, 0 | 1 | 2) => format!("{:+.1} dB", -18.0 + 36.0 * v),
+        (DspKind::Eq3, 3) => fmt_hz(log_map(v, 30.0, 300.0)),
+        (DspKind::Eq3, 4) => fmt_hz(log_map(v, 200.0, 8000.0)),
+        (DspKind::Eq3, 5) => fmt_hz(log_map(v, 2000.0, 16000.0)),
+        (DspKind::Eq3, 6) => format!("Q {:.2}", log_map(v, 0.3, 5.0)),
+        (DspKind::Filter, 0) => {
+            if mode_norm >= 2.0 / 3.0 {
+                if (v - 0.5).abs() < 0.02 {
+                    "Open (DJ center)".into()
+                } else if v < 0.5 {
+                    format!("HP {}", fmt_hz(log_map(1.0 - 2.0 * v, 20.0, 20000.0)))
+                } else {
+                    format!("LP {}", fmt_hz(log_map(2.0 * v - 1.0, 20000.0, 20.0)))
+                }
+            } else {
+                fmt_hz(log_map(v, 20.0, 20000.0))
+            }
+        }
+        (DspKind::Filter, 1) => format!("Q {:.2}", 0.5 * 32.0f32.powf(v)),
+        (DspKind::Filter, 2) => {
+            if v < 1.0 / 3.0 {
+                "Lowpass".into()
+            } else if v < 2.0 / 3.0 {
+                "Highpass".into()
+            } else {
+                "DJ Combo".into()
+            }
+        }
+        (DspKind::Limiter, 0) => format!("{:.1} dBFS", -12.0 * (1.0 - v)),
+        (DspKind::Limiter, 1) => format!("+{:.1} dB", 24.0 * v),
+        (DspKind::Limiter, 2) => format!("{:.0} ms", log_map(v, 10.0, 500.0)),
+        (DspKind::Saturation, 0) => format!("{:.1}x", 40.0f32.powf(v)),
+        (DspKind::Saturation, 1) => format!("{:.0}%", v * 100.0),
+        (DspKind::Saturation, 2) => format!("{:.2}x", 2.0 * v),
+        (DspKind::Delay, 0) => format!("{:.0} ms", log_map(v, DELAY_MIN_S * 1000.0, DELAY_MAX_S * 1000.0)),
+        (DspKind::Delay, 1) => format!("{:.0}%", v * 95.0),
+        (DspKind::Delay, 2) => format!("{:.0}%", v * 100.0),
+        (DspKind::Delay, 3) => if v >= 0.5 { "Ping-Pong" } else { "Stereo" }.into(),
+        (DspKind::Delay, 4) => format!("{} ({:.0}%)", fmt_hz(log_map(v, 20000.0, 500.0)), v * 100.0),
+        (DspKind::Reverb, 0) => format!("{:.0}% (fb {:.2})", v * 100.0, 0.70 + 0.28 * v),
+        (DspKind::Reverb, 1) => format!("{:.0}%", v * 100.0),
+        (DspKind::Reverb, 2) => format!("{:.0}%", v * 100.0),
+        (DspKind::Reverb, 3) => format!("{:.0}%", v * 100.0),
+        _ => format!("{v:.3}"),
+    }
+}
+
+/// Parse a musical text string (e.g. `"300 ms"`, `"800 Hz"`, `"+4 dB"`, `"ping-pong"`,
+/// `"highpass"`, `"40%"`, or plain `"0.5"`) into a normalized 0..1 DSP parameter value.
+pub fn parse_dsp_text_value(kind: &DspKind, native_param: u32, text: &str) -> Option<f32> {
+    let raw = text.trim();
+    let lower = raw.to_ascii_lowercase();
+    match (kind, native_param) {
+        (DspKind::Filter, 2) => {
+            if lower.contains("low") || lower == "lp" || lower == "lpf" {
+                return Some(0.0);
+            }
+            if lower.contains("high") || lower == "hp" || lower == "hpf" {
+                return Some(0.5);
+            }
+            if lower.contains("dj") || lower.contains("combo") || lower.contains("bipolar") {
+                return Some(1.0);
+            }
+        }
+        (DspKind::Delay, 3) => {
+            if lower.contains("ping") || lower == "on" || lower == "true" || lower == "yes" {
+                return Some(1.0);
+            }
+            if lower.contains("stereo") || lower == "off" || lower == "false" || lower == "no" {
+                return Some(0.0);
+            }
+        }
+        (DspKind::Pan, 0) => {
+            if lower == "left" || lower == "l" || lower == "hard left" {
+                return Some(0.0);
+            }
+            if lower == "center" || lower == "centre" || lower == "c" || lower == "mid" {
+                return Some(0.5);
+            }
+            if lower == "right" || lower == "r" || lower == "hard right" {
+                return Some(1.0);
+            }
+        }
+        (DspKind::Gain | DspKind::Bus, 0) => {
+            if lower == "mute" || lower == "off" {
+                return Some(0.0);
+            }
+            if lower == "unity" {
+                return Some(0.5);
+            }
+        }
+        _ => {}
+    }
+
+    let mut num_end = 0;
+    for (i, ch) in lower.char_indices() {
+        if ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-') {
+            num_end = i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if num_end == 0 {
+        return None;
+    }
+    let val: f32 = lower[..num_end].parse().ok()?;
+    let unit = lower[num_end..].trim();
+
+    if unit == "%" {
+        return Some(match (kind, native_param) {
+            (DspKind::Delay, 1) => (val / 95.0).clamp(0.0, 1.0),
+            _ => (val / 100.0).clamp(0.0, 1.0),
+        });
+    }
+    if unit == "khz" || unit == "hz" {
+        let hz = if unit == "khz" { val * 1000.0 } else { val };
+        return match (kind, native_param) {
+            (DspKind::Eq3, 3) => Some(log_norm(hz, 30.0, 300.0)),
+            (DspKind::Eq3, 4) => Some(log_norm(hz, 200.0, 8000.0)),
+            (DspKind::Eq3, 5) => Some(log_norm(hz, 2000.0, 16000.0)),
+            (DspKind::Filter, 0) => Some(log_norm(hz, 20.0, 20000.0)),
+            (DspKind::Delay, 4) => Some(1.0 - log_norm(hz, 500.0, 20000.0)),
+            _ => None,
+        };
+    }
+    if unit == "ms" || unit == "s" || unit == "sec" {
+        let ms = if unit == "ms" { val } else { val * 1000.0 };
+        return match (kind, native_param) {
+            (DspKind::Delay, 0) => Some(log_norm(ms, DELAY_MIN_S * 1000.0, DELAY_MAX_S * 1000.0)),
+            (DspKind::Limiter, 2) => Some(log_norm(ms, 10.0, 500.0)),
+            _ => None,
+        };
+    }
+    if unit == "db" || unit == "dbfs" {
+        return match (kind, native_param) {
+            (DspKind::Gain | DspKind::Bus, 0) => {
+                let amp = 10.0f32.powf(val / 20.0);
+                Some((amp.sqrt() * 0.5).clamp(0.0, 1.0))
+            }
+            (DspKind::Eq3, 0 | 1 | 2) => Some(((val + 18.0) / 36.0).clamp(0.0, 1.0)),
+            (DspKind::Limiter, 0) => Some((1.0 + val / 12.0).clamp(0.0, 1.0)),
+            (DspKind::Limiter, 1) => Some((val / 24.0).clamp(0.0, 1.0)),
+            _ => None,
+        };
+    }
+    if unit == "x" {
+        return match (kind, native_param) {
+            (DspKind::Saturation, 0) => Some((val.max(1.0).ln() / 40.0f32.ln()).clamp(0.0, 1.0)),
+            (DspKind::Saturation, 2) => Some((val / 2.0).clamp(0.0, 1.0)),
+            _ => None,
+        };
+    }
+    if unit == "q" {
+        return match (kind, native_param) {
+            (DspKind::Eq3, 6) => Some(log_norm(val, 0.3, 5.0)),
+            (DspKind::Filter, 1) => Some(((val / 0.5).max(1.0).ln() / 32.0f32.ln()).clamp(0.0, 1.0)),
+            _ => None,
+        };
+    }
+    if unit.is_empty() {
+        return Some(clamp01(val));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1735,5 +2442,29 @@ pub(crate) mod tests {
         assert_eq!(after, before, "process/set_param allocated {} times on the audio thread", after - before);
         // Keep results alive so nothing is optimized away.
         assert!(scratch.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn dsp_catalog_and_musical_text_roundtrip() {
+        assert_eq!(dsp_catalog().len(), 10);
+        // Delay 50..2000 ms matches DELAY_MIN_S..DELAY_MAX_S.
+        let t = find_dsp_param(&DspKind::Delay, "time").expect("delay time");
+        assert_eq!(t.engine_param, 1);
+        assert_eq!(t.native_param, 0);
+        let norm_300 = parse_dsp_text_value(&DspKind::Delay, t.native_param, "300 ms").unwrap();
+        assert_eq!(format_dsp_value(&DspKind::Delay, t.native_param, norm_300), "300 ms");
+        assert_eq!(parse_dsp_text_value(&DspKind::Delay, 3, "ping-pong"), Some(1.0));
+        assert_eq!(format_dsp_value(&DspKind::Delay, 3, 1.0), "Ping-Pong");
+
+        // Filter mode + DJ bipolar formatting.
+        assert_eq!(parse_dsp_text_value(&DspKind::Filter, 2, "dj combo"), Some(1.0));
+        assert_eq!(format_dsp_value_with_mode(&DspKind::Filter, 0, 0.5, 1.0), "Open (DJ center)");
+        assert!(format_dsp_value_with_mode(&DspKind::Filter, 0, 0.25, 1.0).starts_with("HP "));
+
+        // EQ3 dB & Hz.
+        let low = find_dsp_param(&DspKind::Eq3, "bass").expect("bass alias -> low_gain");
+        assert_eq!(low.name, "low_gain");
+        let plus_6 = parse_dsp_text_value(&DspKind::Eq3, low.native_param, "+6 dB").unwrap();
+        assert_eq!(format_dsp_value(&DspKind::Eq3, low.native_param, plus_6), "+6.0 dB");
     }
 }

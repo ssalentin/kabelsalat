@@ -1673,8 +1673,8 @@ mod tests {
                 t
             } },
             Command::SetShowParts { parts: crate::show::ShowParts::new(vec![
-                crate::show::ShowPart { song: 0, skip: false, zones: [RigZone::OPEN; 8] },
-                crate::show::ShowPart { song: 2, skip: true, zones: [RigZone { live: false, key_hi: 59, transpose: 12, ..RigZone::OPEN }; 8] },
+                crate::show::ShowPart { song: 0, skip: false, zones: [RigZone::OPEN; MAX_RIGS] },
+                crate::show::ShowPart { song: 2, skip: true, zones: [RigZone { live: false, key_hi: 59, transpose: 12, ..RigZone::OPEN }; MAX_RIGS] },
             ]) },
             Command::SetShowPart { part: Some(1) },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },

@@ -8484,7 +8484,7 @@ mod tests {
         let mut controls = crate::show::NO_SHOW_CONTROLS;
         controls[0] = Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action: ShowAction::NextPart });
         let part = |a: RigZone, b: RigZone| {
-            let mut z = [RigZone::OPEN; 8];
+            let mut z = [RigZone::OPEN; crate::control::MAX_RIGS];
             z[0] = a;
             z[1] = b;
             z

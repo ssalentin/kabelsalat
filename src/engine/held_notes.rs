@@ -470,7 +470,7 @@ fn show_commands() -> [Command; 2] {
     controls[0] = control(NEXT_CC, ShowAction::NextPart);
     controls[1] = control(PREV_CC, ShowAction::PrevPart);
     let parts = SONGS.iter().enumerate().map(|(song, rigs)| {
-        let mut zones = [RigZone::OPEN; 8];
+        let mut zones = [RigZone::OPEN; crate::control::MAX_RIGS];
         zones[..2].copy_from_slice(rigs);
         crate::show::ShowPart { song, skip: false, zones }
     });

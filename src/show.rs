@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::control::{Command, RigZone};
+use crate::control::{Command, RigZone, MAX_RIGS};
 use crate::matrix::SourceId;
 
 /// Slots in the engine's table of show controls.
@@ -64,7 +64,7 @@ pub struct ShowPart {
     /// Its song's set is skipped: a step from another song passes over it.
     pub skip: bool,
     /// What every rig takes in this part, levels applied (`Setlist::zones_of`).
-    pub zones: [RigZone; 8],
+    pub zones: [RigZone; MAX_RIGS],
 }
 
 /// Every setlist part in setlist order (`Command::SetShowParts`). Shared,
@@ -99,7 +99,7 @@ pub enum Take {
     /// A show control took it; nothing else happens.
     Consumed,
     /// A show control took it and the setlist moved to a part with these zones.
-    Part([RigZone; 8]),
+    Part([RigZone; MAX_RIGS]),
 }
 
 /// The engine's show state. It neither allocates nor frees: a replaced part
@@ -250,15 +250,15 @@ mod tests {
 
     const OFF: RigZone = RigZone { live: false, ..RigZone::OPEN };
 
-    fn part(a: RigZone, b: RigZone) -> [RigZone; 8] {
-        let mut z = [RigZone::OPEN; 8];
+    fn part(a: RigZone, b: RigZone) -> [RigZone; MAX_RIGS] {
+        let mut z = [RigZone::OPEN; MAX_RIGS];
         z[0] = a;
         z[1] = b;
         z
     }
 
     /// Each zone table as a one-part song.
-    fn songs(zones: &[[RigZone; 8]]) -> ShowParts {
+    fn songs(zones: &[[RigZone; MAX_RIGS]]) -> ShowParts {
         ShowParts::new(zones.iter().enumerate().map(|(song, &zones)| ShowPart { song, skip: false, zones }).collect())
     }
 

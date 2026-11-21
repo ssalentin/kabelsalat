@@ -1770,4 +1770,10 @@ Learned so far (2026-11-15, UI polish pass):
     bitmasks) drops muted CCs before `HwDirect::send_cc` and `HwQueues::ccs`
     (`chattering_cc_is_detected_and_skipped_by_knob_and_show_learn`,
     `ignored_cc_is_dropped_at_hw_midi_in_and_synced_by_port_key`).
-
+207. **Check a catalog plugin's upstream installer for external preset/data
+    folders:** `unsampled-piano` installed only `Unsampled Piano.clap` with
+    `data: None`, leaving its editor's preset menu empty because upstream
+    reads `$XDG_DATA_HOME/unsampled-piano/presets` (copied by its own
+    `install.sh`). When a catalog entry's binary reads presets/data from
+    disk, set `CatalogEntry::data` (`RepoData`) so both release and source
+    routes install them (`unsampled_piano_is_a_clap_instrument_with_release_and_source_routes`).

@@ -306,6 +306,13 @@ Sends are saved with the session.
 <p align="center"><img src="docs/shots/sends.png" width="85%" alt="The mixer with an aux bus called Verb carrying a reverb, and SENDS rows under the rig buses and source strips that feed it"/></p>
 
 ### Mix the other apps and pick your sound card
+Kabelsalat creates a native **PipeWire** audio node (`kabelsalat`) out of the
+box — no `pipewire-alsa` bridge required — and you can switch audio backends
+live under **Settings → Audio** (or with `KABELSALAT_AUDIO_BACKEND` /
+`set_audio_backend`) between **Auto**, **PipeWire**, **JACK (`pipewire-jack`)**
+(registers `Kabelsalat:out_1` and `out_2` for `qpwgraph` / `Helvum` / `qjackctl`),
+and **ALSA** (with direct ALSA PCM device selection).
+
 The backing track in your browser sits in the same mixer. Under **System
 audio** every other app that is playing gets its own strip, named after the
 app and what it plays, with a live meter, a volume fader and a mute button, so
@@ -317,8 +324,8 @@ cards: pick your audio interface instead of the laptop speakers and the sound
 moves there at once, without a dropout. The choice is remembered for the next
 start, and **System default** hands the sound back to the system's output. The
 assistant and MCP agents do the same (`list_app_streams`, `set_app_stream`,
-`list_audio_outputs`, `set_audio_output`). This needs PipeWire with its Pulse
-layer (`pactl`, `parec`).
+`list_audio_outputs`, `set_audio_output`, `set_audio_backend`). System-audio
+strips and live sink moves use PipeWire's Pulse layer (`pactl`, `parec`).
 
 <p align="center"><img src="docs/shots/system-audio.png" width="85%" alt="The mixer with a System audio section: a Firefox strip turned down and a muted Spotify strip, each with a meter, beside Master out with the MOTU M2 chosen as the output"/></p>
 

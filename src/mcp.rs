@@ -585,8 +585,15 @@ struct SetAudioInArgs {
 /// Arguments for `set_audio_output`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetAudioOutputArgs {
-    /// PipeWire sink name from list_audio_outputs; omit or empty = system default.
+    /// Output device name from list_audio_outputs; omit or empty = system default.
     output: Option<String>,
+}
+
+/// Arguments for `set_audio_backend`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetAudioBackendArgs {
+    /// Audio backend: "auto", "pipewire", "jack" (pipewire-jack), or "alsa".
+    backend: String,
 }
 
 /// Arguments for `set_buffer_size`.
@@ -2713,14 +2720,19 @@ impl McpServer {
         }))
     }
 
-    #[tool(name = "list_audio_outputs", description = "List the sound cards kabelsalat can play to (PipeWire sinks), the one it plays to now and the user's choice. Needs the running app (kabelsalat mcp --attach).")]
+    #[tool(name = "list_audio_outputs", description = "List the audio outputs kabelsalat can play to (PipeWire sinks or ALSA PCMs), the active audio backend (PipeWire, JACK, or ALSA), the current output and the user's choice. Needs the running app (kabelsalat mcp --attach).")]
     fn list_audio_outputs(&self) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool("list_audio_outputs", json!({}))
     }
 
-    #[tool(name = "set_audio_output", description = "Choose the sound card kabelsalat plays to (name from list_audio_outputs; omit/empty = system default). Moves the live stream, remembered across restarts. Needs the running app.")]
+    #[tool(name = "set_audio_output", description = "Choose the sound card kabelsalat plays to (name from list_audio_outputs; omit/empty = system default). Remembered across restarts. Needs the running app.")]
     fn set_audio_output(&self, Parameters(args): Parameters<SetAudioOutputArgs>) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool("set_audio_output", json!({"output": args.output}))
+    }
+
+    #[tool(name = "set_audio_backend", description = "Switch kabelsalat's audio output backend live: 'auto', 'pipewire' (native PipeWire node), 'jack' (JACK / pipewire-jack), or 'alsa'. Remembered across restarts. Needs the running app.")]
+    fn set_audio_backend(&self, Parameters(args): Parameters<SetAudioBackendArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("set_audio_backend", json!({"backend": args.backend}))
     }
 
     #[tool(name = "set_buffer_size", description = "Change the audio output buffer size in frames (64, 128, 256, 512, 1024, or 2048). Smaller reduces latency; larger gives more headroom against dropouts (xruns). Reopens the audio stream live and is remembered across restarts. Needs the running app.")]

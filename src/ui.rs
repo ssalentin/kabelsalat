@@ -7783,6 +7783,8 @@ impl DemoApp {
         s.set_bus_outs(self.bus_outs.clone());
         s.setlist = self.setlist.clone();
         s.setlist.prune_to_graph(&s.graph);
+        let bindings = self.show_bindings();
+        s.setlist.levels.bindings.retain(|p| bindings.iter().any(|(b, _)| *b == p.of));
         Ok(s)
     }
 

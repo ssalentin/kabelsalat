@@ -461,6 +461,9 @@ mod tests {
         let bus = &v["levels"]["buses"][0];
         assert_eq!((bus["level"].as_str(), bus["set"].as_str()), (Some("set"), Some("Encore")), "{v}");
         assert_eq!(v["levels"]["bindings"][0]["level"], "show");
+        // A binding that is cleared takes its pin with it at the next save.
+        back.exec_tool("clear_cc_map", &serde_json::json!({"node": piano, "source": "hw:0", "cc": 11}));
+        assert!(back.capture_session("Levels").unwrap().setlist.levels.bindings.is_empty());
     }
 
     fn frame_texts(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<String> {

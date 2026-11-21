@@ -135,7 +135,17 @@ away without a MIDI keyboard (`play_demo` / `stop_demo` for agents).
 
 ### Play a setlist without a gap
 Press **F12** (or click **Setlist**) to organize a gig into songs and parts
-(Verse, Chorus, Solo) over the loaded rigs. Every rig stays loaded; each part
+(Verse, Chorus, Solo) over the loaded rigs. By default every rig stays loaded;
+for long gigs on small machines (like a Raspberry Pi), turn on **Load ahead**
+on the setlist to keep only the current song and the next few playable songs
+(plus show-level rigs and active set-level rigs) hosted in memory. Upcoming
+songs load in the background on dedicated CLAP and LV2 loader threads while you
+play, outgoing rigs stay hosted until held notes and tails finish ringing out,
+and the song list shows which songs are **Ready**, **Loading**, or **Unloaded**.
+Jumping directly to an unloaded song announces that it is loading and loads it
+in the background without blocking the audio thread (`set_setlist_window` for
+agents and MCP; `kabelsalat setlist-window-test` measures memory scaling and
+gapless in-order switching with real Surge XT). Each part
 says which rigs take new notes, with per-rig key range, transpose, level, pan,
 effect-chain bypasses and stored knob values (including pinned plugin knobs),
 and each song can set its own tempo and time signature.

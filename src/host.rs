@@ -58,6 +58,10 @@ use crate::main_controls::{self, Candidate, MainControls, RemotePage};
 use crate::plugin_window::PluginWindow;
 use crate::transport::Transport;
 
+mod loader;
+pub use loader::{ClapLoader, ClapLoaderResp, HostedClapMain};
+pub(crate) use loader::trim_heap;
+
 /// Frames per processing block. Small enough for live latency, big enough for Surge.
 const BLOCK: usize = 256;
 /// Upper bound on output ports (Surge XT: main + Scene A + Scene B = 3).
@@ -2817,8 +2821,8 @@ fn replace_xml_attr(xml: &str, attr: &str, value: &str) -> Option<String> {
     Some(out)
 }
 
-/// Load voice `program` (0..32) of a DX7 cartridge into a Dexed CLAP instance.
-pub fn load_dexed_voice(main: &mut ClapVoiceMain, syx_path: &std::path::Path, program: usize) -> Result<()> {
+/// Patch a saved Dexed CLAP state blob with voice `program` (0..32) of a DX7 cartridge.
+fn patch_dexed_voice_state(state: &[u8], syx_path: &std::path::Path, program: usize) -> Result<Vec<u8>> {
     let syx = std::fs::read(syx_path)?;
     anyhow::ensure!(
         syx.len() == 4104 && syx.starts_with(&[0xF0, 0x43, 0x00, 0x09, 0x20, 0x00]),
@@ -2831,7 +2835,6 @@ pub fn load_dexed_voice(main: &mut ClapVoiceMain, syx_path: &std::path::Path, pr
     let sysex_b64 = juce_b64_encode(&syx);
     let prog_b64 = juce_b64_encode(&unpacked);
 
-    let state = main.save_state()?;
     let xml_start = state
         .windows(5)
         .position(|w| w == b"<?xml")
@@ -2850,6 +2853,20 @@ pub fn load_dexed_voice(main: &mut ClapVoiceMain, syx_path: &std::path::Path, pr
     let mut new_state = Vec::with_capacity(prefix.len() + xml.len());
     new_state.extend_from_slice(prefix);
     new_state.extend_from_slice(xml.as_bytes());
+    Ok(new_state)
+}
+
+/// Load voice `program` (0..32) of a DX7 cartridge into a Dexed CLAP instance.
+pub fn load_dexed_voice(main: &mut ClapVoiceMain, syx_path: &std::path::Path, program: usize) -> Result<()> {
+    let state = main.save_state()?;
+    let new_state = patch_dexed_voice_state(&state, syx_path, program)?;
+    main.load_state(&new_state)
+}
+
+/// Load voice `program` (0..32) of a DX7 cartridge into a local or background-hosted Dexed CLAP instance.
+pub fn load_dexed_voice_hosted(main: &mut HostedClapMain, syx_path: &std::path::Path, program: usize) -> Result<()> {
+    let state = main.save_state()?;
+    let new_state = patch_dexed_voice_state(&state, syx_path, program)?;
     main.load_state(&new_state)
 }
 

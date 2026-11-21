@@ -38,7 +38,8 @@ use crate::engine::{
     P_AUDIO_IN_MONITOR, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM,
 };
 use crate::host::{
-    list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, ParamDesc, VoiceController,
+    list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, HostedClapMain, ParamDesc,
+    VoiceController,
 };
 use clack_host::prelude::ClapId;
 use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
@@ -180,6 +181,7 @@ mod show_controls;
 mod show_mode;
 mod preshow;
 mod shared;
+mod window_load;
 use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -913,7 +915,10 @@ fn set_main_knobs(
 
 /// Move a unit's CLAP knobs to the values the plugin reports (a loaded
 /// patch, an agent's edit, a stepped parameter rounding the knob's value).
-fn follow_plugin_values(u: &mut Unit, main: &mut ClapVoiceMain, now: f32, reduce_motion: bool) {
+fn follow_plugin_values(u: &mut Unit, main: &mut HostedClapMain, now: f32, reduce_motion: bool) {
+    if main.is_bg_busy() {
+        return;
+    }
     for k in &mut u.knobs {
         let Some(pin) = k.clap else { continue };
         // An unsent change is the UI's own: publish_pins sends it this frame.
@@ -3194,7 +3199,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo", "set_show_mode", "panic",
     "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check",
-    "set_level", "set_setlist_set",
+    "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
     "record_save_last",
 ];
@@ -4009,8 +4014,9 @@ struct DemoApp {
     /// params) so `list_params`, save/load, and undo preserve them faithfully.
     node_params: std::collections::HashMap<(u32, u32), f32>,
     surge_status: String,
-    // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
-    _surge_main: Vec<ClapVoiceMain>,
+    // !Send: CLAP main-thread objects (or proxies to kabelsalat-clap-loader);
+    // DemoApp never leaves the UI thread.
+    _surge_main: Vec<HostedClapMain>,
     /// RT-safe parameter setters, one per hosted voice. Grabbed
     /// before the voices move into the engine; used by the native editor.
     surge_controllers: Vec<VoiceController>,
@@ -4165,6 +4171,8 @@ struct DemoApp {
     /// node id. The engine builds new LV2 instances on every graph load, so
     /// sessions, rig edits and undo carry it and restore it.
     lv2_states: HashMap<u32, Vec<u8>>,
+    /// Per-setlist windowed plugin loading state (#207).
+    setlist_window: window_load::SetlistWindowState,
     lv2_editor_request: Option<(u32, String, String)>,
     editor_status: String,
     /// Why the open editor's plugin window did not open.
@@ -4598,6 +4606,7 @@ impl DemoApp {
             lv2_editor_presets: Vec::new(),
             lv2_preset_name: None,
             lv2_states: HashMap::new(),
+            setlist_window: window_load::SetlistWindowState::default(),
             lv2_editor_request: None,
             editor_status: String::new(),
             plugin_window_error: None,
@@ -5594,7 +5603,7 @@ impl DemoApp {
     ) {
         self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
         self.clap_voice_ids = voice_ids;
-        self._surge_main = mains;
+        self._surge_main = mains.into_iter().map(HostedClapMain::from).collect();
         self.surge_controllers = controllers;
         self.sample_rate = sample_rate;
         self.voice_tx = Some(voice_tx);
@@ -6060,6 +6069,11 @@ impl DemoApp {
         if g.demo_rev != self.last_demo_rev {
             self.last_demo_rev = g.demo_rev;
             self.demo_playing = g.demo;
+        }
+        if g.lv2_rev != self.setlist_window.last_lv2_rev {
+            self.setlist_window.last_lv2_rev = g.lv2_rev;
+            self.setlist_window.lv2_loaded.clone_from(&g.lv2_loaded);
+            self.setlist_window.lv2_loading.clone_from(&g.lv2_loading);
         }
         let graph_rev_changed = g.rev != self.last_graph_rev;
         // The engine's voice binding. While it has not published the load
@@ -6707,6 +6721,10 @@ impl DemoApp {
             "set_setlist_set" => match args.get("name").and_then(|v| v.as_str()) {
                 Some(n) if !n.trim().is_empty() => format!("Set · {n}"),
                 _ => "Update set".into(),
+            },
+            "set_setlist_window" => match args.get("load_ahead").and_then(|v| v.as_u64()) {
+                Some(n) if n > 0 => format!("Setlist window (+{n} songs)"),
+                _ => "Setlist window off (all loaded)".into(),
             },
             "get_midi_clock" => "MIDI clock status".into(),
             "set_midi_clock" => "Set MIDI clock".into(),
@@ -7592,6 +7610,9 @@ impl DemoApp {
                     }
                 }
             }
+            if plugin_state.is_none() {
+                plugin_state = self.setlist_window.clap_states.get(&node_id).cloned();
+            }
         } else if let Some(blob) = self.lv2_states.get(&node_id) {
             if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| &n.kind) {
                 plugin_state = Some((uri.as_str().to_string(), blob.clone()));
@@ -7907,12 +7928,20 @@ impl DemoApp {
         let mut rig = 0;
         for u in &self.units {
             if matches!(u.node_kind, UnitKind::Clap) {
+                let mut saved = false;
                 if let Some(idx) = self.clap_pool_idx(rig) {
                     let pid = self.clap_plugin_ids.get(idx).cloned().unwrap_or_else(|| SURGE_ID.to_string());
                     if let Some(m) = self._surge_main.get_mut(idx) {
                         if let Ok(blob) = m.save_state() {
+                            self.setlist_window.clap_states.insert(u.node_id, (pid.clone(), blob.clone()));
                             s.set_plugin_state(u.node_id, &pid, blob);
+                            saved = true;
                         }
+                    }
+                }
+                if !saved {
+                    if let Some((pid, blob)) = self.setlist_window.clap_states.get(&u.node_id) {
+                        s.set_plugin_state(u.node_id, pid, blob.clone());
                     }
                 }
                 rig += 1;
@@ -8011,6 +8040,7 @@ impl DemoApp {
     /// Free the hosted voices the engine handed back (plugin main thread:
     /// stop, deactivate, drop) and the tables it grew out of.
     fn free_returned_voices(&mut self) {
+        let mut freed = false;
         while let Some(rx) = self.voice_retire_rx.as_mut() {
             let Ok(back) = rx.pop() else { break };
             let VoiceBack::Voice(slot) = back else { continue };
@@ -8019,10 +8049,23 @@ impl DemoApp {
             if let Some(pos) = self.clap_voice_ids.iter().position(|&v| v == id) {
                 let main = self._surge_main.remove(pos);
                 self.surge_controllers.remove(pos);
-                self.clap_plugin_ids.remove(pos);
+                let pid = self.clap_plugin_ids.remove(pos);
                 self.clap_voice_ids.remove(pos);
-                main.retire(slot.into_voice());
+                let node = self.setlist_window.clap_loaded_nodes.remove(&id).unwrap_or(u32::MAX);
+                if main.is_bg() {
+                    if let Some(loader) = &self.setlist_window.loader {
+                        loader.retire(id, node, pid, slot, node != u32::MAX);
+                    } else {
+                        main.retire(slot.into_voice());
+                    }
+                } else {
+                    main.retire(slot.into_voice());
+                }
+                freed = true;
             }
+        }
+        if freed {
+            self.rebuild_clap_slot_map();
         }
         // Retired file-player buffers: dropping them here is the whole
         // point (the audio thread only moves the Arc into the ring).
@@ -8058,7 +8101,7 @@ impl DemoApp {
             self.engine_voice_cap = cap;
         }
         let _ = tx.push(VoiceMsg::Add(slot));
-        self._surge_main.push(main);
+        self._surge_main.push(HostedClapMain::from(main));
         self.surge_controllers.push(ctrl);
         self.clap_plugin_ids.push(plugin_id.to_string());
         self.clap_voice_ids.push(id);
@@ -8072,6 +8115,10 @@ impl DemoApp {
     /// binding of a graph this frame loads into the engine: known before the
     /// engine answers, because it binds by `control::bind_voices` too.
     fn sync_clap_slots(&mut self, graph: &Graph, published: Option<&[(u64, u32)]>) {
+        if self.setlist.window_enabled() {
+            self.sync_clap_slots_windowed(graph, published);
+            return;
+        }
         self.free_returned_voices();
         let nodes: Vec<(u32, String)> = graph.nodes.iter()
             .filter_map(|n| match &n.kind {
@@ -8102,6 +8149,9 @@ impl DemoApp {
         }
         if self.voice_tx.is_some() {
             for (node, pid) in missing {
+                if self.setlist_window.clap_loading.contains(&node) {
+                    continue;
+                }
                 match self.host_voice(&pid) {
                     Ok(_) => plays.push(Some(node)),
                     Err(e) => self.plugin_msg = e,
@@ -8113,6 +8163,11 @@ impl DemoApp {
                 if let Some(tx) = self.voice_tx.as_mut() {
                     if tx.push(VoiceMsg::Retire(id)).is_ok() { self.clap_leaving.push(id); }
                 }
+            }
+        }
+        for (i, node) in plays.iter().enumerate() {
+            if let (Some(&vid), Some(n)) = (self.clap_voice_ids.get(i), *node) {
+                self.setlist_window.clap_loaded_nodes.insert(vid, n);
             }
         }
         self.clap_slot_map = self.clap_rigs().into_iter()
@@ -8133,6 +8188,12 @@ impl DemoApp {
         self.session_rig_devices = s.rig_devices.clone();
         self.build_rack(&s.graph, s.params());
         self.begin_load_fade();
+        // Restore the setlist and prime any per-setlist load window BEFORE
+        // hosting plugins or loading the graph so opening a long windowed gig
+        // never instantiates out-of-window plugins (#207).
+        self.setlist = s.setlist.clone();
+        self.setlist.prune_to_graph(&s.graph);
+        self.prepare_setlist_window_for_session(s);
         self.sync_clap_slots(&s.graph, None);
         // Restore plugin state into the remapped voices (rig order).
         let clap_nodes: Vec<u32> = self.units.iter()
@@ -8189,7 +8250,20 @@ impl DemoApp {
             NodeKind::Lv2 { uri } => s.plugin_state(n.id).filter(|st| st.plugin_id == uri.as_str()).map(|st| (n.id, st.data.clone())),
             _ => None,
         }).collect();
+        let hosted_mask = self.setlist.window_rigs_mask(&s.graph);
         for (node, state) in restored {
+            let in_window = hosted_mask.map_or(true, |mask| {
+                s.graph.node(node).is_some_and(|n| {
+                    ((n.rig as usize) < Self::MAX_RIGS && (mask & (1u32 << n.rig)) != 0)
+                        || s.graph.after_bus(node)
+                        || crate::setlist::is_master_insert(&s.graph, node)
+                })
+            });
+            if !in_window {
+                // Keep cached; restored automatically when this rig enters the window.
+                self.lv2_states.insert(node, state);
+                continue;
+            }
             if let Err(e) = self.restore_lv2_state(node, state.clone()) {
                 // Kept anyway: the next save or rig edit restores it.
                 self.lv2_states.insert(node, state);
@@ -8221,9 +8295,7 @@ impl DemoApp {
         if let Some(sig) = s.time_sig {
             self.set_time_sig(sig);
         }
-        // Setlist (#204): restore songs/parts and send the active zones (if any).
-        self.setlist = s.setlist.clone();
-        self.setlist.prune_to_graph(&s.graph);
+        // Setlist (#204): already restored above; finish UI state and send active zones.
         self.preshow.report = None;
         self.show_learn = None;
         self.setlist_edit_song = self.setlist.active.map(|p| p.song)
@@ -8399,6 +8471,9 @@ impl DemoApp {
 
     /// Step or clear the setlist and recall the new part.
     fn step_setlist(&mut self, action: &str) -> Result<Option<crate::setlist::SetlistPos>, String> {
+        let prev_ready = |this: &Self, song: usize| {
+            this.song_load_state(song) == crate::setlist::SongLoadState::Ready
+        };
         let moved = match action {
             "next_part" => self.setlist.next_part(),
             "prev_part" => self.setlist.prev_part(),
@@ -8407,23 +8482,30 @@ impl DemoApp {
             "clear" => {
                 self.setlist.active = None;
                 self.apply_setlist_part();
+                self.sync_setlist_window();
                 return Ok(None);
             }
             other => return Err(format!("unknown action '{other}' (use next_part, prev_part, next_song, prev_song or clear)")),
         };
         if let Some(pos) = moved {
+            let was_ready = prev_ready(self, pos.song);
             self.setlist_edit_song = Some(pos.song);
             self.apply_setlist_part();
+            self.sync_setlist_window();
+            self.announce_if_unloaded_jump(pos.song, was_ready);
         }
         Ok(self.setlist.active)
     }
 
     /// Jump directly to `(song, part)` and recall it.
     fn select_setlist(&mut self, song: usize, part: usize) -> Result<crate::setlist::SetlistPos, String> {
+        let was_ready = self.song_load_state(song) == crate::setlist::SongLoadState::Ready;
         let pos = self.setlist.select(song, part)
             .ok_or_else(|| format!("song {song} part {part} is out of range"))?;
         self.setlist_edit_song = Some(pos.song);
         self.apply_setlist_part();
+        self.sync_setlist_window();
+        self.announce_if_unloaded_jump(pos.song, was_ready);
         Ok(pos)
     }
 
@@ -8470,6 +8552,7 @@ impl DemoApp {
                 "time_signature": s.time_sig.map(|t| t.to_json()),
                 "set": self.setlist.set_of(si).map(|x| x.name.as_str()),
                 "backing": s.backing,
+                "load_state": self.song_load_state(si).as_str(),
                 "parts": parts,
             })
         }).collect();
@@ -8484,6 +8567,9 @@ impl DemoApp {
         serde_json::json!({
             "songs": songs,
             "active": active,
+            "load_ahead": self.setlist.load_ahead,
+            "window_songs": self.setlist.window_songs(),
+            "hosted_instances": self.hosted_instrument_count(),
             "show_controls": self.show_controls_json(),
             "sets": show["sets"],
             "levels": show["levels"],
@@ -8705,10 +8791,13 @@ impl DemoApp {
         self.show_sent.part = part;
         let Some(pos) = part.and_then(|i| self.setlist.pos_at(i)) else { return };
         if self.setlist.active != Some(pos) {
+            let was_ready = self.song_load_state(pos.song) == crate::setlist::SongLoadState::Ready;
             self.setlist.active = Some(pos);
             self.setlist_edit_song = Some(pos.song);
             self.send_show_gates_after_engine_step();
             self.recall_setlist_part();
+            self.sync_setlist_window();
+            self.announce_if_unloaded_jump(pos.song, was_ready);
         }
     }
 
@@ -10391,22 +10480,38 @@ impl DemoApp {
             },
             "set_setlist_set" => match self.exec_setlist_set(args) {
                 Ok(val) => {
+                    self.sync_setlist_window();
                     self.agent_activity.record(origin, "Setlist set updated", Vec::new(), now);
+                    val.to_string()
+                }
+                Err(e) => format!("error: {e}"),
+            },
+            "set_setlist_window" => match self.exec_set_setlist_window(args) {
+                Ok(val) => {
+                    self.agent_activity.record(origin, "Setlist load window updated", Vec::new(), now);
                     val.to_string()
                 }
                 Err(e) => format!("error: {e}"),
             },
             "set_setlist_song" => match self.exec_setlist_song(args) {
                 Ok(val) => {
+                    self.sync_setlist_window();
                     self.agent_activity.record(origin, "Setlist updated", Vec::new(), now);
                     val.to_string()
                 }
                 Err(e) => format!("error: {e}"),
             },
             "select_setlist_part" => {
+                let target_song_before = args
+                    .get("song")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let was_ready_before = target_song_before
+                    .map(|s| self.song_load_state(s) == crate::setlist::SongLoadState::Ready)
+                    .unwrap_or(true);
                 let res = if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
                     self.step_setlist(action).map(|_| ())
-                } else if let Some(song) = args.get("song").and_then(|v| v.as_u64()).map(|n| n as usize) {
+                } else if let Some(song) = target_song_before {
                     let part = args.get("part").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     self.select_setlist(song, part).map(|_| ())
                 } else {
@@ -10415,7 +10520,15 @@ impl DemoApp {
                 match res {
                     Ok(()) => {
                         self.agent_activity.record(origin, "Setlist switched", Vec::new(), now);
-                        self.setlist_json().to_string()
+                        let mut v = self.setlist_json();
+                        let still_loading = self.active_song_loading_notice();
+                        if !was_ready_before || still_loading.is_some() {
+                            v["loading"] = serde_json::json!(true);
+                            v["notice"] = serde_json::json!(
+                                still_loading.unwrap_or_else(|| self.session_msg.clone())
+                            );
+                        }
+                        v.to_string()
                     }
                     Err(e) => format!("error: {e}"),
                 }
@@ -17755,7 +17868,16 @@ impl DemoApp {
         // Hosted instrument accounting (#275): real instance count, per-rig sharing
         // status, and each rig's audio effects for per-part effect-chain chips.
         let show_instances = self.show_instances();
-        let instances_badge = show_instances.summary_label(self.setlist.songs.len());
+        let hosted_now = self.hosted_instrument_count();
+        let song_load_states: Vec<crate::setlist::SongLoadState> = (0..self.setlist.songs.len())
+            .map(|si| self.song_load_state(si))
+            .collect();
+        let active_loading_notice = self.active_song_loading_notice();
+        let instances_badge = if let Some(ahead) = self.setlist.load_ahead {
+            format!("{hosted_now}/{} hosted (+{ahead} ahead)", show_instances.hosted)
+        } else {
+            show_instances.summary_label(self.setlist.songs.len())
+        };
         let instances_tip = if show_instances.rigs.is_empty() {
             "No plugin instruments hosted yet.".to_string()
         } else {
@@ -17798,6 +17920,7 @@ impl DemoApp {
         let mut vary_rig: Option<u8> = None;
         let mut split_rig: Option<(usize, usize, u8)> = None;
         let mut active_part_dirty = false;
+        let mut window_dirty = false;
         let mut enter_show = false;
         let mut toggle_check = false;
 
@@ -17848,11 +17971,16 @@ impl DemoApp {
                             }
                         }
                         if let Some((s, p, pos)) = self.setlist.current() {
+                            let (live_txt, live_col) = if let Some(notice) = &active_loading_notice {
+                                (format!("◐ {notice}"), theme::CABLE_AMBER)
+                            } else {
+                                (format!("LIVE  {}. {} · {}", pos.song + 1, s.name, p.name), theme::LIVE_TEAL)
+                            };
                             ui.add(egui::Label::new(
-                                egui::RichText::new(format!("LIVE  {}. {} · {}", pos.song + 1, s.name, p.name))
+                                egui::RichText::new(live_txt)
                                     .size(12.5)
                                     .strong()
-                                    .color(theme::LIVE_TEAL),
+                                    .color(live_col),
                             ).truncate());
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -17889,7 +18017,8 @@ impl DemoApp {
                                  import_session: &mut Option<String>,
                                  move_song: &mut Option<(usize, usize)>,
                                  remove_song: &mut Option<usize>,
-                                 jump_to: &mut Option<(usize, usize)>| {
+                                 jump_to: &mut Option<(usize, usize)>,
+                                 window_dirty: &mut bool| {
                     const PROGRAM_ROW_H: f32 = 28.0;
                     // Device rows the songs list leaves room for; more scroll.
                     const PROGRAM_ROWS_SHOWN: usize = 3;
@@ -17906,12 +18035,39 @@ impl DemoApp {
                         }
                     });
                     ui.add_space(6.0);
-                    if theme::chip_button(ui, if *import_open { "Add song from session ▴" } else { "Add song from session ▾" }, *import_open)
-                        .on_hover_text("Import a saved session's rigs into this gig and create a song")
-                        .clicked()
-                    {
-                        *import_open = !*import_open;
-                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if theme::wrapped_chip_button(ui, if *import_open { "Add song from session ▴" } else { "Add song from session ▾" }, *import_open)
+                            .on_hover_text("Import a saved session's rigs into this gig and create a song")
+                            .clicked()
+                        {
+                            *import_open = !*import_open;
+                        }
+                        let win_on = setlist.load_ahead.is_some();
+                        if theme::wrapped_chip_button(ui, "Load ahead", win_on)
+                            .on_hover_text("Keep only the current song and the next few hosted in memory; the rest load in the background without blocking audio")
+                            .clicked()
+                        {
+                            setlist.load_ahead = if win_on { None } else { Some(crate::setlist::DEFAULT_LOAD_AHEAD) };
+                            *window_dirty = true;
+                        }
+                        if let Some(n) = &mut setlist.load_ahead {
+                            let mut v = *n as usize;
+                            if ui.add(
+                                egui::DragValue::new(&mut v)
+                                    .range(1..=crate::setlist::MAX_LOAD_AHEAD as usize)
+                                    .speed(0.1)
+                                    .prefix("+")
+                                    .suffix(" songs"),
+                            )
+                            .on_hover_text("Upcoming songs kept preloaded ahead of the current song")
+                            .changed()
+                            {
+                                *n = v.clamp(1, crate::setlist::MAX_LOAD_AHEAD as usize) as u8;
+                                *window_dirty = true;
+                            }
+                        }
+                    });
                     if *import_open {
                         ui.add_space(4.0);
                         let saved = Self::list_saved_sessions(sessions_dir);
@@ -17983,9 +18139,25 @@ impl DemoApp {
                                                 bits.join(" · ")
                                             };
                                             let title = format!("{}. {}", si + 1, song.name);
+                                            let load_state = song_load_states.get(si).copied().unwrap_or(crate::setlist::SongLoadState::Ready);
+                                            let show_load_state = setlist.load_ahead.is_some() || load_state != crate::setlist::SongLoadState::Ready;
                                             let r = ui.vertical(|ui| {
                                                 ui.label(egui::RichText::new(&title).size(13.0).strong().color(if is_live { theme::LIVE_TEAL } else { theme::INK }));
-                                                ui.label(egui::RichText::new(meta).size(11.0).color(theme::INK_2));
+                                                if show_load_state {
+                                                    let (lbl, col) = match load_state {
+                                                        crate::setlist::SongLoadState::Ready => ("● Ready", theme::LIVE_TEAL),
+                                                        crate::setlist::SongLoadState::Loading => ("◐ Loading…", theme::CABLE_AMBER),
+                                                        crate::setlist::SongLoadState::Unloaded => ("○ Unloaded", theme::INK_2),
+                                                    };
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                                        ui.label(egui::RichText::new(&meta).size(11.0).color(theme::INK_2));
+                                                        ui.label(egui::RichText::new("·").size(11.0).color(theme::INK_2));
+                                                        ui.label(egui::RichText::new(lbl).size(10.5).color(col));
+                                                    });
+                                                } else {
+                                                    ui.label(egui::RichText::new(meta).size(11.0).color(theme::INK_2));
+                                                }
                                             }).response.interact(egui::Sense::click());
                                             if r.clicked() { *edit_song = Some(si); }
                                             if r.double_clicked() { *jump_to = Some((si, 0)); }
@@ -18352,6 +18524,7 @@ impl DemoApp {
                                 &mut move_song,
                                 &mut remove_song,
                                 &mut jump_to,
+                                &mut window_dirty,
                             );
                         });
                         ui.add_space(10.0);
@@ -18392,6 +18565,7 @@ impl DemoApp {
                         &mut move_song,
                         &mut remove_song,
                         &mut jump_to,
+                        &mut window_dirty,
                     );
                     ui.add_space(12.0);
                     Self::stage_hairline(ui);
@@ -18446,11 +18620,13 @@ impl DemoApp {
                 if self.setlist_edit_song == Some(from) {
                     self.setlist_edit_song = Some(to);
                 }
+                window_dirty = true;
             }
         }
         if let Some(idx) = remove_song {
             self.setlist.remove_song(idx);
             self.apply_setlist_part();
+            window_dirty = true;
         }
         if let Some(si) = add_part_for {
             if let Some(part_len) = self.setlist.songs.get(si).map(|s| s.parts.len()) {
@@ -18511,6 +18687,10 @@ impl DemoApp {
             let _ = self.select_setlist(si, pi);
         } else if active_part_dirty {
             self.apply_setlist_part();
+            window_dirty = true;
+        }
+        if window_dirty {
+            self.sync_setlist_window();
         }
     }
 
@@ -32377,6 +32557,7 @@ impl DemoApp {
         self.serve_ui_inbox();
         self.poll_preshow();
         self.sync_from_engine();
+        self.poll_setlist_window();
         for main in &mut self._surge_main {
             main.pump();
         }
@@ -32384,8 +32565,11 @@ impl DemoApp {
         self.sync_instrument_maps();
         self.poll_plugin_scan();
         self.poll_install();
-        if self.plugin_scan.is_some() || self.install.as_ref().is_some_and(|i| i.running) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if self.plugin_scan.is_some()
+            || self.install.as_ref().is_some_and(|i| i.running)
+            || self.setlist_window.is_active_work()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         // Scheduled note-offs (assistant play_note tool).
@@ -42177,7 +42361,8 @@ mod main_control_tests {
 
     #[test]
     fn a_clap_knob_follows_the_value_the_plugin_reports() {
-        let Ok((mut voice, mut main)) = ClapVoice::new(48000.0) else { return };
+        let Ok((mut voice, main)) = ClapVoice::new(48000.0) else { return };
+        let mut main = HostedClapMain::Local(main);
         let mut app = DemoApp::new_with_sink(None);
         let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
         let face = main.main_controls().face().to_vec();

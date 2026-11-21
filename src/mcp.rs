@@ -234,6 +234,7 @@ fn send_show_gates(st: &mut State) -> Result<(), String> {
 
 fn setlist_json(st: &State) -> Value {
     let sl = &st.setlist;
+    let window_nodes = sl.window_plugin_nodes(&st.graph);
     let songs: Vec<Value> = sl.songs.iter().enumerate().map(|(si, s)| {
         let parts: Vec<Value> = s.parts.iter().enumerate().map(|(pi, p)| {
             let rigs: Vec<Value> = p.rigs.iter().map(|r| json!({
@@ -262,6 +263,10 @@ fn setlist_json(st: &State) -> Value {
                 "plugin_params_count": p.plugin_params.len(),
             })
         }).collect();
+        let load_state = match &window_nodes {
+            None => crate::setlist::SongLoadState::Ready,
+            Some(wn) => sl.song_load_state(si, &st.graph, wn, &[]),
+        };
         json!({
             "index": si,
             "name": s.name,
@@ -269,6 +274,7 @@ fn setlist_json(st: &State) -> Value {
             "time_signature": s.time_sig.map(|t| t.to_json()),
             "set": sl.set_of(si).map(|x| x.name.as_str()),
             "backing": s.backing,
+            "load_state": load_state.as_str(),
             "parts": parts,
         })
     }).collect();
@@ -281,9 +287,16 @@ fn setlist_json(st: &State) -> Value {
     let bus_name = |n: NodeId| st.graph.node(n).map_or_else(String::new, |x| name_str(&x.name).to_string());
     let show = sl.show_json(&st.graph, &headless_bindings(st), bus_name);
     let instances = sl.show_instances(&st.graph).to_json(|r| format!("Rig {}", crate::control::rig_letter(r)));
+    let hosted_instances = match &window_nodes {
+        None => sl.show_instances(&st.graph).hosted,
+        Some(wn) => st.graph.nodes.iter().filter(|n| crate::setlist::is_instrument_node(&st.graph, n) && wn.contains(&n.id)).count(),
+    };
     json!({
         "songs": songs,
         "active": active,
+        "load_ahead": sl.load_ahead,
+        "window_songs": sl.window_songs(),
+        "hosted_instances": hosted_instances,
         "show_controls": headless_show_controls(sl),
         "sets": show["sets"],
         "levels": show["levels"],
@@ -853,6 +866,15 @@ struct SetSetlistSetArgs {
     /// Remove the set (its songs stay).
     #[serde(skip_serializing_if = "Option::is_none")]
     remove: Option<bool>,
+}
+
+/// Arguments for `set_setlist_window`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetSetlistWindowArgs {
+    /// Number of upcoming playable songs to keep preloaded ahead of the active
+    /// song (1..=8), or null / 0 to disable windowing and keep every rig loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_ahead: Option<u8>,
 }
 
 /// Arguments for `set_show_control`.
@@ -4881,6 +4903,10 @@ impl McpServer {
         if let Err(e) = send_show_gates(&mut st) {
             return tool_err(e);
         }
+        if st.setlist.window_enabled() {
+            let mask = st.setlist.window_rigs_mask(&st.graph);
+            let _ = send_cmd(&mut st, Command::SetHostedRigs { mask, for_next_load: false });
+        }
         if let Some(song) = st.setlist.current().map(|(s, _, _)| s.clone()) {
             if let Some(bpm) = song.bpm {
                 let _ = send_cmd(&mut st, Command::SetBpm { bpm });
@@ -4985,6 +5011,28 @@ impl McpServer {
         let mut out = setlist_json(&st);
         out["result"] = json!(msg);
         ok_json(out)
+    }
+
+    /// Configure the per-setlist song load window (#207).
+    #[tool(name = "set_setlist_window", description = "Configure the per-setlist song load window for long gigs on limited RAM: pass load_ahead (1..=8) to keep only the current song and the next load_ahead playable songs hosted in memory while loading upcoming songs in the background without blocking audio, or null / 0 to disable windowing and keep every rig hosted.")]
+    fn set_setlist_window(&self, Parameters(args): Parameters<SetSetlistWindowArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_setlist_window", v);
+        }
+        let load_ahead = match args.load_ahead {
+            None | Some(0) => None,
+            Some(n) if n > crate::setlist::MAX_LOAD_AHEAD => {
+                return tool_err(format!("load_ahead must be 1..={} (or null/0 to disable), got {n}", crate::setlist::MAX_LOAD_AHEAD));
+            }
+            Some(n) => Some(n),
+        };
+        st.setlist.load_ahead = load_ahead;
+        let mask = st.setlist.window_rigs_mask(&st.graph);
+        let _ = send_cmd(&mut st, Command::SetHostedRigs { mask, for_next_load: false });
+        ok_json(setlist_json(&st))
     }
 
     /// Configure master transport count-in.

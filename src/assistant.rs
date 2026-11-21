@@ -752,7 +752,9 @@ fn system_prompt() -> String {
      Levels: every rig, aux bus and CC binding lives at show level (no song switch touches it: \
      a vocal mic, a master reverb, a volume pedal), at the level of a set (a named group of songs, \
      set_setlist_set makes, fills, skips or moves one) or at song level (only where the parts use \
-     it); get_setlist lists sets and levels, set_level changes one. Before a gig, \
+     it); get_setlist lists sets and levels, set_level changes one. For long gigs on limited RAM, \
+     set_setlist_window keeps only the current song and the next load_ahead songs hosted (loading \
+     upcoming songs in the background without blocking audio). Before a gig, \
      preshow_check says what could go wrong (devices, outputs, plugins, silent rigs, backing \
      tracks, disk, buffer, power) and what to do about each.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
@@ -1274,6 +1276,11 @@ pub(crate) fn tools() -> Value {
             "name":"set_setlist_set",
             "description":"Make or change a set: a named group of consecutive songs that moves or is skipped as a whole. Omit set to make a new one (name required); pass set (its name or 0-based index) to change it. songs: the 0-based song indices that make up the set, e.g. '0,1,2' (others leave it; the set's songs are kept together). skip=true makes next/prev stepping jump over its songs. move 'up' | 'down' moves the whole set past its neighbour. remove=true removes the set (its songs stay). name renames it.",
             "parameters":{"type":"object","properties":{"set":{"type":"string"},"name":{"type":"string"},"songs":{"type":"string"},"skip":{"type":"boolean"},"move":{"type":"string","enum":["up","down"]},"remove":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_setlist_window",
+            "description":"Configure the per-setlist song load window for long gigs on limited RAM: pass load_ahead (1..=8) to keep only the current song and the next load_ahead playable songs hosted in memory while loading upcoming songs in the background without blocking audio, or null / 0 to disable windowing and keep every rig hosted.",
+            "parameters":{"type":"object","properties":{"load_ahead":{"type":["integer","null"]}}}
         }},
         {"type":"function","function":{
             "name":"select_setlist_part",

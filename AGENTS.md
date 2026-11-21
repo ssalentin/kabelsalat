@@ -1777,3 +1777,11 @@ Learned so far (2026-11-15, UI polish pass):
     `install.sh`). When a catalog entry's binary reads presets/data from
     disk, set `CatalogEntry::data` (`RepoData`) so both release and source
     routes install them (`unsampled_piano_is_a_clap_instrument_with_release_and_source_routes`).
+207. **Resolve LV2 blank-node `units:unit` via `units:symbol` / `rdfs:label`,
+    never stringify the blank-node ID:** LSP plugins declare inline blank-node
+    units (`units:unit [ a units:Unit ; units:symbol "G" ]`); calling
+    `node_borrowed` on a blank node leaks lilv's internal ID (`"133b11"`).
+    Check `lilv_node_is_blank` and query `lilv_world_get` for `units:symbol`
+    (fallback `rdfs:label`) in `read_control_infos`
+    (`lv2_blank_node_units_resolve_to_symbol_or_label`).
+

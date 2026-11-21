@@ -163,6 +163,18 @@ and `set_setlist_set`.
 
 <p align="center"><img src="docs/shots/setlist-levels.png" width="85%" alt="Setlist → Sets & levels: two sets of songs (one skipped) and a level dropdown for each rig, the Hall bus and a CC 11 pedal binding"/></p>
 
+### Go on stage with Show mode
+Click **Show mode** in the Setlist header (agents: `set_show_mode`) for a
+full-window stage screen you can read from two metres away: the current song
+and part in large type, the next song, tempo and time signature, the master
+meter, one meter per rig that plays in this part, and a clock. Editing is
+locked while it is open: no click or key moves a cable, a fader or a song.
+PageUp / PageDown (Shift for songs) and a foot switch still step the setlist,
+**Panic** sends all notes off on every rig (agents: `panic`), and holding
+**Esc** for a second leaves.
+
+<p align="center"><img src="docs/shots/show-mode.png" width="85%" alt="Show mode: the song Moonlight Drive in large type with its part Chorus and 118 BPM 4/4, the next song Riders on the Storm, meters for the master and the organ, a clock, the Panic button and the hint to hold Esc to leave"/></p>
+
 ### Browse and install plugins by type
 Press **F9** (or **B**) to open **Plugins**, organized by what each unit does
 rather than by plugin format: **Instruments**, **Effects**, **MIDI FX**,

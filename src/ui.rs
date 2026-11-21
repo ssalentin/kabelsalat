@@ -5676,8 +5676,6 @@ impl DemoApp {
                     Err(e) => self.audio_backend_err = Some(e),
                 }
             }
-        } else if let Some(tx) = &self.stream_cmds {
-            let _ = tx.send(crate::audio_out::StreamCmd::Resync);
         }
     }
 

@@ -202,6 +202,36 @@ pub fn save_buffer_frames(frames: u32) -> std::io::Result<()> {
     save_buffer_frames_to(&config_path(), frames)
 }
 
+/// Load persisted `audio_backend` from `path` (default `Auto`).
+pub fn load_audio_backend_from(path: &std::path::Path) -> crate::audio_backend::AudioBackendChoice {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("audio_backend").and_then(Value::as_str).map(str::to_string))
+        .and_then(|s| crate::audio_backend::AudioBackendChoice::parse(&s))
+        .unwrap_or_default()
+}
+
+pub fn save_audio_backend_to(
+    path: &std::path::Path,
+    backend: crate::audio_backend::AudioBackendChoice,
+) -> std::io::Result<()> {
+    save_config_values_to(path, &[("audio_backend", json!(backend.as_str()))])
+}
+
+/// Persisted `audio_backend` in config.json (default `Auto`, test-safe under cfg(test), rule 37).
+pub fn load_audio_backend() -> crate::audio_backend::AudioBackendChoice {
+    if cfg!(test) {
+        return crate::audio_backend::AudioBackendChoice::Auto;
+    }
+    load_audio_backend_from(&config_path())
+}
+
+pub fn save_audio_backend(backend: crate::audio_backend::AudioBackendChoice) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_audio_backend_to(&config_path(), backend)
+}
+
 /// Cable visual opacity bounds (`0.3..=1.0`, default `1.0`).
 pub const MIN_CABLE_OPACITY: f32 = 0.3;
 pub const MAX_CABLE_OPACITY: f32 = 1.0;
@@ -1284,13 +1314,18 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_audio_outputs",
-            "description":"List the sound cards kabelsalat can play to (PipeWire sinks: name to pass, readable label, which is the system default), the one it plays to now, and the user's choice (null = follow the system default).",
+            "description":"List the audio outputs kabelsalat can play to (PipeWire sinks on PipeWire, ALSA PCM devices on ALSA), the active audio backend (PipeWire, JACK, or ALSA), the output it plays to now, and the user's choice (null = system default).",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_audio_output",
-            "description":"Choose the sound card kabelsalat plays to (e.g. the MOTU M2 instead of the laptop speakers). output: a name from list_audio_outputs; null or empty = follow the system default. Moves the live stream without a dropout and is remembered across restarts.",
+            "description":"Choose the sound card kabelsalat plays to (e.g. the MOTU M2 instead of the laptop speakers). output: a name from list_audio_outputs; null or empty = follow the system default. Remembered across restarts.",
             "parameters":{"type":"object","properties":{"output":{"type":["string","null"]}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_audio_backend",
+            "description":"Switch kabelsalat's audio output backend live and remember it across restarts. backend: 'auto' (native PipeWire -> JACK/pipewire-jack -> ALSA), 'pipewire' (native PipeWire audio node), 'jack' (JACK / pipewire-jack client with out_1/out_2 ports), or 'alsa' (direct ALSA PCM).",
+            "parameters":{"type":"object","properties":{"backend":{"type":"string","enum":["auto","pipewire","jack","alsa"]}},"required":["backend"]}
         }},
         {"type":"function","function":{
             "name":"list_app_streams",
@@ -3202,6 +3237,24 @@ mod tests {
         // Invalid config values fall back to default.
         std::fs::write(&p, r#"{"audio_buffer_frames": 300}"#).unwrap();
         assert_eq!(load_buffer_frames_from(&p), crate::bridge::BUFFER_FRAMES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_backend_persists_to_config_and_rejects_invalid_values() {
+        use crate::audio_backend::AudioBackendChoice;
+        let dir = std::env::temp_dir().join(format!("ksalat-backend-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+
+        assert_eq!(load_audio_backend_from(&p), AudioBackendChoice::Auto);
+        for c in [AudioBackendChoice::PipeWire, AudioBackendChoice::Jack, AudioBackendChoice::Alsa, AudioBackendChoice::Auto] {
+            save_audio_backend_to(&p, c).unwrap();
+            assert_eq!(load_audio_backend_from(&p), c);
+        }
+        std::fs::write(&p, r#"{"audio_backend": "oss"}"#).unwrap();
+        assert_eq!(load_audio_backend_from(&p), AudioBackendChoice::Auto);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

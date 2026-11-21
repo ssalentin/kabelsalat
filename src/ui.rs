@@ -23,7 +23,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
@@ -2838,6 +2837,7 @@ enum SettingsAction {
     ToggleAutosave,
     SetCountIn(bool, u8),
     SetTimeSig(crate::transport::TimeSig),
+    SetAudioBackend(crate::audio_backend::AudioBackendChoice),
     SetAudioOutput(Option<String>),
     SetBufferSize(u32),
     SetRetroMinutes(u32),
@@ -3181,7 +3181,7 @@ fn sentence_first(s: &str) -> String {
 const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "set_param", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
-    "set_audio_output", "list_app_streams", "set_app_stream", "add_rig", "clone_rig", "delete_rig",
+    "set_audio_output", "set_audio_backend", "list_app_streams", "set_app_stream", "add_rig", "clone_rig", "delete_rig",
     "save_rig", "load_rig", "list_rig_presets", "load_template",
     "list_instruments", "install_instrument", "play_file", "stop_file",
     "set_scale", "set_arp",
@@ -3225,6 +3225,7 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "save_rig"
             | "reset_engine_peaks"
             | "set_buffer_size"
+            | "set_audio_backend"
             | "set_midi_clock"
             | "set_device_instrument"
             | "play_demo"
@@ -4026,6 +4027,10 @@ struct DemoApp {
     /// voice binding is not adopted until it has published that load.
     voice_hold_rev: Option<u64>,
     sample_rate: f64,
+    audio_backend: crate::audio_backend::AudioBackendChoice,
+    active_audio_backend: Option<crate::audio_backend::ActiveBackend>,
+    audio_backend_err: Option<String>,
+    alsa_outputs: Arc<Mutex<Vec<crate::audio_out::OutputDevice>>>,
     buffer_frames: u32,
     buffer_size_err: Option<String>,
     /// How many minutes retrospective recording keeps (0 = off, #215).
@@ -4521,6 +4526,10 @@ impl DemoApp {
             last_voices_rev: 0,
             voice_hold_rev: None,
             sample_rate: 48000.0,
+            audio_backend: crate::audio_backend::effective_choice(crate::assistant::load_audio_backend()),
+            active_audio_backend: None,
+            audio_backend_err: None,
+            alsa_outputs: Arc::new(Mutex::new(Vec::new())),
             buffer_frames: crate::assistant::load_buffer_frames(),
             buffer_size_err: None,
             retro_minutes: crate::record::retro_minutes_setting(),
@@ -5547,6 +5556,9 @@ impl DemoApp {
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         self.buffer_frames = audio_host.buffer_frames;
+        self.audio_backend = audio_host.backend_choice;
+        self.active_audio_backend = Some(audio_host.active_backend);
+        self.audio_backend_err = audio_host.startup_note.clone();
         self.audio_host = Some(audio_host);
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         if self.count_in_enabled || self.count_in_bars != 1 {
@@ -5591,27 +5603,46 @@ impl DemoApp {
 
     /// Output selection + other apps' streams: scan every second (sooner when
     /// a command arrives), move our stream to the chosen output, apply
-    /// volume/mute changes. All pactl I/O lives here (rule 48).
+    /// volume/mute changes. All pactl / ALSA device I/O lives here (rule 48).
     fn start_audio_out_thread(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel::<crate::audio_out::StreamCmd>();
         self.stream_cmds = Some(tx);
         let state = self.audio_out.clone();
+        let alsa_outputs = self.alsa_outputs.clone();
         let wanted = self.wanted_output.clone();
         let mut meters = crate::audio_out::StreamMeters::new(self.stream_levels.clone());
         let mut capture = crate::capture::take_feed();
         std::thread::Builder::new()
             .name("kabelsalat-audio-out".into())
-            .spawn(move || { let mut previous: Option<String> = None; loop {
+            .spawn(move || { let mut previous: Option<String> = None; let mut alsa_tick = 0u32; loop {
                 let mut cmds = Vec::new();
                 match rx.recv_timeout(std::time::Duration::from_secs(1)) {
                     Ok(c) => { cmds.push(c); while let Ok(c) = rx.try_recv() { cmds.push(c); } }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
+                let active_backend = crate::bridge::active_audio_backend();
+                // Refresh ALSA PCM list on first pass and when ALSA is active (every 4 s).
+                if alsa_tick == 0 || (active_backend == Some(crate::audio_backend::ActiveBackend::Alsa) && alsa_tick % 4 == 0) {
+                    let devs = crate::audio_backend::list_alsa_output_devices();
+                    if let Ok(mut a) = alsa_outputs.lock() { *a = devs; }
+                }
+                alsa_tick = alsa_tick.wrapping_add(1);
                 crate::audio_out::apply_stream_cmds(cmds);
                 let w = wanted.lock().ok().and_then(|w| w.clone());
-                let st = crate::audio_out::scan_and_apply(crate::audio_out::target_for(w.as_deref(), previous.as_deref()));
-                previous = crate::audio_out::remember(w, previous, &st);
+                let target = if active_backend == Some(crate::audio_backend::ActiveBackend::Alsa)
+                    || active_backend == Some(crate::audio_backend::ActiveBackend::Jack)
+                {
+                    crate::audio_out::Target::Follow
+                } else {
+                    crate::audio_out::target_for(w.as_deref(), previous.as_deref())
+                };
+                let st = crate::audio_out::scan_and_apply(target);
+                if active_backend != Some(crate::audio_backend::ActiveBackend::Alsa)
+                    && active_backend != Some(crate::audio_backend::ActiveBackend::Jack)
+                {
+                    previous = crate::audio_out::remember(w, previous, &st);
+                }
                 meters.sync(&st.streams);
                 if let Some(c) = &mut capture { c.sync(&st.capturable); }
                 if let Ok(mut s) = state.lock() { *s = st; }
@@ -5619,10 +5650,79 @@ impl DemoApp {
             .ok();
     }
 
-    /// Choose the output (None = PipeWire default); remembered in config.
+    /// Outputs selectable for the currently active backend (ALSA PCMs when on
+    /// ALSA, PipeWire sinks otherwise).
+    fn current_backend_outputs(&self) -> (Vec<crate::audio_out::OutputDevice>, Option<String>) {
+        if self.active_audio_backend == Some(crate::audio_backend::ActiveBackend::Alsa) {
+            let outs = self.alsa_outputs.lock().map(|v| v.clone()).unwrap_or_default();
+            let cur = self.audio_host.as_ref().map(|h| h.device_label.clone());
+            (outs, cur)
+        } else {
+            self.audio_out
+                .lock()
+                .map(|s| (s.outputs.clone(), s.current.clone()))
+                .unwrap_or_default()
+        }
+    }
+
+    /// Choose the output (None = backend default); remembered in config.
     fn set_audio_output(&mut self, output: Option<String>) {
         let _ = crate::assistant::save_config_field("audio_output", output.as_deref().unwrap_or(""));
-        if let Ok(mut w) = self.wanted_output.lock() { *w = output; }
+        if let Ok(mut w) = self.wanted_output.lock() { *w = output.clone(); }
+        if self.active_audio_backend == Some(crate::audio_backend::ActiveBackend::Alsa) {
+            if let Some(host) = &mut self.audio_host {
+                match host.set_target_device(output) {
+                    Ok(()) => self.audio_backend_err = None,
+                    Err(e) => self.audio_backend_err = Some(e),
+                }
+            }
+        }
+    }
+
+    /// Switch the audio output backend live (Auto / PipeWire / JACK / ALSA)
+    /// and persist in config.json.
+    fn set_audio_backend(&mut self, choice: crate::audio_backend::AudioBackendChoice) -> Result<String, String> {
+        if let Some(host) = &mut self.audio_host {
+            match host.set_backend(choice) {
+                Ok(active) => {
+                    self.audio_backend = choice;
+                    self.active_audio_backend = Some(active);
+                    self.buffer_frames = host.buffer_frames;
+                    self.audio_backend_err = if (host.opened_sample_rate - self.sample_rate).abs() > 1.0 {
+                        Some(format!(
+                            "{} runs at {:.0} Hz while the engine started at {:.0} Hz — restart kabelsalat to match pitch",
+                            active.label(),
+                            host.opened_sample_rate,
+                            self.sample_rate,
+                        ))
+                    } else {
+                        None
+                    };
+                    crate::bridge::set_active_audio_backend(Some(active));
+                    crate::bridge::set_configured_buffer_frames(host.buffer_frames);
+                    crate::engine_info::reset_for_buffer_change();
+                    if let Some(t) = &self.node_times {
+                        t.reset_peaks();
+                    }
+                    if let Some(tx) = &self.stream_cmds {
+                        let _ = tx.send(crate::audio_out::StreamCmd::Resync);
+                    }
+                    let _ = crate::assistant::save_audio_backend(choice);
+                    self.engine_stats_at = f32::NEG_INFINITY;
+                    self.refresh_engine_stats();
+                    Ok(format!("Audio backend set to {} (active: {})", choice.label(), active.label()))
+                }
+                Err(e) => {
+                    self.audio_backend_err = Some(e.clone());
+                    Err(e)
+                }
+            }
+        } else {
+            self.audio_backend = choice;
+            self.audio_backend_err = None;
+            let _ = crate::assistant::save_audio_backend(choice);
+            Ok(format!("Audio backend set to {}", choice.label()))
+        }
     }
 
     /// Change the audio output buffer size in frames live (reopens the stream
@@ -6408,6 +6508,10 @@ impl DemoApp {
             "set_buffer_size" => match args.get("frames").and_then(|v| v.as_u64()) {
                 Some(f) => format!("Buffer size → {f} frames"),
                 None => "Set buffer size".into(),
+            },
+            "set_audio_backend" => match args.get("backend").and_then(|v| v.as_str()) {
+                Some(b) => format!("Audio backend → {b}"),
+                None => "Set audio backend".into(),
             },
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
@@ -8942,6 +9046,8 @@ impl DemoApp {
                 "fps": self.fps,
                 "buffer_frames": self.engine_counters().buffer_frames(),
                 "buffer_latency_ms": self.engine_counters().buffer_frames() as f64 / self.sample_rate.max(1.0) * 1000.0,
+                "audio_backend": self.audio_backend.as_str(),
+                "active_audio_backend": self.active_audio_backend.map(|b| b.as_str()),
                 "xruns": self.engine_counters().xruns,
                 "midi_latency_ms": self.engine_counters().midi_latency_us as f64 / 1000.0,
                 "layout": {
@@ -9293,17 +9399,19 @@ impl DemoApp {
                 }
             }
             "list_audio_outputs" => {
-                let st = self.audio_out.lock().map(|s| s.clone()).unwrap_or_default();
+                let (outputs, current) = self.current_backend_outputs();
                 let wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
                 serde_json::json!({
-                    "outputs": st.outputs.iter().map(|o| serde_json::json!({"name": o.raw, "label": o.name, "default": o.default})).collect::<Vec<_>>(),
-                    "current": st.current,
+                    "backend": self.audio_backend.as_str(),
+                    "active_backend": self.active_audio_backend.map(|b| b.as_str()),
+                    "outputs": outputs.iter().map(|o| serde_json::json!({"name": o.raw, "label": o.name, "default": o.default})).collect::<Vec<_>>(),
+                    "current": current,
                     "selected": wanted,
                 }).to_string()
             }
             "set_audio_output" => {
                 let out = args.get("output").and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty());
-                let known = self.audio_out.lock().map(|s| s.outputs.clone()).unwrap_or_default();
+                let (known, _) = self.current_backend_outputs();
                 if let Some(o) = &out {
                     if !known.iter().any(|k| &k.raw == o) {
                         return format!("no output named '{o}' (see list_audio_outputs)");
@@ -9313,6 +9421,18 @@ impl DemoApp {
                 match out {
                     Some(o) => format!("kabelsalat plays to {o} (moved within a second; remembered)"),
                     None => "kabelsalat follows the system default output".into(),
+                }
+            }
+            "set_audio_backend" => {
+                let Some(raw) = args.get("backend").and_then(|v| v.as_str()) else {
+                    return "set_audio_backend needs 'backend' (auto, pipewire, jack, or alsa)".into();
+                };
+                let Some(choice) = crate::audio_backend::AudioBackendChoice::parse(raw) else {
+                    return format!("unknown audio backend '{raw}'; choose auto, pipewire, jack, or alsa");
+                };
+                match self.set_audio_backend(choice) {
+                    Ok(msg) => msg,
+                    Err(e) => format!("switching to {} failed: {e}", choice.label()),
                 }
             }
             "list_app_streams" => {
@@ -20293,30 +20413,71 @@ impl DemoApp {
     }
 
     fn settings_audio_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
-        let (outputs, out_current) = self
-            .audio_out
-            .lock()
-            .map(|s| (s.outputs.clone(), s.current.clone()))
-            .unwrap_or_default();
+        let backend_choice = self.audio_backend;
+        Self::settings_row(
+            ui,
+            "Audio backend",
+            "Auto prefers native PipeWire (creates a routable PipeWire node), then JACK (pipewire-jack), then ALSA.",
+            |ui| {
+                let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
+                theme::Dropdown::new("dd_settings_audio_backend", backend_choice.label())
+                    .width(dd_w)
+                    .popup_min_width(200.0)
+                    .text_size(12.0)
+                    .show_ui(ui, |menu| {
+                        for &c in crate::audio_backend::AudioBackendChoice::CHOICES {
+                            if menu.item(backend_choice == c, c.label()) {
+                                actions.push(SettingsAction::SetAudioBackend(c));
+                            }
+                        }
+                    });
+            },
+        );
+        if let Some(active) = self.active_audio_backend {
+            ui.label(egui::RichText::new(format!("Active: {}", active.label())).size(11.0).color(theme::CREAM_META));
+        }
+        if let Some(err) = &self.audio_backend_err {
+            ui.label(egui::RichText::new(err).size(11.0).color(theme::CLIP_BRIGHT));
+        }
+        Self::settings_gap(ui);
+
+        let (outputs, out_current) = self.current_backend_outputs();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw).map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string());
-        let selected_out = out_wanted.as_deref().map(label_of).unwrap_or_else(|| "System default".to_string());
-        Self::settings_row(ui, "Audio output", "The sound card kabelsalat plays to (the same choice as in the Mixer).", |ui| {
-            let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
-            theme::Dropdown::new("dd_settings_audio_output", &selected_out)
-                .width(dd_w)
-                .popup_min_width(240.0)
-                .text_size(12.0)
-                .show_ui(ui, |menu| {
-                    if menu.item(out_wanted.is_none(), "System default") {
-                        actions.push(SettingsAction::SetAudioOutput(None));
-                    }
-                    for o in &outputs {
-                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
-                            actions.push(SettingsAction::SetAudioOutput(Some(o.raw.clone())));
+        let is_jack = self.active_audio_backend == Some(crate::audio_backend::ActiveBackend::Jack);
+        let is_alsa = self.active_audio_backend == Some(crate::audio_backend::ActiveBackend::Alsa);
+        let out_desc = if is_jack {
+            "JACK ports (Kabelsalat:out_1 / out_2) are routed in your patchbay (qpwgraph, Helvum, qjackctl)."
+        } else if is_alsa {
+            "The ALSA PCM device kabelsalat opens directly."
+        } else {
+            "The sound card kabelsalat plays to (the same choice as in the Mixer)."
+        };
+        let selected_out = if is_jack {
+            "JACK patchbay".to_string()
+        } else {
+            out_wanted.as_deref().map(label_of).unwrap_or_else(|| "System default".to_string())
+        };
+        Self::settings_row(ui, "Audio output", out_desc, |ui| {
+            if is_jack {
+                ui.label(egui::RichText::new("Kabelsalat:out_1 / out_2").size(12.0).color(theme::CREAM_META));
+            } else {
+                let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
+                theme::Dropdown::new("dd_settings_audio_output", &selected_out)
+                    .width(dd_w)
+                    .popup_min_width(240.0)
+                    .text_size(12.0)
+                    .show_ui(ui, |menu| {
+                        if menu.item(out_wanted.is_none(), "System default") {
+                            actions.push(SettingsAction::SetAudioOutput(None));
                         }
-                    }
-                });
+                        for o in &outputs {
+                            if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                                actions.push(SettingsAction::SetAudioOutput(Some(o.raw.clone())));
+                            }
+                        }
+                    });
+            }
         });
         if let Some(c) = &out_current {
             ui.label(egui::RichText::new(format!("Active: {}", label_of(c))).size(11.0).color(theme::CREAM_META));
@@ -20756,6 +20917,10 @@ impl DemoApp {
             }
             SettingsAction::SetCountIn(enabled, bars) => self.set_count_in(enabled, bars),
             SettingsAction::SetTimeSig(sig) => self.set_time_sig(sig),
+            SettingsAction::SetAudioBackend(choice) => match self.set_audio_backend(choice) {
+                Ok(msg) => self.settings_msg = msg,
+                Err(e) => self.settings_msg = format!("Audio backend failed: {e}"),
+            },
             SettingsAction::SetAudioOutput(out) => self.set_audio_output(out),
             SettingsAction::SetBufferSize(frames) => match self.set_buffer_frames(frames) {
                 Ok(msg) => self.settings_msg = msg,
@@ -26402,8 +26567,7 @@ impl DemoApp {
             self.strip_palette_ui(&ctx);
             self.insert_picker_ui(&ctx, &mut edits);
         }
-        let (outputs, out_current) = self.audio_out.lock()
-            .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
+        let (outputs, out_current) = self.current_backend_outputs();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
@@ -27067,21 +27231,26 @@ impl DemoApp {
                 Some(w) => label_of(w),
                 None => "System default".to_string(),
             };
-            theme::Dropdown::new("dd_mixer_audio_output", &selected)
-                .width(144.0)
-                .popup_min_width(240.0)
-                .text_size(11.5)
-                .show_ui(ui, |menu| {
-                    if menu.item(out_wanted.is_none(), "System default") {
-                        *out_pick = Some(None);
-                    }
-                    for o in &outputs {
-                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
-                            *out_pick = Some(Some(o.raw.clone()));
+            if self.active_audio_backend == Some(crate::audio_backend::ActiveBackend::Jack) {
+                ui.label(egui::RichText::new("JACK patchbay").size(11.5).color(theme::CREAM_META))
+                    .on_hover_text("Route Kabelsalat:out_1 / out_2 in qpwgraph, Helvum, or qjackctl");
+            } else {
+                theme::Dropdown::new("dd_mixer_audio_output", &selected)
+                    .width(144.0)
+                    .popup_min_width(240.0)
+                    .text_size(11.5)
+                    .show_ui(ui, |menu| {
+                        if menu.item(out_wanted.is_none(), "System default") {
+                            *out_pick = Some(None);
                         }
-                    }
-                })
-                .on_hover_text("the sound card kabelsalat plays to");
+                        for o in &outputs {
+                            if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                                *out_pick = Some(Some(o.raw.clone()));
+                            }
+                        }
+                    })
+                    .on_hover_text("the sound card kabelsalat plays to");
+            }
             if let Some(c) = &out_current {
                 ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
             }
@@ -33238,38 +33407,6 @@ pub(crate) fn preferred_host() -> cpal::Host {
     cpal::default_host()
 }
 
-/// Pin the current (audio render) thread to the fastest CPU cores on
-/// heterogeneous systems (e.g. Apple M1 Firestorm P-cores vs Icestorm E-cores).
-/// SCHED_RR otherwise happily parks the audio callback on a slower E-core.
-fn pin_current_thread_to_p_cores() {
-    #[cfg(target_os = "linux")]
-    {
-        let mut freqs: Vec<(usize, u64)> = Vec::new();
-        for cpu in 0..libc::CPU_SETSIZE as usize {
-            let p = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
-            let Ok(s) = std::fs::read_to_string(&p) else { continue };
-            if let Ok(f) = s.trim().parse::<u64>() {
-                freqs.push((cpu, f));
-            }
-        }
-        let Some(max_f) = freqs.iter().map(|&(_, f)| f).max() else { return };
-        let Some(min_f) = freqs.iter().map(|&(_, f)| f).min() else { return };
-        if max_f <= min_f { return; } // homogeneous CPU
-        let p_cores: Vec<usize> = freqs.iter().filter(|&&(_, f)| f == max_f).map(|&(c, _)| c).collect();
-        if p_cores.is_empty() { return; }
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            libc::CPU_ZERO(&mut set);
-            for &c in &p_cores {
-                libc::CPU_SET(c, &mut set);
-            }
-            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
-                eprintln!("audio: pinned render thread to P-cores {p_cores:?} ({} MHz)", max_f / 1000);
-            }
-        }
-    }
-}
-
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
@@ -33287,16 +33424,22 @@ fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Ve
     Ok((voices, mains))
 }
 
-/// Owns the live cpal output stream plus the shared engine handle so the
-/// output stream can be reopened live at a new buffer size without losing
-/// voices, patches, or rack state.
+/// Owns the live output stream (native PipeWire, JACK, or ALSA) plus the
+/// shared engine handle so the stream can be reopened live on a new backend,
+/// ALSA device, or buffer size without losing voices, patches, or rack state.
 struct AudioStreamHost {
     /// Plays buses routed to their own output (#147); stops when dropped.
     _bus_outs: Option<crate::audio_out::BusOutputs>,
-    stream: Option<cpal::Stream>,
+    stream: Option<crate::audio_backend::OutputStream>,
     engine: Arc<Mutex<GraphEngine>>,
     clock_pos: Arc<crate::clocksend::ClockPos>,
+    backend_choice: crate::audio_backend::AudioBackendChoice,
+    active_backend: crate::audio_backend::ActiveBackend,
+    target_device: Option<String>,
+    device_label: String,
+    startup_note: Option<String>,
     sample_rate: f64,
+    opened_sample_rate: f64,
     buffer_frames: u32,
 }
 
@@ -33306,17 +33449,120 @@ impl AudioStreamHost {
     /// audio stays alive.
     fn set_buffer_frames(&mut self, frames: u32) -> Result<u32, String> {
         let prev = self.buffer_frames;
-        // Drop old stream first so the audio callback thread stops cleanly.
         let _ = self.stream.take();
-        match open_output_stream(self.engine.clone(), self.clock_pos.clone(), Some(self.sample_rate), frames) {
-            Ok((stream, _)) => {
-                self.stream = Some(stream);
-                self.buffer_frames = frames;
-                Ok(frames)
+        match open_output_stream(
+            self.engine.clone(),
+            self.clock_pos.clone(),
+            self.backend_choice,
+            self.target_device.as_deref(),
+            Some(self.sample_rate),
+            frames,
+        ) {
+            Ok(opened) => {
+                self.stream = Some(opened.stream);
+                self.active_backend = opened.backend;
+                self.device_label = opened.device_label;
+                self.opened_sample_rate = opened.sample_rate;
+                self.buffer_frames = opened.buffer_frames;
+                crate::bridge::set_active_audio_backend(Some(opened.backend));
+                Ok(self.buffer_frames)
             }
             Err(err) => {
-                if let Ok((stream, _)) = open_output_stream(self.engine.clone(), self.clock_pos.clone(), Some(self.sample_rate), prev) {
-                    self.stream = Some(stream);
+                if let Ok(opened) = open_output_stream(
+                    self.engine.clone(),
+                    self.clock_pos.clone(),
+                    self.backend_choice,
+                    self.target_device.as_deref(),
+                    Some(self.sample_rate),
+                    prev,
+                ) {
+                    self.stream = Some(opened.stream);
+                    self.active_backend = opened.backend;
+                    self.device_label = opened.device_label;
+                }
+                Err(format!("{err}"))
+            }
+        }
+    }
+
+    /// Switch audio backend live (Auto / PipeWire / JACK / ALSA). Falls back
+    /// to the previous backend on error so audio stays alive.
+    fn set_backend(
+        &mut self,
+        choice: crate::audio_backend::AudioBackendChoice,
+    ) -> Result<crate::audio_backend::ActiveBackend, String> {
+        let prev_choice = self.backend_choice;
+        let _ = self.stream.take();
+        match open_output_stream(
+            self.engine.clone(),
+            self.clock_pos.clone(),
+            choice,
+            self.target_device.as_deref(),
+            Some(self.sample_rate),
+            self.buffer_frames,
+        ) {
+            Ok(opened) => {
+                self.stream = Some(opened.stream);
+                self.backend_choice = choice;
+                self.active_backend = opened.backend;
+                self.device_label = opened.device_label;
+                self.opened_sample_rate = opened.sample_rate;
+                self.buffer_frames = opened.buffer_frames;
+                crate::bridge::set_active_audio_backend(Some(opened.backend));
+                Ok(opened.backend)
+            }
+            Err(err) => {
+                if let Ok(opened) = open_output_stream(
+                    self.engine.clone(),
+                    self.clock_pos.clone(),
+                    prev_choice,
+                    self.target_device.as_deref(),
+                    Some(self.sample_rate),
+                    self.buffer_frames,
+                ) {
+                    self.stream = Some(opened.stream);
+                    self.active_backend = opened.backend;
+                    self.device_label = opened.device_label;
+                    crate::bridge::set_active_audio_backend(Some(opened.backend));
+                }
+                Err(format!("{err}"))
+            }
+        }
+    }
+
+    /// Reopen the stream on a new target device (used for direct ALSA PCM selection).
+    fn set_target_device(&mut self, device: Option<String>) -> Result<(), String> {
+        let prev_dev = self.target_device.clone();
+        let _ = self.stream.take();
+        match open_output_stream(
+            self.engine.clone(),
+            self.clock_pos.clone(),
+            self.backend_choice,
+            device.as_deref(),
+            Some(self.sample_rate),
+            self.buffer_frames,
+        ) {
+            Ok(opened) => {
+                self.stream = Some(opened.stream);
+                self.target_device = device;
+                self.active_backend = opened.backend;
+                self.device_label = opened.device_label;
+                self.opened_sample_rate = opened.sample_rate;
+                self.buffer_frames = opened.buffer_frames;
+                Ok(())
+            }
+            Err(err) => {
+                if let Ok(opened) = open_output_stream(
+                    self.engine.clone(),
+                    self.clock_pos.clone(),
+                    self.backend_choice,
+                    prev_dev.as_deref(),
+                    Some(self.sample_rate),
+                    self.buffer_frames,
+                ) {
+                    self.stream = Some(opened.stream);
+                    self.active_backend = opened.backend;
+                    self.device_label = opened.device_label;
                 }
                 Err(format!("{err}"))
             }
@@ -33327,58 +33573,20 @@ impl AudioStreamHost {
 fn open_output_stream(
     engine: Arc<Mutex<GraphEngine>>,
     clock_pos: Arc<crate::clocksend::ClockPos>,
+    backend_choice: crate::audio_backend::AudioBackendChoice,
+    target_device: Option<&str>,
     expected_rate: Option<f64>,
     buffer_frames: u32,
-) -> anyhow::Result<(cpal::Stream, usize)> {
-    let host = preferred_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no output device"))?;
-    let cfg = device.default_output_config()?;
-    let sample_rate = expected_rate.unwrap_or(cfg.sample_rate() as f64);
-    let ch = cfg.channels() as usize;
-    let mut config: cpal::StreamConfig = cfg.into();
-    config.sample_rate = sample_rate as u32;
-    // Default 256 frames @48k = 5.3 ms; user-configurable via Settings / Engine Info.
-    config.buffer_size = cpal::BufferSize::Fixed(buffer_frames);
-    eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms)",
-        host.id().name(),
-        device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
-        sample_rate,
-        ch,
+) -> anyhow::Result<crate::audio_backend::OpenedStream> {
+    let rate_for_cb = expected_rate.unwrap_or(48000.0);
+    crate::audio_backend::open_stream(
+        backend_choice,
+        target_device,
+        expected_rate,
         buffer_frames,
-        buffer_frames as f64 / sample_rate * 1000.0,
-    );
-    let mut rt_tried = false;
-    let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-            // Device output latency for the clock's "Output" compensation.
-            let ts = info.timestamp();
-            let d = ts.playback.duration_since(ts.callback);
-            if !d.is_zero() {
-                clock_pos.publish_out_latency(d.as_nanos() as u64);
-            }
-            // One-time realtime promotion via rtkit (first callback only; the
-            // D-Bus round trip happens once, never in the steady state).
-            // cpal does not promote pipewire-alsa (IOPLUG) streams, so the
-            // render thread ran at normal priority and was preempted by the
-            // UI for up to 26 ms (> the 10.7 ms buffer) → xruns.
-            if !rt_tried {
-                rt_tried = true;
-                pin_current_thread_to_p_cores();
-                if std::env::var_os("KABELSALAT_NO_RT").is_none() {
-                    // Request 1s (clamped to rtkit's RTTimeUSecMax = 200ms) rather
-                    // than one buffer (~5.3ms at 256/48kHz): Surge XT applies
-                    // load_state inside process(), which exceeds 5.3ms and
-                    // otherwise kills the SCHED_RR thread with SIGXCPU.
-                    match audio_thread_priority::promote_current_thread_to_real_time(sample_rate as u32, sample_rate as u32) {
-                        Ok(h) => { _rt_handle = Some(h); eprintln!("audio: render thread promoted to realtime (rtkit)"); }
-                        Err(e) => eprintln!("audio: realtime promotion unavailable ({e}); running at normal priority"),
-                    }
-                }
+        Box::new(move |data: &mut [f32], ch: usize, latency_ns: Option<u64>| {
+            if let Some(ns) = latency_ns {
+                clock_pos.publish_out_latency(ns);
             }
             let t0 = std::time::Instant::now();
             if let Ok(mut eng) = engine.try_lock() {
@@ -33386,16 +33594,13 @@ fn open_output_stream(
             } else {
                 data.fill(0.0);
             }
-            crate::bridge::note_render(t0.elapsed(), data.len() / ch.max(1), sample_rate);
-        },
-        |e| {
+            crate::bridge::note_render(t0.elapsed(), data.len() / ch.max(1), rate_for_cb);
+        }),
+        Box::new(|e| {
             crate::bridge::XRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!("audio stream error: {e}");
-        },
-        None,
-    )?;
-    stream.play()?;
-    Ok((stream, ch))
+        }),
+    )
 }
 
 struct BuiltAudio {
@@ -33422,12 +33627,9 @@ struct BuiltAudio {
 }
 
 fn build_audio() -> anyhow::Result<BuiltAudio> {
-    let host = preferred_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no output device"))?;
-    let cfg = device.default_output_config()?;
-    let sample_rate = cfg.sample_rate() as f64;
+    let backend_choice = crate::audio_backend::effective_choice(crate::assistant::load_audio_backend());
+    let target_device = crate::assistant::load_config_str("audio_output");
+    let sample_rate = crate::audio_backend::probe_sample_rate(backend_choice, target_device.as_deref());
     crate::bridge::SAMPLE_RATE.store(sample_rate as u32, std::sync::atomic::Ordering::Relaxed);
     let wanted_buffer = crate::assistant::load_buffer_frames();
     crate::bridge::set_configured_buffer_frames(wanted_buffer);
@@ -33492,22 +33694,57 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let bus_outs = engine.take_out_taps()
         .map(|taps| crate::audio_out::BusOutputs::spawn(taps, graph_pub.clone(), sample_rate as u32));
     let engine = Arc::new(Mutex::new(engine));
-    let (stream, active_buffer) = match open_output_stream(engine.clone(), clock_pos.clone(), Some(sample_rate), wanted_buffer) {
-        Ok((s, _)) => (s, wanted_buffer),
+    let mut startup_note: Option<String> = None;
+    let opened = match open_output_stream(
+        engine.clone(),
+        clock_pos.clone(),
+        backend_choice,
+        target_device.as_deref(),
+        Some(sample_rate),
+        wanted_buffer,
+    ) {
+        Ok(o) => o,
         Err(e) if wanted_buffer != crate::bridge::BUFFER_FRAMES => {
             eprintln!("audio: buffer size {wanted_buffer} failed ({e}); falling back to {}", crate::bridge::BUFFER_FRAMES);
-            let (s, _) = open_output_stream(engine.clone(), clock_pos.clone(), Some(sample_rate), crate::bridge::BUFFER_FRAMES)?;
-            (s, crate::bridge::BUFFER_FRAMES)
+            open_output_stream(
+                engine.clone(),
+                clock_pos.clone(),
+                backend_choice,
+                target_device.as_deref(),
+                Some(sample_rate),
+                crate::bridge::BUFFER_FRAMES,
+            )?
+        }
+        Err(e) if backend_choice != crate::audio_backend::AudioBackendChoice::Auto => {
+            let note = format!("{} unavailable ({e}); fell back to Auto", backend_choice.label());
+            eprintln!("audio: {note}");
+            startup_note = Some(note);
+            open_output_stream(
+                engine.clone(),
+                clock_pos.clone(),
+                crate::audio_backend::AudioBackendChoice::Auto,
+                target_device.as_deref(),
+                Some(sample_rate),
+                wanted_buffer,
+            )?
         }
         Err(e) => return Err(e),
     };
+    let active_buffer = opened.buffer_frames;
     crate::bridge::set_configured_buffer_frames(active_buffer);
+    crate::bridge::set_active_audio_backend(Some(opened.backend));
     let audio_host = AudioStreamHost {
         _bus_outs: bus_outs,
-        stream: Some(stream),
+        stream: Some(opened.stream),
         engine,
         clock_pos: clock_pos.clone(),
-        sample_rate,
+        backend_choice,
+        active_backend: opened.backend,
+        target_device,
+        device_label: opened.device_label,
+        startup_note,
+        sample_rate: opened.sample_rate,
+        opened_sample_rate: opened.sample_rate,
         buffer_frames: active_buffer,
     };
     Ok(BuiltAudio {
@@ -45788,6 +46025,31 @@ mod engine_info_tests {
     }
 
     #[test]
+    fn set_audio_backend_tool_validates_updates_and_is_in_all_tables() {
+        let names: Vec<String> = crate::assistant::tools().as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert!(names.iter().any(|n| n == "set_audio_backend"), "assistant tools missing set_audio_backend");
+        assert!(UI_BRIDGE_TOOLS.contains(&"set_audio_backend"), "UI_BRIDGE_TOOLS missing set_audio_backend");
+        assert!(!tool_is_read_only("set_audio_backend") && tool_changes_only_system("set_audio_backend"));
+
+        let (mut app, _ctx) = app_at(counters(22.0), SIZE);
+        let bad = app.exec_tool("set_audio_backend", &serde_json::json!({"backend": "oss"}));
+        assert!(bad.contains("unknown audio backend"), "{bad}");
+        let missing = app.exec_tool("set_audio_backend", &serde_json::json!({}));
+        assert!(missing.contains("needs 'backend'"), "{missing}");
+        let ok = app.exec_tool("set_audio_backend", &serde_json::json!({"backend": "jack"}));
+        assert!(ok.contains("JACK"), "{ok}");
+        assert_eq!(app.audio_backend, crate::audio_backend::AudioBackendChoice::Jack);
+        let ok = app.exec_tool("set_audio_backend", &serde_json::json!({"backend": "alsa"}));
+        assert!(ok.contains("ALSA"), "{ok}");
+        assert_eq!(app.audio_backend, crate::audio_backend::AudioBackendChoice::Alsa);
+        let ok = app.exec_tool("set_audio_backend", &serde_json::json!({"backend": "pipewire"}));
+        assert!(ok.contains("PipeWire"), "{ok}");
+        assert_eq!(app.audio_backend, crate::audio_backend::AudioBackendChoice::PipeWire);
+    }
+
+    #[test]
     fn engine_info_buffer_size_buttons_step_up_and_down_and_reset_peaks() {
         let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, render_late: 2, xruns: 4, ..counters(22.0) }, SIZE);
         run_frame(&mut app, &ctx, SIZE, vec![]);
@@ -45862,20 +46124,25 @@ mod engine_info_tests {
     #[test]
     #[ignore = "needs real audio device: cargo test --bin kabelsalat live_audio_stream_reopens_at_new_buffer_size -- --ignored --nocapture"]
     fn live_audio_stream_reopens_at_new_buffer_size() {
-        let host = preferred_host();
-        let device = host.default_output_device().expect("default output device");
-        let sr = device.default_output_config().expect("default config").sample_rate() as f64;
+        let choice = crate::audio_backend::AudioBackendChoice::Auto;
+        let sr = crate::audio_backend::probe_sample_rate(choice, None);
         let (_bus, drain) = crate::control::command_bus();
         let engine = Arc::new(Mutex::new(GraphEngine::new(Graph::demo_patch(), drain, sr, Vec::new())));
         let clock_pos = crate::clocksend::ClockPos::new();
-        let (stream, _) = open_output_stream(engine.clone(), clock_pos.clone(), Some(sr), 256).expect("open 256");
+        let opened = open_output_stream(engine.clone(), clock_pos.clone(), choice, None, Some(sr), 256).expect("open 256");
         let mut audio_host = AudioStreamHost {
             _bus_outs: None,
-            stream: Some(stream),
+            stream: Some(opened.stream),
             engine,
             clock_pos,
-            sample_rate: sr,
-            buffer_frames: 256,
+            backend_choice: choice,
+            active_backend: opened.backend,
+            target_device: None,
+            device_label: opened.device_label,
+            startup_note: None,
+            sample_rate: opened.sample_rate,
+            opened_sample_rate: opened.sample_rate,
+            buffer_frames: opened.buffer_frames,
         };
         let wait_frames = |want: u32| -> u32 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

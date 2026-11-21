@@ -1,0 +1,2 @@
+### Added
+- **Native PipeWire, JACK (`pipewire-jack`), and ALSA backend selection (#349):** kabelsalat now opens a native PipeWire audio node (`kabelsalat`) by default via `libpipewire-0.3.so.0` (no `pipewire-alsa` bridge required) and lets you switch live between **Auto**, **PipeWire**, **JACK (`pipewire-jack`)**, and **ALSA** (with direct ALSA PCM device selection) in **Settings → Audio**, via `KABELSALAT_AUDIO_BACKEND`, or through the `set_audio_backend` agent/MCP tool.

@@ -271,6 +271,10 @@ and never passed off as tested.**
   points; needs `wlrctl`).
 - **Window glitch:** the app process can run while its window stops
   listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
+- **Watchdog (#279):** `kabelsalat` runs the app as a child of its watchdog,
+  so the window's pid is the child's (`pgrep -P <pid you started>`); start
+  with `KABELSALAT_WATCHDOG=0` to get one process. `kabelsalat crash-test`
+  checks crash reports and the restart.
 
 ## Every fixed error becomes a rule (user, 2026-11-15)
 

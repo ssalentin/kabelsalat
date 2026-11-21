@@ -69,10 +69,11 @@ impl DemoApp {
     /// Per frame: write the marker when what it should say changed.
     pub(super) fn track_recovery(&mut self) {
         let Some(path) = &self.recovery.marker else { return };
-        let now = Marker { session: self.open_session.clone().or_else(|| self.recovery.autosaved.clone()), pos: self.setlist.active };
-        if self.recovery.written.as_ref() == Some(&now) {
+        let session = self.open_session.as_deref().or(self.recovery.autosaved.as_deref());
+        if self.recovery.written.as_ref().is_some_and(|w| w.session.as_deref() == session && w.pos == self.setlist.active) {
             return;
         }
+        let now = Marker { session: session.map(str::to_string), pos: self.setlist.active };
         match now.write(path) {
             Ok(()) => self.recovery.written = Some(now),
             Err(e) => {
@@ -91,7 +92,7 @@ impl DemoApp {
             None => "kabelsalat restarted after a crash.".to_string(),
         };
         let detail = if n.report.is_some() {
-            "The crash report stays on this computer. Reporting it opens a new GitHub issue with the report filled in; you send it."
+            "The report stays on this computer; Report on GitHub fills in an issue for you to send."
         } else {
             "It left no report."
         };
@@ -234,6 +235,77 @@ mod tests {
         app.track_recovery();
         assert_eq!(Marker::read(&dir.join("recover.json")).unwrap().session, None, "a template load is not on disk");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn notice_app() -> DemoApp {
+        let mut app = DemoApp::new_with_sink(None);
+        app.recovery.notice = Some(Notice {
+            report: Some("crash-20261121-121014-3028061.txt".into()),
+            restored: Some("'Gig' at Encore · Outro".into()),
+        });
+        app
+    }
+
+    /// One frame at `t` seconds; every text it painted, with its rect.
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, t: f64, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => acc.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => v.iter().for_each(|x| walk(x, acc)),
+                _ => {}
+            }
+        }
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.time = Some(t); // past the popup fade-in (rule 101)
+        raw.events = events;
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        let mut acc = Vec::new();
+        out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        acc
+    }
+
+    #[test]
+    fn the_crash_notice_fits_small_windows_and_dismiss_closes_it() {
+        const NOTICE: [&str; 5] = ["kabelsalat restarted after a crash", "The report stays", "Open folder", "Report on GitHub", "Dismiss"];
+        for size in [Vec2::new(760.0, 520.0), Vec2::new(1600.0, 1000.0)] {
+            let mut app = notice_app();
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let mut texts = Vec::new();
+            for i in 0..4 {
+                texts = frame(&mut app, &ctx, size, i as f64, Vec::new());
+            }
+            let shown: Vec<&(String, Rect)> = texts.iter().filter(|(s, _)| NOTICE.iter().any(|n| s.starts_with(n))).collect();
+            assert_eq!(shown.len(), NOTICE.len(), "{size:?}: {shown:?}");
+            let screen = Rect::from_min_size(Pos2::ZERO, size);
+            for (i, (s, r)) in shown.iter().enumerate() {
+                assert!(screen.contains_rect(*r), "{size:?}: {s:?} {r:?} leaves the window");
+                for (s2, r2) in &shown[i + 1..] {
+                    let o = r.intersect(*r2);
+                    assert!(o.width() <= 1.0 || o.height() <= 1.0, "{size:?}: {s:?} overlaps {s2:?}");
+                }
+            }
+            let at = shown.iter().find(|(s, _)| s == "Dismiss").unwrap().1.center();
+            frame(&mut app, &ctx, size, 4.0, vec![egui::Event::PointerMoved(at)]);
+            frame(&mut app, &ctx, size, 4.1, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
+            frame(&mut app, &ctx, size, 4.2, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+            assert!(app.recovery.notice.is_none(), "{size:?}: Dismiss left the notice up");
+            let after = frame(&mut app, &ctx, size, 4.3, Vec::new());
+            assert!(!after.iter().any(|(s, _)| s.starts_with(NOTICE[0])), "{size:?}: the notice is still painted");
+        }
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat crash_notice_shots -- --ignored"]
+    fn crash_notice_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (w, h) in [(1280.0, 800.0), (760.0, 520.0)] {
+            let mut app = notice_app();
+            crate::ui::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("crash-notice-{w}x{h}.png")));
+        }
     }
 
     #[test]

@@ -35,6 +35,8 @@ const DIR_MAX: usize = 400;
 const MODULE: usize = 48;
 /// The signal stack of the main thread (other std threads have std's).
 const ALT_STACK: usize = 64 * 1024;
+/// Reports kept; older ones are deleted at start.
+const KEEP_REPORTS: usize = 20;
 
 /// What `install` prepared for the handler.
 struct Setup {
@@ -91,14 +93,28 @@ pub fn crash_dir() -> PathBuf {
     }
 }
 
+/// The reports in `dir`, oldest first (their names sort by time).
+fn reports(dir: &Path) -> Vec<PathBuf> {
+    let mut all: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
+    all.retain(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("crash-") && n.ends_with(".txt")));
+    all.sort();
+    all
+}
+
 /// The report the process `pid` wrote into `dir`, if any.
 pub fn report_of(dir: &Path, pid: u32) -> Option<PathBuf> {
     let suffix = format!("-{pid}.txt");
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("crash-") && n.ends_with(&suffix)))
-        .max()
+    reports(dir).into_iter().rfind(|p| p.to_string_lossy().ends_with(&suffix))
+}
+
+/// Delete all but the newest `keep` reports.
+fn prune(dir: &Path, keep: usize) {
+    let all = reports(dir);
+    for old in &all[..all.len().saturating_sub(keep)] {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 /// Install the signal handlers and the panic hook. Call once, early in
@@ -106,6 +122,7 @@ pub fn report_of(dir: &Path, pid: u32) -> Option<PathBuf> {
 pub fn install() {
     let dir = crash_dir();
     let _ = std::fs::create_dir_all(&dir);
+    prune(&dir, KEEP_REPORTS);
     let bytes = dir.as_os_str().as_encoded_bytes();
     if bytes.len() > DIR_MAX {
         eprintln!("crash: report folder path too long, reports go to stderr");
@@ -985,6 +1002,23 @@ f2cccb600000-f2cccb601000 r-xp 00000000 08:01 133179                     /home/a
         let short = short_backtrace(full);
         assert_eq!(short, "   3: core::panicking::panic_fmt\n   4: kabelsalat::ui::headless::run\n             at src/ui/headless.rs:144:33\n");
         assert_eq!(short_backtrace("   0: a\n   1: b\n"), "   0: a\n   1: b\n", "without markers every frame stays");
+    }
+
+    #[test]
+    fn old_reports_are_pruned_and_a_pid_finds_its_own() {
+        let dir = std::env::temp_dir().join(format!("kabelsalat-test-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, pid) in [(1, 300), (2, 31), (3, 300), (4, 7)] {
+            std::fs::write(dir.join(format!("crash-2026112{i}-120000-{pid}.txt")), "").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        assert_eq!(report_of(&dir, 300).unwrap().file_name().unwrap(), "crash-20261123-120000-300.txt");
+        assert_eq!(report_of(&dir, 30), None, "31 is not 30");
+        prune(&dir, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["crash-20261123-120000-300.txt", "crash-20261124-120000-7.txt", "notes.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

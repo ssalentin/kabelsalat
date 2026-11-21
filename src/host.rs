@@ -2091,21 +2091,26 @@ impl ClapVoiceMain {
 
     /// Format a parameter value as the plugin's own text (e.g. "440.0 Hz").
     pub fn param_text(&mut self, id: u32, value: f64) -> String {
-        let Some(params) = self.exts.params else {
-            return format!("{value:.3}");
-        };
+        self.param_text_opt(id, value).unwrap_or_else(|| format!("{value:.3}"))
+    }
+
+    /// Format a parameter value as the plugin's own text (`value_to_text`),
+    /// returning `None` if the plugin does not implement it or returns empty text.
+    pub fn param_text_opt(&mut self, id: u32, value: f64) -> Option<String> {
+        let params = self.exts.params?;
         let mut buf = [0u8; 256];
-        params
+        let bytes = params
             .value_to_text(&self.instance.plugin_handle(), ClapId::new(id), value, &mut buf)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_else(|_| format!("{value:.3}"))
+            .ok()?;
+        let s = String::from_utf8_lossy(bytes).trim().to_string();
+        (!s.is_empty()).then_some(s)
     }
 
     /// Parse human-readable parameter text (e.g. `"440 Hz"`, `"-6 dB"`) using
     /// the plugin's own CLAP `text_to_value` callback.
     pub fn param_text_to_value(&mut self, id: u32, text: &str) -> Option<f64> {
         let params = self.exts.params?;
-        let cstr = CString::new(text).ok()?;
+        let cstr = CString::new(text.trim()).ok()?;
         params.text_to_value(&self.instance.plugin_handle(), ClapId::new(id), &cstr)
     }
 

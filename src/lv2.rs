@@ -292,6 +292,12 @@ extern "C" {
     fn lilv_world_new() -> *mut LilvWorld;
     fn lilv_world_free(world: *mut LilvWorld);
     fn lilv_world_load_all(world: *mut LilvWorld);
+    fn lilv_world_get(
+        world: *mut LilvWorld,
+        subject: *const LilvNode,
+        predicate: *const LilvNode,
+        object: *const LilvNode,
+    ) -> *mut LilvNode;
     fn lilv_world_get_all_plugins(world: *const LilvWorld) -> *const LilvPlugins;
     fn lilv_plugins_begin(collection: *const LilvPlugins) -> *mut LilvIter;
     fn lilv_plugins_is_end(collection: *const LilvPlugins, iter: *const LilvIter) -> bool;
@@ -310,6 +316,8 @@ extern "C" {
     fn lilv_nodes_is_end(nodes: *const LilvNodes, i: *mut LilvIter) -> bool;
     fn lilv_nodes_free(nodes: *mut LilvNodes);
     fn lilv_node_is_uri(value: *const LilvNode) -> bool;
+    fn lilv_node_is_blank(value: *const LilvNode) -> bool;
+    fn lilv_node_is_string(value: *const LilvNode) -> bool;
     fn lilv_node_as_string(value: *const LilvNode) -> *const c_char;
     fn lilv_node_as_uri(value: *const LilvNode) -> *const c_char;
     fn lilv_plugin_get_library_uri(plugin: *const LilvPlugin) -> *const LilvNode;
@@ -754,6 +762,30 @@ fn lv2_unit_symbol(uri: &str) -> Option<&'static str> {
     }
 }
 
+unsafe fn resolve_unit_node_text(
+    world: *mut LilvWorld,
+    unit_node: *const LilvNode,
+    symbol_pred: *const LilvNode,
+    label_pred: *const LilvNode,
+) -> String {
+    for pred in [symbol_pred, label_pred] {
+        let val = lilv_world_get(world, unit_node, pred, std::ptr::null());
+        if !val.is_null() {
+            let text = if lilv_node_is_string(val) {
+                node_borrowed(val)
+            } else {
+                String::new()
+            };
+            lilv_node_free(val);
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 unsafe fn read_control_infos(world: *mut LilvWorld, plugin: *const LilvPlugin) -> Vec<Lv2ControlInfo> {
     let uri = |u: &[u8]| lilv_new_uri(world, u.as_ptr() as *const c_char);
     let toggled_u = uri(b"http://lv2plug.in/ns/lv2core#toggled\0");
@@ -761,6 +793,8 @@ unsafe fn read_control_infos(world: *mut LilvWorld, plugin: *const LilvPlugin) -
     let enum_u = uri(b"http://lv2plug.in/ns/lv2core#enumeration\0");
     let log_u = uri(b"http://lv2plug.in/ns/ext/port-props#logarithmic\0");
     let unit_pred = uri(b"http://lv2plug.in/ns/extensions/units#unit\0");
+    let unit_symbol_pred = uri(b"http://lv2plug.in/ns/extensions/units#symbol\0");
+    let rdfs_label_pred = uri(b"http://www.w3.org/2000/01/rdf-schema#label\0");
 
     let metas = read_control_meta(world, plugin);
     let mut out = Vec::with_capacity(metas.len());
@@ -775,9 +809,15 @@ unsafe fn read_control_infos(world: *mut LilvWorld, plugin: *const LilvPlugin) -
         let unit = if !unit_node.is_null() {
             let u = if lilv_node_is_uri(unit_node) {
                 let raw = node_borrowed(unit_node);
-                lv2_unit_symbol(&raw).map(str::to_string).unwrap_or_default()
-            } else {
+                lv2_unit_symbol(&raw).map(str::to_string).unwrap_or_else(|| {
+                    resolve_unit_node_text(world, unit_node, unit_symbol_pred, rdfs_label_pred)
+                })
+            } else if lilv_node_is_blank(unit_node) {
+                resolve_unit_node_text(world, unit_node, unit_symbol_pred, rdfs_label_pred)
+            } else if lilv_node_is_string(unit_node) {
                 node_borrowed(unit_node)
+            } else {
+                String::new()
             };
             lilv_node_free(unit_node);
             u
@@ -835,6 +875,8 @@ unsafe fn read_control_infos(world: *mut LilvWorld, plugin: *const LilvPlugin) -
     lilv_node_free(enum_u);
     lilv_node_free(log_u);
     lilv_node_free(unit_pred);
+    lilv_node_free(unit_symbol_pred);
+    lilv_node_free(rdfs_label_pred);
     out
 }
 
@@ -3484,4 +3526,101 @@ pub fn instrument_test() -> anyhow::Result<()> {
     anyhow::ensure!(found > 0, "no LV2 instrument detected among candidates");
     println!("lv2-instrument-test: OK — {found} instrument(s) detected, {sounding} produced audio from a MIDI note");
     Ok(())
+}
+
+#[cfg(test)]
+mod unit_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn lv2_blank_node_units_resolve_to_symbol_or_label() {
+        let dir = std::env::temp_dir().join(format!(
+            "kabelsalat-lv2-unit-test-{}.lv2",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let plugin_uri = "http://example.org/kabelsalat/blank_unit_test";
+        std::fs::write(
+            dir.join("manifest.ttl"),
+            format!(
+                "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 <{plugin_uri}> a lv2:Plugin ;\n\
+                     rdfs:seeAlso <plugin.ttl> .\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("plugin.ttl"),
+            format!(
+                "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 @prefix units: <http://lv2plug.in/ns/extensions/units#> .\n\
+                 <{plugin_uri}> a lv2:Plugin ;\n\
+                     lv2:port [\n\
+                         a lv2:InputPort, lv2:ControlPort ;\n\
+                         lv2:index 0 ;\n\
+                         lv2:symbol \"gain\" ;\n\
+                         lv2:name \"Input gain\" ;\n\
+                         lv2:default 1.0 ;\n\
+                         lv2:minimum 0.0 ;\n\
+                         lv2:maximum 10.0 ;\n\
+                         units:unit [\n\
+                             a units:Unit ;\n\
+                             rdfs:label \"gain\" ;\n\
+                             units:symbol \"G\" ;\n\
+                         ] ;\n\
+                     ] , [\n\
+                         a lv2:InputPort, lv2:ControlPort ;\n\
+                         lv2:index 1 ;\n\
+                         lv2:symbol \"steps\" ;\n\
+                         lv2:name \"Steps\" ;\n\
+                         lv2:default 1.0 ;\n\
+                         lv2:minimum 1.0 ;\n\
+                         lv2:maximum 8.0 ;\n\
+                         units:unit [\n\
+                             a units:Unit ;\n\
+                             rdfs:label \"steps\" ;\n\
+                         ] ;\n\
+                     ] , [\n\
+                         a lv2:InputPort, lv2:ControlPort ;\n\
+                         lv2:index 2 ;\n\
+                         lv2:symbol \"lookahead\" ;\n\
+                         lv2:name \"Lookahead\" ;\n\
+                         lv2:default 0.0 ;\n\
+                         lv2:minimum 0.0 ;\n\
+                         lv2:maximum 20.0 ;\n\
+                         units:unit units:ms ;\n\
+                     ] .\n"
+            ),
+        )
+        .unwrap();
+
+        let _lilv = lilv_guard();
+        let infos = unsafe {
+            let world = lilv_world_new();
+            assert!(!world.is_null());
+            let mut path_str = dir.to_string_lossy().into_owned();
+            if !path_str.ends_with('/') {
+                path_str.push('/');
+            }
+            let c_path = std::ffi::CString::new(path_str).unwrap();
+            let bundle_uri = lilv_new_file_uri(world, std::ptr::null(), c_path.as_ptr());
+            lilv_world_load_bundle(world, bundle_uri);
+            lilv_node_free(bundle_uri);
+            let plugin = find_plugin(world, plugin_uri);
+            assert!(!plugin.is_null(), "test LV2 bundle did not load");
+            let infos = read_control_infos(world, plugin);
+            lilv_world_free(world);
+            infos
+        };
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let by_sym = |s: &str| infos.iter().find(|i| i.symbol == s).unwrap().unit.clone();
+        assert_eq!(by_sym("gain"), "G");
+        assert_eq!(by_sym("steps"), "steps");
+        assert_eq!(by_sym("lookahead"), "ms");
+    }
 }

@@ -5745,12 +5745,16 @@ impl DemoApp {
             let valid: Vec<String> = crate::bridge::BUFFER_SIZE_CHOICES.iter().map(|n| n.to_string()).collect();
             return Err(format!("invalid buffer size {frames}; choose one of {}", valid.join(", ")));
         }
+        let mut applied_frames = frames;
         if let Some(host) = &mut self.audio_host {
-            if let Err(e) = host.set_buffer_frames(frames) {
-                self.buffer_size_err = Some(e.clone());
-                return Err(e);
+            match host.set_buffer_frames(frames) {
+                Ok(actual) => applied_frames = actual,
+                Err(e) => {
+                    self.buffer_size_err = Some(e.clone());
+                    return Err(e);
+                }
             }
-            crate::bridge::set_configured_buffer_frames(frames);
+            crate::bridge::set_configured_buffer_frames(applied_frames);
             crate::engine_info::reset_for_buffer_change();
             if let Some(t) = &self.node_times {
                 t.reset_peaks();
@@ -5766,16 +5770,23 @@ impl DemoApp {
                 (c.render_max_us, c.render_late, c.xruns) = (0, 0, 0);
             }
         }
-        self.buffer_frames = frames;
+        self.buffer_frames = applied_frames;
         self.buffer_size_err = None;
-        let _ = crate::assistant::save_buffer_frames(frames);
+        if applied_frames == frames {
+            let _ = crate::assistant::save_buffer_frames(frames);
+        }
         self.resync_all_audio_in_captures();
         self.engine_stats_at = f32::NEG_INFINITY;
         self.stats_timer = 0.0;
         self.refresh_engine_stats();
         let sr = if self.sample_rate > 0.0 { self.sample_rate } else { 48000.0 };
-        let ms = frames as f64 / sr * 1000.0;
-        Ok(format!("Buffer size set to {frames} frames ({ms:.1} ms at {:.1} kHz)", sr / 1000.0))
+        let ms = applied_frames as f64 / sr * 1000.0;
+        if applied_frames != frames {
+            let server = self.active_audio_backend.map(|b| b.label()).unwrap_or("Audio server");
+            Ok(format!("{server} controls the buffer size ({applied_frames} frames, {ms:.1} ms at {:.1} kHz)", sr / 1000.0))
+        } else {
+            Ok(format!("Buffer size set to {applied_frames} frames ({ms:.1} ms at {:.1} kHz)", sr / 1000.0))
+        }
     }
 
     /// Set another app's stream volume/mute (applied by the scan thread).
@@ -20448,8 +20459,9 @@ impl DemoApp {
             (false, true) => ("no key set".to_string(), warn),
             (false, false) => ("no key set".to_string(), ok),
         };
+        let shown_buf = if self.engine_stats.audio_live { self.engine_stats.buffer_frames } else { self.buffer_frames };
         [
-            (format!("{} frames · {out}", self.buffer_frames), ok),
+            (format!("{shown_buf} frames · {out}"), ok),
             (format!("autosave {} · count-in {}", on_off(self.autosave.enabled), on_off(self.count_in_enabled)), ok),
             (format!("{:.2}× · motion {}", ppp, if self.reduce_motion { "reduced" } else { "full" }), ok),
             models,
@@ -20656,7 +20668,11 @@ impl DemoApp {
             },
         );
         if let Some(active) = self.active_audio_backend {
-            ui.label(egui::RichText::new(format!("Active: {}", active.label())).size(11.0).color(theme::CREAM_META));
+            if backend_choice == crate::audio_backend::AudioBackendChoice::Auto
+                || backend_choice.label() != active.label()
+            {
+                ui.label(egui::RichText::new(format!("Active: {}", active.label())).size(11.0).color(theme::CREAM_META));
+            }
         }
         if let Some(err) = &self.audio_backend_err {
             ui.label(egui::RichText::new(err).size(11.0).color(theme::CLIP_BRIGHT));
@@ -20701,32 +20717,52 @@ impl DemoApp {
                     });
             }
         });
-        if let Some(c) = &out_current {
-            ui.label(egui::RichText::new(format!("Active: {}", label_of(c))).size(11.0).color(theme::CREAM_META));
+        if !is_jack {
+            if let Some(c) = &out_current {
+                let active_label = label_of(c);
+                if out_wanted.is_none() || active_label != selected_out {
+                    ui.label(egui::RichText::new(format!("Active: {active_label}")).size(11.0).color(theme::CREAM_META));
+                }
+            }
         }
         Self::settings_gap(ui);
 
         let buffer_frames = self.buffer_frames;
         let sr = if self.sample_rate > 0.0 { self.sample_rate } else { 48000.0 };
         let fmt_buf = |f: u32| format!("{f} frames ({:.1} ms)", f as f64 / sr * 1000.0);
+        let live_buf = if self.engine_stats.audio_live { self.engine_stats.buffer_frames } else { buffer_frames };
         let selected_buf = fmt_buf(buffer_frames);
-        Self::settings_row(ui, "Buffer size", "Lower reduces latency; higher prevents dropouts (xruns).", |ui| {
-            let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
-            theme::Dropdown::new("dd_settings_buffer_size", &selected_buf)
-                .width(dd_w)
-                .popup_min_width(180.0)
-                .text_size(12.0)
-                .show_ui(ui, |menu| {
-                    for &f in crate::bridge::BUFFER_SIZE_CHOICES {
-                        if menu.item(buffer_frames == f, &fmt_buf(f)) {
-                            actions.push(SettingsAction::SetBufferSize(f));
+        let buf_desc = if is_jack {
+            "Controlled by the JACK server."
+        } else {
+            "Lower reduces latency; higher prevents dropouts (xruns)."
+        };
+        Self::settings_row(ui, "Buffer size", buf_desc, |ui| {
+            if is_jack {
+                ui.label(egui::RichText::new(fmt_buf(live_buf)).size(12.0).color(theme::CREAM_META));
+            } else {
+                let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
+                theme::Dropdown::new("dd_settings_buffer_size", &selected_buf)
+                    .width(dd_w)
+                    .popup_min_width(180.0)
+                    .text_size(12.0)
+                    .show_ui(ui, |menu| {
+                        for &f in crate::bridge::BUFFER_SIZE_CHOICES {
+                            if menu.item(buffer_frames == f, &fmt_buf(f)) {
+                                actions.push(SettingsAction::SetBufferSize(f));
+                            }
                         }
-                    }
-                });
+                    });
+            }
         });
-        if self.engine_stats.audio_live && self.engine_stats.buffer_frames != buffer_frames {
+        if !is_jack && self.engine_stats.audio_live && self.engine_stats.buffer_frames != buffer_frames {
             let (f, ms) = (self.engine_stats.buffer_frames, self.engine_stats.buffer_ms);
-            ui.label(egui::RichText::new(format!("Active: {f} frames ({ms:.1} ms)")).size(11.0).color(theme::CREAM_META));
+            let server = self.active_audio_backend.map(|b| b.label()).unwrap_or("Audio server");
+            ui.label(
+                egui::RichText::new(format!("{server} is overriding this to {f} frames ({ms:.1} ms)."))
+                    .size(11.0)
+                    .color(theme::CABLE_AMBER),
+            );
         }
         Self::settings_gap(ui);
 
@@ -43587,6 +43623,59 @@ mod settings_and_dropdown_tests {
         assert!(app.settings_msg.contains("512 frames"), "{}", app.settings_msg);
         let (texts, _, _) = warm(&mut app, &ctx, size);
         assert!(texts.iter().any(|(t, _)| t == "512 frames (10.7 ms)"));
+    }
+
+    #[test]
+    fn settings_audio_page_avoids_redundant_active_labels_and_explains_overrides() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        app.audio_backend = crate::audio_backend::AudioBackendChoice::PipeWire;
+        app.active_audio_backend = Some(crate::audio_backend::ActiveBackend::PipeWire);
+        app.buffer_frames = 128;
+        app.test_counters = Some(crate::engine_info::EngineCounters {
+            sample_rate: 48_000,
+            callback_frames: 128,
+            configured_frames: 128,
+            ..Default::default()
+        });
+        app.engine_stats = app.engine_stats_now();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+
+        // Matching backend + matching buffer: no redundant "Active:" or override line.
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(
+            !texts.iter().any(|(t, _)| t.starts_with("Active:")),
+            "no redundant Active: line when selections match: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t.contains("overriding")),
+            "no override line when buffer matches: {texts:?}"
+        );
+
+        // PipeWire overrides 128 -> 256: explain the override clearly and reflect 256 in the rail.
+        app.test_counters.as_mut().unwrap().callback_frames = 256;
+        app.engine_stats = app.engine_stats_now();
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(
+            texts.iter().any(|(t, _)| t == "PipeWire is overriding this to 256 frames (5.3 ms)."),
+            "override reason shown instead of cryptic Active: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|(t, _)| t.starts_with("Active: 256")),
+            "no cryptic Active: frames line: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, _)| t.starts_with("256 frames · ")),
+            "rail summary shows live 256 frames: {texts:?}"
+        );
+
+        // JACK owns the buffer size: show read-only value, no override notice.
+        app.active_audio_backend = Some(crate::audio_backend::ActiveBackend::Jack);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(texts.iter().any(|(t, _)| t == "Controlled by the JACK server."), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "256 frames (5.3 ms)"), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.contains("overriding")), "{texts:?}");
     }
 
     #[test]

@@ -55,8 +55,9 @@ agents are in [AGENTS.md](../AGENTS.md).
   `frame_end` (`publish_show`, repaint pacing), so a foot switch, an agent
   or a remote edit keeps working and the screen shows its result. Its own
   input is PageUp/PageDown, the Panic button (`Command::Panic`: pedals up and
-  all notes off on every MIDI-destination node, on every channel) and a held
-  Esc.
+  all notes off on every channel, each node released once) and Esc held
+  for a second, which leaves when it is let go (so its key repeats never
+  reach the editing frame).
 - `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
   atomics, read once), `NodeTimes` (lock-free render time per unit) and the
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`

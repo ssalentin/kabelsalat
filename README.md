@@ -170,8 +170,8 @@ and part in large type, the next song, tempo and time signature, the master
 meter, one meter per rig that plays in this part, and a clock. Editing is
 locked while it is open: no click or key moves a cable, a fader or a song.
 PageUp / PageDown (Shift for songs) and a foot switch still step the setlist,
-**Panic** sends all notes off on every rig (agents: `panic`), and holding
-**Esc** for a second leaves.
+**Panic** sends all notes off on every rig (agents: `panic`), and to leave
+you hold **Esc** until its line fills (a second), then let go.
 
 <p align="center"><img src="docs/shots/show-mode.png" width="85%" alt="Show mode: the song Moonlight Drive in large type with its part Chorus and 118 BPM 4/4, the next song Riders on the Storm, meters for the master and the organ, a clock, the Panic button and the hint to hold Esc to leave"/></p>
 

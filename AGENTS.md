@@ -1746,3 +1746,12 @@ Learned so far (2026-11-15, UI polish pass):
     and judge outgoing-rig draining from the engine's pre-fader + held-note
     `rig_busy_mask`/`rig_held_mask` rather than UI mirrors
     (`demo_app_real_engine_window_attach_drain_and_bounce`).
+204. **Settings never repeat a dropdown's value as a second `Active:` line,
+    and explain server overrides:** `settings_audio_page` printed `Active: X`
+    under Audio backend, Audio output and Buffer size even when redundant or
+    contradictory (e.g. `128 frames` in the dropdown with `Active: 256 frames`
+    below when PipeWire's `clock.force-quantum` overrode it). Show `Active:`
+    only when the dropdown is `Auto`/`System default` or differs from the live
+    value; for Buffer size, show a read-only server value on JACK and an
+    explicit `<server> is overriding this to ...` note only on a live mismatch
+    (`settings_audio_page_avoids_redundant_active_labels_and_explains_overrides`).

@@ -17,8 +17,8 @@ agents are in [AGENTS.md](../AGENTS.md).
   `RigSnapshot`, `RigZone` (`Command::SetRigZones`), `merge_rigs`/`split_rigs`,
   the lock-free `command_bus()` (rtrb).
 - `setlist.rs` — gig setlist model (#204): `Setlist`, `Song` (optional BPM and
-  time signature), `Part` (per-rig `PartRig` key range, transpose, level and
-  stored `ParamValue` knobs), `FootSwitch` CC bindings, stepping, validation and
+  time signature), `Part` (per-rig `PartRig` key range, transpose, level,
+  velocity layer and floating split, and stored `ParamValue` knobs), `FootSwitch` CC bindings, stepping, validation and
   node/rig remapping across rig edits. Persisted inside `Session`; switching
   parts sends `Command::SetRigZones` so the engine gates only new notes while
   held notes, releases, pedal-ups and effect tails finish uninterrupted.
@@ -42,6 +42,11 @@ agents are in [AGENTS.md](../AGENTS.md).
   its tempo, levels and knobs. `ShowSent` sends a setlist's changes and
   keeps each part table (`ShowParts`, an `Arc`) until the engine let go, so
   the audio thread frees none.
+- `layer.rs` — velocity layers and floating splits of a rig zone (#276):
+  `VelCurve` and `ZoneHands`, the per-rig record of where the hands last
+  played around each key-range edge. The engine moves it once per live
+  note-on; releases are never gated, so a layer or a floated split cannot
+  strand a note.
 - `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
   atomics, read once), `NodeTimes` (lock-free render time per unit) and the
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`

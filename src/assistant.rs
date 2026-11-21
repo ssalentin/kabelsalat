@@ -709,7 +709,8 @@ fn system_prompt() -> String {
      - Setlist (live song & part switching without cutting held notes or tails): \
      get_setlist reads the songs, parts, active position and foot-switch CCs; \
      set_setlist_song adds, updates, moves or removes a song and its parts (each part names \
-     which rigs are live with key_lo/key_hi, transpose, level and optional stored knobs); \
+     which rigs are live with key_lo/key_hi, transpose, level, a velocity layer vel_lo/vel_hi with \
+     vel_curve, a floating split (float keys) and optional stored knobs); \
      select_setlist_part jumps to a song/part or steps next_part/prev_part/next_song/prev_song/clear; \
      add_song_from_session imports a saved session's rigs into the current gig and makes a song \
      of them; set_setlist_footswitch binds or clears a hardware MIDI CC for next/prev part. \
@@ -1199,12 +1200,12 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"get_setlist",
-            "description":"Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.",
+            "description":"Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_setlist_song",
-            "description":"Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature (e.g. '4/4', '3/4', '6/8', or null to clear). Optional parts: JSON array string of parts, each {name, rigs: [{rig, key_lo?, key_hi?, transpose?, level?}], buses?: [aux bus node ids that take signal in this part], capture_knobs?}. When creating a song without parts, one 'Main' part is created from the active rig.",
+            "description":"Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature (e.g. '4/4', '3/4', '6/8', or null to clear). Optional parts: JSON array string of parts, each {name, rigs: [{rig, key_lo?, key_hi?, transpose?, level?, vel_lo?, vel_hi?, vel_curve?, float?}], buses?: [aux bus node ids that take signal in this part], capture_knobs?}. vel_lo/vel_hi (0-127) make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60); vel_curve is linear | soft | hard; float (0-12 keys) makes the key range's edges a floating split that follows the hand playing across it. When creating a song without parts, one 'Main' part is created from the active rig.",
             "parameters":{"type":"object","properties":{"song":{"type":"integer"},"name":{"type":"string"},"bpm":{"type":["number","null"]},"time_signature":{"type":["string","null"]},"parts":{"type":"string"},"move_to":{"type":"integer"},"remove":{"type":"boolean"}}}
         }},
         {"type":"function","function":{

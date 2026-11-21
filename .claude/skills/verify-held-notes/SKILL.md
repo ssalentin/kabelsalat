@@ -73,6 +73,22 @@ meanwhile), Keys → A transpose +12 / 0, split at 60 / none, and `LoadStart`.
 The engine's part index is part of the fingerprint, its step counter is
 not (it only grows). Expect about 19.5k states to a fixpoint, ~15 s.
 
+## Layers scenario (issue #276)
+
+`held_notes_are_released_across_velocity_layers_and_a_floating_split` starts
+from the zones scenario's patch (Surge B in rig 1). Its alphabet is the notes
+pressed hard (velocity 0.8) or soft (`Soft`, 0.3 = 38), `SetRigZones` with
+each song of `LAYER_SONGS` (both open; A soft with a soft curve and B hard
+with a hard curve; the same layers swapped; a split at C4 floating two keys,
+which puts 59 and 60 inside each other's float, with B +12; that split with B
+out of the song), the matrix transpose and the cable a layer's note passes
+through, and `LoadStart`. The engine's `zone_hands` (one record per floating
+edge of where the hands last played, which moves the split) are part of the
+fingerprint. `LAYER_SONGS` is its own table: the foot-switch scenario steps
+through every entry of `SONGS`, so a song added there grows that search.
+Property as in the routing scenario. Expect about 10k states to a fixpoint.
+A mutation that gates releases by the zone fails it at once.
+
 ## How it works (enough to judge a result)
 
 - A breadth-first search over the **real** `GraphEngine::apply`
@@ -158,7 +174,8 @@ release: stuck about 0.2–0.3, released 0.00). Fixed in the commit after
 
 | Check covers | Where |
 |---|---|
-| Note dispatch | `src/engine.rs`: `apply` arms `NoteOn`, `NoteOff`; `keys_gate`; `release_all`; `zone_of` |
+| Note dispatch | `src/engine.rs`: `apply` arms `NoteOn`, `NoteOff`; `keys_gate`; `release_all`; `zone_of`, `hands_of`; `deliver_keys_note` (zone gate, velocity curve) |
+| Layers | `src/layer.rs`: `ZoneHands::inside`, `ZoneHands::play`, `VelCurve`; `src/control.rs`: `RigZone::starts` |
 | Routing edits | `src/engine.rs`: `apply` arms `SetNodeSplit`, `MatrixRule`, `Connect`, `Disconnect`, `RemoveNode`, `LoadGraph`, `SetRigZones` (`set_rig_zones`) |
 | Matrix | `src/matrix.rs`: `Matrix::route_into`, `Rule::transform`, `transpose_note` |
 | Graph edits | `src/control.rs`: `Graph::set_split`, `connect_with_id`, `disconnect`, `split_port` |
@@ -185,7 +202,7 @@ key), extend `EDITS`/`Step` first.
 - **Detail limits:**
   - Two keys only (59, 60).
   - Splits only at None, 60 and 48.
-  - Velocity ranges are not varied.
+  - Velocity ranges vary only in the layers scenario (two velocities).
   - A note-off silences all voices of that pitch on an instrument. Duplicate
     same-pitch note-ons are not counted separately.
 - **Audio.** Only note delivery. Release tails, CLAP/LV2 plugin behaviour and

@@ -826,7 +826,7 @@ mod tests {
         let z = at(&mut sl, 0).active_zones();
         assert_eq!((z[0], z[1], z[2]), (RigZone::OPEN, RigZone::OPEN, OFF));
         let z = at(&mut sl, 1).active_zones();
-        assert_eq!((z[0], z[1].live, z[2]), (RigZone::OPEN, false, RigZone { live: true, key_lo: 36, key_hi: 96, transpose: -12 }));
+        assert_eq!((z[0], z[1].live, z[2]), (RigZone::OPEN, false, RigZone { key_lo: 36, key_hi: 96, transpose: -12, ..RigZone::OPEN }));
         assert!(sl.gates(&g).closed_buses.is_empty());
         let saved = serde_json::to_string(&sl).unwrap();
         assert!(!saved.contains("levels") && !saved.contains("sets"), "an unchanged old setlist saves in the old shape: {saved}");
@@ -837,7 +837,7 @@ mod tests {
     fn a_show_level_rig_is_untouched_by_every_switch_even_where_a_part_names_it() {
         let (g, _) = three_rigs();
         let mut sl = Setlist { songs: vec![song("A", &[0, 1]), song("B", &[1])], ..Setlist::default() };
-        sl.songs[0].parts[0].rigs[0] = PartRig { rig: 0, key_lo: 60, key_hi: 72, transpose: 5, level: 0.2 };
+        sl.songs[0].parts[0].rigs[0] = PartRig { rig: 0, key_lo: 60, key_hi: 72, transpose: 5, level: 0.2, ..PartRig::default() };
         sl.songs[0].parts[0].params.push(ParamValue { node: 0, param: 0, value: 0.3 });
         sl.songs[0].parts[0].params.push(ParamValue { node: 2, param: 0, value: 0.4 });
         sl.pin_rig(0, Level::Show);
@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(sl.recalled_rigs().iter().map(|r| r.rig).collect::<Vec<_>>(), vec![1], "its fader is never recalled");
         assert_eq!(sl.recalled_params(&g).iter().map(|p| p.node).collect::<Vec<_>>(), vec![2], "nor its knobs");
         sl.pin_rig(0, Level::Song);
-        assert_eq!(sl.active_zones()[0], RigZone { live: true, key_lo: 60, key_hi: 72, transpose: 5 }, "back at song level the part's entry plays again");
+        assert_eq!(sl.active_zones()[0], RigZone { key_lo: 60, key_hi: 72, transpose: 5, ..RigZone::OPEN }, "back at song level the part's entry plays again");
     }
 
     #[test]

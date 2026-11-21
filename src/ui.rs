@@ -8225,6 +8225,10 @@ impl DemoApp {
                     "key_hi": r.key_hi,
                     "transpose": r.transpose,
                     "level": r.level,
+                    "vel_lo": r.vel_lo,
+                    "vel_hi": r.vel_hi,
+                    "vel_curve": r.curve.as_str(),
+                    "float": r.float,
                 })).collect();
                 serde_json::json!({
                     "index": pi,
@@ -8309,7 +8313,9 @@ impl DemoApp {
                         let level = r.get("level").and_then(|v| v.as_f64())
                             .map(|v| (v as f32).clamp(0.0, 1.0))
                             .unwrap_or_else(|| self.rig_mix[rig].vol);
-                        part.set_rig(PartRig { rig: rig as u8, key_lo: key_lo.min(key_hi), key_hi: key_lo.max(key_hi), transpose, level });
+                        let mut pr = PartRig { rig: rig as u8, key_lo: key_lo.min(key_hi), key_hi: key_lo.max(key_hi), transpose, level, ..PartRig::default() };
+                        pr.set_layer_json(r)?;
+                        part.set_rig(pr);
                     }
                 }
                 part.buses = crate::setlist::part_buses(item, &graph)?;
@@ -17998,6 +18004,30 @@ impl DemoApp {
                                                         pr.level = (pct as f32 / 100.0).clamp(0.0, 1.0);
                                                         if is_live { *active_part_dirty = true; }
                                                     }
+                                                    ui.label(egui::RichText::new("Vel").size(11.0).color(theme::INK_2));
+                                                    let mut moved = ui.add(egui::DragValue::new(&mut pr.vel_lo).range(0..=127).speed(0.25))
+                                                        .on_hover_text("Softest velocity this rig plays").changed();
+                                                    if moved && pr.vel_lo > pr.vel_hi { pr.vel_hi = pr.vel_lo; }
+                                                    ui.label(egui::RichText::new("–").size(11.0).color(theme::INK_2));
+                                                    if ui.add(egui::DragValue::new(&mut pr.vel_hi).range(0..=127).speed(0.25))
+                                                        .on_hover_text("Hardest velocity this rig plays").changed()
+                                                    {
+                                                        if pr.vel_hi < pr.vel_lo { pr.vel_lo = pr.vel_hi; }
+                                                        moved = true;
+                                                    }
+                                                    let curve = pr.curve;
+                                                    if theme::wrapped_chip_button(ui, curve.as_str(), curve != crate::layer::VelCurve::Linear)
+                                                        .on_hover_text("Velocity curve: linear, soft (quiet playing louder), hard (needs a firmer touch)")
+                                                        .clicked()
+                                                    {
+                                                        pr.curve = curve.next();
+                                                        moved = true;
+                                                    }
+                                                    ui.label(egui::RichText::new("Float").size(11.0).color(theme::INK_2));
+                                                    moved |= ui.add(egui::DragValue::new(&mut pr.float).range(0..=crate::layer::FLOAT_MAX).speed(0.1))
+                                                        .on_hover_text("Floating split: keys each edge of the key range follows the hand that plays across it")
+                                                        .changed();
+                                                    if moved && is_live { *active_part_dirty = true; }
                                                 }
                                             });
                                         }
@@ -47818,6 +47848,68 @@ mod navigator_tests {
     }
 
     #[test]
+    fn a_velocity_layer_and_a_floating_split_are_set_by_the_assistant_and_in_the_part_editor() {
+        use crate::layer::VelCurve;
+        fn collect_text(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => for c in v { collect_text(c, out); },
+                _ => {}
+            }
+        }
+        let (mut app, _) = two_rigs_with_inserts(true);
+        let res = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Ballad",
+            "parts": [{"name": "Layered", "rigs": [
+                {"rig": 0, "vel_hi": 90},
+                {"rig": 1, "key_lo": 48, "vel_lo": 60, "vel_curve": "hard", "float": 3}
+            ]}]
+        }));
+        let v: serde_json::Value = serde_json::from_str(&res).expect("valid setlist json");
+        let piano = &v["songs"][0]["parts"][0]["rigs"][1];
+        assert_eq!((&piano["vel_lo"], &piano["vel_hi"], &piano["vel_curve"], &piano["float"]), (&serde_json::json!(60), &serde_json::json!(127), &serde_json::json!("hard"), &serde_json::json!(3)), "{piano}");
+        let bad = app.exec_tool("set_setlist_song", &serde_json::json!({"song": 0, "parts": [{"name": "Solo", "rigs": [{"rig": 0, "vel_curve": "loud"}]}]}));
+        assert!(bad.contains("unknown velocity curve"), "{bad}");
+        assert_eq!(app.setlist.songs[0].parts[0].name, "Layered", "a refused call changes nothing");
+
+        let _ = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 0}));
+        assert_eq!((app.rig_zones[0].vel_lo, app.rig_zones[0].vel_hi, app.rig_zones[0].curve), (0, 90, VelCurve::Linear));
+        assert_eq!((app.rig_zones[1].vel_lo, app.rig_zones[1].curve, app.rig_zones[1].float), (60, VelCurve::Hard, 3));
+
+        // The part editor shows each rig's curve as a chip; a click steps it
+        // and the live part goes to the engine at once.
+        app.stage_view = StageView::Setlist;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let chip = |app: &mut DemoApp, label: &str| {
+            let shapes = run_frame_at(app, &ctx, size, vec![]);
+            let mut texts = Vec::new();
+            for c in &shapes { collect_text(&c.shape, &mut texts); }
+            texts.into_iter().find(|(t, _)| t == label).map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("no '{label}' chip in the part editor"))
+        };
+        for _ in 0..2 { run_frame_at(&mut app, &ctx, size, vec![]); }
+        let hard = chip(&mut app, "hard");
+        click_at(&mut app, &ctx, size, hard);
+        assert_eq!(app.rig_zones[1].curve, VelCurve::Linear, "hard steps on to linear");
+        let first_row = chip(&mut app, "linear");
+        click_at(&mut app, &ctx, size, first_row);
+        assert_eq!((app.rig_zones[0].curve, app.rig_zones[1].curve), (VelCurve::Soft, VelCurve::Linear), "rig 1's chip steps linear on to soft");
+
+        // Saved with the session.
+        let dir = std::env::temp_dir().join(format!("kabelsalat-layers-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkg = crate::session::Session::package_path(&dir, "Ballad").unwrap();
+        app.capture_session("Ballad").unwrap().save(&pkg).unwrap();
+        let loaded = crate::session::Session::load(&pkg).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.setlist, app.setlist);
+        let back = loaded.setlist.songs[0].parts[0].rigs[1];
+        assert_eq!((back.key_lo, back.vel_lo, back.float), (48, 60, 3));
+    }
+
+    #[test]
     #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat setlist_shots -- --ignored"]
     fn setlist_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
@@ -47833,8 +47925,8 @@ mod navigator_tests {
                 "parts": [
                     {"name": "Verse", "rigs": [{"rig": 0, "key_lo": 36, "key_hi": 96, "transpose": 0, "level": 0.9}], "capture_knobs": true},
                     {"name": "Chorus", "rigs": [
-                        {"rig": 0, "key_lo": 36, "key_hi": 59, "transpose": 0, "level": 0.85},
-                        {"rig": 1, "key_lo": 60, "key_hi": 96, "transpose": 12, "level": 0.8}
+                        {"rig": 0, "key_lo": 36, "key_hi": 59, "transpose": 0, "level": 0.85, "float": 3},
+                        {"rig": 1, "key_lo": 60, "key_hi": 96, "transpose": 12, "level": 0.8, "vel_lo": 40, "vel_curve": "soft", "float": 3}
                     ], "capture_knobs": true}
                 ]
             }));

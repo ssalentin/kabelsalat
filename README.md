@@ -136,6 +136,9 @@ Press **F12** (or click **Setlist**) to organize a gig into songs and parts
 (Verse, Chorus, Solo) over the loaded rigs. Every rig stays loaded; each part
 says which rigs take new notes, with per-rig key range, transpose, level and
 stored knob values, and each song can set its own tempo and time signature.
+Each rig also takes a velocity range and curve, so a soft pad can sit under a
+hard-struck piano, and a floating split: its key range's edges follow the hand
+that plays across them, by up to the set number of keys.
 Switching parts never cuts held notes or reverb tails — outgoing rigs keep
 sounding until you release the keys or sustain pedal, while new notes play the
 next part from the same audio block on. Step parts from the top bar, with
@@ -144,7 +147,7 @@ page-turner pedals), or bind a hardware MIDI foot-switch CC. **Add song from
 session** pulls a saved session's rigs into the gig as a new song, and the
 assistant and MCP agents can read, build and step the setlist.
 
-<p align="center"><img src="docs/shots/setlist.png" width="85%" alt="The Setlist view: songs with tempo and time signature on the left, parts with per-rig key ranges, transpose, level and knob capture on the right, and the song/part stepper in the top bar"/></p>
+<p align="center"><img src="docs/shots/setlist.png" width="85%" alt="The Setlist view: songs with tempo and time signature on the left, parts with per-rig key ranges, transpose, level, velocity range and curve, floating split and knob capture on the right, and the song/part stepper in the top bar"/></p>
 
 ### Keep what stays through the whole show
 A vocal mic, a master reverb or a volume pedal is set up once and stays through

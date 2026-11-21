@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::layer::{Hands, VelCurve};
 use crate::matrix::SourceId;
 
 pub type NodeId = u32;
@@ -1012,6 +1013,7 @@ pub fn split_rigs(merged: &Graph) -> (Vec<Graph>, Vec<NodeId>) {
 /// The zone gates what STARTS in the rig and never routing: a release, and
 /// any message that returns a control to rest, always passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RigZone {
     /// False: the rig takes no new notes.
     pub live: bool,
@@ -1020,14 +1022,37 @@ pub struct RigZone {
     pub key_hi: u8,
     /// Semitones added to what the rig plays, last of every transform.
     pub transpose: i8,
+    /// Struck velocity range (inclusive) that starts notes: a velocity layer (#276).
+    pub vel_lo: u8,
+    pub vel_hi: u8,
+    /// What the rig makes of the struck velocity.
+    pub curve: VelCurve,
+    /// Keys each edge of the key range follows the hands (#276, `crate::layer`).
+    pub float: u8,
 }
 
 impl RigZone {
-    pub const OPEN: Self = Self { live: true, key_lo: 0, key_hi: 127, transpose: 0 };
+    pub const OPEN: Self = Self {
+        live: true,
+        key_lo: 0,
+        key_hi: 127,
+        transpose: 0,
+        vel_lo: 0,
+        vel_hi: 127,
+        curve: VelCurve::Linear,
+        float: 0,
+    };
 
-    /// Does a note-on of `played` start a note in this rig?
-    pub fn starts(&self, played: u8) -> bool {
-        self.live && (self.key_lo..=self.key_hi).contains(&played)
+    /// Does a note-on of `played`, struck at `velocity`, start a note in
+    /// this rig, with the hands where `hands` last saw them?
+    pub fn starts(&self, played: u8, velocity: u8, hands: &Hands) -> bool {
+        self.live && (self.vel_lo..=self.vel_hi).contains(&velocity) && hands.inside(self, played)
+    }
+}
+
+impl Default for RigZone {
+    fn default() -> Self {
+        Self::OPEN
     }
 }
 
@@ -1610,7 +1635,7 @@ mod tests {
             Command::SetCountIn { enabled: true, bars: 2 },
             Command::SetCountIn { enabled: false, bars: 1 },
             Command::SetTimeSignature { num: 6, den: 8 },
-            Command::SetRigZones { zones: [RigZone { live: false, key_lo: 36, key_hi: 59, transpose: -2 }, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN] },
+            Command::SetRigZones { zones: [RigZone { live: false, key_lo: 36, key_hi: 59, transpose: -2, vel_lo: 40, vel_hi: 110, curve: VelCurve::Soft, float: 3 }, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN] },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
             Command::SetShowControls { controls: {
                 let mut t = crate::show::NO_SHOW_CONTROLS;
@@ -1619,7 +1644,7 @@ mod tests {
             } },
             Command::SetShowParts { parts: crate::show::ShowParts::new(vec![
                 crate::show::ShowPart { song: 0, skip: false, zones: [RigZone::OPEN; 8] },
-                crate::show::ShowPart { song: 2, skip: true, zones: [RigZone { live: false, key_lo: 0, key_hi: 59, transpose: 12 }; 8] },
+                crate::show::ShowPart { song: 2, skip: true, zones: [RigZone { live: false, key_hi: 59, transpose: 12, ..RigZone::OPEN }; 8] },
             ]) },
             Command::SetShowPart { part: Some(1) },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },
@@ -1647,6 +1672,9 @@ mod tests {
             let back: Command = serde_json::from_str(&s).unwrap();
             assert_eq!(format!("{cmd:?}"), format!("{back:?}"));
         }
+        // A zone sent before velocity layers existed (#276) plays as it did.
+        let z: RigZone = serde_json::from_str(r#"{"live":true,"key_lo":36,"key_hi":59,"transpose":-2}"#).unwrap();
+        assert_eq!(z, RigZone { key_lo: 36, key_hi: 59, transpose: -2, ..RigZone::OPEN });
         // The exact shape the CLI/bridge accepts.
         let c: Command = serde_json::from_str(r#"{"SetSystemAudio":{"gain":0.5}}"#).unwrap();
         assert!(matches!(c, Command::SetSystemAudio { gain } if (gain - 0.5).abs() < 1e-6));

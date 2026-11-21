@@ -426,6 +426,26 @@ cd kabelsalat
 cargo run --release
 ```
 
+## Roadmap
+
+The goal: **the best open source live performance DAW for Linux, with
+instruments built by the community. Fast, professional, but easy to use.**
+For live playing, MainStage is the bar.
+
+| Version | Theme |
+|---|---|
+| 0.3 | The MainStage for Linux: a whole gig from one setlist |
+| 0.4 | Trust it on stage: a plugin crash never stops the show |
+| 0.5 | Instruments by the community: SFZ instruments and an open catalog |
+| 0.6 | Runs everywhere, plays everything: VST3 and packages for your distribution |
+| 0.7 | Controllers and remote |
+| 0.8 | Practise and create: looper, practice tools, multi-take recording |
+| 0.9 | The assistant, on your terms: local models |
+| 1.0 | A promise of stability: old sessions keep loading |
+
+The [roadmap to v1.0](https://github.com/ssalentin/kabelsalat/issues/272)
+lists the issues behind each version.
+
 ## Contributing
 
 Pull requests are welcome! Start with [CONTRIBUTING.md](CONTRIBUTING.md) and
@@ -433,7 +453,8 @@ issues labelled
 [`good first issue`](https://github.com/ssalentin/kabelsalat/labels/good%20first%20issue)
 or [`help wanted`](https://github.com/ssalentin/kabelsalat/labels/help%20wanted).
 Changes are listed in [CHANGELOG.md](CHANGELOG.md); planned work is in the
-[issues and milestones](https://github.com/ssalentin/kabelsalat/milestones), and
+[roadmap](https://github.com/ssalentin/kabelsalat/issues/272) and its
+[milestones](https://github.com/ssalentin/kabelsalat/milestones), and
 how it is built in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---

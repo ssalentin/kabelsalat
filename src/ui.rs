@@ -1961,36 +1961,42 @@ fn session_pill_button(
 
 /// Compact inline rig pill for the top bar when the Left Rail is closed:
 /// active rig shows `N · Name` + a live teal meter bar; inactive rigs show a
-/// compact numbered pill (`2`) with a teal activity dot while sounding.
+/// compact numbered pill (`2`) with a bottom horizontal teal meter bar while
+/// sounding. When a setlist is active (`zone_live = Some(live)`), a single
+/// top-right dot shows whether the rig is live in the current part (teal) or
+/// out of song (muted, with a recessed inactive pill).
 fn inline_rig_pill(
     ui: &mut egui::Ui,
     rig: usize,
     name: &str,
     active: bool,
     level: f32,
+    zone_live: Option<bool>,
     agent_alpha: f32,
     max_active_w: f32,
 ) -> egui::Response {
     let font = theme::medium_font(11.5);
-    let (galley, w, show_meter, show_dot) = if active {
+    let out_of_song = zone_live == Some(false);
+    let (galley, w) = if active {
         let text = format!("{} · {name}", rig + 1);
         let meter_slot = 22.0;
         let max_text = (max_active_w - 16.0 - meter_slot).max(24.0);
         let g = DemoApp::ellipsized(ui.painter(), &text, font, theme::DARK_PANEL, max_text);
         let w = (g.size().x + 16.0 + meter_slot).clamp(56.0, max_active_w.max(56.0));
-        (g, w, true, false)
+        (g, w)
     } else {
         let text = format!("{}", rig + 1);
-        let sounding = level > 0.02;
-        let g = ui.painter().layout_no_wrap(text, font, theme::CREAM_MID);
-        let w = (g.size().x + if sounding { 20.0 } else { 14.0 }).max(24.0);
-        (g, w, false, sounding)
+        let g = ui.painter().layout_no_wrap(text, font, if out_of_song { theme::MUTED } else { theme::CREAM_MID });
+        let w = (g.size().x + 16.0).max(26.0);
+        (g, w)
     };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
         let fill = if active {
             if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON }
+        } else if out_of_song {
+            if hov { theme::DARK_PANEL_HI } else { theme::PAPER_SINK }
         } else if hov {
             theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07)
         } else {
@@ -2003,14 +2009,22 @@ fn inline_rig_pill(
         } else {
             theme::HAIRLINE
         };
-        let fg = if active { theme::DARK_PANEL } else if hov { theme::CREAM } else { theme::CREAM_MID };
+        let fg = if active {
+            theme::DARK_PANEL
+        } else if out_of_song {
+            if hov { theme::CREAM_MID } else { theme::MUTED }
+        } else if hov {
+            theme::CREAM
+        } else {
+            theme::CREAM_MID
+        };
         let p = ui.painter();
         p.rect_filled(rect, 2.0, fill);
         p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
         if agent_alpha > 0.01 {
             p.rect_stroke(rect.expand(1.5), 3.0, Stroke::new(1.5, theme::alpha(theme::AGENT_COLOR, agent_alpha)), egui::StrokeKind::Outside);
         }
-        if show_meter {
+        if active {
             p.galley(Pos2::new(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5), galley, fg);
             let mr = Rect::from_min_size(Pos2::new(rect.right() - 22.0, rect.center().y - 1.5), egui::vec2(15.0, 3.0));
             p.rect_filled(mr, 1.0, theme::alpha(theme::DARK_PANEL, 0.25));
@@ -2018,11 +2032,22 @@ fn inline_rig_pill(
             if mw > 0.5 {
                 p.rect_filled(Rect::from_min_size(mr.min, egui::vec2(mw, 3.0)), 1.0, theme::LIVE_TEAL);
             }
-        } else if show_dot {
-            p.galley(Pos2::new(rect.left() + 6.0, rect.center().y - galley.size().y * 0.5), galley, fg);
-            p.circle_filled(Pos2::new(rect.right() - 6.5, rect.center().y), 2.3, theme::LIVE_TEAL);
         } else {
             p.galley(rect.center() - galley.size() * 0.5, galley, fg);
+            if level > 0.02 {
+                let mr = Rect::from_min_size(
+                    Pos2::new(rect.left() + 3.0, rect.bottom() - 3.5),
+                    egui::vec2((rect.width() - 6.0).max(4.0), 2.0),
+                );
+                p.rect_filled(mr, 1.0, theme::METER_TRACK);
+                let mw = (mr.width() * level.clamp(0.0, 1.0)).clamp(3.0, mr.width());
+                p.rect_filled(Rect::from_min_size(mr.min, egui::vec2(mw, 2.0)), 1.0, theme::LIVE_TEAL);
+            }
+        }
+        if let Some(live) = zone_live {
+            let dot_col = if live { theme::LIVE_TEAL } else { theme::MUTED };
+            let dot_c = Pos2::new(rect.right() - 4.5, rect.top() + 4.5);
+            p.circle_filled(dot_c, 2.2, dot_col);
         }
     }
     if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
@@ -17473,13 +17498,8 @@ impl DemoApp {
                                         " · out of song".to_string()
                                     };
                                     let ty = self.rig_type(rig).map(|t| format!(" · {}", t.label())).unwrap_or_default();
-                                    let chip = inline_rig_pill(ui, rig, &name, active, level, agent_t, active_max_w)
+                                    let chip = inline_rig_pill(ui, rig, &name, active, level, zone_active.then_some(zone.live), agent_t, active_max_w)
                                         .on_hover_text(format!("{} · {name}{ty} ({dev}){zone_tip} · right-click for rig actions", rig + 1));
-                                    if zone_active {
-                                        let dot_col = if zone.live { theme::LIVE_TEAL } else { theme::MUTED };
-                                        let dot_c = Pos2::new(chip.rect.right() - 4.5, chip.rect.top() + 4.5);
-                                        ui.painter().circle_filled(dot_c, 2.5, dot_col);
-                                    }
                                     if chip.clicked() { switch_rig = Some(rig); }
                                     if chip.double_clicked() { self.rename_rig_dialog = Some((rig, name.clone())); }
                                     chip.context_menu(|ui| {
@@ -50482,5 +50502,105 @@ mod precision_knob_tests {
             }
             vec![]
         });
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat collapsed_rig_pill_shots -- --ignored"]
+    fn collapsed_rig_pill_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = DemoApp::new_with_sink(None);
+        while app.rig_count() < 4 { app.edit_rigs(None); }
+        let _ = app.rename_rig(0, "Piano");
+        let _ = app.rename_rig(1, "Warm Pad");
+        let _ = app.rename_rig(2, "Lead");
+        let _ = app.rename_rig(3, "Strings");
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Opening Night",
+            "parts": [{
+                "name": "Chorus",
+                "rigs": [
+                    {"rig": 0, "key_lo": 36, "key_hi": 59},
+                    {"rig": 1, "key_lo": 60, "key_hi": 96},
+                    {"rig": 2, "key_lo": 72, "key_hi": 96}
+                ]
+            }]
+        }));
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Outro",
+            "parts": [{"name": "Strings", "rigs": [{"rig": 3}]}]
+        }));
+        let _ = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 0}));
+        app.rig_zones = app.setlist.active_zones();
+        assert!(app.rig_zones[1].live && app.rig_zones[2].live && !app.rig_zones[3].live);
+        app.set_active_rig(0);
+        app.nav_open = false;
+        super::offline_shots::shot_with(&mut app, Vec2::new(1280.0, 800.0), &dir.join("rig-pills.png"), |app, _| {
+            app.rig_levels = vec![0.72, 0.65, 0.0, 0.0];
+            vec![]
+        });
+    }
+
+    #[test]
+    fn collapsed_rig_pill_shows_meter_bar_not_two_dots() {
+        fn circles_in(shapes: &[egui::epaint::ClippedShape], rect: Rect) -> Vec<egui::epaint::CircleShape> {
+            fn walk(s: &egui::Shape, rect: Rect, out: &mut Vec<egui::epaint::CircleShape>) {
+                match s {
+                    egui::Shape::Circle(c) if rect.contains(c.center) => out.push(*c),
+                    egui::Shape::Vec(v) => for inner in v { walk(inner, rect, out); },
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for cs in shapes { walk(&cs.shape, rect, &mut out); }
+            out
+        }
+        fn run(app: &mut DemoApp, ctx: &egui::Context) -> Vec<egui::epaint::ClippedShape> {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+            raw.time = Some(ctx.input(|i| i.time) + 0.25);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            out.shapes
+        }
+
+        let mut app = DemoApp::new_with_sink(None);
+        while app.rig_count() < 3 { app.edit_rigs(None); }
+        app.set_active_rig(0);
+        app.nav_open = false;
+        let ctx = egui::Context::default();
+
+        // 1. Without a setlist: sounding collapsed rig uses a bottom bar (0 dots) and keeps its width.
+        app.rig_levels = vec![0.0, 0.0, 0.0];
+        let _ = run(&mut app, &ctx);
+        let silent_w = app.rig_chip_rects[1].width();
+
+        app.rig_levels = vec![0.5, 0.65, 0.0];
+        let shapes = run(&mut app, &ctx);
+        let pill1 = app.rig_chip_rects[1];
+        assert!((pill1.width() - silent_w).abs() < 0.01, "collapsed rig width stays stable when sounding: {silent_w} vs {}", pill1.width());
+        assert_eq!(circles_in(&shapes, pill1).len(), 0, "no dot for audio level on collapsed rig pill without setlist");
+
+        // 2. With a setlist active: sounding live collapsed rig shows only the single top-right zone dot.
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Live Set",
+            "parts": [{"name": "Chorus", "rigs": [{"rig": 0}, {"rig": 1}]}]
+        }));
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Outro",
+            "parts": [{"name": "Pad", "rigs": [{"rig": 2}]}]
+        }));
+        let _ = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 0}));
+        app.rig_zones = app.setlist.active_zones();
+        assert!(app.rig_zones[1].live && !app.rig_zones[2].live);
+
+        app.rig_levels = vec![0.5, 0.65, 0.0];
+        let shapes = run(&mut app, &ctx);
+        let live_dots = circles_in(&shapes, app.rig_chip_rects[1]);
+        assert_eq!(live_dots.len(), 1, "sounding live collapsed rig must have at most one dot, got {live_dots:?}");
+        assert_eq!(live_dots[0].fill, theme::LIVE_TEAL);
+        let oos_dots = circles_in(&shapes, app.rig_chip_rects[2]);
+        assert_eq!(oos_dots.len(), 1, "out-of-song collapsed rig shows one muted zone dot, got {oos_dots:?}");
+        assert_eq!(oos_dots[0].fill, theme::MUTED);
     }
 }

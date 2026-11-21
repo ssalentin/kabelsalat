@@ -1755,3 +1755,9 @@ Learned so far (2026-11-15, UI polish pass):
     value; for Buffer size, show a read-only server value on JACK and an
     explicit `<server> is overriding this to ...` note only on a live mismatch
     (`settings_audio_page_avoids_redundant_active_labels_and_explains_overrides`).
+205. **Top-bar rig pills never double-dot:** `inline_rig_pill` renders live
+    audio output as a horizontal `LIVE_TEAL` meter bar (bottom edge on
+    collapsed numbered pills, right slot on the active pill) with fixed
+    collapsed width, leaving the single top-right dot exclusively for
+    setlist `zone_live` state (never paint a second `LIVE_TEAL` dot for
+    audio activity; `collapsed_rig_pill_shows_meter_bar_not_two_dots`).

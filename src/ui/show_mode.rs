@@ -85,9 +85,14 @@ fn fitted(p: &egui::Painter, text: &str, max: f32, min: f32, width: f32, color: 
     p.layout_job(job)
 }
 
-/// Tracked upper-case micro-caps (§2.2) at `pos`; returns their size.
+/// Tracked upper-case micro-caps (§2.2).
+fn tracked(p: &egui::Painter, text: &str, size: f32) -> theme::TrackedLabel {
+    p.fonts_mut(|f| theme::layout_tracked(f, &text.to_uppercase(), FontId::proportional(size), 0.14))
+}
+
+/// [`tracked`] painted at `pos`; returns its size.
 fn caption(p: &egui::Painter, pos: Pos2, text: &str, size: f32, color: Color32) -> Vec2 {
-    let label = p.fonts_mut(|f| theme::layout_tracked(f, &text.to_uppercase(), FontId::proportional(size), 0.14));
+    let label = tracked(p, text, size);
     theme::paint_tracked(p, pos, &label, color);
     label.size
 }
@@ -233,29 +238,46 @@ impl DemoApp {
         let clock = p.layout_no_wrap(clock_now(), theme::medium_font(40.0), theme::INK);
         p.galley(Pos2::new(reg.top.right() - clock.size().x, reg.top.center().y - clock.size().y / 2.0), clock, theme::INK);
 
-        // The hero: song, part and tempo.
+        // The hero: song, part and tempo, as large as the panel allows,
+        // centred in it.
         let hero = reg.hero;
         p.rect_filled(hero, 36.0, theme::DARK_PANEL);
-        let scale = (hero.height() / 330.0).clamp(0.5, 1.0);
+        let scale = (hero.height() / 330.0).clamp(0.5, 1.4);
         let q = |v: f32| (v * scale * 2.0).round() / 2.0;
         let pad = q(36.0);
         let inner = hero.shrink2(Vec2::new(pad, pad * 0.8));
-        let cap = caption(&p, inner.left_top(), &board.caption, q(20.0), theme::CREAM_DIM);
+        let cap = tracked(&p, &board.caption, q(20.0));
         let song = fitted(&p, &board.song, q(112.0), q(44.0), inner.width(), theme::CREAM);
-        let song_top = inner.top() + cap.y + q(10.0);
-        let song_h = song.size().y;
-        p.galley(Pos2::new(inner.left(), song_top), song, theme::CREAM);
         let tempo = p.layout_no_wrap(board.tempo.clone(), theme::medium_font(q(44.0)), theme::CREAM_META);
-        let line_top = song_top + song_h + q(8.0);
-        let tempo_w = tempo.size().x;
-        if let Some(part) = &board.part {
-            let part = fitted(&p, part, q(64.0), q(32.0), inner.width() - tempo_w - 32.0, theme::LIVE_TEAL);
-            let part_h = part.size().y;
-            p.galley(Pos2::new(inner.left(), line_top), part, theme::LIVE_TEAL);
-            p.galley(Pos2::new(inner.right() - tempo_w, line_top + part_h - tempo.size().y), tempo, theme::CREAM_META);
-        } else {
-            p.galley(Pos2::new(inner.left(), line_top), tempo, theme::CREAM_META);
-        }
+        // The tempo sits right of the part, or under it when both do not fit.
+        let beside = inner.width() - tempo.size().x - q(48.0);
+        let stacked = board.part.as_ref().is_some_and(|t| p.layout_no_wrap(t.clone(), theme::medium_font(q(64.0)), theme::LIVE_TEAL).size().x > beside);
+        let part_w = if stacked { inner.width() } else { beside };
+        let part = board.part.as_ref().map(|t| fitted(&p, t, q(64.0), q(32.0), part_w, theme::LIVE_TEAL));
+        let part_h = part.as_ref().map_or(0.0, |g| g.size().y);
+        let lines_h = match (&part, stacked) {
+            (Some(_), false) => part_h,
+            (Some(_), true) => part_h + q(4.0) + tempo.size().y,
+            (None, _) => tempo.size().y,
+        };
+        let block_h = cap.size.y + q(10.0) + song.size().y + q(8.0) + lines_h;
+        let top = (hero.center().y - block_h / 2.0).max(inner.top());
+        theme::paint_tracked(&p, Pos2::new(inner.left(), top), &cap, theme::CREAM_DIM);
+        let song_top = top + cap.size.y + q(10.0);
+        let line_top = song_top + song.size().y + q(8.0);
+        p.galley(Pos2::new(inner.left(), song_top), song, theme::CREAM);
+        let tempo_pos = match part {
+            Some(part) => {
+                p.galley(Pos2::new(inner.left(), line_top), part, theme::LIVE_TEAL);
+                if stacked {
+                    Pos2::new(inner.left(), line_top + part_h + q(4.0))
+                } else {
+                    Pos2::new(inner.right() - tempo.size().x, line_top + part_h - tempo.size().y)
+                }
+            }
+            None => Pos2::new(inner.left(), line_top),
+        };
+        p.galley(tempo_pos, tempo, theme::CREAM_META);
 
         // Next song.
         let next = reg.next;

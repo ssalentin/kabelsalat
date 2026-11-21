@@ -7,8 +7,9 @@
 use super::*;
 use crate::show::{ShowAction, ShowMsg};
 
-/// One row of the action list.
+/// One row of the action list, and the width of its action's name.
 const ROW_H: f32 = 28.0;
+const ACTION_W: f32 = 100.0;
 /// The tuner panel's size and the cents its needle spans either way.
 const TUNER_SIZE: Vec2 = Vec2::new(340.0, 168.0);
 const TUNER_SPAN_CENTS: f32 = 50.0;
@@ -83,14 +84,22 @@ impl DemoApp {
                 ui.set_min_height(ROW_H - 4.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if control.is_some() && theme::chip_button(ui, "Clear", false).clicked() {
-                        setlist.forget(action);
+                    // Learn keeps its column whether or not there is a Clear.
+                    if control.is_some() {
+                        if theme::chip_button(ui, "Clear", false).clicked() {
+                            setlist.forget(action);
+                        }
+                    } else {
+                        ui.add_space(theme::chip_button_width(ui, "Clear") + 4.0);
                     }
                     if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
                         *learn = if learning { None } else { Some(action) };
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add_sized([96.0, ROW_H - 4.0], egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
+                        ui.allocate_ui_with_layout(Vec2::new(ACTION_W, ROW_H - 4.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.set_min_width(ACTION_W);
+                            ui.add(egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
+                        });
                         let (text, color) = match (learning, control) {
                             (true, _) => ("Press a pedal, key or button…".to_string(), theme::ACCENT),
                             (false, Some(c)) => {
@@ -99,7 +108,7 @@ impl DemoApp {
                             }
                             (false, None) => ("Unbound".to_string(), theme::INK_2),
                         };
-                        ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).monospace().color(color)).truncate());
+                        ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(color)).truncate());
                     });
                 });
             });
@@ -422,5 +431,79 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_show_controls", &serde_json::json!({}))).unwrap();
         assert!(v["song_of_program"].as_array().unwrap().iter().any(|r| r["device"] == 3 && r["on"] == true), "{v}");
         assert!(app.exec_tool("set_show_control", &serde_json::json!({"action": "nope"})).starts_with("error"));
+    }
+    /// An Audio In unit whose tuner hears a steady 442 Hz sine (A4, +8 ¢),
+    /// through the real ring and estimator the input feeds.
+    fn tuning(app: &mut DemoApp) {
+        let mut g = app.base_graph.clone();
+        let node = g.add_node(NodeKind::AudioIn { device: None, channels: crate::control::AudioInChannel::MonoL }, crate::control::name_bytes("GUITAR"));
+        app.build_rack(&g, &[]);
+        let (mut tx, rx) = rtrb::RingBuffer::new(48000);
+        for i in 0..24000 {
+            let _ = tx.push((std::f32::consts::TAU * 442.0 * i as f32 / 48000.0).sin() * 0.5);
+        }
+        app.audio_in_tuners.insert(node, (rx, crate::audio_in::Tuner::new(48000), None));
+        app.tuner_on = true;
+    }
+
+    #[test]
+    fn the_tuner_shows_the_note_the_audio_in_plays_and_a_click_closes_it() {
+        let mut app = DemoApp::new_with_sink(None);
+        tuning(&mut app);
+        let ctx = egui::Context::default();
+        let mut texts_now = |app: &mut DemoApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)), time: Some(app.ui_time as f64 + 1.0), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            texts(&out.shapes)
+        };
+        texts_now(&mut app, vec![]);
+        let shown = texts_now(&mut app, vec![]);
+        assert!(shown.iter().any(|t| t == "A4") && shown.iter().any(|t| t == "+8 ¢"), "{shown:?}");
+        let at = Pos2::new(SIZE.x / 2.0, 72.0 + super::TUNER_SIZE.y / 2.0);
+        texts_now(&mut app, vec![egui::Event::PointerMoved(at)]);
+        let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        texts_now(&mut app, vec![press(true)]);
+        texts_now(&mut app, vec![press(false)]);
+        assert!(!app.tuner_on, "a click on the tuner closes it");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat show_controls_shots -- --ignored"]
+    fn show_controls_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gig = |tune: bool| {
+            let mut app = DemoApp::new_with_sink(None);
+            if tune {
+                tuning(&mut app);
+            }
+            for (name, bpm) in [("Opener", 124), ("Ballad", 72), ("Closer", 132)] {
+                let parts = serde_json::json!([{"name": "Verse", "rigs": [{"rig": 0}]}, {"name": "Chorus", "rigs": [{"rig": 0}]}]);
+                app.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "bpm": bpm, "parts": parts.to_string()}));
+            }
+            for (action, msg) in [
+                (ShowAction::NextPart, ShowMsg::Cc(80)),
+                (ShowAction::PrevPart, ShowMsg::Cc(81)),
+                (ShowAction::NextSong, ShowMsg::Note(36)),
+                (ShowAction::Panic, ShowMsg::Note(37)),
+                (ShowAction::Tuner, ShowMsg::Program(9)),
+                (ShowAction::Record, ShowMsg::Cc(85)),
+            ] {
+                app.setlist.learn(action, Some(1), msg);
+            }
+            app.select_setlist(0, 1).unwrap();
+            app
+        };
+        // Rule 148: a fresh app per image.
+        for size in [Vec2::new(1280.0, 1000.0), Vec2::new(781.0, 950.0)] {
+            let mut app = gig(false);
+            app.stage_view = StageView::Setlist;
+            app.show_learn = Some(ShowAction::TapTempo);
+            super::super::offline_shots::shot(&mut app, size, &dir.join(format!("show-controls-{}x{}.png", size.x, size.y)));
+        }
+        let mut app = gig(true);
+        app.set_show_mode(true);
+        super::super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("show-tuner-1280x800.png"));
     }
 }

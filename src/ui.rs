@@ -2301,6 +2301,25 @@ impl DspChip {
     const GAP: f32 = 6.0;
 }
 
+/// The REC menu's retrospective item: its label, and whether it can save.
+fn retro_save_item(status: &crate::record::RecordStatus) -> (String, bool) {
+    let retro = &status.retro;
+    if retro.length_seconds == 0 {
+        return ("Save the last minutes: off in Settings → Audio".into(), false);
+    }
+    if !status.armed_master && !status.armed_rigs.contains(&true) {
+        return ("Save the last minutes: nothing is armed".into(), false);
+    }
+    if status.recording {
+        return ("Save the last minutes: stop REC first".into(), false);
+    }
+    if retro.saving {
+        return ("Saving the last minutes…".into(), false);
+    }
+    let s = retro.kept_seconds.floor() as u64;
+    (format!("Save the last {}:{:02}", s / 60, s % 60), retro.kept_seconds > 0.0)
+}
+
 fn rec_chip(ui: &mut egui::Ui, recording: bool, pending: bool, secs: f64) -> egui::Response {
     let (fill, stroke, txt) = if recording {
         (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::ON_ACCENT)
@@ -2816,6 +2835,7 @@ enum SettingsAction {
     SetTimeSig(crate::transport::TimeSig),
     SetAudioOutput(Option<String>),
     SetBufferSize(u32),
+    SetRetroMinutes(u32),
 }
 
 /// The bottom dock holds exactly one occupant at a time: no dock, the full-width
@@ -3176,6 +3196,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch",
     "set_level", "set_setlist_set",
     "inspect_plugin", "set_param", "reset_params",
+    "record_save_last",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3205,6 +3226,7 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "stop_demo"
             | "set_show_mode"
             | "panic"
+            | "record_save_last"
     )
 }
 
@@ -3995,6 +4017,8 @@ struct DemoApp {
     sample_rate: f64,
     buffer_frames: u32,
     buffer_size_err: Option<String>,
+    /// How many minutes retrospective recording keeps (0 = off, #215).
+    retro_minutes: u32,
     voice_tx: Option<rtrb::Producer<VoiceMsg>>,
     voice_retire_rx: Option<rtrb::Consumer<VoiceBack>>,
     audio_host: Option<AudioStreamHost>,
@@ -4485,6 +4509,7 @@ impl DemoApp {
             sample_rate: 48000.0,
             buffer_frames: crate::assistant::load_buffer_frames(),
             buffer_size_err: None,
+            retro_minutes: crate::record::retro_minutes_setting(),
             voice_tx: None,
             voice_retire_rx: None,
             audio_host: None,
@@ -6564,6 +6589,7 @@ impl DemoApp {
             "record_start" => "Start recording".into(),
             "record_stop" => "Stop recording".into(),
             "record_status" => "Recording status".into(),
+            "record_save_last" => "Save the last minutes".into(),
             "set_record_arm" => match args.get("rig").and_then(|v| v.as_u64()) {
                 Some(r) if !args.get("target").and_then(|v| v.as_str()).is_some_and(|t| t.eq_ignore_ascii_case("master")) =>
                     format!("Arm rig {} for recording", r + 1),
@@ -10171,6 +10197,22 @@ impl DemoApp {
                 let masters: Vec<u32> = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect();
                 self.agent_activity.record(origin, "Record stop", masters, now);
                 "recording stopped".into()
+            }
+            "record_save_last" => {
+                let secs = args.get("seconds").and_then(|v| v.as_f64());
+                match self.save_retro_take(secs) {
+                    Ok(seconds) => {
+                        let masters: Vec<u32> = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect();
+                        self.agent_activity.record(origin, "Save the last minutes", masters, now);
+                        serde_json::json!({
+                            "saving": true,
+                            "seconds": seconds,
+                            "into": crate::record::record_dir(),
+                            "next": "record_status names the take folder (retro.last_folder) once it is written",
+                        }).to_string()
+                    }
+                    Err(e) => format!("not saved: {e}"),
+                }
             }
             "record_status" => match &self.recorder {
                 Some(r) => serde_json::to_value(r.snapshot())
@@ -17365,7 +17407,7 @@ impl DemoApp {
                             }
 
                             let rec_resp = rec_chip(ui, recording, pending, secs)
-                                .on_hover_text("record armed targets to ~/Music/kabelsalat/ (bar-quantized while playing; right-click for Sync)");
+                                .on_hover_text("record armed targets to ~/Music/kabelsalat/ (bar-quantized while playing; right-click for Sync and to save the last minutes)");
                             if rec_resp.clicked() {
                                 self.toggle_recording();
                             }
@@ -17377,6 +17419,11 @@ impl DemoApp {
                                     if let Some(bus) = &self.bus {
                                         let _ = bus.lock().unwrap().send(Command::SetRecordSync { on: self.record_sync });
                                     }
+                                    ui.close();
+                                }
+                                let (label, can) = retro_save_item(&snap.clone().unwrap_or_default());
+                                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                                    let _ = self.save_retro_take(None);
                                     ui.close();
                                 }
                             });
@@ -20208,6 +20255,29 @@ impl DemoApp {
             let (f, ms) = (self.engine_stats.buffer_frames, self.engine_stats.buffer_ms);
             ui.label(egui::RichText::new(format!("Active: {f} frames ({ms:.1} ms)")).size(11.0).color(theme::CREAM_META));
         }
+        Self::settings_gap(ui);
+
+        let minutes = self.retro_minutes;
+        let fmt_len = |m: u32| if m == 0 { "Off".to_string() } else { format!("{m} min") };
+        let mb_per_min = sr * 2.0 * 4.0 * 60.0 / 1e6;
+        let desc = format!(
+            "Keeps what you play in memory, so you can save a take after the fact (right-click REC). \
+             {mb_per_min:.0}\u{a0}MB per minute for the master and for each armed stem; a new length starts over."
+        );
+        Self::settings_row(ui, "Keep the last", &desc, |ui| {
+            let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
+            theme::Dropdown::new("dd_settings_retro", &fmt_len(minutes))
+                .width(dd_w)
+                .popup_min_width(140.0)
+                .text_size(12.0)
+                .show_ui(ui, |menu| {
+                    for &m in crate::retro::MINUTES_CHOICES {
+                        if menu.item(minutes == m, &fmt_len(m)) {
+                            actions.push(SettingsAction::SetRetroMinutes(m));
+                        }
+                    }
+                });
+        });
     }
 
     fn settings_session_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
@@ -20601,6 +20671,17 @@ impl DemoApp {
                 Ok(msg) => self.settings_msg = msg,
                 Err(e) => self.settings_msg = format!("Buffer size failed: {e}"),
             },
+            SettingsAction::SetRetroMinutes(minutes) => {
+                self.retro_minutes = minutes;
+                if let Some(rec) = &self.recorder {
+                    rec.set_retro_seconds(minutes * 60);
+                }
+                self.settings_msg = match (crate::record::save_retro_minutes(minutes), minutes) {
+                    (Err(e), _) => format!("Saving the retrospective length failed: {e}"),
+                    (Ok(()), 0) => "Retrospective recording off".into(),
+                    (Ok(()), m) => format!("Keeping the last {m} min"),
+                };
+            }
         }
     }
 
@@ -23949,6 +24030,14 @@ impl DemoApp {
 
     /// Toggle master/stem recording (REC chip). The engine is the authority: it
     /// flips the recorder's recording flag and messages the writer thread.
+    /// Save what retrospective recording kept (the last `secs`, None = all)
+    /// as a new take; the writer thread writes it.
+    fn save_retro_take(&mut self, secs: Option<f64>) -> Result<f64, String> {
+        self.sync_recorder_rig_names();
+        let rec = self.recorder.as_ref().ok_or("recording unavailable: no audio engine")?;
+        rec.save_last(secs)
+    }
+
     fn toggle_recording(&mut self) {
         self.sync_recorder_rig_names();
         let (recording, pending) = self
@@ -32807,6 +32896,7 @@ impl EvalRig {
         engine.spawn_lv2_loader();
         let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
         engine.set_recorder(tap);
+        recorder.set_retro_seconds(app.retro_minutes * 60);
         app.recorder = Some(recorder);
         let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
         engine.set_listen_tap(listen_tap);
@@ -33602,6 +33692,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.remote = crate::bridge::remote();
                     app.player_ctrl = Some(player_ctrl);
                     app.player_retire_rx = Some(player_retire_rx);
+                    recorder.set_retro_seconds(app.retro_minutes * 60);
                     app.recorder = Some(recorder);
                     app.audio_in_tx = Some(audio_in_tx);
                     app.audio_in_levels = Some(audio_in_levels);
@@ -37885,7 +37976,7 @@ mod split_bpm_tests {
         // exec_tool, and record_start does not claim success without a recorder.
         let tools = crate::assistant::tools();
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
-        for t in ["record_start", "record_stop", "record_status", "set_record_sync", "set_record_arm"] {
+        for t in ["record_start", "record_stop", "record_status", "record_save_last", "set_record_sync", "set_record_arm"] {
             assert!(names.contains(&t), "assistant tools missing {t}");
         }
 
@@ -42919,6 +43010,108 @@ mod settings_and_dropdown_tests {
         assert!(app.settings_msg.contains("512 frames"), "{}", app.settings_msg);
         let (texts, _, _) = warm(&mut app, &ctx, size);
         assert!(texts.iter().any(|(t, _)| t == "512 frames (10.7 ms)"));
+    }
+
+    #[test]
+    fn the_keep_the_last_dropdown_sets_how_far_back_a_save_reaches() {
+        let dir = std::env::temp_dir().join(format!("ksalat-retro-ui-{}", std::process::id()));
+        let (tap, recorder) = crate::record::start(dir.clone(), 48_000, 2);
+        let mut app = DemoApp::new_with_sink(None);
+        app.recorder = Some(recorder.clone());
+        app.retro_minutes = 0;
+        app.stage_view = StageView::Settings;
+        assert!(app.exec_tool("record_save_last", &serde_json::json!({})).contains("retrospective recording is off"));
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let title = texts.iter().find(|(t, _)| t == "Keep the last").expect("the row on the Audio page").1;
+        let trigger = texts.iter()
+            .find(|(t, r)| t == "Off" && (r.center().y - title.center().y).abs() < 12.0)
+            .expect("its dropdown, showing Off").1.center();
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, trigger);
+        let opt = texts.iter().find(|(t, _)| t == "1 min").expect("the 1 min choice").1.center();
+        click_at(&mut app, &ctx, size, opt);
+        assert_eq!(app.retro_minutes, 1);
+        assert_eq!(recorder.snapshot().retro.length_seconds, 60, "the recorder keeps what the dropdown says");
+        assert!(app.settings_msg.contains("1 min"), "{}", app.settings_msg);
+        let r = app.exec_tool("record_save_last", &serde_json::json!({}));
+        assert!(r.contains("nothing has been played"), "no engine renders here: {r}");
+        drop(tap);
+        recorder.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #215: the Audio page's "Keep the last" row, and REC's right-click
+    /// menu offering what a recorder kept of 30 s rendered offline.
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat retro_shots -- --ignored"]
+    fn retro_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (w, h, name) in [(1280.0, 800.0, "retro-settings.png"), (781.0, 950.0, "retro-settings-781x950.png")] {
+            let mut app = DemoApp::new_with_sink(None);
+            app.retro_minutes = 2;
+            app.stage_view = StageView::Settings;
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(name));
+        }
+        let takes = std::env::temp_dir().join(format!("ksalat-retro-shots-{}", std::process::id()));
+        let (tap, recorder) = crate::record::start(takes.clone(), 48_000, 2);
+        recorder.set_retro_seconds(120);
+        let (_bus, drain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(Graph::demo_patch(), drain, 48000.0, vec![]);
+        engine.set_recorder(tap);
+        let mut buf = vec![0.0f32; 512 * 2];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while recorder.snapshot().retro.kept_seconds == 0.0 {
+            assert!(std::time::Instant::now() < deadline, "the ring was never allocated");
+            engine.render(&mut buf, 2);
+        }
+        for _ in 0..(30 * 48000 / 512) {
+            engine.render(&mut buf, 2);
+        }
+        let size = Vec2::new(1280.0, 800.0);
+        let rec_at = {
+            let mut probe = DemoApp::new_with_sink(None);
+            probe.recorder = Some(recorder.clone());
+            let ctx = egui::Context::default();
+            let (texts, _, _) = warm(&mut probe, &ctx, size);
+            texts.iter().find(|(t, _)| t.ends_with("REC")).expect("the REC chip").1.center()
+        };
+        let mut app = DemoApp::new_with_sink(None);
+        app.recorder = Some(recorder.clone());
+        let press = |pressed| egui::Event::PointerButton {
+            pos: rec_at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default(),
+        };
+        super::offline_shots::shot_with(&mut app, size, &dir.join("retro-rec-menu.png"), |_, i| match i {
+            2 => vec![egui::Event::PointerMoved(rec_at)],
+            3 => vec![press(true)],
+            4 => vec![press(false)],
+            _ => Vec::new(),
+        });
+        drop(engine);
+        recorder.shutdown();
+        let _ = std::fs::remove_dir_all(&takes);
+    }
+
+    #[test]
+    fn the_rec_menu_says_what_a_retrospective_save_holds() {
+        let mut r = crate::record::RecordStatus { armed_master: true, ..Default::default() };
+        assert_eq!(retro_save_item(&r), ("Save the last minutes: off in Settings → Audio".to_string(), false));
+        r.retro.length_seconds = 120;
+        assert!(!retro_save_item(&r).1, "nothing kept yet");
+        r.retro.kept_seconds = 83.6;
+        assert_eq!(retro_save_item(&r), ("Save the last 1:23".to_string(), true));
+        r.armed_master = false;
+        r.armed_rigs = vec![false, false];
+        assert_eq!(retro_save_item(&r), ("Save the last minutes: nothing is armed".to_string(), false));
+        r.armed_rigs[1] = true;
+        assert!(retro_save_item(&r).1, "an armed stem is enough");
+        r.recording = true;
+        assert_eq!(retro_save_item(&r), ("Save the last minutes: stop REC first".to_string(), false));
+        r.recording = false;
+        assert!(tool_changes_only_system("record_save_last"), "a save changes no patch: no undo step");
+        r.retro.saving = true;
+        assert!(!retro_save_item(&r).1, "one save at a time");
     }
 
     // ---- #147: a bus on its own output ------------------------------------

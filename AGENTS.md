@@ -1695,3 +1695,14 @@ Learned so far (2026-11-15, UI polish pass):
     `Command::Program`, which a show control may take before the matrix
     (`a_wind_controllers_breath_and_bend_become_engine_commands` checks the
     raw bytes); a new message type gets an arm there and a raw-bytes test.
+
+200. **The thread that drains a recording ring never does work that can
+    outlast the ring:** the recorder's writer drains a running take from 4 s
+    rings, and a retrospective save of 10 minutes of master and stems, or a
+    new history of up to 2 GB allocated on the same thread, would have
+    overflowed them (found in review of #215). `writer_loop` reconciles the
+    retrospective lanes and saves only while no take records, and `save_last`
+    refuses while REC runs. A save streams oldest first, a second at a time
+    (`retro::Window::read`), so it needs neither a second copy of the history
+    nor a margin that grows with its length
+    (`a_chunk_the_feed_reached_is_refused_and_one_frame_short_of_it_is_saved`).

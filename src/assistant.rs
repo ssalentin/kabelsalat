@@ -1177,8 +1177,13 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"record_status",
-            "description":"Get recording status: recording (bool), pending (bool, waiting for bar/beat 0), path, folder, seconds, dropped_frames, finalized, stems (per-rig WAV status), armed_master, armed_rigs.",
+            "description":"Get recording status: recording (bool), pending (bool, waiting for bar/beat 0), path, folder, seconds, dropped_frames, finalized, stems (per-rig WAV status), armed_master, armed_rigs, retro (retrospective recording: length_seconds, kept_seconds, saving, last_folder).",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"record_save_last",
+            "description":"Save what was just played, after the fact: retrospective recording keeps the last minutes of the master mix and of every armed rig's stem in memory, and this writes them as a new take folder under ~/Music/kabelsalat/, like a recording that had been running. seconds: how far back (default: everything kept, up to the length set in Settings → Audio). Answers at once; record_status then names the folder (retro.last_folder) and shows retro.kept_seconds.",
+            "parameters":{"type":"object","properties":{"seconds":{"type":"number","description":"how many seconds back to save (default: all that is kept)"}}}
         }},
         {"type":"function","function":{
             "name":"set_record_arm",

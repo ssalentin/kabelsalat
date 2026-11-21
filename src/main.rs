@@ -46,6 +46,7 @@ mod plugins;
 mod plugin_window;
 mod preview;
 mod record;
+mod retro;
 mod rope;
 mod session;
 mod setlist;

@@ -4373,6 +4373,9 @@ impl GraphEngine {
             }
             Command::LoadGraph { graph } => {
                 self.arp_taken = [crate::control::EdgeId::MAX; 8];
+                if let Some(rec) = &self.recorder {
+                    rec.retro_restart_stems();
+                }
                 // Rare structural op (template load): rebuild graph, DSP, voice
                 // mapping, and MIDI matrix. Allocates — acceptable off the hot
                 // path; a future version can rebuild off-thread and swap.
@@ -5759,6 +5762,7 @@ impl GraphEngine {
                     if rec.is_stem_active(rig as u8) {
                         rec.push_rig_stereo(rig as u8, rig_buf);
                     }
+                    rec.retro_rig(rig as u8, rig_buf);
                 }
             }
             // Aux buses (issue #5): each bus is what was sent to it, through
@@ -5940,6 +5944,9 @@ impl GraphEngine {
             // No master wired: the output is silent. Keep the loudness windows
             // honest (they must decay, not hold stale energy).
             self.meter.process_silence(frames);
+        }
+        if let Some(rec) = &mut self.recorder {
+            rec.retro_block(data, ch);
         }
         self.node_timer.end_block();
         self.lv2_in = acc_v;

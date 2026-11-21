@@ -2381,6 +2381,7 @@ pub(crate) mod tests {
 
         thread_local! {
             static COUNT: Cell<u64> = const { Cell::new(0) };
+            static FREES: Cell<u64> = const { Cell::new(0) };
         }
 
         pub struct Counting;
@@ -2395,6 +2396,7 @@ pub(crate) mod tests {
                 unsafe { System.realloc(p, l, n) }
             }
             unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                FREES.with(|c| c.set(c.get() + 1));
                 unsafe { System.dealloc(p, l) }
             }
         }
@@ -2404,6 +2406,10 @@ pub(crate) mod tests {
 
         pub fn count() -> u64 {
             COUNT.with(|c| c.get())
+        }
+
+        pub fn frees() -> u64 {
+            FREES.with(|c| c.get())
         }
     }
 

@@ -418,6 +418,13 @@ after the rig, into the same take folder as the master mix (**ARM** under
 Master out). Pressed while the transport rolls, REC starts and stops on the
 next bar; stopping the transport keeps recording so reverb tails are not cut.
 
+Forgot to press REC? kabelsalat keeps the last two minutes of the master and
+of every armed rig in memory. Right-click **REC** and choose **Save the last
+2:00**: it becomes a take folder like any recording, so the take you did not
+plan is not lost. Settings → Audio → **Keep the last** sets how far back (1 to
+10 minutes, or off); machines with under 3 GB of memory start with it off.
+The assistant and MCP agents save it with `record_save_last`.
+
 ### Play along with a backing track
 Ask the assistant (or an MCP agent) to play a WAV file and it mixes into the
 master like AUM's FilePlayer: **loop** restarts it seamlessly, **sync** plays it

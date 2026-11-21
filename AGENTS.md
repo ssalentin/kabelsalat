@@ -1666,3 +1666,12 @@ Learned so far (2026-11-15, UI polish pass):
     `Arc` until the engine let go (`show::ShowParts`). In a held-notes
     fingerprint, hash only state that can repeat: `Show`'s step counter only
     grows, and with it no search reached a fixpoint.
+198. **State two units must agree on is one record they share, never a copy
+    each kept in step:** the floating split (#276) first kept the hands per
+    rig and reset them per rig, so a part edit that touched one rig of a
+    split left the two rigs disagreeing, and a key near the edge played on
+    both or neither. The hands are one record per floating edge (key and
+    float) in `layer::Hands`, which every rig with that edge reads and moves
+    (`a_key_near_a_floating_split_plays_on_exactly_one_rig_after_a_part_edit_or_a_rig_that_did_not_hear`).
+    Only a key a rig hears (its Keys cable and source filter) moves its edges
+    (`a_keyboard_no_rig_of_a_floating_split_hears_does_not_move_it`).

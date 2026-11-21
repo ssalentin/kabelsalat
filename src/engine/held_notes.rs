@@ -246,25 +246,6 @@ const LAYER_SONGS: [[RigZone; 2]; 5] = [
         RigZone { key_lo: 60, float: 2, transpose: 12, ..RigZone::OPEN },
     ],
     [RigZone { key_hi: 59, float: 2, ..RigZone::OPEN }, RigZone { key_lo: 60, float: 2, transpose: 12, ..OFF }],
-]; 9] = [
-    [RigZone::OPEN, RigZone::OPEN],
-    [RigZone::OPEN, OFF],
-    [OFF, RigZone::OPEN],
-    [
-        RigZone { key_hi: 59, ..RigZone::OPEN },
-        RigZone { key_lo: 60, transpose: 12, ..RigZone::OPEN },
-    ],
-    [RigZone { transpose: 2, ..RigZone::OPEN }, RigZone { transpose: -12, ..OFF }],
-    [
-        RigZone { vel_hi: 63, curve: VelCurve::Soft, ..RigZone::OPEN },
-        RigZone { vel_lo: 64, curve: VelCurve::Hard, ..RigZone::OPEN },
-    ],
-    [RigZone { vel_lo: 64, ..RigZone::OPEN }, RigZone { vel_hi: 63, ..RigZone::OPEN }],
-    [
-        RigZone { key_hi: 59, float: 2, ..RigZone::OPEN },
-        RigZone { key_lo: 60, float: 2, transpose: 12, ..RigZone::OPEN },
-    ],
-    [RigZone { key_hi: 59, float: 2, ..RigZone::OPEN }, RigZone { key_lo: 60, float: 2, transpose: 12, ..OFF }],
 ];
 
 /// Edits of the zones scenario: every song, and the routing edits that

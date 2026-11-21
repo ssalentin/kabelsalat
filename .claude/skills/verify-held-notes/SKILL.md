@@ -78,12 +78,14 @@ not (it only grows). Expect about 19.5k states to a fixpoint, ~15 s.
 `held_notes_are_released_across_velocity_layers_and_a_floating_split` starts
 from the zones scenario's patch (Surge B in rig 1). Its alphabet is the notes
 pressed hard (velocity 0.8) or soft (`Soft`, 0.3 = 38), `SetRigZones` with
-the layer songs of `SONGS` (both open; A soft with a soft curve and B hard
+each song of `LAYER_SONGS` (both open; A soft with a soft curve and B hard
 with a hard curve; the same layers swapped; a split at C4 floating two keys,
 which puts 59 and 60 inside each other's float, with B +12; that split with B
 out of the song), the matrix transpose and the cable a layer's note passes
-through, and `LoadStart`. The engine's `zone_hands` (where each rig last saw
-a note-on, which moves the floating split) are part of the fingerprint.
+through, and `LoadStart`. The engine's `zone_hands` (one record per floating
+edge of where the hands last played, which moves the split) are part of the
+fingerprint. `LAYER_SONGS` is its own table: the foot-switch scenario steps
+through every entry of `SONGS`, so a song added there grows that search.
 Property as in the routing scenario. Expect about 10k states to a fixpoint.
 A mutation that gates releases by the zone fails it at once.
 

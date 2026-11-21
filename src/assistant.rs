@@ -748,6 +748,8 @@ fn system_prompt() -> String {
      panic, tap tempo, tuner, master mute, backing track and record; it also chooses the devices whose \
      program change N picks song N+1; \
      set_show_mode opens or leaves the locked stage screen (\"go on stage\", \"show mode\"). \
+     set_rack_locked locks or unlocks the rack for editing (\"lock the rack\", \"unlock the rack\"); \
+     while locked, playing and inspecting work but patching, unit/rig edits and rack knob changes are blocked. \
      panic: all notes off on every rig when notes hang. \
      Levels: every rig, aux bus and CC binding lives at show level (no song switch touches it: \
      a vocal mic, a master reverb, a volume pedal), at the level of a set (a named group of songs, \
@@ -910,6 +912,11 @@ pub(crate) fn tools() -> Value {
             "name":"set_show_mode",
             "description":"Open (on=true) or leave (on=false) Show mode: the locked full-window stage screen with the current song and part in large type, the next song, tempo, the master meter, one meter per live rig, a clock and a Panic button. While it is open no click or key edits the patch, the mix or the setlist; PageUp/PageDown and foot switches still step parts, and the user leaves by holding Esc for a second and letting go. Returns what the screen shows.",
             "parameters":{"type":"object","properties":{"on":{"type":"boolean"}},"required":["on"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_rack_locked",
+            "description":"Lock (locked=true) or unlock (locked=false) the rack for editing. While locked, playing, transport, rig switching, flipping front/back to inspect cables and read-only views keep working, while patching, unplugging, reordering, adding/deleting units or rigs and rack knob/control edits are blocked. Saved with the session.",
+            "parameters":{"type":"object","properties":{"locked":{"type":"boolean"}},"required":["locked"]}
         }},
         {"type":"function","function":{
             "name":"panic",

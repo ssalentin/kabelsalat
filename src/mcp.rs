@@ -911,6 +911,13 @@ struct SetShowModeArgs {
     on: bool,
 }
 
+/// Arguments for `set_rack_locked`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetRackLockedArgs {
+    /// true locks the rack for editing, false unlocks it.
+    locked: bool,
+}
+
 /// Arguments for `set_count_in`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetCountInArgs {
@@ -4793,6 +4800,17 @@ impl McpServer {
             return Self::ui_bridge_tool("set_show_mode", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
         }
         tool_err("Show mode is a screen of the running app (connect with --attach)")
+    }
+
+    /// Lock or unlock the rack for editing.
+    #[tool(name = "set_rack_locked", description = "Lock (locked=true) or unlock (locked=false) the rack for editing in the running app. While locked, playing, transport, rig switching, flipping front/back to inspect cables and read-only views keep working, while patching, unplugging, reordering, adding/deleting units or rigs and rack knob/control edits are blocked. Saved with the session.")]
+    fn set_rack_locked(&self, Parameters(args): Parameters<SetRackLockedArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_rack_locked", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        tool_err("Rack edit lock is a state of the running app (connect with --attach)")
     }
 
     /// All notes off on every rig (#210).

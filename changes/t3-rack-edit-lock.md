@@ -1,0 +1,2 @@
+### Added
+- **Rack edit lock (#363):** lock the rack against accidental edits from the top-bar padlock button or **Ctrl+L** (agents/MCP: `set_rack_locked`, reported in `get_status`, and saved with the session). While locked, playing, transport, rig switching, setlist stepping, and flipping front/back to inspect wiring keep working, while patching, unplugging, reordering, adding/deleting units or rigs, rack knob edits, and mutating agent calls are blocked.

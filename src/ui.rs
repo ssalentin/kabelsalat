@@ -1091,6 +1091,7 @@ fn remap_session(
     ns.rig_names = s.rig_names.clone(); // names follow their rig (#33)
     ns.master_target = s.master_target; // session-level, no node ids (#12)
     ns.master_mute = s.master_mute;
+    ns.rack_locked = s.rack_locked;
     ns.rig_types = s.rig_types.clone(); // marks follow their rig like names (#198)
     ns.time_sig = s.time_sig; // session-level too (#87)
     ns.rig_devices = s.rig_devices.clone(); // and devices (#227)
@@ -1916,6 +1917,66 @@ fn settings_icon_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
             let dir = Vec2::new(a.cos(), a.sin());
             p.line_segment([c + dir * 4.2, c + dir * 6.0], Stroke::new(1.4, fg));
         }
+    }
+    if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+    resp
+}
+
+/// Top-bar Rack Edit Lock padlock icon button (Ctrl+L): monochrome vector
+/// padlock so it matches Hurricane's flat chrome on every platform. Filled
+/// `CHIP_ON` with a closed shackle when locked, dark with an open shackle
+/// when unlocked.
+fn rack_lock_button(ui: &mut egui::Ui, locked: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hov = resp.hovered();
+        let fill = if locked {
+            if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON }
+        } else if hov {
+            theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07)
+        } else {
+            theme::DARK_PANEL_HI
+        };
+        let stroke = if locked {
+            theme::CABLE_AMBER
+        } else if hov {
+            theme::MUTED
+        } else {
+            theme::HAIRLINE
+        };
+        let fg = if locked { theme::DARK_PANEL } else if hov { theme::CREAM } else { theme::CREAM_MID };
+        let p = ui.painter();
+        p.rect_filled(rect, 2.0, fill);
+        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        let c = rect.center();
+        // Padlock body.
+        let body = Rect::from_center_size(c + Vec2::new(0.0, 2.5), egui::vec2(10.0, 7.2));
+        if locked {
+            p.rect_filled(body, 1.5, fg);
+            p.circle_filled(body.center(), 1.25, fill);
+        } else {
+            p.rect_stroke(body, 1.5, Stroke::new(1.35, fg), egui::StrokeKind::Inside);
+        }
+        // Padlock shackle arch.
+        let r = 3.0_f32;
+        let arch_cx = if locked { c.x } else { c.x + 1.5 };
+        let arch_cy = body.top() - 1.2;
+        let mut pts = Vec::with_capacity(9);
+        if locked {
+            pts.push(Pos2::new(arch_cx - r, body.top() + 0.5));
+        } else {
+            pts.push(Pos2::new(arch_cx - r, body.top() - 0.8));
+        }
+        for step in 0..=6 {
+            let a = std::f32::consts::PI + (step as f32 / 6.0) * std::f32::consts::PI;
+            pts.push(Pos2::new(arch_cx + r * a.cos(), arch_cy + r * a.sin()));
+        }
+        if locked {
+            pts.push(Pos2::new(arch_cx + r, body.top() + 0.5));
+        } else {
+            pts.push(Pos2::new(arch_cx + r, body.top() - 2.6));
+        }
+        p.add(egui::Shape::line(pts, Stroke::new(1.35, fg)));
     }
     if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
     resp
@@ -3222,7 +3283,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_keyboard_state", "set_keyboard_mode",
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
-    "play_demo", "stop_demo", "set_show_mode", "panic",
+    "play_demo", "stop_demo", "set_show_mode", "set_rack_locked", "panic",
     "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check",
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
@@ -3256,6 +3317,7 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "play_demo"
             | "stop_demo"
             | "set_show_mode"
+            | "set_rack_locked"
             | "panic"
             | "record_save_last"
     )
@@ -3603,6 +3665,8 @@ struct DemoApp {
     state_pause_g: Option<Arc<theme::TrackedLabel>>,
     hint_front_g: Option<Arc<Galley>>,
     hint_back_g: Option<Arc<Galley>>,
+    hint_front_locked_g: Option<Arc<Galley>>,
+    hint_back_locked_g: Option<Arc<Galley>>,
     hint_wire_g: Option<Arc<Galley>>,
     help_title_g: Option<Arc<theme::TrackedLabel>>,
     help_cols: Vec<HelpCol>,
@@ -3840,6 +3904,11 @@ struct DemoApp {
     setlist_levels_open: bool,
     /// The locked stage screen (#210), open over every view.
     show_mode: Option<show_mode::ShowMode>,
+    /// Rack edit lock (#363): when true, playing and inspecting work while
+    /// patching, unit/rig edits and rack knob changes are blocked.
+    rack_locked: bool,
+    /// Top-bar rack lock button rect (for hit-testing & tests).
+    rack_lock_btn_rect: Rect,
     /// The pre-show check (#278): its panel, last report and running check.
     preshow: preshow::PreshowState,
     /// The song and backing track the player was started with last (#278).
@@ -4314,6 +4383,8 @@ impl DemoApp {
             state_pause_g: None,
             hint_front_g: None,
             hint_back_g: None,
+            hint_front_locked_g: None,
+            hint_back_locked_g: None,
             hint_wire_g: None,
             help_title_g: None,
             help_cols: Vec::new(),
@@ -4448,6 +4519,8 @@ impl DemoApp {
             setlist_import_open: false,
             setlist_levels_open: false,
             show_mode: None,
+            rack_locked: false,
+            rack_lock_btn_rect: Rect::NOTHING,
             preshow: Default::default(),
             setlist_backing_song: None,
             strips: Vec::new(),
@@ -5083,6 +5156,12 @@ impl DemoApp {
         self.hint_back_g = Some(layout(
             "patch: drag jack to jack · hover jack to trace · right-click cable or jack for color/unplug · Tab flips back",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
+        self.hint_front_locked_g = Some(layout(
+            "locked: play & inspect only · keyboard (V) · Space starts/stops · Tab flips to inspect · Ctrl+L unlocks",
+            FontId::proportional(12.5), theme::CABLE_AMBER, f32::INFINITY));
+        self.hint_back_locked_g = Some(layout(
+            "locked: inspect only · hover jack to trace · click cable to highlight · Tab flips back · Ctrl+L unlocks",
+            FontId::proportional(12.5), theme::CABLE_AMBER, f32::INFINITY));
         self.hint_wire_g = Some(layout(
             "now click a highlighted jack to connect · esc or right-click cancels",
             FontId::proportional(12.5), theme::ACCENT_DEEP, f32::INFINITY));
@@ -5128,6 +5207,7 @@ impl DemoApp {
                 (&["Q"], "left rail (rigs, channels & session library)"),
                 (&["Ctrl", "O"], "quick session switcher & templates"),
                 (&["Ctrl", "S"], "save current session"),
+                (&["Ctrl", "L"], "lock / unlock the rack for editing"),
                 (&[","], "settings"),
                 (&["I"], "MIDI + performance info"),
                 (&["F3"], "per-unit CPU meters on the rack"),
@@ -6591,6 +6671,10 @@ impl DemoApp {
                 Some(false) => "Leave Show mode".into(),
                 _ => "Show mode".into(),
             },
+            "set_rack_locked" => match args.get("locked").and_then(|v| v.as_bool()) {
+                Some(false) => "Unlock rack".into(),
+                _ => "Lock rack".into(),
+            },
             "panic" => "Panic: all notes off".into(),
             "set_octave" => {
                 let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4);
@@ -8031,6 +8115,7 @@ impl DemoApp {
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
         s.master_target = Some(self.master_target);
         s.master_mute = self.master_mute;
+        s.rack_locked = self.rack_locked;
         s.rig_types = self.saved_rig_types();
         s.time_sig = Some(self.time_sig);
         // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
@@ -8342,6 +8427,7 @@ impl DemoApp {
             self.restore_master_target(target);
         }
         self.set_master_mute(s.master_mute);
+        self.set_rack_locked(s.rack_locked);
         // A rack's rigs bring their own marks; one that states none follows
         // its instruments (#198).
         self.rig_types = s.rig_types.clone();
@@ -9025,6 +9111,7 @@ impl DemoApp {
         self.strip_order.clear();
         self.strip_knobs.clear();
         self.master_mute = false;
+        self.set_rack_locked(false);
         self.mixer_knob_drag = None;
         self.setlist = crate::setlist::Setlist::default();
         self.rig_zones = [crate::control::RigZone::OPEN; crate::control::MAX_RIGS];
@@ -9042,12 +9129,56 @@ impl DemoApp {
         self.session_msg = "Loaded multi-rig demo — 1–9 / ←→ switch rigs".into();
     }
 
+    fn set_rack_locked(&mut self, locked: bool) {
+        self.rack_locked = locked;
+        if locked {
+            self.drag = Drag::None;
+            self.pending = None;
+            self.drag_cursor = None;
+            self.drop_ghost = None;
+            self.unit_menu = None;
+            self.cable_menu = None;
+            self.knob_menu = None;
+            self.scale_menu = None;
+            self.cc_learn = None;
+        }
+    }
+
+    fn notify_rack_locked(&mut self) {
+        self.notify_patch("Rack is locked for editing — click the lock button or press Ctrl+L to unlock");
+    }
+
+    fn rack_lock_json(&self) -> serde_json::Value {
+        serde_json::json!({ "rack_locked": self.rack_locked })
+    }
+
     fn exec_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
         self.exec_tool_with_origin(name, args, AgentOrigin::Assistant)
     }
 
     fn exec_tool_with_origin(&mut self, name: &str, args: &serde_json::Value, origin: AgentOrigin) -> String {
         let now = self.ui_time;
+        if self.rack_locked
+            && ((!tool_is_read_only(name)
+                && !tool_changes_only_system(name)
+                && !matches!(
+                    name,
+                    "flip_rack"
+                        | "select_rig"
+                        | "set_octave"
+                        | "set_keyboard_mode"
+                        | "select_setlist_part"
+                        | "play_note"
+                        | "play"
+                        | "stop"
+                        | "tap_tempo"
+                        | "record_start"
+                        | "record_stop"
+                ))
+                || matches!(name, "undo" | "redo"))
+        {
+            return "error: rack is locked for editing — unlock it first (Ctrl+L or set_rack_locked)".into();
+        }
         if !tool_is_read_only(name) && !tool_changes_only_system(name) { self.note_agent_change(origin); }
         match name {
             "undo" => return self.undo_agent_tool(true),
@@ -9102,6 +9233,7 @@ impl DemoApp {
                 "meter": serde_json::to_value(self.master_meter).unwrap_or(serde_json::json!({})),
                 "master_target": self.master_target.readout(&self.master_meter),
                 "master_mute": self.master_mute,
+                "rack_locked": self.rack_locked,
                 "audio_in": self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::AudioIn)).map(|u| serde_json::json!({
                     "node": u.node_id,
                     "device": u.device,
@@ -9251,6 +9383,14 @@ impl DemoApp {
                     self.show_mode_json().to_string()
                 }
                 None => "error: give on=true to open Show mode or on=false to leave it".into(),
+            },
+            "set_rack_locked" => match args.get("locked").and_then(|v| v.as_bool()) {
+                Some(locked) => {
+                    self.set_rack_locked(locked);
+                    self.agent_activity.record(origin, if locked { "Lock rack" } else { "Unlock rack" }, vec![], now);
+                    self.rack_lock_json().to_string()
+                }
+                None => "error: give locked=true to lock the rack or locked=false to unlock it".into(),
             },
             "panic" => {
                 self.panic();
@@ -15887,7 +16027,13 @@ impl DemoApp {
             self.mixer_scroll_target = Some(NavJumpTarget::Node(bnode));
             self.mixer_flash = Some((bnode, self.ui_time + NAV_FLASH_S));
         }
-        if add_rig { self.edit_rigs(None); }
+        if add_rig {
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                self.edit_rigs(None);
+            }
+        }
         if let Some(cmd) = demo_cmd {
             if let Some(bus) = &self.bus {
                 let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(cmd);
@@ -15964,28 +16110,35 @@ impl DemoApp {
                 theme::dropdown_popup_frame().inner_margin(egui::Margin::same(4)).show(ui, |ui| {
                     ui.set_width(176.0);
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    let mut menu_row = |ui: &mut egui::Ui, label: &str, danger: bool| -> bool {
+                    let locked = self.rack_locked;
+                    let mut menu_row = |ui: &mut egui::Ui, label: &str, danger: bool, enabled: bool| -> bool {
                         let w = ui.available_width();
-                        let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
-                        let hov = resp.hovered();
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+                        let hov = enabled && resp.hovered();
                         if hov {
                             ui.painter().rect_filled(r, 2.0, if danger { theme::DANGER_BG } else { theme::DARK_PANEL_HI });
                             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                         }
-                        let col = if danger { theme::CLIP_BRIGHT } else { theme::CREAM };
+                        let col = if !enabled {
+                            theme::MUTED
+                        } else if danger {
+                            theme::CLIP_BRIGHT
+                        } else {
+                            theme::CREAM
+                        };
                         ui.painter().text(Pos2::new(r.left() + 8.0, r.center().y), egui::Align2::LEFT_CENTER, label, FontId::proportional(12.0), col);
-                        resp.clicked()
+                        enabled && resp.clicked()
                     };
-                    if menu_row(ui, "Rename rig…", false) { action = Some("rename"); close = true; }
-                    if n < Self::MAX_RIGS && menu_row(ui, "Clone rig", false) { action = Some("clone"); close = true; }
-                    if menu_row(ui, "Save as rig preset…", false) { action = Some("save_preset"); close = true; }
-                    if menu_row(ui, "Replace from preset…", false) { action = Some("replace_preset"); close = true; }
-                    if menu_row(ui, "MIDI input → Matrix", false) { action = Some("matrix"); close = true; }
+                    if menu_row(ui, "Rename rig…", false, !locked) { action = Some("rename"); close = true; }
+                    if n < Self::MAX_RIGS && menu_row(ui, "Clone rig", false, !locked) { action = Some("clone"); close = true; }
+                    if menu_row(ui, "Save as rig preset…", false, true) { action = Some("save_preset"); close = true; }
+                    if menu_row(ui, "Replace from preset…", false, !locked) { action = Some("replace_preset"); close = true; }
+                    if menu_row(ui, "MIDI input → Matrix", false, true) { action = Some("matrix"); close = true; }
                     if n > 1 {
                         ui.add_space(2.0);
                         Self::stage_hairline(ui);
                         ui.add_space(2.0);
-                        if menu_row(ui, "Delete rig…", true) { action = Some("delete"); close = true; }
+                        if menu_row(ui, "Delete rig…", true, !locked) { action = Some("delete"); close = true; }
                     }
                 });
             });
@@ -17367,6 +17520,7 @@ impl DemoApp {
         self.rail_toggle_rect = Rect::NOTHING;
         self.session_pill_rect = Rect::NOTHING;
         self.settings_btn_rect = Rect::NOTHING;
+        self.rack_lock_btn_rect = Rect::NOTHING;
 
         egui::Panel::top("rig_inputs")
             .resizable(false)
@@ -17417,7 +17571,7 @@ impl DemoApp {
                 let take_w = if show_take { 180.0 } else { 0.0 };
                 let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + (if show_sync { gap } else { 0.0 })
                     + rec_w + gap + take_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
-                let view_w = if compact { 240.0 } else { 268.0 };
+                let view_w = (if compact { 240.0 } else { 268.0 }) + 26.0 + gap;
 
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), ROW_H),
@@ -17501,13 +17655,20 @@ impl DemoApp {
                                     let chip = inline_rig_pill(ui, rig, &name, active, level, zone_active.then_some(zone.live), agent_t, active_max_w)
                                         .on_hover_text(format!("{} · {name}{ty} ({dev}){zone_tip} · right-click for rig actions", rig + 1));
                                     if chip.clicked() { switch_rig = Some(rig); }
-                                    if chip.double_clicked() { self.rename_rig_dialog = Some((rig, name.clone())); }
+                                    if chip.double_clicked() {
+                                        if self.rack_locked {
+                                            self.notify_rack_locked();
+                                        } else {
+                                            self.rename_rig_dialog = Some((rig, name.clone()));
+                                        }
+                                    }
+                                    let locked = self.rack_locked;
                                     chip.context_menu(|ui| {
-                                        if ui.button("Rename…").clicked() {
+                                        if ui.add_enabled(!locked, egui::Button::new("Rename…")).clicked() {
                                             self.rename_rig_dialog = Some((rig, name.clone()));
                                             ui.close();
                                         }
-                                        if n < Self::MAX_RIGS && ui.button("Clone rig").clicked() {
+                                        if n < Self::MAX_RIGS && ui.add_enabled(!locked, egui::Button::new("Clone rig")).clicked() {
                                             clone_rig = Some(rig);
                                             ui.close();
                                         }
@@ -17515,11 +17676,11 @@ impl DemoApp {
                                             self.save_rig_dialog = Some((rig, name.clone()));
                                             ui.close();
                                         }
-                                        if ui.button("Replace from preset…").clicked() {
+                                        if ui.add_enabled(!locked, egui::Button::new("Replace from preset…")).clicked() {
                                             self.load_rig_dialog = Some(Some(rig));
                                             ui.close();
                                         }
-                                        if n > 1 && ui.button("Delete rig…").clicked() {
+                                        if n > 1 && ui.add_enabled(!locked, egui::Button::new("Delete rig…")).clicked() {
                                             self.confirm_delete_rig = Some(rig);
                                             ui.close();
                                         }
@@ -17579,6 +17740,24 @@ impl DemoApp {
                         self.view_group_rect = group;
                         if let Some(view) = pick {
                             if view == StageView::Rack || view != self.stage_view { self.toggle_stage(view); }
+                        }
+
+                        // ── Rack edit lock toggle (Ctrl+L, #363) ──
+                        let lock_tip = if self.rack_locked {
+                            "Rack locked for editing · click or Ctrl+L to unlock"
+                        } else {
+                            "Lock rack for editing (blocks patching, unit/rig edits & rack knobs) · Ctrl+L"
+                        };
+                        let lb = rack_lock_button(ui, self.rack_locked).on_hover_text(lock_tip);
+                        self.rack_lock_btn_rect = lb.rect;
+                        if lb.clicked() {
+                            let next = !self.rack_locked;
+                            self.set_rack_locked(next);
+                            self.notify_patch(if next {
+                                "Rack locked for editing · Ctrl+L to unlock"
+                            } else {
+                                "Rack unlocked for editing"
+                            });
                         }
 
                         // ── Setlist stepper (shown when a setlist has songs and there is room) ──
@@ -17783,7 +17962,13 @@ impl DemoApp {
             });
 
         if let Some(r) = switch_rig { self.set_active_rig(r); }
-        if add_rig { self.edit_rigs(None); }
+        if add_rig {
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                self.edit_rigs(None);
+            }
+        }
         if let Some(r) = clone_rig {
             if let Err(e) = self.clone_rig(r, None) {
                 self.session_msg = format!("Clone rig failed: {e}");
@@ -20347,23 +20532,29 @@ impl DemoApp {
                     });
 
                 if let Some(act) = action {
-                    match act {
-                        BrowserAction::NewClapRig(id, name) => self.add_clap_rig(&id, &name),
-                        BrowserAction::NewLv2Rig(uri, name) => self.add_lv2_instrument_rig(&uri, &name),
-                        BrowserAction::AddInstrument(kind, name) => self.add_instrument_to_active_rig(kind, &name),
-                        BrowserAction::AddEffect(kind, name) => self.add_effect_to_active_rig(kind, &name),
-                        BrowserAction::AddMasterEffect(kind, name) => self.add_effect_to_master(kind, &name),
-                        BrowserAction::AddArp => self.add_arp_to_active_rig(),
-                        BrowserAction::AddMetronome => self.add_metronome_to_active_rig(),
-                        BrowserAction::AddMidiFx(uri, name) => self.add_midi_fx_to_active_rig(uri.as_deref(), &name),
-                        BrowserAction::Install(id) => {
-                            if let Err(e) = self.start_install(&id) {
-                                self.plugin_msg = format!("Install: {e}");
+                    let is_edit = !matches!(act, BrowserAction::Install(_) | BrowserAction::ShowType(_));
+                    if self.rack_locked && is_edit {
+                        self.plugin_msg = "Rack is locked for editing — unlock (Ctrl+L) to add plugins".into();
+                        self.notify_rack_locked();
+                    } else {
+                        match act {
+                            BrowserAction::NewClapRig(id, name) => self.add_clap_rig(&id, &name),
+                            BrowserAction::NewLv2Rig(uri, name) => self.add_lv2_instrument_rig(&uri, &name),
+                            BrowserAction::AddInstrument(kind, name) => self.add_instrument_to_active_rig(kind, &name),
+                            BrowserAction::AddEffect(kind, name) => self.add_effect_to_active_rig(kind, &name),
+                            BrowserAction::AddMasterEffect(kind, name) => self.add_effect_to_master(kind, &name),
+                            BrowserAction::AddArp => self.add_arp_to_active_rig(),
+                            BrowserAction::AddMetronome => self.add_metronome_to_active_rig(),
+                            BrowserAction::AddMidiFx(uri, name) => self.add_midi_fx_to_active_rig(uri.as_deref(), &name),
+                            BrowserAction::Install(id) => {
+                                if let Err(e) = self.start_install(&id) {
+                                    self.plugin_msg = format!("Install: {e}");
+                                }
                             }
-                        }
-                        BrowserAction::ShowType(ty) => {
-                            self.plugin_category = PluginCategory::of_type(ty);
-                            self.plugin_subtype = None;
+                            BrowserAction::ShowType(ty) => {
+                                self.plugin_category = PluginCategory::of_type(ty);
+                                self.plugin_subtype = None;
+                            }
                         }
                     }
                 }
@@ -25897,7 +26088,9 @@ impl DemoApp {
             }
             if i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace) {
                 if let Some(sel) = self.selected {
-                    if let Some(ci) = self.cables.iter().position(|c| c.id == sel) {
+                    if self.rack_locked {
+                        self.notify_rack_locked();
+                    } else if let Some(ci) = self.cables.iter().position(|c| c.id == sel) {
                         self.unplug_cable(ci, true);
                         self.selected = None;
                     }
@@ -25938,20 +26131,28 @@ impl DemoApp {
             }
         }
         if reset_knobs {
-            for u in &mut self.units {
-                for k in &mut u.knobs { k.set_immediate(k.default); }
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                for u in &mut self.units {
+                    for k in &mut u.knobs { k.set_immediate(k.default); }
+                }
             }
         }
         if let (Some(action), Some(node_id)) = (unit_shortcut, self.selected_unit) {
             self.unit_menu = None;
-            let res: Result<(), String> = match action {
-                "bypass" => self.toggle_unit_bypass(node_id, true).map(|_| ()),
-                "duplicate" => self.duplicate_unit(node_id, None, None, true).map(|_| ()),
-                "randomize" => self.randomize_unit_params(node_id, 1.0, None, true).map(|_| ()),
-                _ => Ok(()),
-            };
-            if let Err(e) = res {
-                self.session_msg = e;
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                let res: Result<(), String> = match action {
+                    "bypass" => self.toggle_unit_bypass(node_id, true).map(|_| ()),
+                    "duplicate" => self.duplicate_unit(node_id, None, None, true).map(|_| ()),
+                    "randomize" => self.randomize_unit_params(node_id, 1.0, None, true).map(|_| ()),
+                    _ => Ok(()),
+                };
+                if let Err(e) = res {
+                    self.session_msg = e;
+                }
             }
         }
 
@@ -26027,7 +26228,14 @@ impl DemoApp {
         }
 
         if right_clicked && !self.dock_rect.contains(s) {
-            if self.pending.is_some() {
+            if self.rack_locked {
+                match self.hit_test(s) {
+                    Hit::Knob { .. } | Hit::Unit(_) | Hit::Cable(..) | Hit::Jack { .. } => {
+                        self.notify_rack_locked();
+                    }
+                    _ => {}
+                }
+            } else if self.pending.is_some() {
                 self.pending = None;
             } else if self.side == Side::Front {
                 match self.hit_test(s) {
@@ -26145,59 +26353,69 @@ impl DemoApp {
 
         if pressed {
             self.press = Some((hit, s));
-            // Ctrl+press on a stack unit → rearrange drag (task-21). Overrides
-            // knob/jack sub-hits so the whole box is grabbable; KEYS/MASTER and
-            // non-Ctrl presses fall through to the normal behavior untouched.
-            if ctrl {
-                if let Some(unit) = self.stack_unit_at(l) {
-                    let grab = l - self.unit_rects[unit].min.to_vec2();
-                    self.drag = Drag::Unit { unit, grab };
+            if self.rack_locked {
+                let edit_press = (ctrl && self.stack_unit_at(l).is_some())
+                    || matches!(hit, Hit::Knob { .. })
+                    || (self.side == Side::Back && matches!(hit, Hit::Jack { .. }))
+                    || (self.side == Side::Front && matches!(hit, Hit::Unit(ui) if self.on_face_field(ui, l.to_pos2())));
+                if edit_press {
+                    self.notify_rack_locked();
                 }
-            }
-            if !matches!(self.drag, Drag::Unit { .. }) {
-                match hit {
-                    Hit::Knob { unit, idx } => {
-                        self.drag = Drag::Knob {
-                            unit,
-                            idx,
-                            accum: self.units[unit].knobs[idx].value,
-                            last_y: s.y,
-                            fine: shift,
-                        };
+            } else {
+                // Ctrl+press on a stack unit → rearrange drag (task-21). Overrides
+                // knob/jack sub-hits so the whole box is grabbable; KEYS/MASTER and
+                // non-Ctrl presses fall through to the normal behavior untouched.
+                if ctrl {
+                    if let Some(unit) = self.stack_unit_at(l) {
+                        let grab = l - self.unit_rects[unit].min.to_vec2();
+                        self.drag = Drag::Unit { unit, grab };
                     }
-                    Hit::Jack { unit, jack } if self.side == Side::Back => {
-                        let j = &self.units[unit].jacks[jack];
-                        // Shift on an occupied output = fan out a new cable
-                        // (handled as a pending wire below), not grab the plug.
-                        let fan_out = shift && j.dir == Dir::Out;
-                        if !fan_out {
-                            if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port) {
-                                self.drag = Drag::Plug { id: self.cables[ci].id, end: j.dir };
+                }
+                if !matches!(self.drag, Drag::Unit { .. }) {
+                    match hit {
+                        Hit::Knob { unit, idx } => {
+                            self.drag = Drag::Knob {
+                                unit,
+                                idx,
+                                accum: self.units[unit].knobs[idx].value,
+                                last_y: s.y,
+                                fine: shift,
+                            };
+                        }
+                        Hit::Jack { unit, jack } if self.side == Side::Back => {
+                            let j = &self.units[unit].jacks[jack];
+                            // Shift on an occupied output = fan out a new cable
+                            // (handled as a pending wire below), not grab the plug.
+                            let fan_out = shift && j.dir == Dir::Out;
+                            if !fan_out {
+                                if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port) {
+                                    self.drag = Drag::Plug { id: self.cables[ci].id, end: j.dir };
+                                }
                             }
                         }
-                    }
-                    Hit::Cable(id, u) if self.side == Side::Back => {
-                        self.drag = Drag::Cable { id, u };
-                    }
-                    // Face drag fields (custom-painted, so no egui focus can
-                    // swallow rack keys — rule 12 by construction).
-                    Hit::Unit(ui) if self.side == Side::Front => {
-                        let lp = l.to_pos2();
-                        let split = self.units[ui].split;
-                        if let (Some(p), Some((_, readout))) = (split, self.split_rects(ui)) {
-                            if readout.contains(lp) {
-                                self.drag = Drag::Split { unit: ui, start: p, press: s, cur: p };
+                        Hit::Cable(id, u) if self.side == Side::Back => {
+                            self.drag = Drag::Cable { id, u };
+                        }
+                        // Face drag fields (custom-painted, so no egui focus can
+                        // swallow rack keys — rule 12 by construction).
+                        Hit::Unit(ui) if self.side == Side::Front => {
+                            let lp = l.to_pos2();
+                            let split = self.units[ui].split;
+                            if let (Some(p), Some((_, readout))) = (split, self.split_rects(ui)) {
+                                if readout.contains(lp) {
+                                    self.drag = Drag::Split { unit: ui, start: p, press: s, cur: p };
+                                }
+                            }
+                            if self.bpm_rects(ui).map_or(false, |b| b.value.contains(lp)) {
+                                self.drag = Drag::Bpm { start: self.bpm, press: s };
+                            }
+                            if let Some(bar) = self.drawbar_rects(ui).and_then(|b| b.iter().position(|r| r.contains(lp))) {
+                                self.drag = Drag::Drawbar { unit: ui, bar };
+                                self.set_drawbar_at(ui, bar, lp.y);
                             }
                         }
-                        if self.bpm_rects(ui).map_or(false, |b| b.value.contains(lp)) {
-                            self.drag = Drag::Bpm { start: self.bpm, press: s };
-                        }
-                        if let Some(bar) = self.drawbar_rects(ui).and_then(|b| b.iter().position(|r| r.contains(lp))) {
-                            self.drag = Drag::Drawbar { unit: ui, bar };
-                            self.set_drawbar_at(ui, bar, lp.y);
-                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -26276,14 +26494,16 @@ impl DemoApp {
                     }
                 }
                 Drag::None => {
-                    // Drag-from-jack: one-gesture patching.
-                    if let Some((Hit::Jack { unit, jack }, press_pos)) = self.press {
-                        if self.pending.is_none() && self.side == Side::Back && (s - press_pos).length() > 7.0 {
-                            let (occupied, fan_out) = {
-                                let j = &self.units[unit].jacks[jack];
-                                (self.cable_at_jack(unit, j.dir, j.port).is_some(), shift && j.dir == Dir::Out)
-                            };
-                            if !occupied || fan_out { self.start_pending(unit, jack, l); }
+                    // Drag-from-jack: one-gesture patching (blocked while locked).
+                    if !self.rack_locked {
+                        if let Some((Hit::Jack { unit, jack }, press_pos)) = self.press {
+                            if self.pending.is_none() && self.side == Side::Back && (s - press_pos).length() > 7.0 {
+                                let (occupied, fan_out) = {
+                                    let j = &self.units[unit].jacks[jack];
+                                    (self.cable_at_jack(unit, j.dir, j.port).is_some(), shift && j.dir == Dir::Out)
+                                };
+                                if !occupied || fan_out { self.start_pending(unit, jack, l); }
+                            }
                         }
                     }
                 }
@@ -26327,7 +26547,67 @@ impl DemoApp {
             }
 
             if moved < 6.0 && !was_plug {
-                match press_hit {
+                if self.rack_locked {
+                    match press_hit {
+                        Some(Hit::Play) => self.toggle_play(),
+                        Some(Hit::Cable(id, _)) if self.side == Side::Back => {
+                            if self.live_cable(id).is_some() {
+                                self.selected = if self.selected == Some(id) { None } else { Some(id) };
+                            }
+                        }
+                        Some(Hit::Unit(ui)) if self.side == Side::Front
+                            && self.metro_action_rects(ui).map_or(false, |m| m.tap.contains(l.to_pos2())) => {
+                            self.ui_transport_grace = self.ui_time + 0.6;
+                            self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
+                        }
+                        Some(Hit::Unit(ui)) if self.side == Side::Front
+                            && self.transport_chip_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
+                            let (node, playing) = (self.units[ui].node_id, self.units[ui].playing);
+                            self.ui_node_grace.insert(node, self.ui_time + 0.6);
+                            self.set_node_playing(node, !playing);
+                        }
+                        Some(Hit::Unit(ui)) if self.side == Side::Front
+                            && self.aeolus_rects(ui).is_some_and(|a| a.tabs.iter().any(|r| r.contains(l.to_pos2()))) => {
+                            let a = self.aeolus_rects(ui).unwrap();
+                            let node = self.units[ui].node_id;
+                            if let Some(d) = a.tabs.iter().position(|r| r.contains(l.to_pos2())) {
+                                self.aeolus_faces.entry(node).or_default().division = d;
+                            }
+                        }
+                        Some(Hit::Unit(ui)) if self.side == Side::Front
+                            && (self.split_rects(ui).map_or(false, |(c, f)| c.contains(l.to_pos2()) || f.contains(l.to_pos2()))
+                                || self.zone_rects(ui).map_or(false, |z| z.iter().any(|z| z.minus.contains(l.to_pos2()) || z.plus.contains(l.to_pos2())))
+                                || self.scale_rects(ui).map_or(false, |(c, r)| c.contains(l.to_pos2()) || r.contains(l.to_pos2()))
+                                || self.bpm_rects(ui).map_or(false, |b| b.minus.map_or(false, |r| r.contains(l.to_pos2())) || b.plus.map_or(false, |r| r.contains(l.to_pos2())))
+                                || self.metro_action_rects(ui).map_or(false, |m| m.count_in.contains(l.to_pos2()) || m.sig.map_or(false, |r| r.contains(l.to_pos2())))
+                                || self.audio_in_monitor_rect(ui).map_or(false, |c| c.contains(l.to_pos2()))
+                                || self.audio_in_channel_rect(ui).map_or(false, |c| c.contains(l.to_pos2()))
+                                || self.audio_in_device_rect(ui).map_or(false, |c| c.contains(l.to_pos2()))
+                                || self.aeolus_rects(ui).is_some_and(|a| a.stops.iter().any(|r| r.contains(l.to_pos2())))
+                                || self.bypass_badge_rect(ui).is_some_and(|b| b.contains(l.to_pos2()))) => {
+                            self.notify_rack_locked();
+                        }
+                        Some(Hit::Unit(ui)) if self.side == Side::Back
+                            && self.back_bypass_badge_rect(ui).is_some_and(|b| b.contains(l.to_pos2())) => {
+                            self.notify_rack_locked();
+                        }
+                        Some(Hit::Knob { .. }) | Some(Hit::Jack { .. }) => {
+                            self.notify_rack_locked();
+                        }
+                        Some(Hit::Unit(ui)) => {
+                            if let Some(u) = self.units.get(ui) {
+                                self.selected_unit = Some(u.node_id);
+                            }
+                            self.ping_unit(ui);
+                        }
+                        Some(Hit::Background) | None if rect.contains(s) => {
+                            self.selected = None;
+                            self.selected_unit = None;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match press_hit {
                     Some(Hit::Knob { unit, idx }) if double_clicked && !ctrl && self.side == Side::Front => {
                         let def = self.units[unit].knobs[idx].default;
                         self.set_unit_knob(unit, idx, def);
@@ -26508,30 +26788,39 @@ impl DemoApp {
                     }
                     _ => {}
                 }
+                }
             }
         }
 
         // Cursor affordances.
-        let on_field = match self.hover {
-            Some(Hit::Unit(u)) if self.side == Side::Front => self.on_face_field(u, l.to_pos2()),
-            _ => false,
-        };
-        let icon = if matches!(self.drag, Drag::Unit { .. }) {
-            CursorIcon::Grabbing
-        } else if ctrl && matches!(self.hover, Some(Hit::Unit(_))) {
-            CursorIcon::Grab
-        } else if on_field || matches!(self.drag, Drag::Split { .. } | Drag::Bpm { .. } | Drag::Drawbar { .. }) {
-            CursorIcon::ResizeVertical
-        } else {
+        let icon = if self.rack_locked {
             match self.hover {
-                Some(Hit::Play) | Some(Hit::Jack { .. }) => CursorIcon::PointingHand,
-                Some(Hit::Knob { .. }) => CursorIcon::ResizeVertical,
-                Some(Hit::Cable(..)) => match self.drag {
-                    Drag::Cable { .. } => CursorIcon::Grabbing,
-                    _ => CursorIcon::Grab,
-                },
-                Some(Hit::Unit(_)) => CursorIcon::PointingHand,
+                Some(Hit::Play) => CursorIcon::PointingHand,
+                Some(Hit::Cable(..)) if self.side == Side::Back => CursorIcon::PointingHand,
                 _ => CursorIcon::Default,
+            }
+        } else {
+            let on_field = match self.hover {
+                Some(Hit::Unit(u)) if self.side == Side::Front => self.on_face_field(u, l.to_pos2()),
+                _ => false,
+            };
+            if matches!(self.drag, Drag::Unit { .. }) {
+                CursorIcon::Grabbing
+            } else if ctrl && matches!(self.hover, Some(Hit::Unit(_))) {
+                CursorIcon::Grab
+            } else if on_field || matches!(self.drag, Drag::Split { .. } | Drag::Bpm { .. } | Drag::Drawbar { .. }) {
+                CursorIcon::ResizeVertical
+            } else {
+                match self.hover {
+                    Some(Hit::Play) | Some(Hit::Jack { .. }) => CursorIcon::PointingHand,
+                    Some(Hit::Knob { .. }) => CursorIcon::ResizeVertical,
+                    Some(Hit::Cable(..)) => match self.drag {
+                        Drag::Cable { .. } => CursorIcon::Grabbing,
+                        _ => CursorIcon::Grab,
+                    },
+                    Some(Hit::Unit(_)) => CursorIcon::PointingHand,
+                    _ => CursorIcon::Default,
+                }
             }
         };
         ctx.set_cursor_icon(icon);
@@ -26564,6 +26853,37 @@ impl DemoApp {
         }
 
         self.draw_pan_bars(&painter);
+        if self.rack_locked && !self.show_help && (rack.top() - rect.top()) >= 24.0 {
+            let label = painter.layout_no_wrap(
+                "LOCKED · CTRL+L TO UNLOCK".to_owned(),
+                theme::medium_font(10.0),
+                theme::CABLE_AMBER,
+            );
+            let pill_w = label.size().x + 28.0;
+            let pill_h = 20.0;
+            let pill = Rect::from_min_size(
+                Pos2::new((rack.right() - pill_w).max(rect.left() + 12.0), rect.top() + ((rack.top() - rect.top() - pill_h) * 0.5).max(4.0)),
+                Vec2::new(pill_w, pill_h),
+            );
+            painter.rect_filled(pill, 2.0, theme::PAPER_SINK);
+            painter.rect_stroke(pill, 2.0, Stroke::new(1.0, theme::alpha(theme::CABLE_AMBER, 0.55)), egui::StrokeKind::Inside);
+            // Tiny closed padlock icon inside the left of the badge.
+            let ic = Pos2::new(pill.left() + 10.5, pill.center().y + 1.5);
+            let body = Rect::from_center_size(ic, Vec2::new(7.0, 5.2));
+            painter.rect_filled(body, 1.0, theme::CABLE_AMBER);
+            let r = 2.1_f32;
+            let mut shackle = Vec::with_capacity(7);
+            for step in 0..=4 {
+                let a = std::f32::consts::PI + (step as f32 / 4.0) * std::f32::consts::PI;
+                shackle.push(Pos2::new(ic.x + r * a.cos(), body.top() - 0.6 + r * a.sin()));
+            }
+            painter.add(Shape::line(shackle, Stroke::new(1.15, theme::CABLE_AMBER)));
+            painter.galley(
+                Pos2::new(pill.left() + 19.0, pill.center().y - label.size().y * 0.5),
+                label,
+                theme::CABLE_AMBER,
+            );
+        }
         if self.side == Side::Back && !self.flipping && !self.show_help && rect.width() >= 680.0 {
             self.draw_back_controls(ui, rect);
         } else {
@@ -31174,9 +31494,18 @@ impl DemoApp {
 
     fn draw_hint(&self, painter: &egui::Painter, rect: Rect) {
         // Plain caption line on paper (§4.15) — no pill container.
-        let g = if self.pending.is_some() { &self.hint_wire_g }
-            else if self.side == Side::Front { &self.hint_front_g }
-            else { &self.hint_back_g };
+        let (g, col) = if self.pending.is_some() {
+            (&self.hint_wire_g, theme::ACCENT_DEEP)
+        } else if self.rack_locked {
+            (
+                if self.side == Side::Front { &self.hint_front_locked_g } else { &self.hint_back_locked_g },
+                theme::CABLE_AMBER,
+            )
+        } else if self.side == Side::Front {
+            (&self.hint_front_g, theme::INK_2)
+        } else {
+            (&self.hint_back_g, theme::INK_2)
+        };
         let Some(g) = g else { return };
         // The Left Rail owns the window's left edge now: the hint starts at
         // the STAGE's left, never over the rail (rule 5: no decoration over
@@ -31205,7 +31534,7 @@ impl DemoApp {
         };
         let hint_clip = Rect::from_min_max(Pos2::new(pos.x, pos.y - 4.0), Pos2::new(hint_limit.max(pos.x), pos.y + 22.0));
         let hint_right = (pos.x + g.size().x).min(hint_clip.right());
-        painter.with_clip_rect(hint_clip).galley(pos, g.clone(), theme::INK_2);
+        painter.with_clip_rect(hint_clip).galley(pos, g.clone(), col);
         // Info line fallback (narrow window): right-aligned on the hint row,
         // clipped so it never runs into the hint text or back controls.
         if self.info_in_hint && !self.stats_line.is_empty() && !self.back_controls_rect.is_positive() {
@@ -32587,11 +32916,25 @@ impl DemoApp {
                     self.kb_expanded = false;
                 }
             }
+            // Rack edit lock toggle (Ctrl+L, #363).
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::L)) {
+                let next = !self.rack_locked;
+                self.set_rack_locked(next);
+                self.notify_patch(if next {
+                    "Rack locked for editing · Ctrl+L to unlock"
+                } else {
+                    "Rack unlocked for editing"
+                });
+            }
             // Agent undo/redo (Ctrl+Shift+Z first: Ctrl+Z would match it too).
             let redo = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
             let undo = !redo && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z));
             if redo || undo {
-                if let Err(e) = self.undo_agent(undo) { self.session_msg = e; }
+                if self.rack_locked {
+                    self.notify_rack_locked();
+                } else if let Err(e) = self.undo_agent(undo) {
+                    self.session_msg = e;
+                }
             }
         }
 
@@ -38027,6 +38370,124 @@ mod split_bpm_tests {
         let kb = app.dock_group_rect.left_center() + Vec2::new(12.0, 0.0);
         click(&mut app, &ctx, kb);
         assert!(app.keyboard_open() && app.stage_view == StageView::Rack);
+    }
+
+    #[test]
+    fn rack_edit_lock_blocks_edits_persists_and_keeps_play_and_inspect_working() {
+        let (mut app, ctx) = demo();
+        app.load_multi_rig_demo();
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(!app.rack_locked, "starts unlocked");
+        assert!(app.rack_lock_btn_rect.is_positive(), "top-bar lock button is laid out");
+        assert!(!texts.iter().any(|t| t.contains("LOCKED · CTRL+L")));
+
+        // 1. Clicking the top-bar lock button locks the rack.
+        let lock_btn = app.rack_lock_btn_rect.center();
+        click(&mut app, &ctx, lock_btn);
+        assert!(app.rack_locked, "clicking lock button locks the rack");
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t.contains("LOCKED · CTRL+L")), "locked badge shown on rack: {texts:?}");
+
+        // 2. While locked, knob drags, right-clicks, and edit shortcuts are blocked.
+        let surge_unit = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
+        let before_val = app.units[surge_unit].knobs[level_idx].value;
+        let kpos = app.xf.p(app.knob_center(surge_unit, level_idx));
+        frame(&mut app, &ctx, vec![
+            egui::Event::PointerMoved(kpos),
+            egui::Event::PointerButton { pos: kpos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+        ]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(Pos2::new(kpos.x, kpos.y - 60.0))]);
+        frame(&mut app, &ctx, vec![
+            egui::Event::PointerButton { pos: Pos2::new(kpos.x, kpos.y - 60.0), button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+        ]);
+        assert!((app.units[surge_unit].knobs[level_idx].value - before_val).abs() < 1e-6, "knob drag blocked while locked");
+
+        rclick(&mut app, &ctx, kpos);
+        assert!(app.knob_menu.is_none() && app.cc_learn.is_none(), "knob right-click blocked while locked");
+        let ucenter = app.xf.rect(app.unit_rects[surge_unit]).center();
+        rclick(&mut app, &ctx, ucenter);
+        assert!(app.unit_menu.is_none(), "unit context menu blocked while locked");
+
+        // R (reset knobs) and Ctrl+E/D/R are blocked.
+        app.units[surge_unit].knobs[level_idx].set_immediate(0.25);
+        app.selected_unit = Some(app.units[surge_unit].node_id);
+        let unit_count = app.units.len();
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::R, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::R, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert!((app.units[surge_unit].knobs[level_idx].value - 0.25).abs() < 1e-6, "R reset knobs blocked while locked");
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::D, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND },
+            egui::Event::Key { key: Key::D, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND },
+        ]);
+        assert_eq!(app.units.len(), unit_count, "Ctrl+D duplicate blocked while locked");
+
+        // 3. Play, rig switch, and flipping to back to inspect still work.
+        let was_playing = app.playing;
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Space, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert_ne!(app.playing, was_playing, "Space play/stop still works while locked");
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Num2, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Num2, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert_eq!(app.active_rig, 1, "digit rig switching still works while locked");
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Num1, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Num1, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert_eq!(app.active_rig, 0);
+
+        // Flip to back: cable unplug via jack click and Delete are blocked.
+        app.side = Side::Back;
+        app.flip_to = Side::Back;
+        app.flipping = false;
+        frame(&mut app, &ctx, vec![]);
+        let cables_before = app.cables.len();
+        assert!(cables_before > 0);
+        let first_cable_id = app.cables[0].id;
+        app.selected = Some(first_cable_id);
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Delete, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Delete, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert_eq!(app.cables.len(), cables_before, "Delete cable blocked while locked");
+        let jpos = app.xf.p(app.jack_pos(app.cables[0].src, app.units[app.cables[0].src].jack_index(Dir::Out, app.cables[0].src_port).unwrap()));
+        click(&mut app, &ctx, jpos);
+        assert_eq!(app.cables.len(), cables_before, "jack click unplug blocked while locked");
+
+        // 4. Session persistence round-trip preserves rack_locked.
+        let saved = app.capture_session("locked-test").unwrap();
+        assert!(saved.rack_locked, "to_session captures rack_locked");
+        app.set_rack_locked(false);
+        assert!(!app.rack_locked);
+        app.apply_session(&saved).unwrap();
+        assert!(app.rack_locked, "apply_session restores rack_locked");
+
+        // 5. Agent / MCP parity: get_status reports it, mutating tools are refused, set_rack_locked toggles it.
+        let st: serde_json::Value = serde_json::from_str(&app.exec_tool("get_status", &serde_json::json!({}))).unwrap();
+        assert_eq!(st["rack_locked"], serde_json::json!(true));
+        let refused = app.exec_tool("add_rig", &serde_json::json!({}));
+        assert!(refused.contains("locked"), "mutating agent tool refused while locked: {refused}");
+        let res: serde_json::Value = serde_json::from_str(&app.exec_tool("set_rack_locked", &serde_json::json!({"locked": false}))).unwrap();
+        assert_eq!(res["rack_locked"], serde_json::json!(false));
+        assert!(!app.rack_locked);
+
+        // 6. Ctrl+L toggles lock on and off.
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::L, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND },
+            egui::Event::Key { key: Key::L, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND },
+        ]);
+        assert!(app.rack_locked, "Ctrl+L locks the rack");
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::L, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND },
+            egui::Event::Key { key: Key::L, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND },
+        ]);
+        assert!(!app.rack_locked, "second Ctrl+L unlocks the rack");
     }
 
     #[test]

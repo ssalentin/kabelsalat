@@ -123,6 +123,8 @@ pub struct Session {
     pub master_target: Option<crate::meter::MasterTarget>,
     /// Whether Kabelsalat's master mix to Master out is muted.
     pub master_mute: bool,
+    /// Whether the rack is locked against editing (patching, unit/rig edits, rack knobs).
+    pub rack_locked: bool,
     /// Each rig's instrument-type mark in rig order (#198); `None` = the
     /// rig follows its instrument, and the list is empty while no rig is
     /// marked. Travels by rig like `rig_names`.
@@ -276,6 +278,7 @@ impl Session {
             bus_outs: Vec::new(),
             master_target: None,
             master_mute: false,
+            rack_locked: false,
             rig_types: Vec::new(),
             time_sig: None,
             midi_sources: Vec::new(),
@@ -300,6 +303,7 @@ impl Session {
             && self.bus_outs == other.bus_outs
             && self.master_target == other.master_target
             && self.master_mute == other.master_mute
+            && self.rack_locked == other.rack_locked
             && self.rig_types == other.rig_types
             && self.time_sig == other.time_sig
             && self.midi_sources == other.midi_sources
@@ -692,6 +696,7 @@ impl Session {
             bus_outs: self.bus_outs.clone(),
             master_target: self.master_target,
             master_mute: self.master_mute,
+            rack_locked: self.rack_locked,
             rig_types: self.rig_types.clone(),
             keyboard_mode: None,
             time_signature: self.time_sig,
@@ -744,6 +749,7 @@ impl Session {
             bus_outs: manifest.bus_outs,
             master_target: manifest.master_target,
             master_mute: manifest.master_mute,
+            rack_locked: manifest.rack_locked,
             rig_types,
             // A hand-edited file cannot give the clock a bar it cannot count.
             time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
@@ -873,6 +879,9 @@ struct SessionFile {
     /// Whether Kabelsalat's master mix is muted; older sessions default to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     master_mute: bool,
+    /// Whether the rack is locked for editing; older sessions default to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rack_locked: bool,
     /// Rig instrument-type marks (#198); absent while no rig is marked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rig_types: Vec<Option<crate::keyboard::KeyboardType>>,
@@ -2012,6 +2021,24 @@ mod tests {
         let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
         assert!(!json.contains("master_mute"), "absent when false: old readers stay happy");
         assert!(!Session::load(&pkg2).unwrap().master_mute);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rack_locked_round_trips_and_defaults_false() {
+        let dir = std::env::temp_dir().join(format!("ksalat-racklock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("locked.ksalat");
+        let mut s = Session::new("l", Graph::demo_patch());
+        s.rack_locked = true;
+        s.save(&pkg).unwrap();
+        assert!(Session::load(&pkg).unwrap().rack_locked);
+        s.rack_locked = false;
+        let pkg2 = dir.join("unlocked.ksalat");
+        s.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
+        assert!(!json.contains("rack_locked"), "absent when false: old readers stay happy");
+        assert!(!Session::load(&pkg2).unwrap().rack_locked);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -46234,7 +46234,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 38] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 40] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {

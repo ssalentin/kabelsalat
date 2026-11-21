@@ -2219,8 +2219,6 @@ impl GraphEngine {
         }
     }
 
-    /// The bar line a synced start waits for: beat 0 (the song's own
-    /// downbeat) during a count-in, else the next bar boundary.
     /// File-player play-enable (`Command::SetPlayerEnable`); no file, no change.
     fn set_player_enable(&mut self, on: bool) {
         let target = self.player_target_beats();
@@ -2243,6 +2241,8 @@ impl GraphEngine {
         self.player_dirty = true;
     }
 
+    /// The bar line a synced start waits for: beat 0 (the song's own
+    /// downbeat) during a count-in, else the next bar boundary.
     fn player_target_beats(&self) -> f64 {
         if self.master_clock.is_counting_in() {
             0.0

@@ -36,9 +36,15 @@ agents are in [AGENTS.md](../AGENTS.md).
   and the first new note's onset at three block sizes. Nothing loads on a
   switch, so the first note waits only for the next block: one device buffer
   plus the instrument's own onset (Surge's saw: 0 to 1 ms).
-- `show.rs` — show controls (#261): `ShowControl` (a MIDI message from a
-  device, consumed by a `ShowAction`) in one fixed table the engine checks
-  before the matrix, so a foot switch's CC never reaches an instrument. The
+- `show.rs` — show controls (#261, #277): `ShowControl` (a CC, note or
+  program change from a device, consumed by a `ShowAction`) in one fixed
+  table the engine checks before the matrix, so a learned control never
+  reaches an instrument. Its size is one slot per learned action plus the
+  program devices (`MAX_SHOW_CONTROLS`); the session keeps the same list in
+  `Setlist::controls`. Panic, tap tempo (engine time), master mute and the
+  backing track happen in the block; the engine counts every press
+  (`GraphPub::show_presses`) and the app does the tuner and recording from
+  them in `frame_feeds` (`ui/show_controls.rs`), so they work in Show mode. The
   engine also holds every part (`SetShowParts`: its song, whether stepping
   skips that song's set, its level-aware zones from `Setlist::zones_of`) and
   the active part (`SetShowPart`), steps the part itself in the block the CC

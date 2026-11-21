@@ -152,11 +152,11 @@ first note of the next song starts in the block that switched (at most one
 buffer later, 5.3 ms at the default 256 frames, plus the sound card's own
 output latency). Step parts from the top bar, with
 **PageUp / PageDown** (**Shift+PageUp / Shift+PageDown** for songs — works with
-page-turner pedals), or bind a hardware MIDI foot-switch CC. Under **Program
-change picks the song**, turn a keyboard or foot controller on, and its preset
-buttons pick songs: program change N jumps to song N+1 in the next audio block,
-and that device's program changes no longer reach its instruments (other
-devices' still do). **Add song from
+page-turner pedals), or from a pedal or button you learned (see "Run the show
+from a pedal"). Under **Program change picks the song**, turn a keyboard or
+foot controller on, and its preset buttons pick songs: program change N jumps
+to song N+1 in the next audio block, and that device's program changes no
+longer reach its instruments (other devices' still do). **Add song from
 session** pulls a saved session's rigs into the gig as a new song, and the
 assistant and MCP agents can read, build and step the setlist.
 
@@ -200,6 +200,25 @@ same list from the `preshow_check` tool, and `kabelsalat preshow-check
 <session.ksalat>` prints it in a terminal (exit status 1 on a problem).
 
 <p align="center"><img src="docs/shots/preshow.png" width="85%" alt="Setlist → Check show: nine checks with a tick, a warning mark or a cross — an unplugged FM-1, a missing Odin 2 and a missing backing track are problems, running on battery is a warning, and each row says what to do"/></p>
+
+### Run the show from a pedal
+Every show action has a row under **Setlist → Show controls**: next and
+previous song, next and previous part, Panic, tap tempo, tuner on/off, master
+mute, start/stop the backing track and start/stop recording. Click **Learn**
+and press a foot switch, a pad, a key or a preset button: a CC, a note or a
+program change from that device is learned, like a knob's MIDI learn. From
+then on its press does the action in the next audio block (the tuner and
+recording a frame later), in every song and in Show mode, and it never reaches
+an instrument; a key held while it is learned still gets its release. One
+message does one action: learning it for another moves it there. The devices
+whose program change picks the song are rows of the same list. The tuner shows
+the note the first Audio In plays and how many cents it is off; click it to
+close it. Agents list and set the controls with `get_show_controls` and
+`set_show_control`.
+
+<p align="center"><img src="docs/shots/show-controls.png" width="85%" alt="Setlist → Show controls: every show action with its learned control (a note, a CC or a program change from a device), Learn and Clear, one row waiting for a press, and the row that lets a device's program change pick the song"/></p>
+
+<p align="center"><img src="docs/shots/show-tuner.png" width="85%" alt="Show mode with the tuner open: A4, +8 cents, its needle right of centre, under the caption TUNER"/></p>
 
 ### Browse and install plugins by type
 Press **F9** (or **B**) to open **Plugins**, organized by what each unit does

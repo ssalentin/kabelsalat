@@ -208,8 +208,11 @@ mod tests {
 
     const PEDAL: u32 = 1;
 
+    /// Tall enough for the whole list: in a shorter window it scrolls.
+    const SIZE: Vec2 = Vec2::new(1280.0, 1400.0);
+
     fn frame(app: &mut DemoApp, ctx: &egui::Context) {
-        let mut raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))), ..Default::default() };
+        let mut raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)), ..Default::default() };
         raw.time = Some(app.ui_time as f64 + 1.0);
         let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
         out.textures_delta.clear();
@@ -320,10 +323,11 @@ mod tests {
         assert_eq!(at(&s), Some((0, 1)), "next part");
         s.tap(&press_of(idx(ShowAction::NextSong)));
         assert_eq!(at(&s), Some((1, 0)), "next song");
-        s.tap(&press_of(idx(ShowAction::PrevPart)));
-        assert_eq!(at(&s), Some((0, 1)), "previous part");
         s.tap(&press_of(idx(ShowAction::PrevSong)));
-        assert_eq!(at(&s), Some((0, 0)), "previous song is the first song's start, there is none before it");
+        assert_eq!(at(&s), Some((0, 0)), "previous song, at its first part");
+        s.tap(&press_of(idx(ShowAction::NextSong)));
+        s.tap(&press_of(idx(ShowAction::PrevPart)));
+        assert_eq!(at(&s), Some((0, 1)), "previous part, across the song boundary");
 
         s.app.notes_down[60] = 1;
         s.tap(&press_of(idx(ShowAction::Panic)));
@@ -389,7 +393,7 @@ mod tests {
         app.tuner_on = true;
         let ctx = egui::Context::default();
         frame(&mut app, &ctx);
-        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0))), time: Some(5.0), ..Default::default() };
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)), time: Some(5.0), ..Default::default() };
         let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
         out.textures_delta.clear();
         let texts = texts(&out.shapes);

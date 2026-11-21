@@ -289,9 +289,8 @@ const ZONE_EDITS: [Edit; 11] = [
 ];
 
 /// Edits of the foot-switch scenario: both switches, a song picked in the UI
-/// meanwhile, the matrix transpose and split the zone transpose stacks on,
-/// and a key learned as a show control and forgotten again.
-const SWITCH_EDITS: [Edit; 12] = [
+/// meanwhile, and the matrix transpose and split the zone transpose stacks on.
+const SWITCH_EDITS: [Edit; 10] = [
     Edit::Switch(NEXT_CC),
     Edit::Switch(PREV_CC),
     Edit::Program(3),
@@ -302,8 +301,20 @@ const SWITCH_EDITS: [Edit; 12] = [
     Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
     Edit::Split(Some(60)),
     Edit::Split(None),
+];
+
+/// Edits of the foot-switch scenario's pad run (#277): the pad key learned
+/// and forgotten while keys and the pad are held, beside the switches, a
+/// song picked in the UI and a matrix transpose. Its own run: with the
+/// switch edits the product passes any bound a test can exhaust (rule 146).
+const PAD_EDITS: [Edit; 7] = [
     Edit::LearnPad(true),
     Edit::LearnPad(false),
+    Edit::Switch(NEXT_CC),
+    Edit::Switch(PREV_CC),
+    Edit::Zones(3),
+    Edit::Rule { dest: SURGE_A, transpose: 12, enabled: true },
+    Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
 ];
 
 /// Edits of the layers scenario (#276): its songs, the plain one, and the
@@ -1016,7 +1027,17 @@ pub(super) fn explore_arp_bypass(max_states: usize) -> Report {
 pub(super) fn explore_foot_switch(max_states: usize) -> Report {
     let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
     alphabet.extend(SWITCH_EDITS.iter().map(|&e| Step::Edit(e)));
-    alphabet.extend([Step::Pad(true), Step::Pad(false), Step::Edit(Edit::LoadStart)]);
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::FootSwitch)
+}
+
+/// The foot-switch scenario with a key of the foot switches' device learned
+/// as a show control while it, or another key, is held (#277).
+pub(super) fn explore_pad(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.extend([Step::Pad(true), Step::Pad(false)]);
+    alphabet.extend(PAD_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
     explore_with(&alphabet, max_states, Scenario::FootSwitch)
 }
 
@@ -1109,6 +1130,21 @@ fn held_notes_are_released_across_foot_switch_steps() {
     }
     assert!(report.stuck.is_empty(), "stuck notes across foot-switch steps (traces above)");
     assert!(report.complete, "state bound hit before fixpoint: the foot-switch alphabet's state space grew");
+}
+
+#[test]
+fn held_notes_are_released_when_a_held_key_becomes_a_show_control() {
+    let report = explore_pad(100_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (pad): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes when a held key is learned as a show control (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the pad alphabet's state space grew");
 }
 
 #[test]

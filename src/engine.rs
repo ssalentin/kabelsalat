@@ -8583,6 +8583,8 @@ mod tests {
         assert_eq!(play(&mut e, &mut bus, on(80)), vec![(a_after, 80, true)], "the old range and transpose are gone (was node {a})");
     }
 
+    mod show_actions;
+
     // ---- #261: show controls (setlist foot switch) ---------------------
 
     const PEDAL: SourceId = SourceId::Hardware(1);

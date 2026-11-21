@@ -2338,12 +2338,16 @@ mod tests {
         bus.send(Command::LoadRigs { rigs, active: 0 });
         let mut buf = vec![0.0f32; 480 * 2];
         engine.render(&mut buf, 2);
+        for rig in 0..RIGS as u8 {
+            let pan = if rig == 19 { 1.0 } else { -1.0 };
+            bus.send(Command::SetRigMix { rig, vol: None, pan: Some(pan), mute: Some(rig == 7), solo: None });
+        }
+        // A fader or mute takes 5 ms to land (#274): before the clicks start.
+        engine.render(&mut buf, 2);
         for &node in &clicks {
             bus.send(Command::SetNodePlaying { node, playing: true });
         }
         for rig in 0..RIGS as u8 {
-            let pan = if rig == 19 { 1.0 } else { -1.0 };
-            bus.send(Command::SetRigMix { rig, vol: None, pan: Some(pan), mute: Some(rig == 7), solo: None });
             shared.ensure_stem(rig);
             bus.send(Command::SetRecordArm { rig: Some(rig), armed: true });
         }

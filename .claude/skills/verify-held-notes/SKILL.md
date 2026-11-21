@@ -89,6 +89,23 @@ through every entry of `SONGS`, so a song added there grows that search.
 Property as in the routing scenario. Expect about 10k states to a fixpoint.
 A mutation that gates releases by the zone fails it at once.
 
+## Pedal scenario (issue #274)
+
+`held_notes_are_released_across_setlist_switches_under_the_sustain_pedal`
+starts from the zones scenario's patch and switches songs both ways the app
+does: `Song(n)` sends the whole command list the app sends for a part's gates
+(`Setlist::gates(..).commands()` plus `SetShowPart`) for each song of
+`pedal_setlist` (both rigs; A; B; A below 60 and B from 60 up, +12; A +2; no
+song), and the setlist's foot switches (CC 80 / 81) step its parts in the
+engine. The sustain pedal (CC 64 from the same hardware keyboard, so it
+passes `Show::take` before the matrix) goes down and up in between.
+The observer reads the pedal each instrument last got from the test-only
+`cc_passthrough_log`: a note-off or `release_all` under it moves the note to
+`sustained`, and the pedal coming up at that instrument ends them. Property:
+when the last key and the pedal are up, nothing sounds. A first assertion
+checks that the pedal reaches both synths at all. Expect 69662 states to a
+fixpoint, about 2 minutes in debug.
+
 ## How it works (enough to judge a result)
 
 - A breadth-first search over the **real** `GraphEngine::apply`
@@ -176,7 +193,8 @@ release: stuck about 0.2–0.3, released 0.00). Fixed in the commit after
 |---|---|
 | Note dispatch | `src/engine.rs`: `apply` arms `NoteOn`, `NoteOff`; `keys_gate`; `release_all`; `zone_of`, `hands_of`; `deliver_keys_note` (zone gate, velocity curve) |
 | Layers | `src/layer.rs`: `ZoneHands::inside`, `ZoneHands::play`, `VelCurve`; `src/control.rs`: `RigZone::starts` |
-| Routing edits | `src/engine.rs`: `apply` arms `SetNodeSplit`, `MatrixRule`, `Connect`, `Disconnect`, `RemoveNode`, `LoadGraph`, `SetRigZones` (`set_rig_zones`) |
+| Routing edits | `src/engine.rs`: `apply` arms `SetNodeSplit`, `MatrixRule`, `Connect`, `Disconnect`, `RemoveNode`, `LoadGraph`, `SetRigZones` (`set_rig_zones`), `ClearShowGates`, `SetShowPart` |
+| Sustain pedal | `src/engine.rs`: the `Cc` arm (`Show::take`, zone and binding gates, `cc_at_rest`) |
 | Matrix | `src/matrix.rs`: `Matrix::route_into`, `Rule::transform`, `transpose_note` |
 | Graph edits | `src/control.rs`: `Graph::set_split`, `connect_with_id`, `disconnect`, `split_port` |
 
@@ -192,7 +210,11 @@ key), extend `EDITS`/`Step` first.
 
 - **Sources other than `SourceId::Keys`.** Hardware MIDI (`Hardware(dev)`,
   the `HwDirect` thread) takes the same `apply` path but is not in the
-  alphabet.
+  alphabet, except for the foot switches' CCs.
+- **The pedal outside the pedal scenario.** Only its alphabet has CC 64;
+  cable, matrix and node edits under a held pedal are not searched.
+- **Bus and binding gates.** The pedal scenario's rack has no aux bus and no
+  pinned binding, so its switches send no `SetBusLive` or `SetBindingLive`.
 - **The voice-level source filter.** `source_accepted`, `SetRigSource`,
   `SetRigDevice`: the check runs with no CLAP voice slots, so it cannot see
   them. Their release was confirmed by audio once (Fixed findings 4).

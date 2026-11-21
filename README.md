@@ -143,7 +143,14 @@ hard-struck piano, and a floating split: its key range's edges follow the hand
 that plays across them, by up to the set number of keys.
 Switching parts never cuts held notes or reverb tails — outgoing rigs keep
 sounding until you release the keys or sustain pedal, while new notes play the
-next part from the same audio block on. Step parts from the top bar, with
+next part from the same audio block on. A part that moves a rig's fader or an
+instrument's level moves it over 5 ms, so a chord held through the switch does
+not click.
+`kabelsalat setlist-switch-test` measures a switch under a held chord with real
+Surge XT voices: no gap, no click, the reverb and delay tails ring on, and the
+first note of the next song starts in the block that switched (at most one
+buffer later, 5.3 ms at the default 256 frames, plus the sound card's own
+output latency). Step parts from the top bar, with
 **PageUp / PageDown** (**Shift+PageUp / Shift+PageDown** for songs — works with
 page-turner pedals), or bind a hardware MIDI foot-switch CC. Under **Program
 change picks the song**, turn a keyboard or foot controller on, and its preset

@@ -368,6 +368,8 @@ pub struct VoiceSlot {
     node: NodeId,
     voice: ClapVoice,
     level: f32,
+    /// `level` as applied, on its way to a new value (#274).
+    gain: gain_ramp::GainRamp,
     scratch: Vec<f32>,
     // Per-rig input selection (AUM): which source classes feed this rig —
     // the computer keyboard (on-screen + laptop) and hardware MIDI.
@@ -387,6 +389,7 @@ impl VoiceSlot {
             node: NodeId::MAX,
             voice,
             level: 0.85,
+            gain: gain_ramp::GainRamp::at(0.85),
             scratch: vec![0.0; 8192 * 2],
             src_keys: true,
             src_hw: true,
@@ -410,6 +413,7 @@ impl VoiceSlot {
     fn bind(&mut self, node: NodeId) {
         self.node = node;
         self.level = 0.85;
+        self.gain = gain_ramp::GainRamp::at(0.85);
         self.src_keys = true;
         self.src_hw = true;
         self.rig_device = None;
@@ -1019,7 +1023,7 @@ fn source_out(
     taps: &mut BusTaps,
     pdc: &mut pdc::Pdc,
     node: NodeId,
-    level: f32,
+    level: Option<&mut gain_ramp::GainRamp>,
     muted: bool,
     buf: &mut [f32],
 ) {
@@ -1032,8 +1036,8 @@ fn source_out(
     if tapped {
         taps.tap(pdc, sends, SendSource::Node(node), true, send_gain, buf);
     }
-    if level != 1.0 {
-        for x in buf.iter_mut() { *x *= level; }
+    if let Some(level) = level {
+        level.apply(buf);
     }
     if let Some((gl, gr)) = gains {
         if gl == gr {
@@ -1493,6 +1497,9 @@ pub struct GraphEngine {
     // Per-rig mixer (SetRigMix): vol/pan/mute/solo applied at each rig's
     // MasterOut when summing. Fixed MAX_RIGS slots — no allocation on the audio path.
     rig_mix: [RigMix; MAX_RIGS],
+    /// Each rig fader's gain on its way to the mix's (#274): a new fader
+    /// value, a mute or another rig's solo moves it over `gain_ramp::RAMP_S`.
+    rig_gain: [gain_ramp::GainRamp; MAX_RIGS],
     /// Per-rig zone (SetRigZones, #204): what each rig takes from its
     /// sources. All OPEN = no gate. Read only through `zone_of`.
     rig_zones: [RigZone; MAX_RIGS],
@@ -1740,6 +1747,7 @@ impl GraphEngine {
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; MAX_RIGS],
+            rig_gain: [gain_ramp::GainRamp::UNITY; MAX_RIGS],
             rig_zones: [RigZone::OPEN; MAX_RIGS],
             show_gates: show_gates::ShowGates::new(),
             show: crate::show::Show::default(),
@@ -2938,10 +2946,10 @@ impl GraphEngine {
             let solo = if source { solo_rigs } else { &[false; MAX_RIGS] };
             let strips = &self.strips;
             match taps.as_deref_mut() {
-                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, &mut self.pdc, node, 1.0, false, &mut buf[..n2]),
+                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, &mut self.pdc, node, None, false, &mut buf[..n2]),
                 None => {
                     let mut none = BusTaps { nodes: [NodeId::MAX; MAX_BUSES], n: 0, acc: &mut [], span: 0 };
-                    source_out(strips, &self.graph, solo, &[], &mut none, &mut self.pdc, node, 1.0, false, &mut buf[..n2]);
+                    source_out(strips, &self.graph, solo, &[], &mut none, &mut self.pdc, node, None, false, &mut buf[..n2]);
                 }
             }
             self.node_timer.record(node, node_t0.elapsed());
@@ -4500,6 +4508,7 @@ impl GraphEngine {
                 }
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; MAX_RIGS];
+                self.rig_gain = [gain_ramp::GainRamp::UNITY; MAX_RIGS];
                 self.master_mute = false;
                 self.rig_zones = [RigZone::OPEN; MAX_RIGS];
                 self.show_gates.reset();
@@ -5449,6 +5458,7 @@ impl GraphEngine {
             return;
         }
         let n2 = frames * 2;
+        let ramp = (gain_ramp::RAMP_S * self.sample_rate) as u32;
         // Per-source strip state (#73), once per block: which rigs have a
         // soloed source decides every source's mute/solo gain below.
         let solo_rigs = self.rigs_with_solo_source();
@@ -5491,7 +5501,8 @@ impl GraphEngine {
             // the edge levels published from this buffer stay post-fader
             // (rule 53). Sends tap on either side of it; PDC keeps running
             // while bypassed so parallel paths stay aligned.
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, s.level, bypassed, &mut s.scratch[..n2]);
+            s.gain.set((s.level, s.level), ramp);
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, Some(&mut s.gain), bypassed, &mut s.scratch[..n2]);
             // One clock read per voice: each ends where the next begins.
             let now = std::time::Instant::now();
             self.node_timer.record(s.node, now - node_t0);
@@ -5506,7 +5517,7 @@ impl GraphEngine {
         for a in &mut self.audio_in {
             let muted = !zone_of(&self.rig_zones, &self.graph, a.node).live
                 || strip_bypassed(&self.strips, a.node);
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, a.node, 1.0, muted, &mut a.buf[..n2]);
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, a.node, None, muted, &mut a.buf[..n2]);
         }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
@@ -5545,7 +5556,7 @@ impl GraphEngine {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, sig, suppress_wrap_click);
                 let muted = !zone_of(&self.rig_zones, &self.graph, d.node).live
                     || strip_bypassed(&self.strips, d.node);
-                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, 1.0, muted, &mut d.buf[..n2]);
+                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, None, muted, &mut d.buf[..n2]);
             }
         }
         if counting_in_this_block {
@@ -5702,9 +5713,11 @@ impl GraphEngine {
         }
         if n_masters > 0 {
             // Per-rig mix gains, once per block (rig_mix changes only via
-            // commands drained at block start). Constant-power pan, unity
-            // center: gl = sqrt(1-pan), gr = sqrt(1+pan).
+            // commands drained at block start), which each rig's fader ramps
+            // to (`rig_gain`). Constant-power pan, unity center:
+            // gl = sqrt(1-pan), gr = sqrt(1+pan).
             let any_solo = self.rig_mix.iter().any(|m| m.solo);
+            let ramp_from = self.rig_gain;
             // (sounds at all, gain L, gain R): a muted or soloed-out rig
             // sends nothing either.
             let mut gains = [(true, 1.0f32, 1.0f32); MAX_RIGS];
@@ -5732,9 +5745,15 @@ impl GraphEngine {
                 }
                 let sends = self.sends.iter().any(|s| s.from == from);
                 let live = open && (gl != 0.0 || gr != 0.0 || sends);
+                // A rig that goes quiet (fader down, mute, another rig's solo)
+                // sums until its fader has faded out. Several masters of one
+                // rig each start from the same ramp.
+                let mut fader = ramp_from[rig];
+                fader.set(if live { (gl, gr) } else { (0.0, 0.0) }, ramp);
+                let heard = live || !fader.is_silent();
                 // A rig with compensation delays sums while silent too, or
                 // its delay lines would replay stale audio when it returns.
-                if live || self.pdc.feeds(master) {
+                if heard || self.pdc.feeds(master) {
                     // The rig's dry sum at unity: everything wired into its
                     // master except the buses and their chains (the returns),
                     // each through its compensation delay when the plan has
@@ -5762,21 +5781,17 @@ impl GraphEngine {
                         }
                     }
                 }
-                if !live {
+                if !heard {
                     rig_buf.fill(0.0);
                 } else {
                     // Sends tap the rig bus on either side of its fader.
-                    if sends { taps.tap(&mut self.pdc, &self.sends, from, true, 1.0, rig_buf); }
-                    if gl != 1.0 || gr != 1.0 {
-                        for f in rig_buf.chunks_exact_mut(2) {
-                            f[0] *= gl;
-                            f[1] *= gr;
-                        }
-                    }
-                    if sends { taps.tap(&mut self.pdc, &self.sends, from, false, 1.0, rig_buf); }
+                    if live && sends { taps.tap(&mut self.pdc, &self.sends, from, true, 1.0, rig_buf); }
+                    fader.apply(rig_buf);
+                    if live && sends { taps.tap(&mut self.pdc, &self.sends, from, false, 1.0, rig_buf); }
                 }
+                self.rig_gain[rig] = fader;
                 self.pdc.rig_out(master, rig_buf);
-                if live && !bus_solo {
+                if heard && !bus_solo {
                     let slot = if routed { self.out_slot_of(from) } else { None };
                     let dest = match slot {
                         Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
@@ -6243,6 +6258,8 @@ mod bench;
 pub use bench::bench;
 pub mod analysis_test;
 pub mod setlist_test;
+pub mod setlist_switch_test;
+mod gain_ramp;
 pub mod levels_test;
 
 #[cfg(test)]
@@ -11783,6 +11800,9 @@ mod send_tests {
 
         // Its fader and mute still act on it.
         r.bus.send(Command::SetRigMix { rig: 1, vol: Some(0.5), pan: None, mute: None, solo: None });
+        r.render(2);
+        // The fader ramps over its first block (#274).
+        drain(&taps, 0);
         r.render(2);
         assert!(close(drain(&taps, 0).1, 0.5 * r.in_peak(1)), "the rig fader is the output's level");
 

@@ -3785,8 +3785,8 @@ struct DemoApp {
     show_mode: Option<show_mode::ShowMode>,
     /// The pre-show check (#278): its panel, last report and running check.
     preshow: preshow::PreshowState,
-    /// The song whose backing track was started last (#278).
-    setlist_backing_song: Option<usize>,
+    /// The song and backing track the player was started with last (#278).
+    setlist_backing_song: Option<(usize, String)>,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
     /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
     /// node id like the session's strips (`remap_session` carries them).
@@ -8082,6 +8082,7 @@ impl DemoApp {
         // Setlist (#204): restore songs/parts and send the active zones (if any).
         self.setlist = s.setlist.clone();
         self.setlist.prune_to_graph(&s.graph);
+        self.preshow.report = None;
         self.setlist_footswitch_learn = None;
         self.setlist_edit_song = self.setlist.active.map(|p| p.song)
             .or_else(|| (!self.setlist.songs.is_empty()).then_some(0));
@@ -8209,13 +8210,12 @@ impl DemoApp {
     /// without one stops the track a song started (#278). Parts of the same
     /// song leave it playing.
     fn follow_song_backing(&mut self) {
-        let song = self.setlist.active.map(|p| p.song);
-        let track = song.and_then(|i| self.setlist.songs.get(i)).and_then(|s| s.backing.clone());
+        let track = self.setlist.active.and_then(|p| Some((p.song, self.setlist.songs.get(p.song)?.backing.clone()?)));
         let cmd = match track {
-            Some(path) if self.setlist_backing_song != song => {
+            Some(t) if self.setlist_backing_song.as_ref() != Some(&t) => {
                 let Some(pc) = &self.player_ctrl else { return };
-                pc.play(path);
-                self.setlist_backing_song = song;
+                pc.play(&t.1);
+                self.setlist_backing_song = Some(t);
                 Command::SetPlayer { gain: if self.player.gain > 0.0 { self.player.gain } else { 0.8 } }
             }
             None if self.setlist_backing_song.is_some() => {
@@ -35556,7 +35556,7 @@ mod rig_switch_tests {
         // (list_instruments/install_instrument shipped like that once).
         let src = include_str!("mcp.rs");
         let mut missing = Vec::new();
-        for part in src.split("ui_bridge_tool(\"").skip(1) {
+        for part in src.split("ui_bridge_tool(\"").skip(1).chain(src.split("ui_bridge_tool_within(\"").skip(1)) {
             let name = part.split('"').next().unwrap_or("");
             if !name.is_empty() && !UI_BRIDGE_TOOLS.contains(&name) { missing.push(name.to_string()); }
         }

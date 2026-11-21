@@ -2877,7 +2877,11 @@ impl McpServer {
     }
 
     fn ui_bridge_tool(tool: &str, args: Value) -> Result<CallToolResult, McpError> {
-        match bridge::request(&json!({"op": "ui", "tool": tool, "args": args})) {
+        Self::ui_bridge_tool_within(tool, args, std::time::Duration::from_secs(5))
+    }
+
+    fn ui_bridge_tool_within(tool: &str, args: Value, wait: std::time::Duration) -> Result<CallToolResult, McpError> {
+        match bridge::request_within(&json!({"op": "ui", "tool": tool, "args": args}), wait) {
             Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => {
                 let data = reply.get("data").cloned().unwrap_or(Value::Null);
                 if let Some(s) = data.as_str() {
@@ -4742,7 +4746,9 @@ impl McpServer {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
             drop(st);
-            return Self::ui_bridge_tool("preshow_check", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+            // The app probes every rig: seconds, past the bridge's usual 5 s.
+            let args = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+            return Self::ui_bridge_tool_within("preshow_check", args, std::time::Duration::from_secs(65));
         }
         let path = args.session.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
         let mut session = crate::session::Session::new("Headless rack", st.graph.clone());

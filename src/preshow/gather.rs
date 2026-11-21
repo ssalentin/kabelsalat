@@ -125,17 +125,17 @@ fn power_in(root: &Path) -> Option<Power> {
 }
 
 /// Fill in what the app does not keep: the backing tracks, the disk, the
-/// power, the probe of every rig, and the render time when no running
-/// engine measured it.
-pub fn complete(facts: &mut Facts, s: &Session, buffer_frames: u32) {
+/// power, the probe of every rig and the render time with every rig
+/// playing, at the app's buffer size and sample rate.
+pub fn complete(facts: &mut Facts, s: &Session, buffer_frames: u32, sample_rate: f64) {
     facts.files = files(s);
     facts.disk = disk(&crate::record::record_dir());
     facts.power = power();
     // Without the scan the probe would take every plugin for missing.
     if let Some(installed) = &facts.plugins {
-        let (probe, render) = super::probe::run(s, installed, buffer_frames);
+        let (probe, render) = super::probe::run(s, installed, buffer_frames, sample_rate);
         facts.probe = Some(probe);
-        facts.render.get_or_insert(render);
+        facts.render = Some(render);
     }
 }
 
@@ -155,8 +155,7 @@ pub fn machine_facts(s: &Session) -> Facts {
         plugins: Some(installed),
         ..Default::default()
     };
-    let frames = crate::assistant::load_buffer_frames_from(&crate::assistant::config_path());
-    complete(&mut facts, s, frames);
+    complete(&mut facts, s, crate::assistant::load_buffer_frames(), 48_000.0);
     facts
 }
 

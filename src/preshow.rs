@@ -87,6 +87,9 @@ pub struct Facts {
     pub files: Vec<(String, FileFact)>,
     pub disk: Option<Disk>,
     pub render: Option<Render>,
+    /// Dropouts the running app's output counted since the last reset;
+    /// `None` outside the app.
+    pub xruns: Option<u32>,
     pub power: Option<Power>,
 }
 
@@ -136,15 +139,13 @@ pub struct Disk {
     pub free_bytes: u64,
 }
 
-/// How long rendering one buffer takes.
+/// How long rendering one buffer of the show takes with every rig playing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Render {
     pub sample_rate: u32,
     pub buffer_frames: u32,
     pub avg_us: f64,
     pub max_us: f64,
-    /// Dropouts the running app counted; `None` = measured offline.
-    pub xruns: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -265,7 +266,8 @@ fn midi_devices(s: &Session, f: &Facts) -> Outcome {
             want(port, r);
         }
     }
-    for m in s.midi_sources() {
+    // A synth with hardware off keeps its device but hears none.
+    for m in s.midi_sources().iter().filter(|m| m.hardware) {
         if let (Some(port), Some(n)) = (&m.device, s.graph.node(m.node)) {
             want(port, rig_label(s, n.rig));
         }
@@ -554,7 +556,7 @@ fn render(_: &Session, f: &Facts) -> Outcome {
             "{setup}: {took}: one buffer ran late. Reset the peaks in Engine Info and watch them while you play; a larger buffer gives more room."
         ));
     }
-    if let Some(x) = r.xruns.filter(|&x| x > 0) {
+    if let Some(x) = f.xruns.filter(|&x| x > 0) {
         return Outcome::warning(format!(
             "{setup}: {took}, but the output dropped out {x} time{} since the start. Reset the peaks in Engine Info and watch it while you play.",
             if x == 1 { "" } else { "s" }
@@ -593,7 +595,7 @@ pub fn rig_label(s: &Session, rig: u8) -> String {
         .get(rig as usize)
         .filter(|n| !n.trim().is_empty())
         .cloned()
-        .unwrap_or_else(|| format!("Rig {}", (b'A' + rig.min(25)) as char))
+        .unwrap_or_else(|| format!("Rig {}", crate::control::rig_letter(rig as usize)))
 }
 
 fn node_label(s: &Session, n: &Node) -> String {
@@ -682,7 +684,8 @@ pub(crate) mod tests {
             probe: Some(Probe { rigs: (0..rig_count(s) as u8).map(|r| (r, 0.3)).collect(), failed: vec![] }),
             files: vec![("/gig/intro.wav".into(), FileFact::Audio { seconds: 245.0 })],
             disk: Some(Disk { dir: "~/Music/kabelsalat".into(), free_bytes: 80_000_000_000 }),
-            render: Some(Render { sample_rate: 48_000, buffer_frames: 256, avg_us: 900.0, max_us: 2100.0, xruns: Some(0) }),
+            render: Some(Render { sample_rate: 48_000, buffer_frames: 256, avg_us: 900.0, max_us: 2100.0 }),
+            xruns: Some(0),
             power: Some(Power::Mains { battery: Some(97) }),
         }
     }
@@ -727,6 +730,20 @@ pub(crate) mod tests {
         assert_eq!(row(&rows, "backing_tracks").text, "Song 1 “Song 1” plays /gig/intro.wav, which is missing. Put the file back, or give the song another backing track.");
         assert!(row(&rows, "rigs_sound").text.ends_with("Lead not probed: a plugin is missing (see Plugins)."), "{}", row(&rows, "rigs_sound").text);
         let _ = odin;
+    }
+
+    #[test]
+    fn a_synth_with_hardware_off_needs_no_device() {
+        let mut s = show();
+        s.set_hw_ports(Default::default());
+        s.rig_devices.clear();
+        let a = s.midi_sources()[0].node;
+        s.set_midi_sources(MidiSources { node: a, keyboard: true, hardware: false, device: Some(FM1.into()) });
+        let mut f = healthy(&s);
+        f.midi_ports = Some(vec![]);
+        assert_eq!(row(&run(&s, &f), "midi_devices").status, Status::Ok);
+        s.set_midi_sources(MidiSources { node: a, keyboard: false, hardware: true, device: Some(FM1.into()) });
+        assert_eq!(row(&run(&s, &f), "midi_devices").status, Status::Problem);
     }
 
     #[test]
@@ -786,6 +803,8 @@ pub(crate) mod tests {
         s.graph.nodes.iter_mut().find(|n| n.id == vocal).unwrap().kind =
             NodeKind::AudioIn { device: None, channels: crate::control::AudioInChannel::MonoL };
         assert_eq!(row(&run(&s, &f), "audio_inputs").text, "Connected: M2 for Vocal (Piano).");
+        let unknown = Facts { inputs: None, ..f };
+        assert_eq!(row(&run(&s, &unknown), "audio_inputs").status, Status::Warning, "no scan yet is no problem found");
     }
 
     #[test]
@@ -842,7 +861,8 @@ pub(crate) mod tests {
         let s = show();
         let mut f = healthy(&s);
         let at = |f: &mut Facts, avg_us: f64, max_us: f64, xruns: u32| {
-            f.render = Some(Render { sample_rate: 48_000, buffer_frames: 256, avg_us, max_us, xruns: Some(xruns) });
+            f.render = Some(Render { sample_rate: 48_000, buffer_frames: 256, avg_us, max_us });
+            f.xruns = Some(xruns);
             row(&run(&s, f), "render").status
         };
         assert_eq!(at(&mut f, 1000.0, 2000.0, 0), Status::Ok);
@@ -850,7 +870,8 @@ pub(crate) mod tests {
         assert_eq!(at(&mut f, 5000.0, 5200.0, 0), Status::Problem, "94 %");
         assert_eq!(at(&mut f, 1000.0, 6000.0, 0), Status::Warning, "one late block at a light load");
         assert_eq!(at(&mut f, 1000.0, 2000.0, 3), Status::Warning, "dropouts already happened");
-        f.render = Some(Render { sample_rate: 48_000, buffer_frames: 2048, avg_us: 1000.0, max_us: 2000.0, xruns: None });
+        f.render = Some(Render { sample_rate: 48_000, buffer_frames: 2048, avg_us: 1000.0, max_us: 2000.0 });
+        f.xruns = None;
         assert_eq!(row(&run(&s, &f), "render").status, Status::Warning, "43 ms of latency");
         f.render = None;
         assert_eq!(row(&run(&s, &f), "render").status, Status::Warning);

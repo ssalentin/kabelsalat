@@ -7,13 +7,13 @@
 use std::sync::mpsc;
 
 use super::*;
-use crate::preshow::{gather, Facts, Installed, Render, Report, Status};
+use crate::preshow::{gather, Facts, Installed, Report, Status};
 
 type Reply = Box<dyn FnOnce(Result<Report, String>) + Send>;
 
 enum Job {
     /// The rack as it plays now, with what the app knows of the machine.
-    Live { session: crate::session::Session, facts: Facts, frames: u32 },
+    Live { session: crate::session::Session, facts: Facts, frames: u32, sample_rate: f64 },
     /// A saved package, checked as `kabelsalat preshow-check` does.
     Package(std::path::PathBuf),
 }
@@ -42,9 +42,9 @@ fn send_job(job: Job, reply: Reply) -> bool {
 
 fn run_job(job: Job) -> Result<Report, String> {
     match job {
-        Job::Live { session, mut facts, frames } => {
+        Job::Live { session, mut facts, frames, sample_rate } => {
             let t = std::time::Instant::now();
-            gather::complete(&mut facts, &session, frames);
+            gather::complete(&mut facts, &session, frames, sample_rate);
             Ok(Report::of(&session, &facts, t.elapsed()))
         }
         Job::Package(path) => gather::check_package(&path).map_err(|e| format!("{e:#}")),
@@ -61,7 +61,9 @@ pub(super) fn status_color(status: Status) -> Color32 {
 
 impl DemoApp {
     /// What the app already knows of the machine: its MIDI devices, outputs,
-    /// inputs, plugin scan and the running engine's render time.
+    /// inputs, plugin scan and the running output's dropouts. An empty
+    /// device list is one no scan has filled yet. The render time comes
+    /// from the probe, with every rig playing: an idle engine says little.
     fn preshow_facts(&mut self) -> Facts {
         self.adopt_hw_devices();
         let midi_ports = self
@@ -79,15 +81,9 @@ impl DemoApp {
             outputs: self.audio_out.lock().ok().map(|s| s.outputs.clone()).filter(|o| !o.is_empty()),
             chosen_output: self.wanted_output.lock().ok().and_then(|w| w.clone()),
             audio_running: Some(running),
-            inputs: self.input_devices.lock().ok().map(|d| d.clone()),
+            inputs: self.input_devices.lock().ok().map(|d| d.clone()).filter(|d| !d.is_empty()),
             plugins,
-            render: running.then(|| Render {
-                sample_rate: c.sample_rate,
-                buffer_frames: c.buffer_frames(),
-                avg_us: c.render_avg_ns as f64 / 1000.0,
-                max_us: c.render_max_us as f64,
-                xruns: Some(c.xruns),
-            }),
+            xruns: running.then_some(c.xruns),
             ..Default::default()
         }
     }
@@ -106,7 +102,7 @@ impl DemoApp {
         };
         let facts = self.preshow_facts();
         let (tx, rx) = mpsc::channel();
-        let job = Job::Live { session, facts, frames: self.buffer_frames };
+        let job = Job::Live { session, facts, frames: self.buffer_frames, sample_rate: self.sample_rate };
         if send_job(job, Box::new(move |r| drop(tx.send(r)))) {
             self.preshow.running = Some(rx);
         } else {
@@ -179,14 +175,13 @@ impl DemoApp {
         "checking the show".into()
     }
 
-    /// Open or close the Setlist view's check panel; opening it checks.
+    /// Open or close the Setlist view's check panel; opening it checks the
+    /// show as it is now.
     pub(super) fn toggle_preshow_panel(&mut self) {
         self.preshow.open = !self.preshow.open;
         if self.preshow.open {
             self.setlist_levels_open = false;
-            if self.preshow.report.is_none() {
-                self.start_preshow();
-            }
+            self.start_preshow();
         }
     }
 
@@ -215,7 +210,7 @@ impl DemoApp {
             egui::RichText::new(format!("The check failed: {e}")).color(theme::CLIP_BRIGHT)
         } else if let Some(r) = &self.preshow.report {
             let worst = r.rows.iter().map(|row| row.status).max().unwrap_or(Status::Ok);
-            egui::RichText::new(format!("{} · {:.1} s", r.summary(), r.took_ms as f64 / 1000.0)).color(status_color(worst))
+            egui::RichText::new(format!("{} · {} · {:.1} s", r.session, r.summary(), r.took_ms as f64 / 1000.0)).color(status_color(worst))
         } else {
             egui::RichText::new("Finds what could go wrong before the first song.").color(theme::INK_2)
         };
@@ -336,8 +331,10 @@ pub(super) mod tests {
         for row in &report.rows {
             assert!(texts.iter().any(|t| t == row.title), "{} is shown: {texts:?}", row.title);
         }
-        assert!(texts.iter().any(|t| t.starts_with(&report.summary())), "the summary line: {texts:?}");
+        assert!(texts.iter().any(|t| t.contains(&report.summary())), "the summary line: {texts:?}");
         assert!(texts.iter().any(|t| t == "Check again"));
+        app.apply_session(&crate::session::Session::new("Another show", crate::control::standard_rig_graph(true))).unwrap();
+        assert!(app.preshow.report.is_none(), "a report of the last show is not this one's");
     }
 
     #[test]
@@ -445,6 +442,19 @@ pub(super) mod tests {
         assert!(!commands(&mut drain).iter().any(|c| matches!(c, Command::SetPlayerEnable { .. })));
         app.exec_tool("select_setlist_part", &serde_json::json!({"action": "next_part"}));
         assert!(commands(&mut drain).iter().any(|c| matches!(c, Command::SetPlayerEnable { on: false })), "the ballad has no track: the intro's stops");
+        // A song that moved to another place, or got another file, starts
+        // what it names now.
+        let second = wav.with_extension("v2.wav");
+        write_wav(&second);
+        app.exec_tool("set_setlist_song", &serde_json::json!({"song": 1, "backing": second.to_string_lossy()}));
+        app.exec_tool("set_setlist_song", &serde_json::json!({"song": 1, "move_to": 0}));
+        app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0}));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while decoded.pop().is_err() {
+            assert!(std::time::Instant::now() < deadline, "the moved song's track was never started");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(&second);
         let _ = std::fs::remove_file(&wav);
     }
 

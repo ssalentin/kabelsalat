@@ -730,7 +730,7 @@ fn on_panic(info: &std::panic::PanicHookInfo) {
         .or_else(|| info.payload().downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "(no message)".into());
     let at = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
-    let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+    let backtrace = short_backtrace(&std::backtrace::Backtrace::force_capture().to_string());
     let home = std::env::var("HOME").ok();
     let home = home.as_deref();
     // SAFETY: WRITING is ours.
@@ -752,6 +752,26 @@ fn on_panic(info: &std::panic::PanicHookInfo) {
     }
     PANIC_REPORTED.store(true, Ordering::Release);
     WRITING.store(false, Ordering::Release);
+}
+
+/// The frames between std's short-backtrace markers, as `RUST_BACKTRACE=1`
+/// prints them: no capture or hook frames above, no runtime start below.
+fn short_backtrace(full: &str) -> String {
+    let mut frames: Vec<String> = Vec::new();
+    for line in full.lines() {
+        let head = line.trim_start();
+        let starts = head.split_once(": ").is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        match frames.last_mut() {
+            Some(f) if !starts => {
+                f.push_str(line);
+                f.push('\n');
+            }
+            _ => frames.push(format!("{line}\n")),
+        }
+    }
+    let end = frames.iter().rposition(|f| f.contains("__rust_end_short_backtrace")).map_or(0, |i| i + 1);
+    let begin = frames.iter().position(|f| f.contains("__rust_begin_short_backtrace")).filter(|&b| b > end).unwrap_or(frames.len());
+    frames[end..begin].concat()
 }
 
 // -- scrubbing ---------------------------------------------------------------
@@ -947,6 +967,24 @@ f2cccb600000-f2cccb601000 r-xp 00000000 08:01 133179                     /home/a
         let (mut chunk, mut line) = ([0u8; 1024], [0u8; LINE]);
         scan_maps(reader(&long), &mut chunk, &mut line, |l| names.push((l.start, String::from_utf8_lossy(file_name(l.path)).into_owned())));
         assert_eq!(names, [(0xf2cccb600000, "libdeep.so".to_string())]);
+    }
+
+    #[test]
+    fn a_panic_backtrace_starts_at_the_panic_and_ends_at_main() {
+        let full = "   0: std::backtrace::Backtrace::create
+             at std/src/backtrace.rs:331:13
+   1: kabelsalat::crash::on_panic
+   2: std::sys::backtrace::__rust_end_short_backtrace
+             at std/src/sys/backtrace.rs:182:18
+   3: core::panicking::panic_fmt
+   4: kabelsalat::ui::headless::run
+             at src/ui/headless.rs:144:33
+   5: std::sys::backtrace::__rust_begin_short_backtrace
+   6: main
+";
+        let short = short_backtrace(full);
+        assert_eq!(short, "   3: core::panicking::panic_fmt\n   4: kabelsalat::ui::headless::run\n             at src/ui/headless.rs:144:33\n");
+        assert_eq!(short_backtrace("   0: a\n   1: b\n"), "   0: a\n   1: b\n", "without markers every frame stays");
     }
 
     #[test]

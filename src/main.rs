@@ -58,16 +58,15 @@ mod theme;
 mod transport;
 mod ui;
 mod vital;
+mod watchdog;
 
-const MODES: &str = "app, preview, analysis-test [--save <dir>], audio-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, demo-test, preset-test, state-race-test [seconds] [patch.fxp...], add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, setlist-test, levels-test [--save <dir>], preshow-check <session.ksalat>, send-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
+const MODES: &str = "app [--headless], crash-test, preview, analysis-test [--save <dir>], audio-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, demo-test, preset-test, state-race-test [seconds] [patch.fxp...], add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, setlist-test, levels-test [--save <dir>], preshow-check <session.ksalat>, send-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
     match mode.as_str() {
-        "app" => {
-            crash::install();
-            ui::run_app()
-        }
+        "app" => watchdog::run_app(std::env::args().any(|a| a == "--headless")),
+        "crash-test" => watchdog::run_test(),
         "preview" => preview::run(),
         "audio-test" => audio::run_test(),
         "midi-test" => midi::run_test(),

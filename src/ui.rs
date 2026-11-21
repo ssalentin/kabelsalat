@@ -258,7 +258,7 @@ fn spawn_hw_midi(
 
 /// A MIDI port name without ALSA's trailing "client:port" numbers
 /// ("FM-1:FM-1 MIDI 1 24:0" → "FM-1:FM-1 MIDI 1"): stable across re-plugs.
-fn midi_port_key(name: &str) -> &str {
+pub(crate) fn midi_port_key(name: &str) -> &str {
     match name.rsplit_once(' ') {
         Some((head, tail)) if tail.split_once(':').is_some_and(|(c, p)| {
             !c.is_empty() && !p.is_empty() && c.bytes().all(|b| b.is_ascii_digit()) && p.bytes().all(|b| b.is_ascii_digit())
@@ -272,9 +272,9 @@ fn midi_port_key(name: &str) -> &str {
 /// "ESI MIDIMATE eX" + "Port 2"). ALSA repeats the client name in the port
 /// name and appends "client:port" numbers that change on a re-plug.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MidiPortName { device: String, port: String }
+pub(crate) struct MidiPortName { pub device: String, pub port: String }
 
-fn midi_port_name(raw: &str) -> MidiPortName {
+pub(crate) fn midi_port_name(raw: &str) -> MidiPortName {
     let key = midi_port_key(raw);
     let Some((client, port)) = key.split_once(':') else {
         return MidiPortName { device: key.trim().to_string(), port: String::new() };
@@ -346,6 +346,14 @@ fn alsa_port_subscribed(seq_clients: &str, name: &str) -> Option<bool> {
     found.then_some(false)
 }
 
+/// A MIDI input port that is a device: not ours, not ALSA's own. The
+/// kernel's Midi Through port counts with KABELSALAT_MIDI_THROUGH=1, a
+/// hardware-path self-test feed (aseqsend -p 14:0).
+pub(crate) fn is_hw_midi_port(name: &str) -> bool {
+    let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
+    !(name.contains("kabelsalat") || (name.contains("Midi Through") && !through_ok) || name == "System" || name == "Announce")
+}
+
 fn rescan_hw_midi(
     hw: &HwMidi,
     conns: &mut Vec<Option<midir::MidiInputConnection<()>>>,
@@ -354,15 +362,9 @@ fn rescan_hw_midi(
     direct: &Arc<HwDirect>,
 ) {
     let Ok(probe) = midir::MidiInput::new("kabelsalat-probe") else { return };
-    // KABELSALAT_MIDI_THROUGH=1 accepts the kernel's Midi Through port — a
-    // hardware-path self-test feed (aseqsend -p 14:0).
-    let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
     let ports: Vec<(String, midir::MidiInputPort)> = probe.ports().into_iter()
         .map(|p| (probe.port_name(&p).unwrap_or_default(), p))
-        .filter(|(name, _)| !(name.contains("kabelsalat")
-            || (name.contains("Midi Through") && !through_ok)
-            || name == "System"
-            || name == "Announce"))
+        .filter(|(name, _)| is_hw_midi_port(name))
         .collect();
     // Decide under the lock, connect/close outside it: the UI frame reads
     // the same list and must never wait for an ALSA port to open.

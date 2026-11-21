@@ -2668,6 +2668,11 @@ impl GraphEngine {
         self.meter.snapshot()
     }
 
+    /// The LV2 nodes whose instance the loader thread has attached.
+    pub fn lv2_attached(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.lv2.iter().map(|s| s.node)
+    }
+
     /// Lock-free per-edge audio levels for the UI's breathing/flowing cables.
     pub fn edge_levels_handle(&self) -> Arc<EdgeLevels> {        self.edge_levels.clone()
     }

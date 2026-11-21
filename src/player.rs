@@ -284,7 +284,7 @@ pub(crate) fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
                     (i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8) as f32 / 8_388_608.0
                 })),
                 (3, 32) => data.extend(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))),
-                _ => anyhow::bail!("unsupported WAV (format {format}, {bits}-bit): 16/24-bit PCM or 32-bit float"),
+                _ => anyhow::bail!(unsupported(format, bits)),
             }
         }
         i = body + size + (size & 1);
@@ -293,6 +293,50 @@ pub(crate) fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
         anyhow::bail!("WAV missing fmt/data chunks");
     }
     Ok(Wav { sample_rate, channels, data })
+}
+
+fn unsupported(format: u16, bits: u16) -> String {
+    format!("unsupported WAV (format {format}, {bits}-bit): 16/24-bit PCM or 32-bit float")
+}
+
+/// How long a WAV the player can read lasts, from its chunk headers alone:
+/// the pre-show check looks at every backing track of a show (#278).
+pub fn wav_seconds(path: &Path) -> anyhow::Result<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut head = [0u8; 12];
+    if file.read_exact(&mut head).is_err() || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        anyhow::bail!("not a RIFF/WAVE file");
+    }
+    let mut fmt: Option<(u16, u16, u32, u16)> = None;
+    let mut chunk = [0u8; 8];
+    while file.read_exact(&mut chunk).is_ok() {
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+        if &chunk[0..4] == b"fmt " && size >= 16 {
+            let mut b = [0u8; 26];
+            let n = size.min(26) as usize;
+            file.read_exact(&mut b[..n])?;
+            file.seek(SeekFrom::Current((size - n as u64 + (size & 1)) as i64))?;
+            let mut format = u16::from_le_bytes([b[0], b[1]]);
+            if format == 0xFFFE && n >= 26 {
+                format = u16::from_le_bytes([b[24], b[25]]);
+            }
+            let channels = u16::from_le_bytes([b[2], b[3]]);
+            let rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+            fmt = Some((format, channels, rate, u16::from_le_bytes([b[14], b[15]])));
+        } else if &chunk[0..4] == b"data" {
+            let Some((format, channels, rate, bits)) = fmt.filter(|f| f.1 > 0 && f.2 > 0) else { break };
+            if !matches!((format, bits), (1, 16) | (1, 24) | (3, 32)) {
+                anyhow::bail!(unsupported(format, bits));
+            }
+            let size = size.min(len.saturating_sub(file.stream_position()?));
+            return Ok(size as f64 / (channels as u64 * bits as u64 / 8 * rate as u64) as f64);
+        } else {
+            file.seek(SeekFrom::Current((size + (size & 1)) as i64))?;
+        }
+    }
+    anyhow::bail!("WAV missing fmt/data chunks")
 }
 
 #[cfg(test)]
@@ -340,6 +384,30 @@ mod wav_format_tests {
         assert!((w.data[0] - 0.5).abs() < 1e-6);
 
         assert!(parse(&wav_bytes(1, 8, 44100, 1, &[128])).is_err(), "8-bit is refused with a reason");
+    }
+
+    /// What `wav_seconds` accepts, the player plays, and it tells the length
+    /// without reading the samples.
+    #[test]
+    fn wav_seconds_reads_the_length_of_what_the_player_plays() {
+        let dir = std::env::temp_dir().join(format!("ksalat-wav-seconds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (format, bits, ch, rate) in [(3u16, 32u16, 2u16, 48000u32), (1, 24, 1, 44100), (1, 16, 2, 44100), (1, 8, 1, 8000)] {
+            let frame = (ch * bits / 8) as usize;
+            let bytes = wav_bytes(format, bits, rate, ch, &vec![0u8; frame * rate as usize / 2]);
+            let p = dir.join(format!("{format}-{bits}.wav"));
+            std::fs::write(&p, &bytes).unwrap();
+            let plays = parse(&bytes).is_ok();
+            match wav_seconds(&p) {
+                Ok(s) => assert!(plays && (s - 0.5).abs() < 1e-9, "{format}/{bits}: {s} s, plays {plays}"),
+                Err(e) => assert!(!plays && e.to_string() == unsupported(format, bits), "{format}/{bits}: {e}"),
+            }
+        }
+        let text = dir.join("notes.wav");
+        std::fs::write(&text, b"just some text, not audio").unwrap();
+        assert_eq!(wav_seconds(&text).unwrap_err().to_string(), "not a RIFF/WAVE file");
+        assert!(wav_seconds(&dir.join("gone.wav")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A parsed file becomes stereo at its own rate (rule 54: the player

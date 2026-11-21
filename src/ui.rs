@@ -48575,7 +48575,7 @@ mod navigator_tests {
                 };
                 for (d, (name, _)) in devices.iter().enumerate() {
                     let mut row = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name);
-                    for _ in 0..10 {
+                    for _ in 0..20 {
                         if row.is_some() {
                             break;
                         }

@@ -93,40 +93,49 @@ impl DemoApp {
                 }
                 (false, None) => ("Unbound".to_string(), theme::INK_2),
             };
-            ui.horizontal(|ui| {
-                ui.set_min_height(ROW_H - 4.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    // Learn keeps its column whether or not there is a Clear; while
-                    // learning, Cancel replaces Learn and uses the room for the prompt.
-                    if control.is_some() && !learning {
-                        if theme::chip_button(ui, "Clear", false).clicked() {
-                            setlist.forget(action);
+            let draw_row = |ui: &mut egui::Ui, setlist: &mut crate::setlist::Setlist, learn: &mut Option<ShowAction>| {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(ROW_H - 4.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        // Learn keeps its column whether or not there is a Clear; while
+                        // learning, Cancel replaces Learn and uses the room for the prompt.
+                        if control.is_some() && !learning {
+                            if theme::chip_button(ui, "Clear", false).clicked() {
+                                setlist.forget(action);
+                            }
+                        } else if !learning {
+                            ui.add_space(theme::chip_button_width(ui, "Clear") + 4.0);
                         }
-                    } else if !learning {
-                        ui.add_space(theme::chip_button_width(ui, "Clear") + 4.0);
-                    }
-                    if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
-                        *learn = if learning { None } else { Some(action) };
-                    }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        if narrow {
-                            ui.add(egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
-                        } else {
-                            ui.allocate_ui_with_layout(Vec2::new(ACTION_W, ROW_H - 4.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.set_min_width(ACTION_W);
+                        if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
+                            *learn = if learning { None } else { Some(action) };
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if narrow {
                                 ui.add(egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
-                            });
-                            ui.add(egui::Label::new(egui::RichText::new(&text).size(11.5).color(color)).truncate());
-                        }
+                            } else {
+                                ui.allocate_ui_with_layout(Vec2::new(ACTION_W, ROW_H - 4.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.set_min_width(ACTION_W);
+                                    ui.add(egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
+                                });
+                                ui.add(egui::Label::new(egui::RichText::new(&text).size(11.5).color(color)).truncate());
+                            }
+                        });
                     });
                 });
-            });
+            };
             if narrow {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.add(egui::Label::new(egui::RichText::new(&text).size(11.0).color(color)).truncate());
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    draw_row(ui, setlist, learn);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.add(egui::Label::new(egui::RichText::new(&text).size(11.0).color(color)).truncate());
+                    });
+                    ui.add_space(2.0);
                 });
+            } else {
+                draw_row(ui, setlist, learn);
             }
         }
         ui.add_space(6.0);

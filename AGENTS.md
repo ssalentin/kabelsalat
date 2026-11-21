@@ -226,6 +226,8 @@ and never passed off as tested.**
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `demo-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `send-test`, `cc-map-test`,
+  `levels-test [--save <dir>]` (a show-level vocal rig and reverb bus through
+  ten song switches, no gap in the rendered file; no plugins),
   `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
   temporary null sinks, so nothing is heard),
   `state-race-test [seconds] [patch.fxp...]`,
@@ -1640,3 +1642,10 @@ Learned so far (2026-11-15, UI polish pass):
     A rack rebuilt from parts carries each synth's `VoiceRow`, device
     included, never only its switches. A new field holding a device index
     goes through `map_session_hw` too (`ui::hw_ports_tests`).
+196. **A header whose right-hand group can grow draws that group first and
+    truncates its subtitle in what is left:** the Setlist header laid the
+    subtitle out in `horizontal_wrapped` and then the buttons right-to-left
+    (rule 136's trap), so at 781 px "LIVE 2. Song 2 · Main" ran over the
+    subtitle, worse once "Sets & levels" joined the buttons (#273). Draw the
+    buttons in `right_to_left`, then the subtitle as a truncating label in a
+    nested `left_to_right`; check a shot with a long live song name.

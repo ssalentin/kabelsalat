@@ -712,7 +712,11 @@ fn system_prompt() -> String {
      which rigs are live with key_lo/key_hi, transpose, level and optional stored knobs); \
      select_setlist_part jumps to a song/part or steps next_part/prev_part/next_song/prev_song/clear; \
      add_song_from_session imports a saved session's rigs into the current gig and makes a song \
-     of them; set_setlist_footswitch binds or clears a hardware MIDI CC for next/prev part.\n\
+     of them; set_setlist_footswitch binds or clears a hardware MIDI CC for next/prev part. \
+     Levels: every rig, aux bus and CC binding lives at show level (no song switch touches it: \
+     a vocal mic, a master reverb, a volume pedal), at the level of a set (a named group of songs, \
+     set_setlist_set makes, fills, skips or moves one) or at song level (only where the parts use \
+     it); get_setlist lists sets and levels, set_level changes one.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
      sound once wired.\n\
@@ -1195,13 +1199,23 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"get_setlist",
-            "description":"Read the session's setlist: every song (index, name, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level and stored knob count), the active song/part (null = all rigs open), and any learned foot-switch CCs.",
+            "description":"Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_setlist_song",
-            "description":"Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature (e.g. '4/4', '3/4', '6/8', or null to clear). Optional parts: JSON array string of parts, each {name, rigs: [{rig, key_lo?, key_hi?, transpose?, level?}], capture_knobs?}. When creating a song without parts, one 'Main' part is created from the active rig.",
+            "description":"Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature (e.g. '4/4', '3/4', '6/8', or null to clear). Optional parts: JSON array string of parts, each {name, rigs: [{rig, key_lo?, key_hi?, transpose?, level?}], buses?: [aux bus node ids that take signal in this part], capture_knobs?}. When creating a song without parts, one 'Main' part is created from the active rig.",
             "parameters":{"type":"object","properties":{"song":{"type":"integer"},"name":{"type":"string"},"bpm":{"type":["number","null"]},"time_signature":{"type":["string","null"]},"parts":{"type":"string"},"move_to":{"type":"integer"},"remove":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_level",
+            "description":"Choose where one rig, aux bus or CC binding lives in the show. level 'show' = every song, never touched by a song or part switch (a vocal mic, a master reverb, a volume pedal); 'set' = through the songs of one set (set = its name or 0-based index); 'song' = only where the setlist's parts use it (a part's rigs and buses; a binding works while its node's rig plays). Give rig (0-based), OR bus (aux bus node id), OR a binding's node and cc (with source 'keys' | 'hw:<device>', default keys; list_cc_maps lists them). Without a choice a rig or bus a part uses is at song level and any other at show level; a binding follows its rig, a mixer binding is at show level.",
+            "parameters":{"type":"object","properties":{"level":{"type":"string","enum":["show","set","song"]},"set":{"type":"string"},"rig":{"type":"integer"},"bus":{"type":"integer"},"node":{"type":"integer"},"cc":{"type":"integer"},"source":{"type":"string"}},"required":["level"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_setlist_set",
+            "description":"Make or change a set: a named group of consecutive songs that moves or is skipped as a whole. Omit set to make a new one (name required); pass set (its name or 0-based index) to change it. songs: the 0-based song indices that make up the set, e.g. '0,1,2' (others leave it; the set's songs are kept together). skip=true makes next/prev stepping jump over its songs. move 'up' | 'down' moves the whole set past its neighbour. remove=true removes the set (its songs stay). name renames it.",
+            "parameters":{"type":"object","properties":{"set":{"type":"string"},"name":{"type":"string"},"songs":{"type":"string"},"skip":{"type":"boolean"},"move":{"type":"string","enum":["up","down"]},"remove":{"type":"boolean"}}}
         }},
         {"type":"function","function":{
             "name":"select_setlist_part",

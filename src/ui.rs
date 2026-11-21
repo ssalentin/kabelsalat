@@ -172,6 +172,8 @@ const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black k
 use crate::theme::{alpha, mix};
 
 mod console;
+mod levels;
+use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -1157,7 +1159,7 @@ fn hw_indices_in_use(rules: &[SavedRule], rig_devices: &[Option<u32>]) -> std::c
 }
 
 /// `s` with every hardware device index it holds (matrix rule sources, rig
-/// devices) moved through `map` (#227). What is left is in this run's
+/// devices, binding levels) moved through `map` (#227). What is left is in this run's
 /// indices, so its table of port names goes.
 fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndexMap) {
     let rules: Option<Vec<SavedRule>> = s.matrix().and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1177,6 +1179,10 @@ fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndex
         s.set_matrix(serde_json::to_value(&rules).ok());
     }
     for d in s.rig_devices.iter_mut().flatten() { *d = map.get(*d); }
+    // A pinned binding's level (#273) names its controller's device too.
+    for p in &mut s.setlist.levels.bindings {
+        if let SourceId::Hardware(d) = &mut p.of.source { *d = map.get(*d); }
+    }
     s.set_hw_ports(Default::default());
 }
 
@@ -3161,6 +3167,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo",
     "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch",
+    "set_level", "set_setlist_set",
     "inspect_plugin", "set_param", "reset_params",
 ];
 
@@ -3755,6 +3762,8 @@ struct DemoApp {
     setlist_new_part_name: String,
     /// Whether the "Add song from session" picker is expanded in the Setlist view.
     setlist_import_open: bool,
+    /// The Setlist view shows Sets & levels (#273) instead of the song editor.
+    setlist_levels_open: bool,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
     /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
     /// node id like the session's strips (`remap_session` carries them).
@@ -4342,6 +4351,7 @@ impl DemoApp {
             setlist_new_song_name: String::new(),
             setlist_new_part_name: String::new(),
             setlist_import_open: false,
+            setlist_levels_open: false,
             strips: Vec::new(),
             sends: Vec::new(),
             bus_outs: Vec::new(),
@@ -6518,6 +6528,14 @@ impl DemoApp {
                 args.get("session").and_then(|v| v.as_str()).unwrap_or("session")
             ),
             "set_setlist_footswitch" => "Setlist foot-switch".into(),
+            "set_level" => match args.get("level").and_then(|v| v.as_str()) {
+                Some(l) => format!("Level · {l}"),
+                None => "Set level".into(),
+            },
+            "set_setlist_set" => match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) if !n.trim().is_empty() => format!("Set · {n}"),
+                _ => "Update set".into(),
+            },
             "get_midi_clock" => "MIDI clock status".into(),
             "set_midi_clock" => "Set MIDI clock".into(),
             "record_start" => "Start recording".into(),
@@ -7769,6 +7787,8 @@ impl DemoApp {
         s.set_bus_outs(self.bus_outs.clone());
         s.setlist = self.setlist.clone();
         s.setlist.prune_to_graph(&s.graph);
+        let bindings = self.show_bindings();
+        s.setlist.levels.bindings.retain(|p| bindings.iter().any(|(b, _)| *b == p.of));
         Ok(s)
     }
 
@@ -8023,7 +8043,7 @@ impl DemoApp {
             .or_else(|| (!self.setlist.songs.is_empty()).then_some(0));
         self.rig_zones = self.setlist.active_zones();
         if self.setlist.active.is_some() {
-            self.send_rig_zones();
+            self.send_show_gates();
         }
         Ok(())
     }
@@ -8069,25 +8089,18 @@ impl DemoApp {
 
     // -- setlist (#204) ------------------------------------------------------
 
-    /// Publish `self.rig_zones` to the engine (`Command::SetRigZones`).
-    fn send_rig_zones(&mut self) {
-        self.ui_zone_grace = self.ui_time + 0.6;
-        if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetRigZones { zones: self.rig_zones });
-        }
-    }
-
     /// Recall the currently active setlist part (or open every rig when none is
-    /// active): sends `SetRigZones` (never touches routing), updates tempo/time
+    /// active): sends the part's gates (`send_show_gates`, never routing), updates tempo/time
     /// signature if specified on the song, recalls rig levels and stored knobs,
     /// and switches the rack view to the first live rig if needed.
     fn apply_setlist_part(&mut self) {
-        self.rig_zones = self.setlist.active_zones();
-        self.send_rig_zones();
-        let Some((song_bpm, song_sig, song_name, part_name, part_rigs, part_params)) =
-            self.setlist.current().map(|(s, p, _)| {
-                (s.bpm, s.time_sig, s.name.clone(), p.name.clone(), p.rigs.clone(), p.params.clone())
-            })
+        self.send_show_gates();
+        // Only song-level rigs are recalled: show- and set-level rigs keep
+        // their fader and knobs through every switch (#273).
+        let graph = self.mirror_graph();
+        let (part_rigs, part_params) = (self.setlist.recalled_rigs(), self.setlist.recalled_params(&graph));
+        let Some((song_bpm, song_sig, song_name, part_name)) =
+            self.setlist.current().map(|(s, p, _)| (s.bpm, s.time_sig, s.name.clone(), p.name.clone()))
         else {
             return;
         };
@@ -8207,6 +8220,7 @@ impl DemoApp {
                     "index": pi,
                     "name": p.name,
                     "rigs": rigs,
+                    "buses": p.buses,
                     "params_count": p.params.len(),
                 })
             }).collect();
@@ -8215,6 +8229,7 @@ impl DemoApp {
                 "name": s.name,
                 "bpm": s.bpm,
                 "time_signature": s.time_sig.map(|t| t.to_json()),
+                "set": self.setlist.set_of(si).map(|x| x.name.as_str()),
                 "parts": parts,
             })
         }).collect();
@@ -8227,6 +8242,7 @@ impl DemoApp {
         let fs = |f: Option<crate::setlist::FootSwitch>| {
             f.map(|x| serde_json::json!({"cc": x.cc, "channel": x.channel}))
         };
+        let show = self.show_json();
         serde_json::json!({
             "songs": songs,
             "active": active,
@@ -8234,13 +8250,25 @@ impl DemoApp {
                 "next_cc": fs(self.setlist.next_cc),
                 "prev_cc": fs(self.setlist.prev_cc),
             },
+            "sets": show["sets"],
+            "levels": show["levels"],
         })
     }
 
     /// Execute `set_setlist_song` from the assistant or MCP.
     fn exec_setlist_song(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let gates_before = self.show_gates_now();
+        let out = self.exec_setlist_song_edit(args);
+        if self.show_gates_now() != gates_before {
+            self.send_show_gates();
+        }
+        out
+    }
+
+    fn exec_setlist_song_edit(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
         use crate::setlist::{Part, PartRig, Song};
         let n_rigs = self.rig_count();
+        let graph = self.mirror_graph();
         let parse_sig = |v: &serde_json::Value| -> Result<crate::transport::TimeSig, String> {
             if let Some(s) = v.as_str() {
                 let (ns, ds) = s.trim().split_once('/').ok_or("time_signature must be like '4/4' or '6/8'")?;
@@ -8274,6 +8302,7 @@ impl DemoApp {
                         part.set_rig(PartRig { rig: rig as u8, key_lo: key_lo.min(key_hi), key_hi: key_lo.max(key_hi), transpose, level });
                     }
                 }
+                part.buses = crate::setlist::part_buses(item, &graph)?;
                 if item.get("capture_knobs").and_then(|v| v.as_bool()).unwrap_or(false) {
                     part.params = self.capture_part_knobs(&part.rigs);
                 }
@@ -8334,9 +8363,7 @@ impl DemoApp {
             let parts = match parsed_parts {
                 Some(parts) => parts,
                 None => {
-                    let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
-                    let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
-                    let mut p = Part::new("Main", vec![pr]);
+                    let mut p = Part::new("Main", self.default_part_rigs());
                     p.params = self.capture_part_knobs(&p.rigs);
                     vec![p]
                 }
@@ -10169,6 +10196,20 @@ impl DemoApp {
                 }
             }
             "get_setlist" => self.setlist_json().to_string(),
+            "set_level" => match self.exec_set_level(args) {
+                Ok(val) => {
+                    self.agent_activity.record(origin, "Level set", Vec::new(), now);
+                    val.to_string()
+                }
+                Err(e) => format!("error: {e}"),
+            },
+            "set_setlist_set" => match self.exec_setlist_set(args) {
+                Ok(val) => {
+                    self.agent_activity.record(origin, "Setlist set updated", Vec::new(), now);
+                    val.to_string()
+                }
+                Err(e) => format!("error: {e}"),
+            },
             "set_setlist_song" => match self.exec_setlist_song(args) {
                 Ok(val) => {
                     self.agent_activity.record(origin, "Setlist updated", Vec::new(), now);
@@ -13523,13 +13564,20 @@ impl DemoApp {
         let kb_target_node = kb_target.map(|u| self.units[u].node_id);
         let mut mixer: Vec<(u32, MixControl, f64)> = Vec::new();
         let mut midi_ccs: Vec<(u32, u8, f32)> = Vec::new();
+        // A binding the engine does not apply in this part (#273) moves no
+        // on-screen control either, or the screen and the sound part ways.
+        let gated = self.setlist.active.is_some() && !crate::engine::cc_at_rest(cc, val);
+        let (setlist, graph) = (&self.setlist, &self.base_graph);
+        let works = |dest: u32, target: CcTarget| {
+            !gated || setlist.binding_works(crate::setlist::Binding { source: src, dest, cc }, target, graph)
+        };
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
             if let Some(rule_ch) = edit.channel {
                 if rule_ch != ch { continue; }
             }
             for m in &edit.cc_map {
-                if m.cc != cc { continue; }
+                if m.cc != cc || !works(*dest, m.target) { continue; }
                 if m.target == CcTarget::ChannelPressure {
                     continue;
                 }
@@ -17460,6 +17508,16 @@ impl DemoApp {
     }
 
     fn setlist_stage_in(&mut self, ui: &mut egui::Ui, sessions_dir: &std::path::Path) {
+        let gates_before = self.show_gates_now();
+        self.setlist_stage_body(ui, sessions_dir);
+        // An edit can move a rig or bus between levels, also from a song
+        // that is not playing: the live part takes it at once (#273).
+        if self.show_gates_now() != gates_before {
+            self.send_show_gates();
+        }
+    }
+
+    fn setlist_stage_body(&mut self, ui: &mut egui::Ui, sessions_dir: &std::path::Path) {
         use crate::setlist::{FootSwitchAction, Part, PartRig, Song};
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
@@ -17470,6 +17528,23 @@ impl DemoApp {
         let help = self.show_help;
         let n_rigs = self.rig_count();
         let rig_names: Vec<String> = (0..n_rigs).map(|r| self.rig_name(r)).collect();
+        // Levels (#273): what a part's rig and bus chips say, and each song's set.
+        let rig_level_tags: Vec<Option<String>> = (0..n_rigs as u8)
+            .map(|r| match self.setlist.rig_level(r) {
+                crate::setlist::Level::Song => None,
+                crate::setlist::Level::Show => Some("Show level: plays in every part".into()),
+                l => Some(format!("Set level ({}): plays through that set's songs", self.setlist.level_label(l))),
+            })
+            .collect();
+        let part_buses: Vec<(u32, String, bool)> = self.bus_units().into_iter()
+            .map(|u| {
+                let node = self.units[u].node_id;
+                (node, sentence_case(&self.units[u].name), self.setlist.bus_level(node) == crate::setlist::Level::Song)
+            })
+            .collect();
+        let song_sets: Vec<Option<(String, bool)>> = (0..self.setlist.songs.len())
+            .map(|si| self.setlist.set_of(si).map(|s| (s.name.clone(), s.skip)))
+            .collect();
 
         // Keep selected song index valid.
         if self.setlist.songs.is_empty() {
@@ -17493,16 +17568,19 @@ impl DemoApp {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 // ── Header ──
-                ui.horizontal_wrapped(|ui| {
+                // The buttons first, from the right; the subtitle truncates in
+                // what is left, so it never runs under them (rule 136).
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Setlist").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new("songs & parts over loaded rigs · PageUp / PageDown step · F12 / Esc: rack")
-                            .size(12.5)
-                            .color(theme::INK_2),
-                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        if theme::chip_button(ui, "Sets & levels", self.setlist_levels_open)
+                            .on_hover_text("group songs into sets; choose what stays through the whole show")
+                            .clicked()
+                        {
+                            self.setlist_levels_open = !self.setlist_levels_open;
+                        }
                         if self.setlist.active.is_some() {
                             if theme::chip_button(ui, "All rigs", false)
                                 .on_hover_text("Deactivate setlist so every rig plays openly")
@@ -17527,6 +17605,13 @@ impl DemoApp {
                                     .color(theme::LIVE_TEAL),
                             );
                         }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new("songs & parts over loaded rigs · PageUp / PageDown step · F12 / Esc: rack")
+                                    .size(12.5)
+                                    .color(theme::INK_2),
+                            ).truncate());
+                        });
                     });
                 });
                 ui.add_space(10.0);
@@ -17633,6 +17718,9 @@ impl DemoApp {
                                                 let mut bits = vec![format!("{} part{}", song.parts.len(), if song.parts.len() == 1 { "" } else { "s" })];
                                                 if let Some(b) = song.bpm { bits.push(format!("{} BPM", b.round() as u32)); }
                                                 if let Some(sig) = song.time_sig { bits.push(sig.to_string()); }
+                                                if let Some(Some((set, skip))) = song_sets.get(si) {
+                                                    bits.push(if *skip { format!("{set} (skipped)") } else { set.clone() });
+                                                }
                                                 bits.join(" · ")
                                             };
                                             let title = format!("{}. {}", si + 1, song.name);
@@ -17844,7 +17932,10 @@ impl DemoApp {
                                                     }
                                                     if is_live { *active_part_dirty = true; }
                                                 }
-                                                if let Some(pr) = part.rigs.iter_mut().find(|r| r.rig == r_u8) {
+                                                if let Some(Some(tag)) = rig_level_tags.get(ri) {
+                                                    ui.label(egui::RichText::new(tag).size(11.0).color(theme::INK_2))
+                                                        .on_hover_text("Setlist → Sets & levels sets where this rig lives");
+                                                } else if let Some(pr) = part.rigs.iter_mut().find(|r| r.rig == r_u8) {
                                                     ui.label(egui::RichText::new("Keys").size(11.0).color(theme::INK_2));
                                                     let lo_lbl = crate::setlist::note_label(pr.key_lo);
                                                     if ui.add(
@@ -17885,6 +17976,24 @@ impl DemoApp {
                                                 }
                                             });
                                         }
+                                        if !part_buses.is_empty() {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                ui.label(egui::RichText::new("Buses").size(11.0).color(theme::INK_2));
+                                                for (node, name, song_level) in &part_buses {
+                                                    let on = part.buses.contains(node);
+                                                    let tip = if *song_level {
+                                                        "song level: takes signal only in the parts that use it"
+                                                    } else {
+                                                        "at show or set level: takes signal whatever the part says"
+                                                    };
+                                                    if theme::wrapped_chip_button(ui, name, on).on_hover_text(tip).clicked() {
+                                                        if on { part.buses.retain(|b| b != node) } else { part.buses.push(*node) }
+                                                        if is_live { *active_part_dirty = true; }
+                                                    }
+                                                }
+                                            });
+                                        }
                                     });
                                 ui.add_space(8.0);
                             }
@@ -17910,6 +18019,10 @@ impl DemoApp {
                         });
                         ui.add_space(10.0);
                         ui.allocate_ui_with_layout(egui::vec2(right_w, avail_h), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            if self.setlist_levels_open {
+                                self.setlist_levels_panel(ui, avail_h - 8.0);
+                                return;
+                            }
                             draw_right(
                                 ui,
                                 &mut self.setlist,
@@ -17940,17 +18053,21 @@ impl DemoApp {
                     ui.add_space(12.0);
                     Self::stage_hairline(ui);
                     ui.add_space(10.0);
-                    draw_right(
-                        ui,
-                        &mut self.setlist,
-                        self.setlist_edit_song,
-                        &mut self.setlist_new_part_name,
-                        &mut add_part_for,
-                        &mut remove_part,
-                        &mut capture_knobs_for,
-                        &mut jump_to,
-                        &mut active_part_dirty,
-                    );
+                    if self.setlist_levels_open {
+                        self.setlist_levels_panel(ui, avail_h - 8.0);
+                    } else {
+                        draw_right(
+                            ui,
+                            &mut self.setlist,
+                            self.setlist_edit_song,
+                            &mut self.setlist_new_part_name,
+                            &mut add_part_for,
+                            &mut remove_part,
+                            &mut capture_knobs_for,
+                            &mut jump_to,
+                            &mut active_part_dirty,
+                        );
+                    }
                 }
             });
         });
@@ -17964,9 +18081,7 @@ impl DemoApp {
                 name
             };
             self.setlist_new_song_name.clear();
-            let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
-            let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
-            let mut part = Part::new("Main", vec![pr]);
+            let mut part = Part::new("Main", self.default_part_rigs());
             part.params = self.capture_part_knobs(&part.rigs);
             self.setlist.songs.push(Song::new(title, vec![part]));
             self.setlist_edit_song = Some(self.setlist.songs.len() - 1);
@@ -17998,9 +18113,7 @@ impl DemoApp {
                     raw
                 };
                 self.setlist_new_part_name.clear();
-                let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
-                let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
-                let mut part = Part::new(pname, vec![pr]);
+                let mut part = Part::new(pname, self.default_part_rigs());
                 part.params = self.capture_part_knobs(&part.rigs);
                 if let Some(song) = self.setlist.songs.get_mut(si) {
                     song.parts.push(part);
@@ -25972,7 +26085,9 @@ impl DemoApp {
                 let sends_h = if buses.is_empty() { 0.0 } else { 18.0 + (SLOT_H + 3.0) * buses.len() as f32 };
                 // The latency row (#76) brings its own height (rule 167).
                 let latency_h = if self.strip_latency.is_empty() { 0.0 } else { STRIP_LATENCY_H + 3.0 };
-                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32 + sends_h + latency_h;
+                // The level row (#273) shows while the setlist has songs.
+                let level_h = if self.setlist.songs.is_empty() { 0.0 } else { SLOT_H + 3.0 };
+                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32 + sends_h + latency_h + level_h;
                 let fader_h = (view_h - overhead).clamp(64.0, 480.0);
                 let h = view_h.max(fader_h + overhead);
                 ui.horizontal_top(|ui| {
@@ -26370,6 +26485,9 @@ impl DemoApp {
                 plate.on_hover_text(tip);
                 if is_bus {
                     self.bus_output_ui(ui, SendSource::Node(node), w - 8.0);
+                    if !self.setlist.songs.is_empty() {
+                        self.level_dropdown_ui(ui, LevelItem::Bus(node), w - 8.0);
+                    }
                 }
                 // Insert slots (#74/#107): a view of the cable chain.
                 let chain = self.strip_chain(unit);
@@ -26469,6 +26587,9 @@ impl DemoApp {
             ui.set_width(STRIP_W);
             ui.label(egui::RichText::new("Rig bus").size(13.0).strong().color(theme::INK));
             self.bus_output_ui(ui, SendSource::Rig(rig as u8), STRIP_W - 8.0);
+            if !self.setlist.songs.is_empty() {
+                self.level_dropdown_ui(ui, LevelItem::Rig(rig as u8), STRIP_W - 8.0);
+            }
             ui.add_space(8.0);
             let fr = self.strip_fader_ui(ui, rig_strip_key(rig), &mut vol, level, fader_h, vol_dest);
             self.mixer_fader_rects.push(fr);

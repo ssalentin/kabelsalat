@@ -22,6 +22,14 @@ agents are in [AGENTS.md](../AGENTS.md).
   node/rig remapping across rig edits. Persisted inside `Session`; switching
   parts sends `Command::SetRigZones` so the engine gates only new notes while
   held notes, releases, pedal-ups and effect tails finish uninterrupted.
+  `setlist/levels.rs` (#273): `Set` (named group of consecutive songs, skip
+  flag) and `Level` (`Show` | `Set(id)` | `Song`) for every rig, aux bus and
+  `Binding` (source, node, CC). A `Pin` in `Levels` overrides the default
+  (rig or bus a part names = song, else show; a binding follows its rig, a
+  mixer binding is show). `Setlist::gates` turns the active part into
+  `SetRigZones` + `ClearShowGates` + `SetBusLive` (closed buses take no new
+  signal, fading over one block) + `SetBindingLive` (pinned bindings); the app,
+  headless MCP and `levels-test` all send that same list.
 - `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
   atomics, read once), `NodeTimes` (lock-free render time per unit) and the
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`

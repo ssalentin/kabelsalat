@@ -54,7 +54,7 @@ mod transport;
 mod ui;
 mod vital;
 
-const MODES: &str = "app, preview, analysis-test [--save <dir>], audio-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, demo-test, preset-test, state-race-test [seconds] [patch.fxp...], add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, setlist-test, send-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
+const MODES: &str = "app, preview, analysis-test [--save <dir>], audio-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, demo-test, preset-test, state-race-test [seconds] [patch.fxp...], add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, setlist-test, levels-test [--save <dir>], send-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
@@ -141,6 +141,11 @@ fn main() -> anyhow::Result<()> {
         "multi-rig-test" => engine::multi_rig_test(),
         "rig-mix-test" => engine::rig_mix_test(),
         "setlist-test" => engine::setlist_test::run(),
+        "levels-test" => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let save = args.iter().position(|a| a == "--save").and_then(|i| args.get(i + 1));
+            engine::levels_test::run(save.map(std::path::Path::new))
+        }
         "send-test" => engine::send_test(),
         "multi-rig-load-test" => engine::multi_rig_load_test(),
         "cc-map-test" => engine::cc_map_test(),

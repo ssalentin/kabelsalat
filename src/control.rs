@@ -1102,6 +1102,17 @@ pub enum Command {
     /// started. A live rig whose transpose changes is released first
     /// (rule 41). Resets to [`RigZone::OPEN`] on graph loads.
     SetRigZones { zones: [RigZone; 8] },
+    /// Show levels (#273): every aux bus takes its sends again and every
+    /// binding goes back to its default. Sent before the gates of a part.
+    ClearShowGates,
+    /// An aux bus that is not live takes no new signal (its input fades out
+    /// over one block); what its chain holds rings out.
+    SetBusLive { bus: NodeId, live: bool },
+    /// The binding of `cc` from `source` on `dest`: `live` = it works also
+    /// while its rig is not live; not live = it moves nothing (except a
+    /// control back to rest). Without an entry a mixer binding always works
+    /// and any other works while its rig is live. Cleared on graph loads.
+    SetBindingLive { source: SourceId, dest: NodeId, cc: u8, live: bool },
     /// Per-SOURCE strip mix (#73): pan and mute/solo on one instrument /
     /// audio-in / generator node, applied to the node's own output (post its
     /// LEVEL knob — the strip fader) before anything downstream hears it, so
@@ -1399,6 +1410,9 @@ impl Command {
             | Command::SetRigMix { .. }
             // Zones gate live input; the demo plays past them.
             | Command::SetRigZones { .. }
+            | Command::ClearShowGates
+            | Command::SetBusLive { .. }
+            | Command::SetBindingLive { .. }
             | Command::SetStripMix { .. }
             | Command::SetSend { .. }
             | Command::SetBusOutput { .. }

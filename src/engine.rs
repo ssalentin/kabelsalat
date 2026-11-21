@@ -908,12 +908,17 @@ fn zone_of(zones: &[RigZone; 8], graph: &Graph, node: NodeId) -> RigZone {
 /// that is not live (#204), so leaving a song never leaves a pedal down, a
 /// note bent or a key pressed: note-off, sustain/sostenuto/soft pedal up,
 /// all-sound-off and all-notes-off, bend centre, pressure 0.
+/// A controller back at rest: all sound/notes off, or a pedal let up.
+pub(crate) fn cc_at_rest(cc: u8, value: u8) -> bool {
+    matches!(cc, 120 | 123) || (matches!(cc, 64 | 66 | 67) && value < 64)
+}
+
 fn at_rest(m: &MidiMsg) -> bool {
     use crate::matrix::{CHANNEL_AFTERTOUCH, CONTROL_CHANGE, PITCH_BEND, POLY_AFTERTOUCH};
     let [d1, d2] = m.data;
     match m.status {
         _ if m.is_note_off() => true,
-        CONTROL_CHANGE => matches!(d1, 120 | 123) || (matches!(d1, 64 | 66 | 67) && d2 < 64),
+        CONTROL_CHANGE => cc_at_rest(d1, d2),
         PITCH_BEND => m.pitch_bend_value() == 0,
         CHANNEL_AFTERTOUCH => d1 == 0,
         POLY_AFTERTOUCH => d2 == 0,
@@ -1467,6 +1472,8 @@ pub struct GraphEngine {
     /// Per-rig zone (SetRigZones, #204): what each rig takes from its
     /// sources. All OPEN = no gate. Read only through `zone_of`.
     rig_zones: [RigZone; 8],
+    /// Show levels (#273): closed aux buses and pinned bindings.
+    show_gates: show_gates::ShowGates,
     /// Per-node strip state (SetStripMix/SetStripBypass): pan/mute/solo on
     /// sources, bypass on FX nodes. Capacity is fixed (MAX_STRIP_MIXES): a
     /// node past it keeps playing at unity. Linear scans, like the rest.
@@ -1700,6 +1707,7 @@ impl GraphEngine {
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; 8],
             rig_zones: [RigZone::OPEN; 8],
+            show_gates: show_gates::ShowGates::new(),
             strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
             latency_dirty: false,
@@ -4155,6 +4163,7 @@ impl GraphEngine {
                 let before = self.sends.len();
                 self.sends.retain(|s| s.bus != id && s.from != SendSource::Node(id));
                 if self.sends.len() != before { self.mix_dirty = true; }
+                self.show_gates.forget_bus(id);
                 if self.bus_outs.iter().any(|o| o.bus == SendSource::Node(id)) {
                     self.bus_outs.retain(|o| o.bus != SendSource::Node(id));
                     self.assign_out_slots();
@@ -4348,6 +4357,7 @@ impl GraphEngine {
                 self.rig_mix = [RigMix::DEFAULT; 8];
                 self.master_mute = false;
                 self.rig_zones = [RigZone::OPEN; 8];
+                self.show_gates.reset();
                 self.strips.clear();
                 self.sends.clear();
                 self.bus_outs.clear();
@@ -4475,6 +4485,9 @@ impl GraphEngine {
                 self.set_rig_mix(rig, crate::matrix::MixEdit { vol, pan, mute, solo, send: None });
             }
             Command::SetRigZones { zones } => self.set_rig_zones(zones),
+            Command::ClearShowGates => self.show_gates.clear(),
+            Command::SetBusLive { bus, live } => self.show_gates.set_bus(bus, live),
+            Command::SetBindingLive { source, dest, cc, live } => self.show_gates.set_binding(source, dest, cc, live),
             Command::SetStripMix { node, pan, mute, solo } => {
                 self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo, send: None });
             }
@@ -4626,6 +4639,13 @@ impl GraphEngine {
                         .iter()
                         .find(|r| r.source == source && r.dest == dest && r.transform(msg).is_some())
                         .and_then(|r| r.mapping_for_cc(m.data[0]));
+                    // A binding the show closed for this part moves nothing
+                    // but a control back to rest; one it opened works while
+                    // the rig is out of the song too (#273).
+                    let gate = mapping.and_then(|b| self.show_gates.binding(source, dest, b.cc));
+                    if gate == Some(false) && !at_rest(&m) {
+                        continue;
+                    }
                     let is_clap_node = self
                         .graph
                         .node(dest)
@@ -4672,8 +4692,11 @@ impl GraphEngine {
                         continue;
                     }
                     // A learned mixer control (above) always works; a rig that
-                    // is not live takes no other CC unless it returns to rest.
-                    if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) {
+                    // is not live takes no other CC unless it returns to rest,
+                    // or the show keeps the binding live. A master's or an aux
+                    // bus's knob is a mix control no rig gates.
+                    let mix_unit = self.graph.is_bus(dest) || self.graph.node(dest).is_some_and(|n| matches!(n.kind, NodeKind::MasterOut));
+                    if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) && gate != Some(true) && !mix_unit {
                         continue;
                     }
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
@@ -5604,6 +5627,7 @@ impl GraphEngine {
                     let (gl, gr) = (g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt());
                     let Some(d) = self.dsp.iter_mut().find(|d| d.node == node) else { continue };
                     d.buf[..n2].copy_from_slice(taps.buf(b, n2));
+                    self.show_gates.gate_bus_input(node, &mut d.buf[..n2]);
                     d.proc.process(&mut d.buf[..n2], frames);
                     if gl != 1.0 || gr != 1.0 {
                         for f in d.buf[..n2].chunks_exact_mut(2) {
@@ -6034,10 +6058,12 @@ mod held_notes;
 mod latent;
 mod pdc;
 mod probe;
+mod show_gates;
 mod bench;
 pub use bench::bench;
 pub mod analysis_test;
 pub mod setlist_test;
+pub mod levels_test;
 
 #[cfg(test)]
 mod master_target_tests {

@@ -801,6 +801,7 @@ impl Rig {
 /// and zones, the recorder's stems and take mask, the UI mirrors) is a fixed
 /// array of this size, so the audio thread never allocates for a rig.
 pub const MAX_RIGS: usize = 32;
+const _: () = assert!(MAX_RIGS <= 64, "per-rig bit masks are u64");
 
 /// The letter of rig `rig` in a default name: A..Z, then AA, AB, …
 pub fn rig_letter(rig: usize) -> String {

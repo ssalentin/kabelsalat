@@ -4543,10 +4543,10 @@ impl GraphEngine {
             Command::NoteOn { note, velocity, source, channel } => {
                 let msg = MidiMsg::note_on(channel & 0x0F, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                 self.matrix.route_into(source, msg, &mut self.route_out);
-                let mut heard = 0u8;
+                let mut heard = 0u64;
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    if let Some(rig) = self.graph.node(dest).map(|n| n.rig).filter(|&r| r < 8) {
+                    if let Some(rig) = self.graph.node(dest).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
                         if self.hears(dest, source, note) {
                             heard |= 1 << rig;
                         }

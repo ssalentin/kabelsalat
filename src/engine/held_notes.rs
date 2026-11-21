@@ -447,7 +447,7 @@ impl Edit {
                 Command::SetRigZones { zones }
             }
             Edit::Layers(n) => {
-                let mut zones = [RigZone::OPEN; 8];
+                let mut zones = [RigZone::OPEN; crate::control::MAX_RIGS];
                 zones[..2].copy_from_slice(&LAYER_SONGS[n as usize]);
                 Command::SetRigZones { zones }
             }

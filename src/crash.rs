@@ -53,6 +53,10 @@ static COMMANDS: Ring = Ring::new();
 static WRITING: AtomicBool = AtomicBool::new(false);
 /// A panic was reported; the abort that may follow writes no second report.
 static PANIC_REPORTED: AtomicBool = AtomicBool::new(false);
+/// glibc has `_dl_find_object` (2.35+), which libgcc's unwinder uses instead
+/// of `dl_iterate_phdr` and its loader lock. Without it the signal handler
+/// takes no frames: a crash inside dlopen would hold that lock.
+static UNWIND_LOCK_FREE: AtomicBool = AtomicBool::new(false);
 
 struct Scratch {
     chunk: [u8; 1024],
@@ -140,6 +144,8 @@ pub fn install() {
     unsafe {
         let mut warm = [std::ptr::null_mut(); 4];
         libc::backtrace(warm.as_mut_ptr(), warm.len() as c_int);
+        let find_object = libc::dlsym(std::ptr::null_mut(), c"_dl_find_object".as_ptr());
+        UNWIND_LOCK_FREE.store(!find_object.is_null(), Ordering::Relaxed);
     }
     unsafe {
         let stack = libc::mmap(std::ptr::null_mut(), ALT_STACK, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
@@ -658,12 +664,18 @@ fn write_thread_and_uptime<O: Out>(t: &mut Text<O>, setup: &Setup) {
 }
 
 /// The sections every report ends with: plugins, commands, frames.
-fn write_tail<O: Out>(t: &mut Text<O>, s: &mut Scratch) {
+/// `unwind` false leaves the frames out.
+fn write_tail<O: Out>(t: &mut Text<O>, s: &mut Scratch, unwind: bool) {
     if let Some(maps) = open_maps_reader() {
         write_plugins(t, maps, &mut s.chunk, &mut s.line);
     }
     write_commands(t, &COMMANDS);
     t.flush();
+    if !unwind || cfg!(not(target_env = "gnu")) {
+        t.str("\nframes: not taken (this system's unwinder takes a lock the crash may hold; glibc 2.35 or newer has none)\n");
+        t.flush();
+        return;
+    }
     #[cfg(target_env = "gnu")]
     let n = unsafe { libc::backtrace(s.frames.as_mut_ptr(), FRAMES as c_int) }.max(0) as usize;
     #[cfg(not(target_env = "gnu"))]
@@ -720,7 +732,7 @@ extern "C" fn on_fatal(sig: c_int, info: *mut libc::siginfo_t, _ctx: *mut c_void
     }
     t.str("\n");
     write_thread_and_uptime(&mut t, setup);
-    write_tail(&mut t, s);
+    write_tail(&mut t, s, UNWIND_LOCK_FREE.load(Ordering::Relaxed));
     if fd != 2 {
         unsafe {
             libc::fsync(fd);
@@ -761,7 +773,7 @@ fn on_panic(info: &std::panic::PanicHookInfo) {
     t.str("at: ").str(&scrub(&at, home)).str("\n");
     write_thread_and_uptime(&mut t, setup);
     t.str("\nbacktrace:\n").str(&scrub(&backtrace, home));
-    write_tail(&mut t, s);
+    write_tail(&mut t, s, true);
     if fd != 2 {
         unsafe { libc::close(fd) };
         let len = s.path.iter().position(|&b| b == 0).unwrap_or(0);

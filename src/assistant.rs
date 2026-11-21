@@ -1237,7 +1237,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_song_from_session",
-            "description":"Import a saved session's rigs into the current gig (up to 8 rigs total) and append a new song in the setlist pointing at those imported rigs. session = saved session name from list_sessions; optional name overrides the song title.",
+            "description":"Import a saved session's rigs into the current gig (up to the gig's rig limit) and append a new song in the setlist pointing at those imported rigs. session = saved session name from list_sessions; optional name overrides the song title.",
             "parameters":{"type":"object","properties":{"session":{"type":"string"},"name":{"type":"string"}},"required":["session"]}
         }},
         {"type":"function","function":{
@@ -1943,7 +1943,6 @@ const SHORTCUTS: &[Shortcut] = &[
 const NOT_A_SHORTCUT: &str = "other";
 /// Below this probability Jev's pick is not acted on.
 const DECISION_CONFIDENCE: f64 = 0.85;
-const MAX_RIGS: u64 = 8;
 /// Batches one plan may run. The longest plan takes three.
 const MAX_PLAN_BATCHES: usize = 6;
 
@@ -1955,7 +1954,7 @@ fn decision_questions() -> Value {
         "Anything else: a question, a request for more than one change, wiring or rewiring units, a new rig with a sound \
          or a level, an effect with settings or placed between two other units, or anything unclear."));
     let mut rigs = serde_json::Map::new();
-    for n in 1..=MAX_RIGS { rigs.insert(format!("rig_{n}"), json!(format!("The request names rig {n} (by number, letter or name; see 'all rigs' in the context)."))); }
+    for n in 1..=crate::control::MAX_RIGS { rigs.insert(format!("rig_{n}"), json!(format!("The request names rig {n} (by number, letter or name; see 'all rigs' in the context)."))); }
     rigs.insert(NO_PICK.to_string(), json!("The request names no rig, or says 'this rig' / 'the current rig'."));
     let mut questions = json!({
         "action": { "type": "choice", "instructions": "Which ONE action does the user's request (the text after the [context] line) ask for?", "criteria": actions },

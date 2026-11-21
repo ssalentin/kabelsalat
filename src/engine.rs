@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::control::{AuxSend, BusOut, SendSource, SinkName};
+use crate::control::MAX_RIGS;
 use crate::control::{
     split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
     NodeId, NodeKind, ParamId, PortKind, RigSnapshot, RigZone,
@@ -667,7 +668,7 @@ impl AudioInSlot {
 /// Lock-free per-AudioIn-node input level (pre-gain), engine → UI (rule 33).
 /// Same slot/tag scheme as [`EdgeLevels`], keyed by node id.
 pub struct AudioInLevels {
-    slots: [AtomicU64; 64],
+    slots: [AtomicU64; MAX_STRIP_MIXES],
 }
 
 impl AudioInLevels {
@@ -676,10 +677,10 @@ impl AudioInLevels {
     }
     pub fn store(&self, node: u32, peak: f32) {
         let packed = ((node as u64) << 32) | peak.max(0.0).to_bits() as u64;
-        self.slots[node as usize % 64].store(packed, Ordering::Relaxed);
+        self.slots[node as usize % MAX_STRIP_MIXES].store(packed, Ordering::Relaxed);
     }
     pub fn load(&self, node: u32) -> f32 {
-        let v = self.slots[node as usize % 64].load(Ordering::Relaxed);
+        let v = self.slots[node as usize % MAX_STRIP_MIXES].load(Ordering::Relaxed);
         if (v >> 32) as u32 == node { f32::from_bits(v as u32) } else { 0.0 }
     }
 }
@@ -736,8 +737,10 @@ enum Lv2Response {
     Restored { node: NodeId, gen: u64, slot: Lv2Slot },
 }
 
-const LV2_RING: usize = 64;
-const LV2_SLOT_CAP: usize = 32;
+/// LV2 instances the engine hosts at once: two per rig (an organ and an
+/// effect, say). The rings carry a request and a reply for each.
+const LV2_SLOT_CAP: usize = 2 * MAX_RIGS;
+const LV2_RING: usize = 2 * LV2_SLOT_CAP;
 
 fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
     match crate::lv2::Lv2Plugin::load(uri, sample_rate, 8192) {
@@ -836,8 +839,9 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
         .collect()
 }
 
-/// Number of lock-free per-edge level slots (`EdgeLevels`).
-pub const EDGE_LEVEL_SLOTS: usize = 256;
+/// Number of lock-free per-edge level slots (`EdgeLevels`): sixteen cables
+/// per rig.
+pub const EDGE_LEVEL_SLOTS: usize = 16 * MAX_RIGS;
 
 /// Per-edge audio levels, engine → UI (docs/ARCHITECTURE.md §2: cables breathe with live
 /// level). Fixed-size lock-free slots indexed by `edge id % EDGE_LEVEL_SLOTS`;
@@ -887,12 +891,12 @@ fn strip_gains_of(
     strips: &[(NodeId, StripMix)],
     graph: &Graph,
     node: NodeId,
-    solo_rigs: &[bool; 8],
+    solo_rigs: &[bool; MAX_RIGS],
 ) -> Option<(f32, f32)> {
     // A source nobody touched has no entry but is still silenced by another
     // source's solo in its rig (rule 134).
     let m = strips.iter().find(|(n, _)| *n == node).map(|(_, m)| *m).unwrap_or(StripMix::DEFAULT);
-    let rig = graph.node(node).map(|n| n.rig as usize).unwrap_or(0).min(7);
+    let rig = graph.node(node).map(|n| n.rig as usize).unwrap_or(0).min(MAX_RIGS - 1);
     if m.is_default() && !solo_rigs[rig] { return None; }
     let g = if m.mute || (solo_rigs[rig] && !m.solo) { 0.0 } else { 1.0 };
     Some((g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt()))
@@ -901,7 +905,7 @@ fn strip_gains_of(
 /// The zone of the rig `node` belongs to (#204). A node the graph does not
 /// know, or a rig past the table, is never gated. Free function on field
 /// references, like `strip_gains_of`: the render loops borrow the slots.
-fn zone_of(zones: &[RigZone; 8], graph: &Graph, node: NodeId) -> RigZone {
+fn zone_of(zones: &[RigZone; MAX_RIGS], graph: &Graph, node: NodeId) -> RigZone {
     graph.node(node).and_then(|n| zones.get(n.rig as usize)).copied().unwrap_or(RigZone::OPEN)
 }
 
@@ -933,14 +937,15 @@ pub const MAX_BUSES: usize = 8;
 const _: () = assert!(MAX_BUSES == crate::matrix::MixControl::SEND_SLOTS as usize);
 /// One bus accumulator: a stereo block of the largest device buffer.
 const BUS_SPAN: usize = 8192 * 2;
-/// Sends the engine tracks and publishes; one past it is dropped.
-pub const MAX_SENDS: usize = 64;
+/// Sends the engine tracks and publishes, eight per rig; one past it is
+/// dropped.
+pub const MAX_SENDS: usize = 8 * MAX_RIGS;
 
 /// Outputs besides the master's that buses can play to at once (#147): one
 /// stereo mix, one ring and one playback stream each.
 pub const MAX_OUTS: usize = 4;
 /// Buses that can leave the main mix: every rig bus and every aux bus.
-pub const MAX_BUS_OUTS: usize = 8 + MAX_BUSES;
+pub const MAX_BUS_OUTS: usize = MAX_RIGS + MAX_BUSES;
 /// An empty slot of the published bus-output table.
 pub const NO_BUS_OUT: BusOut = BusOut { bus: SendSource::Rig(0), sink: SinkName::NONE };
 
@@ -1006,7 +1011,7 @@ impl BusTaps<'_> {
 fn source_out(
     strips: &[(NodeId, StripMix)],
     graph: &Graph,
-    solo_rigs: &[bool; 8],
+    solo_rigs: &[bool; MAX_RIGS],
     sends: &[AuxSend],
     taps: &mut BusTaps,
     pdc: &mut pdc::Pdc,
@@ -1090,10 +1095,10 @@ impl Default for RigMix {
     fn default() -> Self { Self::DEFAULT }
 }
 
-/// How many per-node strip states the engine tracks (and publishes). The
-/// architecture's fixed RT limit is 64 nodes; the table is allocated once in
-/// the constructor and never grows — an entry past it is dropped.
-pub const MAX_STRIP_MIXES: usize = 64;
+/// How many per-node strip states the engine tracks (and publishes): eight
+/// per rig. The table is allocated once in the constructor and never grows —
+/// an entry past it is dropped.
+pub const MAX_STRIP_MIXES: usize = 8 * MAX_RIGS;
 
 /// How many master-insert FX the render path walks per block (#77). A longer
 /// chain than this keeps playing but its tail is ignored.
@@ -1148,8 +1153,8 @@ impl Default for GraphPub {
             rev: 0,
             graph: Graph::default(),
             rules: Vec::new(),
-            mix: [RigMix::DEFAULT; 8],
-            zones: [RigZone::OPEN; 8],
+            mix: [RigMix::DEFAULT; MAX_RIGS],
+            zones: [RigZone::OPEN; MAX_RIGS],
             show_part: None,
             show_steps: 0,
             strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
@@ -1276,9 +1281,9 @@ pub struct GraphPub {
     /// Per-rig mixer state, bumped by `mix_rev` on every SetRigMix (a plain
     /// array copy — never a graph clone on the audio thread). Lets the UI
     /// mixer mirror remote (MCP/CLI/agent) mix changes.
-    pub mix: [RigMix; 8],
+    pub mix: [RigMix; MAX_RIGS],
     /// Per-rig zones (#204), published with the mix (same `mix_rev`).
-    pub zones: [RigZone; 8],
+    pub zones: [RigZone; MAX_RIGS],
     /// The active setlist part (index into `SetShowParts`) and how many
     /// parts the engine stepped to on a show control (#261), published with
     /// the mix. A changed `show_steps` means the engine moved the part.
@@ -1427,11 +1432,12 @@ pub struct GraphEngine {
     master_target: MasterTarget,
     /// Organ (setBfree) knob values that arrived before the node's LV2
     /// instance was live (it loads on its own thread, rule 46); replayed by
-    /// `attach_lv2`. Fixed size: no allocation on the audio thread.
-    organ_pending: [Option<OrganPending>; 8],
+    /// `attach_lv2`. One slot per rig (a session load starts every rig's
+    /// organ at once); fixed size: no allocation on the audio thread.
+    organ_pending: [Option<OrganPending>; MAX_RIGS],
     /// Control values that arrived before ANY still-loading LV2 instance
     /// was live (`Lv2Pending`); replayed by `attach_lv2` (rule 113).
-    lv2_pending: [Option<Lv2Pending>; 8],
+    lv2_pending: [Option<Lv2Pending>; MAX_RIGS],
     // Song clock handed to every CLAP voice. Its tempo is shared by every
     // transport-capable node (per-node run state lives in each DspSlot's
     // SlotTransport); its playing flag is the MASTER transport only.
@@ -1478,11 +1484,11 @@ pub struct GraphEngine {
     rig_meta: Vec<RigMeta>,
     active_rig: usize,
     // Per-rig mixer (SetRigMix): vol/pan/mute/solo applied at each rig's
-    // MasterOut when summing. Fixed 8 slots — no allocation on the audio path.
-    rig_mix: [RigMix; 8],
+    // MasterOut when summing. Fixed MAX_RIGS slots — no allocation on the audio path.
+    rig_mix: [RigMix; MAX_RIGS],
     /// Per-rig zone (SetRigZones, #204): what each rig takes from its
     /// sources. All OPEN = no gate. Read only through `zone_of`.
-    rig_zones: [RigZone; 8],
+    rig_zones: [RigZone; MAX_RIGS],
     /// Show levels (#273): closed aux buses and pinned bindings.
     show_gates: show_gates::ShowGates,
     /// Show controls and the setlist parts they step through (#261).
@@ -1588,9 +1594,9 @@ pub struct GraphEngine {
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
     recorder: Option<RecorderTap>,
-    // Record-arm state: master mix + up to 8 rig stems.
+    // Record-arm state: master mix + one stem per rig.
     arm_master: bool,
-    arm_rigs: [bool; 8],
+    arm_rigs: [bool; MAX_RIGS],
     // Bar-quantized start/stop when record is pressed while transport rolls:
     // Some((true, beat)) = start at `beat`, Some((false, beat)) = stop at `beat`.
     record_pending: Option<(bool, f64)>,
@@ -1680,8 +1686,9 @@ impl GraphEngine {
             dsp,
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
-            fx_done: Vec::with_capacity(256),
-            fx_after_bus: Vec::with_capacity(256),
+            // Sixteen effect units per rig before a push would allocate.
+            fx_done: Vec::with_capacity(16 * MAX_RIGS),
+            fx_after_bus: Vec::with_capacity(16 * MAX_RIGS),
             sends: Vec::with_capacity(MAX_SENDS),
             bus_acc: vec![0.0; MAX_BUSES * BUS_SPAN],
             bus_outs: Vec::with_capacity(MAX_BUS_OUTS),
@@ -1695,8 +1702,8 @@ impl GraphEngine {
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
             master_target: MasterTarget::OFF,
-            organ_pending: [None; 8],
-            lv2_pending: [None; 8],
+            organ_pending: [None; MAX_RIGS],
+            lv2_pending: [None; MAX_RIGS],
             transport: Transport::stopped(96.0),
             master_clock: MasterClock::Stopped,
             count_in: CountInConfig::default(),
@@ -1723,8 +1730,8 @@ impl GraphEngine {
             cc_passthrough_log: Vec::new(),
             rig_meta: Vec::new(),
             active_rig: 0,
-            rig_mix: [RigMix::DEFAULT; 8],
-            rig_zones: [RigZone::OPEN; 8],
+            rig_mix: [RigMix::DEFAULT; MAX_RIGS],
+            rig_zones: [RigZone::OPEN; MAX_RIGS],
             show_gates: show_gates::ShowGates::new(),
             show: crate::show::Show::default(),
             zone_hands: Hands::default(),
@@ -1760,7 +1767,7 @@ impl GraphEngine {
             lv2_retire_backlog: Vec::new(),
             recorder: None,
             arm_master: true,
-            arm_rigs: [false; 8],
+            arm_rigs: [false; MAX_RIGS],
             record_pending: None,
             rig_buf: vec![0.0; 8192 * 2],
             listen: None,
@@ -2346,9 +2353,9 @@ impl GraphEngine {
         self.listen = Some(tap);
     }
 
-    fn record_mask(&self) -> u16 {
+    fn record_mask(&self) -> u64 {
         let mut mask = if self.arm_master { crate::record::MASK_MASTER } else { 0 };
-        for rig in 0..8u8 {
+        for rig in 0..MAX_RIGS as u8 {
             if self.arm_rigs[rig as usize] && self.recorder.as_ref().is_some_and(|r| r.stem_ready(rig)) {
                 mask |= crate::record::mask_rig(rig);
             }
@@ -2841,7 +2848,7 @@ impl GraphEngine {
     /// metronomes, buses and other effects. A feedback loop reads the
     /// previous block's output of the effect not yet run. `taps` = the send
     /// taps of this pass (None for a bus's own chain, which cannot send).
-    fn run_effects(&mut self, bus: &mut [f32], frames: usize, solo_rigs: &[bool; 8], mut taps: Option<&mut BusTaps>) {
+    fn run_effects(&mut self, bus: &mut [f32], frames: usize, solo_rigs: &[bool; MAX_RIGS], mut taps: Option<&mut BusTaps>) {
         let n2 = frames * 2;
         let n_dsp = self.dsp.len();
         let n_lv2 = self.lv2.len();
@@ -2900,7 +2907,7 @@ impl GraphEngine {
             // Another source's solo silences sources, never effects: it took
             // the soloed source's own chain with it. An LV2 instrument is a
             // source; an effect keeps only what its own strip entry says.
-            let solo = if source { solo_rigs } else { &[false; 8] };
+            let solo = if source { solo_rigs } else { &[false; MAX_RIGS] };
             let strips = &self.strips;
             match taps.as_deref_mut() {
                 Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, &mut self.pdc, node, 1.0, false, &mut buf[..n2]),
@@ -2948,12 +2955,12 @@ impl GraphEngine {
     /// Which rigs have a soloed source (#73): solo scope is WITHIN a rig — a
     /// soloed source silences only the other sources of its own rig, while
     /// rig buses keep their own global solo. Allocation-free.
-    fn rigs_with_solo_source(&self) -> [bool; 8] {
-        let mut solo = [false; 8];
+    fn rigs_with_solo_source(&self) -> [bool; MAX_RIGS] {
+        let mut solo = [false; MAX_RIGS];
         for (node, m) in &self.strips {
             // A bus's solo is its own scope (it silences the dry rigs).
             if !m.solo || self.graph.is_bus(*node) { continue; }
-            let rig = self.graph.node(*node).map(|n| n.rig as usize).unwrap_or(0).min(7);
+            let rig = self.graph.node(*node).map(|n| n.rig as usize).unwrap_or(0).min(MAX_RIGS - 1);
             solo[rig] = true;
         }
         solo
@@ -3430,12 +3437,12 @@ impl GraphEngine {
     /// One rig bus's mix (SetRigMix, or a CC bound to it). Omitted fields
     /// keep their value. Allocation-free.
     fn set_rig_mix(&mut self, rig: u8, e: crate::matrix::MixEdit) {
-        let m = &mut self.rig_mix[(rig as usize).min(7)];
+        let m = &mut self.rig_mix[(rig as usize).min(MAX_RIGS - 1)];
         if let Some(v) = e.vol { m.vol = v.clamp(0.0, 1.0); }
         if let Some(p) = e.pan { m.pan = p.clamp(-1.0, 1.0); }
         if let Some(b) = e.mute { m.mute = b; }
         if let Some(b) = e.solo { m.solo = b; }
-        if e.solo == Some(true) { RigMix::solo_only(&mut self.rig_mix, (rig as usize).min(7)); }
+        if e.solo == Some(true) { RigMix::solo_only(&mut self.rig_mix, (rig as usize).min(MAX_RIGS - 1)); }
         self.mix_dirty = true;
     }
 
@@ -3446,7 +3453,7 @@ impl GraphEngine {
     /// change starts every floating split from home (#276); velocity and
     /// float gate only note-ons, so they need no release.
     /// Allocation-free: index loops over the graph.
-    fn set_rig_zones(&mut self, zones: [RigZone; 8]) {
+    fn set_rig_zones(&mut self, zones: [RigZone; MAX_RIGS]) {
         let before = self.rig_zones;
         for (rig, z) in zones.into_iter().enumerate() {
             if !z.live {
@@ -3500,7 +3507,7 @@ impl GraphEngine {
     /// chain: feedback) or the table is full. Allocation-free.
     fn set_send(&mut self, from: SendSource, bus: NodeId, level: Option<f32>, pre: Option<bool>) -> bool {
         let ok_from = match from {
-            SendSource::Rig(r) => r < 8,
+            SendSource::Rig(r) => (r as usize) < MAX_RIGS,
             SendSource::Node(n) => self.graph.node(n).is_some() && !self.graph.is_bus(n) && !self.is_after_bus(n),
         };
         if !self.graph.is_bus(bus) || !ok_from { return false; }
@@ -3532,7 +3539,7 @@ impl GraphEngine {
     /// extra output already plays another sink. Allocation-free.
     fn set_bus_output(&mut self, bus: SendSource, sink: Option<SinkName>) -> bool {
         let is_bus = match bus {
-            SendSource::Rig(r) => r < 8,
+            SendSource::Rig(r) => (r as usize) < MAX_RIGS,
             SendSource::Node(n) => self.graph.is_bus(n),
         };
         if !is_bus { return false; }
@@ -4436,8 +4443,8 @@ impl GraphEngine {
                 self.fit_route_out();
                 self.rig_meta.clear();
                 // Values parked for the old graph's organs (ids are reused).
-                self.organ_pending = [None; 8];
-                self.lv2_pending = [None; 8];
+                self.organ_pending = [None; MAX_RIGS];
+                self.lv2_pending = [None; MAX_RIGS];
                 for i in 0..self.graph.nodes.len() {
                     let id = self.graph.nodes[i].id;
                     match self.graph.nodes[i].kind {
@@ -4447,9 +4454,9 @@ impl GraphEngine {
                     }
                 }
                 self.active_rig = 0;
-                self.rig_mix = [RigMix::DEFAULT; 8];
+                self.rig_mix = [RigMix::DEFAULT; MAX_RIGS];
                 self.master_mute = false;
-                self.rig_zones = [RigZone::OPEN; 8];
+                self.rig_zones = [RigZone::OPEN; MAX_RIGS];
                 self.show_gates.reset();
                 self.zone_hands = Hands::default();
                 self.strips.clear();
@@ -4536,10 +4543,10 @@ impl GraphEngine {
             Command::NoteOn { note, velocity, source, channel } => {
                 let msg = MidiMsg::note_on(channel & 0x0F, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                 self.matrix.route_into(source, msg, &mut self.route_out);
-                let mut heard = 0u8;
+                let mut heard = 0u64;
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    if let Some(rig) = self.graph.node(dest).map(|n| n.rig).filter(|&r| r < 8) {
+                    if let Some(rig) = self.graph.node(dest).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
                         if self.hears(dest, source, note) {
                             heard |= 1 << rig;
                         }
@@ -5106,7 +5113,7 @@ impl GraphEngine {
             Command::SetRecordArm { rig, armed } => {
                 match rig {
                     None => self.arm_master = armed,
-                    Some(r) => self.arm_rigs[(r as usize).min(7)] = armed,
+                    Some(r) => self.arm_rigs[(r as usize).min(MAX_RIGS - 1)] = armed,
                 }
                 if let Some(rec) = &self.recorder {
                     rec.shared().set_arms(self.arm_master, &self.arm_rigs);
@@ -5626,8 +5633,8 @@ impl GraphEngine {
         let ply = self.player.is_some() && self.player_gain > 0.0;
         let mut peak = 0.0f32;
         // Multi-rig: sum every rig's MasterOut to the physical output. Fixed
-        // stack array — no allocation on the audio thread (max 8 rigs).
-        let mut masters = [0u32; 8];
+        // stack array — no allocation on the audio thread (at most MAX_RIGS).
+        let mut masters = [0u32; MAX_RIGS];
         let mut n_masters = 0usize;
         for n in &self.graph.nodes {
             if matches!(n.kind, NodeKind::MasterOut) && n_masters < masters.len() {
@@ -5655,9 +5662,9 @@ impl GraphEngine {
             let any_solo = self.rig_mix.iter().any(|m| m.solo);
             // (sounds at all, gain L, gain R): a muted or soloed-out rig
             // sends nothing either.
-            let mut gains = [(true, 1.0f32, 1.0f32); 8];
+            let mut gains = [(true, 1.0f32, 1.0f32); MAX_RIGS];
             for mi in 0..n_masters {
-                let rig = self.graph.node(masters[mi]).map(|n| n.rig as usize).unwrap_or(0).min(7);
+                let rig = self.graph.node(masters[mi]).map(|n| n.rig as usize).unwrap_or(0).min(MAX_RIGS - 1);
                 let m = self.rig_mix[rig];
                 let open = !(m.mute || (any_solo && !m.solo));
                 gains[mi] = (open, m.vol * (1.0 - m.pan).sqrt(), m.vol * (1.0 + m.pan).sqrt());
@@ -5671,7 +5678,7 @@ impl GraphEngine {
             }
             for mi in 0..n_masters {
                 let master = masters[mi];
-                let rig = self.graph.node(master).map(|n| n.rig as usize).unwrap_or(0).min(7);
+                let rig = self.graph.node(master).map(|n| n.rig as usize).unwrap_or(0).min(MAX_RIGS - 1);
                 let (open, gl, gr) = gains[mi];
                 let from = SendSource::Rig(rig as u8);
                 let rig_buf = &mut rig_v[..n2];
@@ -5765,7 +5772,7 @@ impl GraphEngine {
                     self.fx_done.push(!self.fx_after_bus[f]);
                 }
                 // A source's solo is its rig's business, not the returns'.
-                self.run_effects(&mut rig_v, frames, &[false; 8], None);
+                self.run_effects(&mut rig_v, frames, &[false; MAX_RIGS], None);
                 for &master in &masters[..n_masters] {
                     for (i, d) in self.dsp.iter().enumerate() {
                         if d.kind == DspKind::Bus || self.fx_after_bus[i] {
@@ -6471,12 +6478,12 @@ mod tests {
         let a = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("x") }, name_bytes("A"));
         let b = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new("x") }, name_bytes("B"));
         let strips = [(b, super::StripMix { solo: true, ..super::StripMix::DEFAULT })];
-        let mut solo = [false; 8];
+        let mut solo = [false; crate::control::MAX_RIGS];
         solo[0] = true;
         assert_eq!(super::strip_gains_of(&strips, &g, a, &solo), Some((0.0, 0.0)), "untouched A is silenced by B's solo");
         let b_gain = super::strip_gains_of(&strips, &g, b, &solo).expect("the soloed source has a gain");
         assert!(b_gain.0 > 0.99 && b_gain.1 > 0.99, "the soloed source plays: {b_gain:?}");
-        assert_eq!(super::strip_gains_of(&[], &g, a, &[false; 8]), None, "no solo, no entry: untouched path");
+        assert_eq!(super::strip_gains_of(&[], &g, a, &[false; crate::control::MAX_RIGS]), None, "no solo, no entry: untouched path");
     }
 
     /// Rig solo is exclusive: soloing rig 1 un-solos rig 0, in the engine
@@ -7755,7 +7762,7 @@ mod tests {
             "the parked Drive was replayed at attach: {} (max {})",
             desc.value, desc.max
         );
-        engine.lv2_pending = [None; 8];
+        engine.lv2_pending = [None; crate::control::MAX_RIGS];
     }
 
     #[test]
@@ -8194,7 +8201,7 @@ mod tests {
 
     /// SetRigZones with rig A (0) and rig B (1) set, every other rig open.
     fn zones(a: crate::control::RigZone, b: crate::control::RigZone) -> Command {
-        let mut zones = [crate::control::RigZone::OPEN; 8];
+        let mut zones = [crate::control::RigZone::OPEN; crate::control::MAX_RIGS];
         zones[0] = a;
         zones[1] = b;
         Command::SetRigZones { zones }
@@ -8464,8 +8471,8 @@ mod tests {
             assert_eq!((p.zones[0], p.zones[1].live, p.zones[2]), (song, false, RigZone::OPEN));
         }
         play(&mut e, &mut bus, Command::LoadGraph { graph: rig_graph() });
-        assert_eq!(e.rig_zones, [RigZone::OPEN; 8], "a load opens every zone");
-        assert_eq!(pub_.lock().unwrap().zones, [RigZone::OPEN; 8], "and publishes it");
+        assert_eq!(e.rig_zones, [RigZone::OPEN; crate::control::MAX_RIGS], "a load opens every zone");
+        assert_eq!(pub_.lock().unwrap().zones, [RigZone::OPEN; crate::control::MAX_RIGS], "and publishes it");
         let a_after = synth_of(&e, 0);
         assert_eq!(play(&mut e, &mut bus, on(80)), vec![(a_after, 80, true)], "the old range and transpose are gone (was node {a})");
     }
@@ -8482,7 +8489,7 @@ mod tests {
         let mut controls = crate::show::NO_SHOW_CONTROLS;
         controls[0] = Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(cc), action: ShowAction::NextPart });
         let part = |a: RigZone, b: RigZone| {
-            let mut z = [RigZone::OPEN; 8];
+            let mut z = [RigZone::OPEN; crate::control::MAX_RIGS];
             z[0] = a;
             z[1] = b;
             z
@@ -11488,6 +11495,22 @@ mod send_tests {
     }
 
     #[test]
+    fn a_rig_past_the_eighth_sends_and_plays_to_its_own_output() {
+        // #205: sends and bus outputs took rigs 0..7 only.
+        let mut r = Rack::new();
+        let pubd = std::sync::Arc::new(std::sync::Mutex::new(GraphPub::default()));
+        r.engine.set_graph_pub(pubd.clone());
+        r.send(SendSource::Rig(19), 0.5, false);
+        r.send(SendSource::Rig(crate::control::MAX_RIGS as u8), 0.5, false);
+        route(&mut r, SendSource::Rig(19), Some("phones"));
+        r.render(1);
+        let g = pubd.lock().unwrap();
+        let sends: Vec<SendSource> = g.sends.iter().filter(|s| s.bus != NodeId::MAX).map(|s| s.from).collect();
+        assert_eq!(sends, vec![SendSource::Rig(19)], "rig 20 sends, a rig past the limit does not");
+        assert!(g.bus_outs.iter().any(|o| o.bus == SendSource::Rig(19) && o.sink == SinkName::new("phones")), "rig 20's bus plays to its own output");
+    }
+
+    #[test]
     fn a_send_level_is_independent_of_the_rig_fader_when_pre_and_follows_it_when_post() {
         let mut r = Rack::new();
         r.send(SendSource::Rig(0), 1.0, false);
@@ -11861,7 +11884,7 @@ mod send_tests {
         let mut engine = GraphEngine::new(merged, drain, 48000.0, vec![]);
         bus.send(Command::LoadRigs { rigs, active: 0 });
         // Rig A is out of the song, with a transpose: live keys do not reach it.
-        let mut zones = [RigZone::OPEN; 8];
+        let mut zones = [RigZone::OPEN; MAX_RIGS];
         zones[0] = RigZone { live: false, transpose: 5, ..RigZone::OPEN };
         bus.send(Command::SetRigZones { zones });
         let mut buf = vec![0.0f32; 256 * 2];

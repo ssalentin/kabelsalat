@@ -122,8 +122,10 @@ intact. Agents and MCP clients have the same actions (`set_node_bypass`,
 
 ### Run several rigs at once
 **+ Rig** adds an independent setup with its own synth and output — for example
-bass on one keyboard and pads on another. All rigs play together; switch the one
-you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
+bass on one keyboard and pads on another. A session holds up to 32 rigs, enough
+to keep every sound of a gig loaded. All rigs play together; switch the one you
+are looking at with **1–9** or **← →**, or pick any rig from the Left Rail or
+the top bar, which scroll when there are many. Any installed CLAP or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
 it has loaded. Every rig row in the Left Rail (**Q**) has a **▶** demo button
 that loops a live musical phrase suited to its sound (keys, bass, lead, pad,

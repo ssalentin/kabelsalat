@@ -21,7 +21,7 @@ const CHORD: [u8; 3] = [60, 64, 67];
 const OFF: RigZone = RigZone { live: false, ..RigZone::OPEN };
 
 fn zones(a: RigZone, b: RigZone) -> Command {
-    let mut zones = [RigZone::OPEN; 8];
+    let mut zones = [RigZone::OPEN; crate::control::MAX_RIGS];
     zones[0] = a;
     zones[1] = b;
     Command::SetRigZones { zones }

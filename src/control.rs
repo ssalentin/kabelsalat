@@ -797,6 +797,19 @@ impl Rig {
     }
 }
 
+/// Most rigs one session holds (#205). Every per-rig table (the engine's mix
+/// and zones, the recorder's stems and take mask, the UI mirrors) is a fixed
+/// array of this size, so the audio thread never allocates for a rig.
+pub const MAX_RIGS: usize = 32;
+const _: () = assert!(MAX_RIGS <= 64, "per-rig bit masks are u64");
+
+/// The letter of rig `rig` in a default name: A..Z, then AA, AB, …
+pub fn rig_letter(rig: usize) -> String {
+    let (hi, lo) = (rig / 26, rig % 26);
+    let lo = (b'A' + lo as u8) as char;
+    if hi == 0 { lo.to_string() } else { format!("{}{lo}", (b'A' + (hi - 1).min(25) as u8) as char) }
+}
+
 /// Per-rig metadata: the rig list frontends (UI/MCP/bridge) display. Mirrors
 /// [`Rig`] without the graph payload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1126,7 +1139,7 @@ pub enum Command {
     /// range and transpose, so a held note is released at the pitch it
     /// started. A live rig whose transpose changes is released first
     /// (rule 41). Resets to [`RigZone::OPEN`] on graph loads.
-    SetRigZones { zones: [RigZone; 8] },
+    SetRigZones { zones: [RigZone; MAX_RIGS] },
     /// Show levels (#273): every aux bus takes its sends again and every
     /// binding goes back to its default. Sent before the gates of a part.
     ClearShowGates,
@@ -1144,7 +1157,7 @@ pub enum Command {
     SetShowControls { controls: crate::show::ShowControls },
     /// Every setlist part's zones in setlist order, the table a
     /// `ShowAction::NextPart`/`PrevPart` steps through. Kept across graph
-    /// loads. Sent as JSON, it is a list of 8-zone lists.
+    /// loads. Sent as JSON, it is a list of `MAX_RIGS`-zone lists.
     SetShowParts { parts: crate::show::ShowParts },
     /// The active part as an index into `SetShowParts` (`None`: no part).
     SetShowPart { part: Option<usize> },
@@ -1517,6 +1530,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_rig_gets_its_own_default_letter() {
+        let letters: Vec<String> = (0..MAX_RIGS).map(rig_letter).collect();
+        assert_eq!([&letters[0], &letters[25], &letters[26], &letters[MAX_RIGS - 1]], ["A", "Z", "AA", "AF"]);
+        let distinct: std::collections::BTreeSet<&String> = letters.iter().collect();
+        assert_eq!(distinct.len(), MAX_RIGS, "{letters:?}");
+    }
+
+    #[test]
     fn a_clap_id_longer_than_a_name_reaches_its_voice_whole() {
         let cardinal = "studio.kx.distrho.cardinal#synth"; // 32 bytes
         let g = plugin_rig_graph(cardinal, "Cardinal");
@@ -1640,7 +1661,12 @@ mod tests {
             Command::SetCountIn { enabled: true, bars: 2 },
             Command::SetCountIn { enabled: false, bars: 1 },
             Command::SetTimeSignature { num: 6, den: 8 },
-            Command::SetRigZones { zones: [RigZone { live: false, key_lo: 36, key_hi: 59, transpose: -2, vel_lo: 40, vel_hi: 110, curve: VelCurve::Soft, float: 3 }, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN, RigZone::OPEN] },
+            Command::SetRigZones { zones: {
+                let mut z = [RigZone::OPEN; MAX_RIGS];
+                z[0] = RigZone { live: false, key_lo: 36, key_hi: 59, transpose: -2, vel_lo: 40, vel_hi: 110, curve: VelCurve::Soft, float: 3 };
+                z[MAX_RIGS - 1].live = false;
+                z
+            } },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
             Command::SetShowControls { controls: {
                 let mut t = crate::show::NO_SHOW_CONTROLS;
@@ -1648,8 +1674,8 @@ mod tests {
                 t
             } },
             Command::SetShowParts { parts: crate::show::ShowParts::new(vec![
-                crate::show::ShowPart { song: 0, skip: false, zones: [RigZone::OPEN; 8] },
-                crate::show::ShowPart { song: 2, skip: true, zones: [RigZone { live: false, key_hi: 59, transpose: 12, ..RigZone::OPEN }; 8] },
+                crate::show::ShowPart { song: 0, skip: false, zones: [RigZone::OPEN; MAX_RIGS] },
+                crate::show::ShowPart { song: 2, skip: true, zones: [RigZone { live: false, key_hi: 59, transpose: 12, ..RigZone::OPEN }; MAX_RIGS] },
             ]) },
             Command::SetShowPart { part: Some(1) },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },

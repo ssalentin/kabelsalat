@@ -31,26 +31,34 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde::Serialize;
 
+use crate::control::MAX_RIGS;
+
 /// The live app's recorder, published once at startup so the control bridge can
 /// answer `record_status` without threading an Arc through every signature.
 pub static LIVE_RECORDER: OnceLock<Arc<RecorderShared>> = OnceLock::new();
 
-/// One take's targets, as a bitmask: bit 8 = the master mix, bits 0..7 the rig
-/// stems (index = rig). Set by the engine from its arm tables when the take
-/// begins, frozen for the take's length (an arm change mid-take only applies to
-/// the NEXT take, so every file of the take stays sample-aligned).
-pub const MASK_MASTER: u16 = 1 << 8;
+/// One take's targets, as a bitmask: bit `MAX_RIGS` = the master mix, the bits
+/// below it the rig stems (index = rig). Set by the engine from its arm tables
+/// when the take begins, frozen for the take's length (an arm change mid-take
+/// only applies to the NEXT take, so every file of the take stays
+/// sample-aligned).
+pub const MASK_MASTER: u64 = 1 << MAX_RIGS;
+const _: () = assert!(MAX_RIGS < 64, "the take mask holds every rig and the master");
+
+fn slot(rig: u8) -> usize {
+    (rig as usize).min(MAX_RIGS - 1)
+}
 
 /// Mask bit of rig `rig`'s stem.
-pub fn mask_rig(rig: u8) -> u16 {
-    1 << (rig.min(7) as u16)
+pub fn mask_rig(rig: u8) -> u64 {
+    1 << slot(rig)
 }
 
 #[derive(Debug, PartialEq)]
 enum RecorderMsg {
     /// Begin a take of every target in `mask`; the writer opens one WAV per
     /// target inside a fresh timestamped take folder.
-    Start { mask: u16 },
+    Start { mask: u64 },
     Stop,
 }
 
@@ -115,17 +123,17 @@ pub struct RecorderShared {
     pending: AtomicBool,
     shutdown: AtomicBool,
     dropped_frames: AtomicU64,
-    stem_dropped: [AtomicU64; 8],
+    stem_dropped: [AtomicU64; MAX_RIGS],
     arm_master: AtomicBool,
-    arm_rigs: [AtomicBool; 8],
+    arm_rigs: [AtomicBool; MAX_RIGS],
     status: Mutex<WavStatus>,
     writer: OnceLock<Thread>,
     join: Mutex<Option<JoinHandle<()>>>,
     /// Stem ring consumers created by `arm_stem`; the writer adopts (moves)
     /// them into its own table on its next wake.
-    stems: Mutex<[Option<Consumer<f32>>; 8]>,
+    stems: Mutex<[Option<Consumer<f32>>; MAX_RIGS]>,
     /// Which rigs already have an allocated stem ring (so re-arming reuses it).
-    stem_allocated: [AtomicBool; 8],
+    stem_allocated: [AtomicBool; MAX_RIGS],
     /// Channel to deliver newly-allocated stem producers to the audio thread.
     stem_tx: Mutex<Option<Producer<StemWire>>>,
     /// Rig display names, one per rig, newest last; stem files are named
@@ -173,14 +181,14 @@ impl RecorderShared {
             pending: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             dropped_frames: AtomicU64::new(0),
-            stem_dropped: Default::default(),
+            stem_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             arm_master: AtomicBool::new(true),
-            arm_rigs: Default::default(),
+            arm_rigs: std::array::from_fn(|_| AtomicBool::new(false)),
             status: Mutex::new(WavStatus::default()),
             writer: OnceLock::new(),
             join: Mutex::new(None),
             stems: Mutex::new(std::array::from_fn(|_| None)),
-            stem_allocated: Default::default(),
+            stem_allocated: std::array::from_fn(|_| AtomicBool::new(false)),
             stem_tx: Mutex::new(None),
             rig_names: Mutex::new(Vec::new()),
             sample_rate,
@@ -211,7 +219,7 @@ impl RecorderShared {
     /// Engine side: the arm tables the engine holds authoritatively, mirrored
     /// here so `record_status` (UI, bridge, MCP) reports what the next take
     /// records without locking the engine's publication.
-    pub fn set_arms(&self, master: bool, rigs: &[bool; 8]) {
+    pub fn set_arms(&self, master: bool, rigs: &[bool; MAX_RIGS]) {
         self.arm_master.store(master, Ordering::Relaxed);
         for (a, r) in self.arm_rigs.iter().zip(rigs.iter()) {
             a.store(*r, Ordering::Relaxed);
@@ -233,19 +241,19 @@ impl RecorderShared {
     /// created once per rig and stays parked while unarmed. None when this
     /// recorder has no writer (attach mode, tests).
     pub fn arm_stem(&self, rig: u8) -> Option<Producer<f32>> {
-        let rig = rig.min(7);
+        let rig = slot(rig);
         if !self.is_live() {
             return None;
         }
-        if self.stem_allocated[rig as usize].swap(true, Ordering::AcqRel) {
+        if self.stem_allocated[rig].swap(true, Ordering::AcqRel) {
             return None;
         }
         let cap = (self.sample_rate as usize).max(8000) * 2 * 4; // ~4 s stereo
         let (producer, consumer) = RingBuffer::new(cap);
         if let Ok(mut stems) = self.stems.lock() {
-            stems[rig as usize] = Some(consumer);
+            stems[rig] = Some(consumer);
         } else {
-            self.stem_allocated[rig as usize].store(false, Ordering::Release);
+            self.stem_allocated[rig].store(false, Ordering::Release);
             return None;
         }
         self.unpark_writer();
@@ -258,7 +266,7 @@ impl RecorderShared {
         if let Some(producer) = self.arm_stem(rig) {
             if let Ok(mut tx) = self.stem_tx.lock() {
                 if let Some(tx) = tx.as_mut() {
-                    let _ = tx.push(StemWire { rig: rig.min(7), ring: producer });
+                    let _ = tx.push(StemWire { rig: slot(rig) as u8, ring: producer });
                 }
             }
         }
@@ -324,9 +332,9 @@ pub struct RecorderTap {
     producer: Producer<f32>,
     /// One parked producer per rig stem (delivered through the engine's stem
     /// channel before the arm command applies — see `RecorderShared::arm_stem`).
-    stems: [Option<Producer<f32>>; 8],
+    stems: [Option<Producer<f32>>; MAX_RIGS],
     stem_rx: Option<Consumer<StemWire>>,
-    active_mask: u16,
+    active_mask: u64,
     msg_tx: Producer<RecorderMsg>,
     shared: Arc<RecorderShared>,
 }
@@ -334,7 +342,7 @@ pub struct RecorderTap {
 impl RecorderTap {
     /// Idempotent take begin: only the false→true transition messages the
     /// writer (with the take's target mask) and resets the drop counters.
-    pub fn begin(&mut self, mask: u16) {
+    pub fn begin(&mut self, mask: u64) {
         if !self.shared.recording.swap(true, Ordering::Relaxed) {
             self.active_mask = mask;
             self.shared.dropped_frames.store(0, Ordering::Relaxed);
@@ -367,7 +375,7 @@ impl RecorderTap {
     pub fn is_stem_active(&self, rig: u8) -> bool {
         self.shared.recording.load(Ordering::Relaxed)
             && (self.active_mask & mask_rig(rig) != 0)
-            && self.stems[rig.min(7) as usize].is_some()
+            && self.stems[slot(rig)].is_some()
     }
 
     pub fn shared(&self) -> &Arc<RecorderShared> {
@@ -382,14 +390,14 @@ impl RecorderTap {
 
     /// Park a rig's stem producer (engine side of `RecorderShared::arm_stem`).
     pub fn attach_stem(&mut self, rig: u8, ring: Producer<f32>) {
-        self.stems[rig.min(7) as usize] = Some(ring);
+        self.stems[slot(rig)] = Some(ring);
     }
 
     /// Does the tap hold rig `rig`'s stem ring? The engine's take mask only
     /// arms rigs whose ring is parked here, so a take never opens a stem file
     /// nothing feeds.
     pub fn stem_ready(&self, rig: u8) -> bool {
-        self.stems[rig.min(7) as usize].is_some()
+        self.stems[slot(rig)].is_some()
     }
 
     /// Push one block of interleaved f32 as stereo (channels 0/1) into the
@@ -429,8 +437,8 @@ impl RecorderTap {
             return;
         }
         let frames = data.len() / 2;
-        let Some(ring) = &mut self.stems[rig.min(7) as usize] else {
-            self.shared.stem_dropped[rig.min(7) as usize].fetch_add(frames as u64, Ordering::Relaxed);
+        let Some(ring) = &mut self.stems[slot(rig)] else {
+            self.shared.stem_dropped[slot(rig)].fetch_add(frames as u64, Ordering::Relaxed);
             return;
         };
         let mut dropped = 0u64;
@@ -443,7 +451,7 @@ impl RecorderTap {
             }
         }
         if dropped > 0 {
-            self.shared.stem_dropped[rig.min(7) as usize].fetch_add(dropped, Ordering::Relaxed);
+            self.shared.stem_dropped[slot(rig)].fetch_add(dropped, Ordering::Relaxed);
         }
     }
 }
@@ -484,7 +492,9 @@ fn start_with_capacity(
     let shared = Arc::new(RecorderShared::live(sample_rate));
     let (producer, consumer) = RingBuffer::new(cap.max(2));
     let (msg_tx, msg_rx) = RingBuffer::new(64);
-    let (stem_tx, stem_rx) = RingBuffer::new(16);
+    // Each rig delivers its stem ring once per recorder: arming every rig
+    // before the engine's next block never finds this channel full.
+    let (stem_tx, stem_rx) = RingBuffer::new(MAX_RIGS);
     if let Ok(mut tx) = shared.stem_tx.lock() {
         *tx = Some(stem_tx);
     }
@@ -577,7 +587,7 @@ fn writer_loop(
 ) {
     // Stem ring consumers, adopted from `shared.stems` (never locked again on
     // the hot path; the writer owns them once adopted).
-    let mut stems: [Option<Consumer<f32>>; 8] = Default::default();
+    let mut stems: [Option<Consumer<f32>>; MAX_RIGS] = std::array::from_fn(|_| None);
     let mut take: Option<Take> = None;
     let mut buf = vec![0.0f32; 4096];
     let mut bytes = Vec::with_capacity(4096 * 4);
@@ -707,7 +717,7 @@ fn writer_loop(
 fn finalize_take(
     t: &mut Take,
     data: &mut Consumer<f32>,
-    stems: &mut [Option<Consumer<f32>>; 8],
+    stems: &mut [Option<Consumer<f32>>; MAX_RIGS],
     buf: &mut [f32],
     bytes: &mut Vec<u8>,
     max_data_samples: u64,
@@ -761,8 +771,8 @@ fn begin_take(
     dir: &Path,
     sample_rate: u32,
     channels: usize,
-    mask: u16,
-    stems: &[Option<Consumer<f32>>; 8],
+    mask: u64,
+    stems: &[Option<Consumer<f32>>; MAX_RIGS],
     shared: &Arc<RecorderShared>,
 ) -> Option<Take> {
     if let Err(e) = std::fs::create_dir_all(dir) {
@@ -804,7 +814,7 @@ fn begin_take(
     if mask & MASK_MASTER != 0 {
         ok = open(TargetKind::Master, "master", &mut files);
     }
-    for rig in 0..8u8 {
+    for rig in 0..MAX_RIGS as u8 {
         if mask & mask_rig(rig) == 0 || stems[rig as usize].is_none() {
             continue;
         }
@@ -1961,6 +1971,84 @@ mod tests {
         assert_eq!(wav_samples(&std::fs::read(&r0_path).unwrap()), r0_data);
         assert_eq!(wav_samples(&std::fs::read(&r1_path).unwrap()), r1_data);
         drop(tap);
+        shared.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn twenty_rigs_each_mix_and_record_their_own_stem() {
+        // #205: past the old 8-slot tables. Every rig is a click into its
+        // master and every rig is armed before the engine's next block. Rig
+        // 7 is muted, so its stem is silent while rig 19's is not (the old
+        // tables clamped rig 19 onto slot 7); rig 19 alone plays on the
+        // right (rule 182), so its fader shows on that channel.
+        use crate::control::{merge_rigs, name_bytes, rig_letter, DspKind, NodeKind, PortKind, PortRef, Rig};
+        const SR: u32 = 48000;
+        const RIGS: usize = 20;
+        let rigs: Vec<Rig> = (0..RIGS).map(|i| {
+            let mut g = Graph::default();
+            let click = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("CLICK"));
+            let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: click, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+            Rig::new(format!("Rig {}", rig_letter(i)), g, None)
+        }).collect();
+        let clicks: Vec<u32> = merge_rigs(&rigs).nodes.iter()
+            .filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Metronome))).map(|n| n.id).collect();
+        assert_eq!(clicks.len(), RIGS);
+        let dir = temp_dir("twenty-rigs");
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::default(), drain, SR as f64, vec![]);
+        let (tap, shared) = start(dir.clone(), SR, 2);
+        engine.set_recorder(tap);
+        shared.set_rig_names(rigs.iter().map(|r| r.name.clone()).collect());
+        bus.send(Command::LoadRigs { rigs, active: 0 });
+        let mut buf = vec![0.0f32; 480 * 2];
+        engine.render(&mut buf, 2);
+        for &node in &clicks {
+            bus.send(Command::SetNodePlaying { node, playing: true });
+        }
+        for rig in 0..RIGS as u8 {
+            let pan = if rig == 19 { 1.0 } else { -1.0 };
+            bus.send(Command::SetRigMix { rig, vol: None, pan: Some(pan), mute: Some(rig == 7), solo: None });
+            shared.ensure_stem(rig);
+            bus.send(Command::SetRecordArm { rig: Some(rig), armed: true });
+        }
+        bus.send(Command::SetRecordArm { rig: None, armed: false });
+        bus.send(Command::RecordStart);
+        let mut right = 0.0f32;
+        for _ in 0..100 {
+            engine.render(&mut buf, 2);
+            right = buf.chunks(2).fold(right, |p, f| p.max(f[1].abs()));
+        }
+        bus.send(Command::RecordStop);
+        engine.render(&mut buf, 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            let s = shared.snapshot();
+            if s.finalized && !s.recording {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "the take did not finalize");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(right > 0.01, "rig 19 plays on its own side: right peak {right}");
+        assert_eq!(status.stems.iter().map(|s| s.rig as usize).collect::<Vec<_>>(), (0..RIGS).collect::<Vec<_>>(), "one stem per armed rig");
+        let folder = PathBuf::from(status.folder.expect("take folder"));
+        let peak = |name: &str| wav_samples(&std::fs::read(folder.join(format!("{name}.wav"))).unwrap())
+            .iter().fold(0.0f32, |p, x| p.max(x.abs()));
+        assert!(peak("Rig T") > 0.01, "rig 19 (T) records its click: {}", peak("Rig T"));
+        assert!(peak("Rig H") < 1e-6, "muted rig 7 (H) records silence: {}", peak("Rig H"));
+        assert!(peak("Rig A") > 0.01, "rig 0 records its click");
+
+        bus.send(Command::SetRigMix { rig: 19, vol: None, pan: None, mute: Some(true), solo: None });
+        for _ in 0..30 { engine.render(&mut buf, 2); } // the master's tails (rule 133)
+        let mut right = 0.0f32;
+        for _ in 0..100 {
+            engine.render(&mut buf, 2);
+            right = buf.chunks(2).fold(right, |p, f| p.max(f[1].abs()));
+        }
+        assert!(right < 1e-4, "muting rig 19 silences the right side: {right}");
+        drop(engine);
         shared.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -176,6 +176,7 @@ use crate::theme::{alpha, mix};
 
 mod console;
 mod levels;
+mod show_controls;
 mod show_mode;
 mod preshow;
 use levels::LevelItem;
@@ -238,16 +239,11 @@ struct HwMidi {
 /// The MIDI thread: connects every hardware input, rescans every
 /// `HW_RESCAN_SECS` for hot-plugged devices, and owns the connections, so
 /// sound never depends on UI frames (rule 31). Ends with the app.
-fn spawn_hw_midi(
-    hw: Arc<HwMidi>,
-    q: Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
-    cc_q: Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
-    direct: Arc<HwDirect>,
-) {
+fn spawn_hw_midi(hw: Arc<HwMidi>, queues: HwQueues, direct: Arc<HwDirect>) {
     let spawned = std::thread::Builder::new().name("kabelsalat-midi".into()).spawn(move || {
         let mut conns: Vec<Option<midir::MidiInputConnection<()>>> = Vec::new();
         while Arc::strong_count(&hw) > 1 {
-            rescan_hw_midi(&hw, &mut conns, &q, &cc_q, &direct);
+            rescan_hw_midi(&hw, &mut conns, &queues, &direct);
             std::thread::sleep(std::time::Duration::from_secs_f32(HW_RESCAN_SECS));
         }
     });
@@ -354,13 +350,7 @@ pub(crate) fn is_hw_midi_port(name: &str) -> bool {
     !(name.contains("kabelsalat") || (name.contains("Midi Through") && !through_ok) || name == "System" || name == "Announce")
 }
 
-fn rescan_hw_midi(
-    hw: &HwMidi,
-    conns: &mut Vec<Option<midir::MidiInputConnection<()>>>,
-    q: &Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
-    cc_q: &Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
-    direct: &Arc<HwDirect>,
-) {
+fn rescan_hw_midi(hw: &HwMidi, conns: &mut Vec<Option<midir::MidiInputConnection<()>>>, queues: &HwQueues, direct: &Arc<HwDirect>) {
     let Ok(probe) = midir::MidiInput::new("kabelsalat-probe") else { return };
     let ports: Vec<(String, midir::MidiInputPort)> = probe.ports().into_iter()
         .map(|p| (probe.port_name(&p).unwrap_or_default(), p))
@@ -410,7 +400,7 @@ fn rescan_hw_midi(
     }
     for (dev, name, port) in to_connect {
         if conns.len() <= dev { conns.resize_with(dev + 1, || None); }
-        conns[dev] = connect_hw_input(&port, dev as u32, q, cc_q, direct);
+        conns[dev] = connect_hw_input(&port, dev as u32, queues, direct);
         if conns[dev].is_some() {
             if let Ok(mut devices) = hw.devices.lock() {
                 if let Some(d) = devices.get_mut(dev) { d.1 = true; }
@@ -441,54 +431,58 @@ fn hw_expression(dev: u32, msg: &[u8]) -> Option<Command> {
     }
 }
 
-/// Open one hardware input. Events sound from the MIDI thread (rule 31) and
-/// queue for the UI animation.
-fn connect_hw_input(
-    port: &midir::MidiInputPort,
-    dev: u32,
-    q: &Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
-    cc_q: &Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
-    direct: &Arc<HwDirect>,
-) -> Option<midir::MidiInputConnection<()>> {
+/// What the MIDI thread queues for the UI: notes (with whether they
+/// sounded), CCs as (source, channel, cc, value) and program changes as
+/// (source, channel, program).
+#[derive(Clone)]
+struct HwQueues {
+    notes: Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
+    ccs: Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
+    programs: Arc<Mutex<VecDeque<(SourceId, u8, u8)>>>,
+}
+
+fn push_bounded<T>(q: &Mutex<VecDeque<T>>, item: T) {
+    if let Ok(mut q) = q.lock() {
+        q.push_back(item);
+        while q.len() > 256 {
+            q.pop_front();
+        }
+    }
+}
+
+/// One hardware MIDI message from device `dev`: it sounds from here
+/// (rule 31) and queues for the UI, which animates it and learns from it.
+fn hw_midi_in(dev: u32, msg: &[u8], queues: &HwQueues, direct: &HwDirect) {
+    if let Some(cmd) = hw_expression(dev, msg) {
+        if let Command::Program { source, channel, program } = cmd {
+            push_bounded(&queues.programs, (source, channel, program));
+        }
+        let _ = direct.send_now(cmd, std::time::Instant::now());
+        return;
+    }
+    if msg.len() >= 3 {
+        let st = msg[0] & 0xF0;
+        if st == 0x90 || st == 0x80 {
+            let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
+            let ev = NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() };
+            let sounded = direct.send(&ev);
+            push_bounded(&queues.notes, (ev, sounded));
+        } else if st == 0xB0 {
+            let ch = msg[0] & 0x0F;
+            let cc = msg[1] & 0x7F;
+            let val = msg[2] & 0x7F;
+            let src = SourceId::Hardware(dev);
+            let _ = direct.send_cc(src, ch, cc, val, std::time::Instant::now());
+            push_bounded(&queues.ccs, (src, ch, cc, val));
+        }
+    }
+}
+
+/// Open one hardware input.
+fn connect_hw_input(port: &midir::MidiInputPort, dev: u32, queues: &HwQueues, direct: &Arc<HwDirect>) -> Option<midir::MidiInputConnection<()>> {
     let mi = midir::MidiInput::new("kabelsalat-hw").ok()?;
-    let (q, cc_q, direct) = (q.clone(), cc_q.clone(), direct.clone());
-    mi.connect(
-        port,
-        "kabelsalat-hw",
-        move |_stamp, msg: &[u8], _| {
-            if let Some(cmd) = hw_expression(dev, msg) {
-                let _ = direct.send_now(cmd, std::time::Instant::now());
-                return;
-            }
-            if msg.len() >= 3 {
-                let st = msg[0] & 0xF0;
-                if st == 0x90 || st == 0x80 {
-                    let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
-                    let ev = NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() };
-                    let sounded = direct.send(&ev);
-                    if let Ok(mut q) = q.lock() {
-                        q.push_back((ev, sounded));
-                        while q.len() > 256 {
-                            q.pop_front();
-                        }
-                    }
-                } else if st == 0xB0 {
-                    let ch = msg[0] & 0x0F;
-                    let cc = msg[1] & 0x7F;
-                    let val = msg[2] & 0x7F;
-                    let src = SourceId::Hardware(dev);
-                    let _ = direct.send_cc(src, ch, cc, val, std::time::Instant::now());
-                    if let Ok(mut cq) = cc_q.lock() {
-                        cq.push_back((src, ch, cc, val));
-                        while cq.len() > 256 {
-                            cq.pop_front();
-                        }
-                    }
-                }
-            }
-        },
-        (),
-    ).ok()
+    let (queues, direct) = (queues.clone(), direct.clone());
+    mi.connect(port, "kabelsalat-hw", move |_stamp, msg: &[u8], _| hw_midi_in(dev, msg, &queues, &direct), ()).ok()
 }
 
 struct HwDirect {
@@ -1191,7 +1185,7 @@ fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndex
     for p in &mut s.setlist.levels.bindings {
         if let SourceId::Hardware(d) = &mut p.of.source { *d = map.get(*d); }
     }
-    for d in &mut s.setlist.program_devices { *d = map.get(*d); }
+    for d in s.setlist.controls.iter_mut().filter_map(|c| c.device.as_mut()) { *d = map.get(*d); }
     s.set_hw_ports(Default::default());
 }
 
@@ -3198,7 +3192,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo", "set_show_mode", "panic",
-    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch", "preshow_check",
+    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check",
     "set_level", "set_setlist_set",
     "inspect_plugin", "set_param", "reset_params",
     "record_save_last",
@@ -3790,14 +3784,19 @@ struct DemoApp {
     rig_zones: [crate::control::RigZone; crate::control::MAX_RIGS],
     /// Grace deadline (`ui_time`) so our own SetRigZones echo does not clobber local state.
     ui_zone_grace: f32,
-    /// Session setlist (#204): songs, parts, active cursor, and foot-switch CCs.
+    /// Session setlist (#204): songs, parts, active cursor, and show controls.
     setlist: crate::setlist::Setlist,
-    /// When armed, the next hardware MIDI CC binds that foot-switch action.
-    setlist_footswitch_learn: Option<crate::setlist::FootSwitchAction>,
+    /// When armed, the next hardware CC, note-on or program change is
+    /// learned for that show action (#277).
+    show_learn: Option<crate::show::ShowAction>,
     /// The engine's copy of the setlist's show controls and parts (#261).
     show_sent: crate::show::ShowSent,
     /// `GraphPub::show_steps` last followed.
     show_steps_seen: u64,
+    /// `GraphPub::show_presses` last followed.
+    show_presses_seen: [u64; crate::show::ShowAction::ALL.len()],
+    /// The tuner a show control opens (#277).
+    tuner_on: bool,
     /// Song index currently selected for editing in the Setlist view.
     setlist_edit_song: Option<usize>,
     /// Text input for adding a new song in the Setlist view.
@@ -3977,6 +3976,7 @@ struct DemoApp {
     /// animates it.
     hw_queue: Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
     hw_cc_queue: Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
+    hw_program_queue: Arc<Mutex<VecDeque<(SourceId, u8, u8)>>>,
     /// Hardware MIDI → engine straight from the midir thread: sound never
     /// waits for a UI frame (16 ms focused, 33 ms when throttled unfocused).
     hw_direct: Arc<HwDirect>,
@@ -4403,9 +4403,11 @@ impl DemoApp {
             rig_zones: [crate::control::RigZone::OPEN; crate::control::MAX_RIGS],
             ui_zone_grace: -1.0,
             setlist: crate::setlist::Setlist::default(),
-            setlist_footswitch_learn: None,
+            show_learn: None,
             show_sent: crate::show::ShowSent::default(),
             show_steps_seen: 0,
+            show_presses_seen: [0; crate::show::ShowAction::ALL.len()],
+            tuner_on: false,
             setlist_edit_song: None,
             setlist_new_song_name: String::new(),
             setlist_new_part_name: String::new(),
@@ -4496,6 +4498,7 @@ impl DemoApp {
             note_offs: Vec::new(),
             hw_queue: Arc::new(Mutex::new(VecDeque::new())),
             hw_cc_queue: Arc::new(Mutex::new(VecDeque::new())),
+            hw_program_queue: Arc::new(Mutex::new(VecDeque::new())),
             hw_direct: Arc::new(HwDirect::default()),
             hw_midi: Arc::new(HwMidi::default()),
             hw_midi_rev: u64::MAX,
@@ -4603,7 +4606,7 @@ impl DemoApp {
         // Hardware MIDI: a thread connects what is plugged in now and keeps
         // rescanning, so devices plugged in later are picked up too.
         if hw_scan {
-            spawn_hw_midi(app.hw_midi.clone(), app.hw_queue.clone(), app.hw_cc_queue.clone(), app.hw_direct.clone());
+            spawn_hw_midi(app.hw_midi.clone(), app.hw_queues(), app.hw_direct.clone());
         }
 
         // Default rack = the engine's demo patch (2 stacks). build_rack mirrors
@@ -6677,6 +6680,7 @@ impl DemoApp {
             ),
             "get_setlist" => "Read setlist".into(),
             "preshow_check" => "Check the show".into(),
+            "get_show_controls" => "Read show controls".into(),
             "set_setlist_song" => match args.get("name").and_then(|v| v.as_str()) {
                 Some(n) if !n.trim().is_empty() => format!("Setlist · {n}"),
                 _ if args.get("remove").and_then(|v| v.as_bool()) == Some(true) => "Remove setlist song".into(),
@@ -6694,7 +6698,7 @@ impl DemoApp {
                 "Import song · {}",
                 args.get("session").and_then(|v| v.as_str()).unwrap_or("session")
             ),
-            "set_setlist_footswitch" => "Setlist foot-switch".into(),
+            "set_show_control" => "Show control".into(),
             "set_level" => match args.get("level").and_then(|v| v.as_str()) {
                 Some(l) => format!("Level · {l}"),
                 None => "Set level".into(),
@@ -7929,10 +7933,10 @@ impl DemoApp {
         }
         s.rig_devices = self.rig_snapshot.lock().map(|sn| sn.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
         while s.rig_devices.last() == Some(&None) { s.rig_devices.pop(); }
-        // Rules, rig devices and the devices whose program change selects
-        // the song (#208) hold device indices, places in this run's scan
-        // only, so the session names the devices it depends on.
-        let devices: Vec<Option<u32>> = s.rig_devices.iter().copied().chain(self.setlist.program_devices.iter().map(|&d| Some(d))).collect();
+        // Rules, rig devices and show controls (#208, #277) hold device
+        // indices, places in this run's scan only, so the session names the
+        // devices it depends on.
+        let devices: Vec<Option<u32>> = s.rig_devices.iter().copied().chain(self.setlist.controls.iter().map(|c| c.device)).collect();
         s.set_hw_ports(self.hw_ports_in_use(&rules, &devices));
         // Each synth's input selection (#124). The device goes by its port
         // name: its index is only its place in this run's scan (rule 58).
@@ -8220,7 +8224,7 @@ impl DemoApp {
         self.setlist = s.setlist.clone();
         self.setlist.prune_to_graph(&s.graph);
         self.preshow.report = None;
-        self.setlist_footswitch_learn = None;
+        self.show_learn = None;
         self.setlist_edit_song = self.setlist.active.map(|p| p.song)
             .or_else(|| (!self.setlist.songs.is_empty()).then_some(0));
         self.rig_zones = self.setlist.active_zones();
@@ -8458,17 +8462,11 @@ impl DemoApp {
             "song_name": s.name,
             "part_name": p.name,
         }));
-        let fs = |f: Option<crate::setlist::FootSwitch>| {
-            f.map(|x| serde_json::json!({"cc": x.cc, "channel": x.channel}))
-        };
         let show = self.show_json();
         serde_json::json!({
             "songs": songs,
             "active": active,
-            "foot_switch": {
-                "next_cc": fs(self.setlist.next_cc),
-                "prev_cc": fs(self.setlist.prev_cc),
-            },
+            "show_controls": self.show_controls_json(),
             "sets": show["sets"],
             "levels": show["levels"],
         })
@@ -8773,26 +8771,8 @@ impl DemoApp {
         Ok((song_idx, new_rig_indices))
     }
 
-    /// Learn a hardware CC as a setlist foot switch. Returns `true` when the
-    /// CC is a foot switch's, so no knob learns or follows it; the engine
-    /// steps the part on it (#261).
-    fn handle_setlist_cc(&mut self, ch: u8, cc: u8) -> bool {
-        let cc = cc & 0x7F;
-        if let Some(action) = self.setlist_footswitch_learn.take() {
-            let fs = crate::setlist::FootSwitch { cc, channel: None };
-            match action {
-                crate::setlist::FootSwitchAction::Next => {
-                    self.setlist.next_cc = Some(fs);
-                    self.session_msg = format!("Learned CC {cc} for Next part");
-                }
-                crate::setlist::FootSwitchAction::Prev => {
-                    self.setlist.prev_cc = Some(fs);
-                    self.session_msg = format!("Learned CC {cc} for Previous part");
-                }
-            }
-            return true;
-        }
-        [self.setlist.next_cc, self.setlist.prev_cc].iter().flatten().any(|fs| fs.matches(ch, cc))
+    fn hw_queues(&self) -> HwQueues {
+        HwQueues { notes: self.hw_queue.clone(), ccs: self.hw_cc_queue.clone(), programs: self.hw_program_queue.clone() }
     }
 
     /// Send the engine what changed of the setlist's show controls, parts
@@ -8985,7 +8965,7 @@ impl DemoApp {
         self.mixer_knob_drag = None;
         self.setlist = crate::setlist::Setlist::default();
         self.rig_zones = [crate::control::RigZone::OPEN; crate::control::MAX_RIGS];
-        self.setlist_footswitch_learn = None;
+        self.show_learn = None;
         self.setlist_edit_song = None;
         self.begin_load_fade();
         self.sync_clap_slots(&merged, None);
@@ -10549,26 +10529,16 @@ impl DemoApp {
                     Err(e) => format!("error: {e}"),
                 }
             }
-            "set_setlist_footswitch" => {
-                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                let fs = args.get("cc").and_then(|v| v.as_u64()).map(|cc| crate::setlist::FootSwitch {
-                    cc: (cc as u8) & 0x7F,
-                    channel: args.get("channel").and_then(|v| v.as_u64()).map(|c| (c as u8) & 0x0F),
-                });
-                match action {
-                    "next" => {
-                        self.setlist.next_cc = fs;
-                        self.agent_activity.record(origin, "Setlist foot-switch", Vec::new(), now);
-                        self.setlist_json().to_string()
-                    }
-                    "prev" => {
-                        self.setlist.prev_cc = fs;
-                        self.agent_activity.record(origin, "Setlist foot-switch", Vec::new(), now);
-                        self.setlist_json().to_string()
-                    }
-                    other => format!("error: unknown action '{other}' (use 'next' or 'prev')"),
+            "get_show_controls" => self.show_controls_json().to_string(),
+            "set_show_control" => match self.setlist.set_show_control(args) {
+                Ok(done) => {
+                    self.agent_activity.record(origin, "Show control", Vec::new(), now);
+                    let mut v = self.show_controls_json();
+                    v["changed"] = serde_json::json!(done);
+                    v.to_string()
                 }
-            }
+                Err(e) => format!("error: {e}"),
+            },
             "get_midi_clock" => self.midi_clock_json().to_string(),
             "set_midi_clock" => match self.set_midi_clock(args) {
                 Ok(json) => {
@@ -17839,7 +17809,7 @@ impl DemoApp {
     }
 
     fn setlist_stage_body(&mut self, ui: &mut egui::Ui, sessions_dir: &std::path::Path) {
-        use crate::setlist::{FootSwitchAction, Part, PartRig, Song};
+        use crate::setlist::{Part, PartRig, Song};
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
         let painter = ui.painter().clone();
@@ -17969,7 +17939,7 @@ impl DemoApp {
                                  edit_song: &mut Option<usize>,
                                  new_song_name: &mut String,
                                  import_open: &mut bool,
-                                 learn: &mut Option<FootSwitchAction>,
+                                 learn: &mut Option<crate::show::ShowAction>,
                                  add_song: &mut bool,
                                  import_session: &mut Option<String>,
                                  move_song: &mut Option<(usize, usize)>,
@@ -18095,9 +18065,8 @@ impl DemoApp {
                             }
                         });
 
-                    // Foot switches and program change scroll together in
-                    // what the column has left, so a short window never cuts
-                    // them off (rule 27).
+                    // The show controls scroll in what the column has
+                    // left, so a short window never cuts them off (rule 27).
                     ui.add_space(10.0);
                     let rest = ui.available_height().max(0.0);
                     egui::ScrollArea::vertical()
@@ -18107,69 +18076,7 @@ impl DemoApp {
                         .show(ui, |ui| {
                             Self::stage_hairline(ui);
                             ui.add_space(8.0);
-                            theme::section_label(ui, "Foot-switch CC");
-                            ui.add_space(6.0);
-                            for (label, action, binding) in [
-                                ("Next part", FootSwitchAction::Next, setlist.next_cc),
-                                ("Prev part", FootSwitchAction::Prev, setlist.prev_cc),
-                            ] {
-                                let learning = *learn == Some(action);
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
-                                    let txt = if learning {
-                                        "Press pedal…".to_string()
-                                    } else if let Some(fs) = binding {
-                                        format!("CC {}", fs.cc)
-                                    } else {
-                                        "Unbound".to_string()
-                                    };
-                                    ui.label(egui::RichText::new(txt).size(11.5).monospace().color(if learning { theme::ACCENT } else { theme::INK_2 }));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        if binding.is_some() && theme::chip_button(ui, "Clear", false).clicked() {
-                                            match action {
-                                                FootSwitchAction::Next => setlist.next_cc = None,
-                                                FootSwitchAction::Prev => setlist.prev_cc = None,
-                                            }
-                                        }
-                                        if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
-                                            *learn = if learning { None } else { Some(action) };
-                                        }
-                                    });
-                                });
-                                ui.add_space(4.0);
-                            }
-
-                            ui.add_space(6.0);
-                            Self::stage_hairline(ui);
-                            ui.add_space(8.0);
-                            theme::section_label(ui, "Program change picks the song");
-                            ui.add_space(6.0);
-                            if program_rows.is_empty() {
-                                ui.label(egui::RichText::new("Plug in a MIDI device to pick songs with its program buttons.").size(11.5).color(theme::INK_2));
-                            }
-                            for (d, name, live) in &program_rows {
-                                let on = setlist.program_selects_song(*d);
-                                let full = !on && setlist.program_devices.len() >= crate::setlist::MAX_PROGRAM_DEVICES;
-                                ui.horizontal(|ui| {
-                                    ui.set_min_height(PROGRAM_ROW_H - 4.0);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let hint = if full {
-                                            format!("At most {} devices pick songs", crate::setlist::MAX_PROGRAM_DEVICES)
-                                        } else {
-                                            "Program N selects song N+1; this device's program changes no longer reach its instruments".to_string()
-                                        };
-                                        let chip = ui.add_enabled_ui(!full, |ui| theme::chip_button(ui, if on { "On" } else { "Off" }, on)).inner;
-                                        if chip.on_hover_text(hint).clicked() {
-                                            setlist.set_program_selects_song(*d, !on);
-                                        }
-                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                            let color = if *live { theme::INK } else { theme::INK_2 };
-                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(color)).truncate());
-                                        });
-                                    });
-                                });
-                            }
+                            Self::show_controls_rows(ui, setlist, learn, &program_rows);
                         });
                 };
 
@@ -18418,7 +18325,7 @@ impl DemoApp {
                                 &mut self.setlist_edit_song,
                                 &mut self.setlist_new_song_name,
                                 &mut self.setlist_import_open,
-                                &mut self.setlist_footswitch_learn,
+                                &mut self.show_learn,
                                 &mut add_song,
                                 &mut import_session,
                                 &mut move_song,
@@ -18456,7 +18363,7 @@ impl DemoApp {
                         &mut self.setlist_edit_song,
                         &mut self.setlist_new_song_name,
                         &mut self.setlist_import_open,
-                        &mut self.setlist_footswitch_learn,
+                        &mut self.show_learn,
                         &mut add_song,
                         &mut import_session,
                         &mut move_song,
@@ -25608,7 +25515,7 @@ impl DemoApp {
                 else if self.cable_menu.is_some() { self.cable_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
-                else if self.setlist_footswitch_learn.is_some() { self.setlist_footswitch_learn = None; }
+                else if self.show_learn.is_some() { self.show_learn = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
                 else if self.confirm_session.is_some() { self.confirm_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
@@ -32415,6 +32322,7 @@ impl DemoApp {
         self.save_rig_modal(&ctx);
         self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
+        self.tuner_panel(&ctx);
 
         self.frame_end(&ctx);
     }
@@ -32425,6 +32333,7 @@ impl DemoApp {
         // Before the assistant and remote edits: a part they pick this frame
         // wins over a foot-switch step the engine took before it.
         self.follow_show();
+        self.follow_show_presses();
         self.poll_assistant();
         self.serve_ui_inbox();
         self.poll_preshow();
@@ -32473,6 +32382,13 @@ impl DemoApp {
             } else {
                 format!("{} off", note_name(ev.note))
             }));
+            if self.show_control_msg(ev.source, 0, crate::show::ShowMsg::Note(ev.note & 0x7F), ev.velocity > 0.0) {
+                if ev.velocity == 0.0 {
+                    let bit = note_source_bit(ev.source);
+                    self.notes_down[(ev.note as usize).min(127)] &= !bit;
+                }
+                continue;
+            }
             let semi = ev.note as usize;
             self.current_source = ev.source;
             self.fire_keys_with(semi, ev.velocity, !sounded);
@@ -32487,11 +32403,19 @@ impl DemoApp {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
             self.last_midi = Some(self.midi_event_text(src, &format!("CC{cc} {val}")));
-            if self.handle_setlist_cc(ch, cc) {
+            if self.show_control_msg(src, ch, crate::show::ShowMsg::Cc(cc & 0x7F), val >= 64) {
                 continue;
             }
             let learned = self.feed_cc_learn(src, cc, val);
             self.apply_cc_to_knobs(src, ch, cc, val, learned);
+        }
+        let programs: Vec<(SourceId, u8, u8)> = self.hw_program_queue.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
+        for (src, ch, program) in programs {
+            if let SourceId::Hardware(d) = src {
+                if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
+            }
+            self.last_midi = Some(self.midi_event_text(src, &format!("Program {program}")));
+            self.show_control_msg(src, ch, crate::show::ShowMsg::Program(program & 0x7F), true);
         }
     }
 
@@ -46853,7 +46777,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 41] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 42] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {
@@ -46959,6 +46883,22 @@ mod window_size_layout_tests {
                 a.stage_view = StageView::Setlist;
                 a.preshow.open = true;
                 a.preshow.report = Some(super::preshow::tests::a_report());
+            }),
+            ("setlist show controls", &|a| {
+                for name in ["Opener", "Ballad"] {
+                    a.exec_tool("set_setlist_song", &serde_json::json!({"name": name}));
+                }
+                a.hw_midi.devices.lock().unwrap().extend([
+                    ("Launchkey Mini:Launchkey Mini MIDI 1 24:0".into(), true),
+                    ("FCB1010:FCB1010 MIDI 1 32:0".into(), true),
+                ]);
+                a.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+                a.adopt_hw_devices();
+                a.setlist.learn(crate::show::ShowAction::NextPart, Some(1), crate::show::ShowMsg::Cc(80));
+                a.setlist.learn(crate::show::ShowAction::Panic, Some(0), crate::show::ShowMsg::Note(36));
+                a.setlist.set_program_selects_song(1, true);
+                a.show_learn = Some(crate::show::ShowAction::TapTempo);
+                a.stage_view = StageView::Setlist;
             }),
         ];
 }
@@ -48635,7 +48575,7 @@ mod navigator_tests {
                 };
                 for (d, (name, _)) in devices.iter().enumerate() {
                     let mut row = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name);
-                    for _ in 0..10 {
+                    for _ in 0..20 {
                         if row.is_some() {
                             break;
                         }
@@ -48671,7 +48611,7 @@ mod navigator_tests {
             for (name, rig) in [("Opener", 0), ("Ballad", 1), ("Closer", 0)] {
                 let _ = app.exec_tool("set_setlist_song", &serde_json::json!({"name": name, "parts": [{"name": "Main", "rigs": [{"rig": rig}]}]}));
             }
-            app.setlist.next_cc = Some(crate::setlist::FootSwitch { cc: 64, channel: None });
+            app.setlist.learn(crate::show::ShowAction::NextPart, None, crate::show::ShowMsg::Cc(64));
             app.setlist.set_program_selects_song(1, true);
             app.select_setlist(1, 0).unwrap();
             app.stage_view = StageView::Setlist;
@@ -48697,7 +48637,7 @@ mod navigator_tests {
                 {"name": "Bridge", "rigs": [{"rig": 1, "transpose": -5, "level": 0.7}]}
             ]
         }));
-        let _ = app.exec_tool("set_setlist_footswitch", &serde_json::json!({"action": "next", "cc": 80}));
+        let _ = app.exec_tool("set_show_control", &serde_json::json!({"action": "next_part", "cc": 80}));
         // Rig A plays through the whole show (#273), whatever the part names.
         app.setlist.pin_rig(0, crate::setlist::Level::Show);
         app.select_setlist(0, 0).unwrap();
@@ -48734,7 +48674,7 @@ mod navigator_tests {
         // 1. Agent / MCP parity (rules 6, 23).
         let tools = crate::assistant::tools();
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
-        for name in ["get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch"] {
+        for name in ["get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control"] {
             assert!(names.contains(&name), "assistant tools missing {name}");
             assert!(UI_BRIDGE_TOOLS.contains(&name), "UI_BRIDGE_TOOLS missing {name}");
         }
@@ -48770,13 +48710,15 @@ mod navigator_tests {
         assert!(app.rig_zones[0].live && app.rig_zones[0].key_hi == 59);
         assert!(app.rig_zones[1].live && app.rig_zones[1].key_lo == 60 && app.rig_zones[1].transpose == 12);
 
-        // 3. Foot-switch CC learn. The engine steps on it (#261), the app only
-        // keeps it away from its knobs.
-        app.setlist_footswitch_learn = Some(crate::setlist::FootSwitchAction::Prev);
-        assert!(app.handle_setlist_cc(0, 67), "learn consumes CC");
-        assert_eq!(app.setlist.prev_cc, Some(crate::setlist::FootSwitch { cc: 67, channel: None }));
-        assert!(app.handle_setlist_cc(0, 67), "a foot switch's CC moves no knob");
-        assert!(!app.handle_setlist_cc(0, 1));
+        // 3. Show control learn (#277). The engine steps on it (#261), the
+        // app only keeps it away from its knobs.
+        use crate::show::{ShowAction, ShowMsg};
+        let pedal = SourceId::Hardware(0);
+        app.show_learn = Some(ShowAction::PrevPart);
+        assert!(app.show_control_msg(pedal, 0, ShowMsg::Cc(67), true), "learn consumes CC");
+        assert_eq!(app.setlist.control_of(ShowAction::PrevPart).map(|c| (c.msg, c.device)), Some((ShowMsg::Cc(67), Some(0))));
+        assert!(app.show_control_msg(pedal, 0, ShowMsg::Cc(67), true), "a show control's CC moves no knob");
+        assert!(!app.show_control_msg(pedal, 0, ShowMsg::Cc(1), true));
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
 
         // 4. Survives save/load round-trip.
@@ -48917,7 +48859,7 @@ mod navigator_tests {
                     {"name": "Theme", "rigs": [{"rig": 1, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.85}]}
                 ]
             }));
-            let _ = app.exec_tool("set_setlist_footswitch", &serde_json::json!({"action": "next", "cc": 64}));
+            let _ = app.exec_tool("set_show_control", &serde_json::json!({"action": "next_part", "cc": 64}));
             let _ = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 1}));
             app
         };

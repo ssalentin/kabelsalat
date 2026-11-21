@@ -27,7 +27,7 @@ agents are in [AGENTS.md](../AGENTS.md).
   the lock-free `command_bus()` (rtrb).
 - `setlist.rs` — gig setlist model (#204): `Setlist`, `Song` (optional BPM and
   time signature), `Part` (per-rig `PartRig` key range, transpose, level,
-  velocity layer and floating split, and stored `ParamValue` knobs), `FootSwitch` CC bindings, stepping, validation and
+  velocity layer and floating split, and stored `ParamValue` knobs), `ShowControl` bindings, stepping, validation and
   node/rig remapping across rig edits. Persisted inside `Session`; switching
   parts sends `Command::SetRigZones` so the engine gates only new notes while
   held notes, releases, pedal-ups and effect tails finish uninterrupted.
@@ -45,14 +45,20 @@ agents are in [AGENTS.md](../AGENTS.md).
   and the first new note's onset at three block sizes. Nothing loads on a
   switch, so the first note waits only for the next block: one device buffer
   plus the instrument's own onset (Surge's saw: 0 to 1 ms).
-- `show.rs` — show controls (#261): `ShowControl` (a MIDI message from a
-  device, consumed by a `ShowAction`) in one fixed table the engine checks
-  before the matrix, so a foot switch's CC never reaches an instrument. The
+- `show.rs` — show controls (#261, #277): `ShowControl` (a CC, note or
+  program change from a device, consumed by a `ShowAction`) in one fixed
+  table the engine checks before the matrix, so a learned control never
+  reaches an instrument. Its size is one slot per learned action plus the
+  program devices (`MAX_SHOW_CONTROLS`); the session keeps the same list in
+  `Setlist::controls`. Panic, tap tempo (engine time), master mute and the
+  backing track happen in the block; the engine counts every press
+  (`GraphPub::show_presses`) and the app does the tuner and recording from
+  them in `frame_feeds` (`ui/show_controls.rs`), so they work in Show mode. The
   engine also holds every part (`SetShowParts`: its song, whether stepping
   skips that song's set, its level-aware zones from `Setlist::zones_of`) and
   the active part (`SetShowPart`), steps the part itself in the block the CC
   arrives in, as `next_part`/`prev_part` would, or jumps to song N+1's first
-  part on program change N from a device in `Setlist::program_devices` (#208:
+  part on program change N from a device in `Setlist::program_devices()` (#208:
   `ShowMsg::AnyProgram` + `ShowAction::SongOfProgram`; a control naming one
   program, `ShowMsg::Program(n)`, goes before it in the table), and publishes
   `GraphPub::show_part`/`show_steps`. The UI follows one frame later with

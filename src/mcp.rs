@@ -265,16 +265,20 @@ fn setlist_json(st: &State) -> Value {
         "song_name": s.name,
         "part_name": p.name,
     }));
-    let fs = |f: Option<crate::setlist::FootSwitch>| f.map(|x| json!({"cc": x.cc, "channel": x.channel}));
     let bus_name = |n: NodeId| st.graph.node(n).map_or_else(String::new, |x| name_str(&x.name).to_string());
     let show = sl.show_json(&st.graph, &headless_bindings(st), bus_name);
     json!({
         "songs": songs,
         "active": active,
-        "foot_switch": { "next_cc": fs(sl.next_cc), "prev_cc": fs(sl.prev_cc) },
+        "show_controls": headless_show_controls(sl),
         "sets": show["sets"],
         "levels": show["levels"],
     })
+}
+
+/// Headless MCP knows no hardware devices: it names them by index.
+fn headless_show_controls(sl: &crate::setlist::Setlist) -> Value {
+    sl.show_controls_json(&[], &|d| format!("hw:{d}"))
 }
 
 fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Result<(), String> {
@@ -811,15 +815,31 @@ struct SetSetlistSetArgs {
     remove: Option<bool>,
 }
 
-/// Arguments for `set_setlist_footswitch`.
+/// Arguments for `set_show_control`.
 #[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
-struct SetSetlistFootswitchArgs {
-    /// Which step to bind: "next" | "prev".
+struct SetShowControlArgs {
+    /// next_song | prev_song | next_part | prev_part | panic | tap_tempo |
+    /// tuner | master_mute | backing_track | record | song_of_program.
     action: String,
-    /// MIDI CC number (0..=127), or null/omitted to clear.
+    /// A CC (0..127): acts when it rises to 64 or above.
+    #[serde(skip_serializing_if = "Option::is_none")]
     cc: Option<u8>,
-    /// Optional MIDI channel (0..=15); omit for any channel.
-    channel: Option<u8>,
+    /// A note (0..127 or a name like "C2"): acts on its note-on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<Value>,
+    /// A program change (0..127): every one acts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    program: Option<u8>,
+    /// Hardware device index (get_show_controls); omit for any device.
+    /// Required for song_of_program.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<u32>,
+    /// true removes the action's control.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear: Option<bool>,
+    /// song_of_program: whether the device's program change picks the song (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on: Option<bool>,
 }
 
 /// Arguments for `set_show_mode`.
@@ -4728,7 +4748,7 @@ impl McpServer {
     }
 
     /// Read the session's setlist (#204).
-    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), buses and stored knob count), the active song/part (null = all rigs open), any learned foot-switch CCs, the sets, and the level (show, set or song) of every rig, aux bus and CC binding.")]
+    #[tool(name = "get_setlist", description = "Read the session's setlist: every song (index, name, set, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level, velocity layer (vel_lo, vel_hi, vel_curve), floating split (float), buses and stored knob count), the active song/part (null = all rigs open), the show controls (as get_show_controls), the sets, and the level (show, set or song) of every rig, aux bus and CC binding.")]
     fn get_setlist(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4847,24 +4867,34 @@ impl McpServer {
         tool_err("add_song_from_session requires the running app (connect with --attach)")
     }
 
-    /// Bind or clear a hardware MIDI CC foot-switch for stepping the setlist (#204).
-    #[tool(name = "set_setlist_footswitch", description = "Bind or clear a hardware MIDI CC foot-switch to step the setlist on rising edge (value >= 64). action: 'next' | 'prev'. cc: 0..127 (omit or null to clear). channel: optional 0..15 (omit = any channel).")]
-    fn set_setlist_footswitch(&self, Parameters(args): Parameters<SetSetlistFootswitchArgs>) -> Result<CallToolResult, McpError> {
-        let mut st = self.state.lock().unwrap();
+    /// Every show action and its control (#277).
+    #[tool(name = "get_show_controls", description = "List the show actions a pedal, key or button can trigger (next_song, prev_song, next_part, prev_part, panic, tap_tempo, tuner, master_mute, backing_track, record), the control learned for each (a CC, a note or a program change, and from which hardware device), and every hardware device with whether its program change N picks song N+1 (song_of_program). Show controls work in every song: they are at show level.")]
+    fn get_show_controls(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
             drop(st);
-            return Self::ui_bridge_tool("set_setlist_footswitch", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+            return Self::ui_bridge_tool("get_show_controls", json!({}));
         }
-        let fs = args.cc.map(|cc| crate::setlist::FootSwitch {
-            cc: cc & 0x7F,
-            channel: args.channel.map(|c| c & 0x0F),
-        });
-        match args.action.as_str() {
-            "next" => st.setlist.next_cc = fs,
-            "prev" => st.setlist.prev_cc = fs,
-            other => return tool_err(format!("unknown action '{other}' (use 'next' or 'prev')")),
+        ok_json(headless_show_controls(&st.setlist))
+    }
+
+    /// Bind or clear one show action's control, or choose a program-change device (#277, #208).
+    #[tool(name = "set_show_control", description = "Bind a hardware control to a show action, clear it, or choose whether a device's program change picks the song. action: next_song | prev_song | next_part | prev_part | panic | tap_tempo | tuner | master_mute | backing_track | record | song_of_program. Give one of cc (0..127, acts when it rises to 64 or above), note (0..127 or a name like \"C2\", acts on its note-on) or program (0..127), and optionally device (hardware device index from get_show_controls; omitted = any device); or clear: true. A message another action had moves to this one. song_of_program takes device and on (default true): program N from that device then selects song N+1. What a control takes never reaches an instrument.")]
+    fn set_show_control(&self, Parameters(args): Parameters<SetShowControlArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_show_control", v);
         }
-        ok_json(setlist_json(&st))
+        match st.setlist.set_show_control(&v) {
+            Ok(done) => {
+                let mut out = headless_show_controls(&st.setlist);
+                out["changed"] = json!(done);
+                ok_json(out)
+            }
+            Err(e) => tool_err(e),
+        }
     }
 
     /// Choose the level of one rig, aux bus or CC binding (#273).
@@ -6194,12 +6224,28 @@ mod tests {
             part: None,
         })));
         assert_eq!(stepped["active"]["part_name"], json!("Chorus"));
-        let fs = tool_json(&server.set_setlist_footswitch(Parameters(SetSetlistFootswitchArgs {
-            action: "next".into(),
+        let fs = tool_json(&server.set_show_control(Parameters(SetShowControlArgs {
+            action: "next_part".into(),
             cc: Some(64),
-            channel: None,
+            note: None,
+            program: None,
+            device: None,
+            clear: None,
+            on: None,
         })));
-        assert_eq!(fs["foot_switch"]["next_cc"]["cc"], json!(64));
+        assert!(fs["changed"].as_str().is_some_and(|t| t.contains("CC 64")), "{fs}");
+        let tap = tool_json(&server.set_show_control(Parameters(SetShowControlArgs {
+            action: "tap_tempo".into(),
+            cc: None,
+            note: Some(json!("C1")),
+            program: None,
+            device: Some(2),
+            clear: None,
+            on: None,
+        })));
+        let row = |v: &Value, a: &str| v["actions"].as_array().unwrap().iter().find(|r| r["action"] == a).cloned().unwrap();
+        assert_eq!((row(&tap, "tap_tempo")["control"]["note"].clone(), row(&tap, "tap_tempo")["control"]["device_name"].clone()), (json!(24), json!("hw:2")));
+        assert_eq!(row(&tool_json(&server.get_show_controls()), "next_part")["control"]["cc"], json!(64));
         let got = tool_json(&server.get_setlist());
         assert_eq!(got["active"]["part"], json!(1));
         let chorus = &got["songs"][0]["parts"][1]["rigs"][0];

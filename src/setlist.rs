@@ -11,7 +11,9 @@
 //! binding has a level (show, set or song) that decides what a switch
 //! touches: see [`levels`] (#273).
 
+mod controls;
 mod levels;
+pub use controls::msg_label;
 pub use levels::{part_buses, source_str, Binding, Gates, Level, Levels, Set, SetId};
 
 use anyhow::{bail, Result};
@@ -21,11 +23,8 @@ use crate::control::{Graph, NodeId, RigZone};
 use crate::layer::{VelCurve, FLOAT_MAX};
 use crate::session::ParamValue;
 use crate::show::{ShowAction, ShowControl, ShowControls, ShowMsg, ShowPart, NO_SHOW_CONTROLS};
+pub use crate::show::MAX_PROGRAM_DEVICES;
 use crate::transport::TimeSig;
-
-/// Devices whose program change can select the song (#208): the show
-/// table's slots after the two foot switches.
-pub const MAX_PROGRAM_DEVICES: usize = crate::show::MAX_SHOW_CONTROLS - 2;
 
 pub use crate::control::MAX_RIGS;
 
@@ -224,45 +223,37 @@ pub struct SetlistPos {
     pub part: usize,
 }
 
-/// A learned hardware MIDI CC that steps the setlist (rising edge: val >= 64).
+/// A foot switch of a session saved before #277: a CC from any device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FootSwitch {
     pub cc: u8,
-    /// `None` matches any channel; `Some(0..=15)` matches one MIDI channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<u8>,
 }
 
-impl FootSwitch {
-    pub fn matches(self, channel: u8, cc: u8) -> bool {
-        self.cc == (cc & 0x7F) && self.channel.is_none_or(|c| c == (channel & 0x0F))
-    }
-}
-
-/// Which setlist step a foot-switch CC or MIDI learn targets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FootSwitchAction {
-    Next,
-    Prev,
-}
-
-/// The session's setlist: ordered songs, active position, optional
-/// foot-switch CC bindings, the sets that group songs, and the chosen
-/// levels of rigs, buses and bindings (#273).
+/// The session's setlist: ordered songs, active position, the show
+/// controls, the sets that group songs, and the chosen levels of rigs,
+/// buses and bindings (#273).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Setlist {
     pub songs: Vec<Song>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<SetlistPos>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cc: Option<FootSwitch>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prev_cc: Option<FootSwitch>,
-    /// Hardware devices whose program change N selects song N+1 (#208),
-    /// as device indices: a session names their ports (`hw_ports`, #227).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub program_devices: Vec<u32>,
+    /// Every show action's learned control, then the devices whose program
+    /// change N selects song N+1 (#208), in table order (`normalize`).
+    /// They work in every song: show controls are at show level (#273).
+    /// Devices are indices: a session names their ports (`hw_ports`, #227).
+    #[serde(rename = "show_controls", skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<ShowControl>,
+    /// The foot switches and program-change devices of a session saved before
+    /// #277, read only: `normalize` moves them into `controls`.
+    #[serde(skip_serializing)]
+    pub(crate) next_cc: Option<FootSwitch>,
+    #[serde(skip_serializing)]
+    pub(crate) prev_cc: Option<FootSwitch>,
+    #[serde(skip_serializing)]
+    pub(crate) program_devices: Vec<u32>,
     /// Sets in song order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sets: Vec<Set>,
@@ -275,6 +266,7 @@ impl Setlist {
     /// omit the `"setlist"` field in `session.json`).
     pub fn is_empty(&self) -> bool {
         self.songs.is_empty()
+            && self.controls.is_empty()
             && self.next_cc.is_none()
             && self.prev_cc.is_none()
             && self.program_devices.is_empty()
@@ -322,33 +314,64 @@ impl Setlist {
         None
     }
 
-    /// The foot switches (#261) and the devices whose program change selects
-    /// the song (#208) as the engine's show controls.
+    /// The show controls as the engine's table. `controls` is in table
+    /// order: the learned actions first, so a control naming one program
+    /// goes before a device that takes every program.
     pub fn show_controls(&self) -> ShowControls {
-        let foot = [(self.next_cc, ShowAction::NextPart), (self.prev_cc, ShowAction::PrevPart)]
-            .map(|(fs, action)| fs.map(|fs| ShowControl { device: None, channel: fs.channel, msg: ShowMsg::Cc(fs.cc), action }));
-        let songs = self.program_devices.iter().map(|&d| {
-            Some(ShowControl { device: Some(d), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram })
-        });
         let mut t = NO_SHOW_CONTROLS;
-        for (slot, c) in t.iter_mut().zip(foot.into_iter().chain(songs)) {
-            *slot = c;
+        for (slot, c) in t.iter_mut().zip(&self.controls) {
+            *slot = Some(*c);
         }
         t
     }
 
+    /// The control learned for `action`.
+    pub fn control_of(&self, action: ShowAction) -> Option<ShowControl> {
+        self.controls.iter().copied().find(|c| c.action == action && c.action != ShowAction::SongOfProgram)
+    }
+
+    /// Learn `msg` from `device` for `action` (one of `ShowAction::LEARNED`),
+    /// in place of its control. Another action that took the same message
+    /// lets go of it, so one press never does two things. Returns that action.
+    pub fn learn(&mut self, action: ShowAction, device: Option<u32>, msg: ShowMsg) -> Option<ShowAction> {
+        let control = ShowControl { device, channel: None, msg, action };
+        let overlaps = |c: &ShowControl| c.msg == msg && (c.device.is_none() || device.is_none() || c.device == device);
+        let taken = self.controls.iter().find(|c| c.action != action && c.action != ShowAction::SongOfProgram && overlaps(c)).map(|c| c.action);
+        self.controls.retain(|c| c.action == ShowAction::SongOfProgram || (c.action != action && !overlaps(c)));
+        self.controls.push(control);
+        self.sort_controls();
+        taken
+    }
+
+    /// Clear the control learned for `action`.
+    pub fn forget(&mut self, action: ShowAction) {
+        self.controls.retain(|c| c.action != action || action == ShowAction::SongOfProgram);
+    }
+
     /// Whether device `d`'s program change selects the song (#208).
     pub fn program_selects_song(&self, d: u32) -> bool {
-        self.program_devices.contains(&d)
+        self.controls.iter().any(|c| c.action == ShowAction::SongOfProgram && c.device == Some(d))
+    }
+
+    /// The devices whose program change selects the song.
+    pub fn program_devices(&self) -> impl Iterator<Item = u32> + '_ {
+        self.controls.iter().filter(|c| c.action == ShowAction::SongOfProgram).filter_map(|c| c.device)
     }
 
     /// Past `MAX_PROGRAM_DEVICES`, turning one on does nothing.
     pub fn set_program_selects_song(&mut self, d: u32, on: bool) {
-        self.program_devices.retain(|&x| x != d);
-        if on && self.program_devices.len() < MAX_PROGRAM_DEVICES {
-            self.program_devices.push(d);
-            self.program_devices.sort_unstable();
+        self.controls.retain(|c| !(c.action == ShowAction::SongOfProgram && c.device == Some(d)));
+        if on && self.program_devices().count() < MAX_PROGRAM_DEVICES {
+            self.controls.push(ShowControl { device: Some(d), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
+            self.sort_controls();
         }
+    }
+
+    /// Table order: learned actions as `ShowAction::LEARNED` lists them,
+    /// then program devices by index.
+    fn sort_controls(&mut self) {
+        let rank = |c: &ShowControl| (ShowAction::ALL.iter().position(|&a| a == c.action), c.device);
+        self.controls.sort_by_key(rank);
     }
 
     /// Select `(song, part)` if it exists.
@@ -588,19 +611,47 @@ impl Setlist {
                 part.rigs.dedup_by_key(|r| r.rig);
             }
         }
-        if let Some(fs) = &mut self.next_cc {
-            fs.cc &= 0x7F;
-            fs.channel = fs.channel.map(|c| c & 0x0F);
-        }
-        if let Some(fs) = &mut self.prev_cc {
-            fs.cc &= 0x7F;
-            fs.channel = fs.channel.map(|c| c & 0x0F);
-        }
-        self.program_devices.sort_unstable();
-        self.program_devices.dedup();
-        self.program_devices.truncate(MAX_PROGRAM_DEVICES);
+        self.normalize_controls();
         self.normalize_levels();
         self.clamp_active();
+    }
+
+    /// One control per learned action and one per program device, at most
+    /// as many as the engine's table has slots, in table order. A session
+    /// saved before #277 brings its foot switches and program-change devices.
+    fn normalize_controls(&mut self) {
+        for (fs, action) in [(self.next_cc.take(), ShowAction::NextPart), (self.prev_cc.take(), ShowAction::PrevPart)] {
+            if let Some(fs) = fs.filter(|_| self.control_of(action).is_none()) {
+                self.controls.push(ShowControl { device: None, channel: fs.channel, msg: ShowMsg::Cc(fs.cc), action });
+            }
+        }
+        for d in std::mem::take(&mut self.program_devices) {
+            self.controls.push(ShowControl { device: Some(d), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
+        }
+        for c in &mut self.controls {
+            c.channel = c.channel.map(|ch| ch & 0x0F);
+            c.msg = match c.msg {
+                ShowMsg::Cc(n) => ShowMsg::Cc(n & 0x7F),
+                ShowMsg::Note(n) => ShowMsg::Note(n & 0x7F),
+                ShowMsg::Program(n) => ShowMsg::Program(n & 0x7F),
+                ShowMsg::AnyProgram => ShowMsg::AnyProgram,
+            };
+        }
+        let program_row = |c: &ShowControl| c.msg == ShowMsg::AnyProgram && c.device.is_some();
+        self.controls.retain(|c| (c.action == ShowAction::SongOfProgram) == program_row(c));
+        self.sort_controls();
+        let mut seen = Vec::new();
+        self.controls.retain(|c| {
+            let key = if c.action == ShowAction::SongOfProgram { (c.action, c.device) } else { (c.action, None) };
+            let first = !seen.contains(&key);
+            seen.push(key);
+            first
+        });
+        let mut programs = 0;
+        self.controls.retain(|c| {
+            programs += usize::from(c.action == ShowAction::SongOfProgram);
+            programs <= MAX_PROGRAM_DEVICES || c.action != ShowAction::SongOfProgram
+        });
     }
 
     /// Plain-language integrity check run by `Session::validate`.
@@ -759,36 +810,71 @@ mod tests {
     }
 
     /// #208: each device chosen for it becomes a control that takes every
-    /// program change from that device; the foot switches keep their slots.
+    /// program change from that device, after the learned actions.
     #[test]
     fn devices_chosen_for_program_changes_become_song_select_controls_and_are_saved() {
         let mut sl = sample_setlist();
-        sl.prev_cc = Some(FootSwitch { cc: 81, channel: None });
+        sl.learn(ShowAction::PrevPart, Some(2), ShowMsg::Cc(81));
         sl.set_program_selects_song(4, true);
         sl.set_program_selects_song(1, true);
         sl.set_program_selects_song(4, true);
-        assert_eq!(sl.program_devices, [1, 4]);
+        assert_eq!(sl.program_devices().collect::<Vec<_>>(), [1, 4]);
         let song_select = |d| Some(ShowControl { device: Some(d), channel: None, msg: ShowMsg::AnyProgram, action: ShowAction::SongOfProgram });
         let t = sl.show_controls();
-        assert_eq!(t[0], None, "no next switch");
-        assert!(t[1].is_some_and(|c| c.msg == ShowMsg::Cc(81)));
-        assert_eq!(t[2..5], [song_select(1), song_select(4), None]);
+        assert!(t[0].is_some_and(|c| c.msg == ShowMsg::Cc(81) && c.action == ShowAction::PrevPart));
+        assert_eq!(t[1..4], [song_select(1), song_select(4), None]);
 
         let text = serde_json::to_string(&sl).unwrap();
-        assert!(text.contains(r#""program_devices":[1,4]"#), "{text}");
+        assert!(text.contains(r#"{"device":1,"msg":"any_program","action":"song_of_program"}"#), "{text}");
         assert_eq!(serde_json::from_str::<Setlist>(&text).unwrap(), sl);
         sl.set_program_selects_song(1, false);
         sl.set_program_selects_song(4, false);
-        assert!(!serde_json::to_string(&sl).unwrap().contains("program_devices"), "nothing chosen, nothing saved");
-        let only = Setlist { program_devices: vec![0], ..Setlist::default() };
+        sl.forget(ShowAction::PrevPart);
+        assert!(!serde_json::to_string(&sl).unwrap().contains("show_controls"), "nothing chosen, nothing saved");
+        let mut only = Setlist::default();
+        only.set_program_selects_song(0, true);
         assert!(!only.is_empty(), "a setlist that only chose a device is saved");
 
+        for action in ShowAction::LEARNED {
+            sl.learn(action, None, ShowMsg::Note(action as u8));
+        }
         for d in 0..16 {
             sl.set_program_selects_song(d, true);
         }
-        assert_eq!(sl.program_devices.len(), MAX_PROGRAM_DEVICES, "no more devices than the table has slots");
+        assert_eq!(sl.program_devices().count(), MAX_PROGRAM_DEVICES, "no more devices than the table has slots");
         let t = sl.show_controls();
-        assert!(sl.program_devices.iter().all(|&d| t.contains(&song_select(d))), "every device that shows On selects songs");
+        assert!(sl.program_devices().all(|d| t.contains(&song_select(d))), "every device that shows On selects songs");
+        assert!(ShowAction::LEARNED.iter().all(|&a| t.iter().flatten().any(|c| c.action == a)), "and every action keeps its control");
+    }
+
+    /// #277: one control per action; learning a message another action had
+    /// moves it, so one press never does two things.
+    #[test]
+    fn a_learned_message_belongs_to_one_action() {
+        let mut sl = Setlist::default();
+        assert_eq!(sl.learn(ShowAction::NextPart, Some(1), ShowMsg::Cc(80)), None);
+        assert_eq!(sl.learn(ShowAction::NextPart, Some(1), ShowMsg::Note(36)), None, "a relearn replaces the action's control");
+        assert_eq!(sl.control_of(ShowAction::NextPart).map(|c| c.msg), Some(ShowMsg::Note(36)));
+        assert_eq!(sl.learn(ShowAction::Panic, None, ShowMsg::Note(36)), Some(ShowAction::NextPart));
+        assert_eq!(sl.control_of(ShowAction::NextPart), None);
+        sl.learn(ShowAction::Record, Some(2), ShowMsg::Note(37));
+        assert_eq!(sl.learn(ShowAction::Tuner, Some(3), ShowMsg::Note(37)), None, "the same note on another device is another control");
+        assert_eq!(sl.controls.len(), 3);
+        assert_eq!(sl.show_controls().iter().flatten().map(|c| c.action).collect::<Vec<_>>(), [ShowAction::Panic, ShowAction::Tuner, ShowAction::Record]);
+    }
+
+    /// A session saved before #277 kept two foot switches and a program_devices
+    /// list (#208) beside the controls.
+    #[test]
+    fn a_session_with_the_old_foot_switches_loads_them_as_controls() {
+        let mut sl: Setlist = serde_json::from_str(r#"{"next_cc":{"cc":80},"prev_cc":{"cc":209,"channel":3},"program_devices":[2,1,2]}"#).unwrap();
+        assert!(!sl.is_empty());
+        sl.normalize();
+        assert_eq!(sl.control_of(ShowAction::NextPart), Some(ShowControl { device: None, channel: None, msg: ShowMsg::Cc(80), action: ShowAction::NextPart }));
+        assert_eq!(sl.control_of(ShowAction::PrevPart), Some(ShowControl { device: None, channel: Some(3), msg: ShowMsg::Cc(81), action: ShowAction::PrevPart }));
+        assert_eq!(sl.program_devices().collect::<Vec<_>>(), [1, 2]);
+        let text = serde_json::to_string(&sl).unwrap();
+        assert!(!text.contains("next_cc") && !text.contains("program_devices") && text.contains(r#""msg":{"cc":80}"#) && text.contains(r#""action":"song_of_program""#), "{text}");
     }
 
     #[test]

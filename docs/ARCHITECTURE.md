@@ -244,6 +244,27 @@ agents are in [AGENTS.md](../AGENTS.md).
   model. `llm.rs` is the one client and the route per role (decide, act).
   The agent takes text only: there is no image input.
 - `session.rs` — sessions (multi-rig), templates.
+- `crash.rs` — crash reports (#279): a fatal signal or a panic writes
+  `crash-<local time>-<pid>.txt` into `~/.local/state/kabelsalat/crashes`
+  (version, cause, thread, the plugin bundles mapped, the last engine
+  commands, `module+offset` frames; a panic adds its scrubbed backtrace).
+  The signal handler allocates nothing and takes no lock: folder, version and
+  clock are prepared by `install`, `CommandBus::send` notes each command's
+  variant name into a ring of atomics, plugins and frames come from
+  `/proc/self/maps` by file name only, and the buffers are statics claimed
+  with one atomic swap. Panic text loses every path but source files.
+- `watchdog.rs` — `kabelsalat` (app mode) runs the app as its child and
+  starts it again after a crash (a signal other than INT/TERM/HUP, or exit
+  101), with `KABELSALAT_RECOVER` and the report. The app keeps a `Marker`
+  (`recover.json` beside the crash folder: the saved session its rack is in
+  and the setlist position, rewritten when either changes); a restarted app
+  opens that session and selects that part (`ui/recovery.rs`), and shows a
+  note with the report folder and a prefilled GitHub issue. A child that
+  crashed before it wrote the marker starts fresh; five crashes in a minute
+  end the watch; `KABELSALAT_WATCHDOG=0` runs without one.
+  `watchdog/selftest.rs` is `kabelsalat crash-test`: the binary headless
+  (`app --headless`, `ui/headless.rs`) in a scratch home, killed with
+  SIGSEGV, a panic and a segfault.
 
 ## 0. Decision log
 
@@ -818,7 +839,7 @@ Estimates: playable host ≈ 3–4 weeks · AUM-core ≈ 6 weeks · full ≈ 3 m
 | Plugin GUIs X11/XWayland quirks | own-window model first; verify in P0 |
 | RT violations on graph changes | off-thread RenderPlan + block-boundary swap; allocator guard; soak test |
 | Animation costs UI frame time | tessellation caps, LOD, snapshot-driven; never on audio thread |
-| In-process plugin crash | autosave; out-of-process later |
+| In-process plugin crash | crash report + watchdog restart on the same session and setlist part (#279); out-of-process later |
 | ARM plugin ecosystem thinner | verified list §4; CLAP-first; no emulation |
 | System-audio feedback loop (capturing our own output) | per-app capture that never includes our own stream (done, #27) |
 | Plugin embedding quirks (resize, focus, HiDPI under XWayland) | CLAP resize negotiation; per-plugin fallback flag; XWayland scaling config; P0 proof with Surge |

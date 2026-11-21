@@ -438,6 +438,16 @@ plan is not lost. Settings → Audio → **Keep the last** sets how far back (1 
 10 minutes, or off); machines with under 3 GB of memory start with it off.
 The assistant and MCP agents save it with `record_save_last`.
 
+### Get back on stage after a crash
+If kabelsalat crashes, it starts again by itself and reopens the session and
+the setlist part you were on, so the next song is seconds away. It writes a crash report to
+`~/.local/state/kabelsalat/crashes/` (under `$XDG_STATE_HOME` when that is
+set): the version, what went wrong, the
+plugins loaded and the last engine commands, and no folder or file names of
+yours. Nothing is sent anywhere; the restarted app offers to open the folder
+or a GitHub issue with the report filled in, which you send yourself. Set
+`KABELSALAT_WATCHDOG=0` to run without the restart.
+
 ### Play along with a backing track
 Ask the assistant (or an MCP agent) to play a WAV file and it mixes into the
 master like AUM's FilePlayer: **loop** restarts it seamlessly, **sync** plays it

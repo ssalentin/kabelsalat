@@ -3476,6 +3476,8 @@ struct DemoApp {
     /// writes there (`AUTOSAVE_NAME` while None).
     open_session: Option<String>,
     autosave: Autosave,
+    /// The watchdog's marker and the note after a crash (#279).
+    recovery: recovery::Recovery,
     session_msg: String,
     confirm_session: Option<SessionConfirm>,
     /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
@@ -4214,6 +4216,7 @@ impl DemoApp {
                 due: AUTOSAVE_SETTLE,
                 saved: None,
             },
+            recovery: Default::default(),
             session_msg: String::new(),
             confirm_session: None,
             patch_notice: None,
@@ -17657,6 +17660,7 @@ impl DemoApp {
     fn autosave_rebase(&mut self) {
         self.autosave.saved = None;
         self.autosave.due = AUTOSAVE_SETTLE;
+        self.recovery.autosaved = None;
     }
 
     fn autosave_target(&self) -> String {
@@ -17689,6 +17693,7 @@ impl DemoApp {
                     Ok(()) => {
                         self.session_msg = format!("Autosaved '{name}'");
                         self.autosave.saved = Some(s);
+                        self.recovery.autosaved = Some(name);
                     }
                     Err(e) => self.session_msg = format!("Autosave failed: {e}"),
                 }
@@ -25521,6 +25526,7 @@ impl DemoApp {
         if (self.engine_info_open && self.engine_info_rect.contains(s))
             || (self.session_popover_open && self.session_popover_rect.contains(s))
             || (self.nav_rig_menu.is_some() && self.nav_rig_menu_rect.contains(s))
+            || self.crash_notice_covers(s)
             || (self.stage_view == StageView::Rack && self.side == Side::Back && self.back_controls_rect.contains(s))
         {
             self.hover = Some(Hit::Background);
@@ -32325,6 +32331,8 @@ impl DemoApp {
         // After every view and dialog of the frame, so their setlist edits
         // reach the engine before the next foot-switch press can.
         self.publish_show();
+        self.crash_notice(&ctx);
+        self.track_recovery();
 
         // Full frame rate while focused (the cables are the show) or while an
         // animation / agent run is active; ~30 fps when unfocused and idle.
@@ -33806,6 +33814,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app
                 }
             };
+            let mut app = app;
+            app.start_recovery();
             Ok(Box::new(app))
         }),
     )
@@ -46398,6 +46408,9 @@ mod voice_host_tests {
 
 mod bench;
 pub use bench::run as run_ui_bench;
+mod headless;
+pub use headless::run as run_headless;
+mod recovery;
 #[cfg(test)]
 mod hw_ports_tests;
 

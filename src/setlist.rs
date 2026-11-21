@@ -100,6 +100,27 @@ impl PartRig {
         }
         Ok(())
     }
+
+    /// [`PartRig::set_layer`] from a tool's part-rig entry (`vel_lo`,
+    /// `vel_hi`, `vel_curve`, `float`). A value of the wrong type is refused,
+    /// never defaulted (rule 77).
+    pub fn set_layer_json(&mut self, r: &serde_json::Value) -> Result<(), String> {
+        use serde_json::Value;
+        let num = |k: &str| -> Result<Option<u64>, String> {
+            match r.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v.as_u64()
+                    .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| f as u64))
+                    .map(Some)
+                    .ok_or_else(|| format!("{k} must be a whole number, got {v}")),
+            }
+        };
+        let curve = match r.get("vel_curve") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_str().ok_or_else(|| format!("vel_curve must be 'linear', 'soft' or 'hard', got {v}"))?),
+        };
+        self.set_layer(num("vel_lo")?, num("vel_hi")?, curve, num("float")?)
+    }
 }
 
 /// One musical section of a [`Song`] (e.g. Verse, Chorus, Solo).
@@ -519,6 +540,9 @@ impl Setlist {
                     pr.key_lo = lo.min(hi);
                     pr.key_hi = lo.max(hi);
                     pr.transpose = pr.transpose.clamp(-48, 48);
+                    let (vlo, vhi) = (pr.vel_lo.min(127), pr.vel_hi.min(127));
+                    (pr.vel_lo, pr.vel_hi) = (vlo.min(vhi), vlo.max(vhi));
+                    pr.float = pr.float.min(FLOAT_MAX);
                     if !pr.level.is_finite() {
                         pr.level = 1.0;
                     } else {
@@ -765,6 +789,18 @@ mod tests {
         assert_eq!((z.vel_lo, z.vel_hi, z.curve, z.float), (20, 100, VelCurve::Soft, FLOAT_MAX));
         let back: PartRig = serde_json::from_str(&serde_json::to_string(&pad).unwrap()).unwrap();
         assert_eq!(back, pad, "the layer is saved with the session");
+        let mut tool = PartRig::new(0);
+        tool.set_layer_json(&serde_json::json!({"vel_lo": 60.0, "vel_curve": "hard", "float": 3})).unwrap();
+        assert_eq!((tool.vel_lo, tool.curve, tool.float), (60, VelCurve::Hard, 3), "a whole float is a number");
+        for bad in [serde_json::json!({"vel_lo": "60"}), serde_json::json!({"vel_hi": 0.5}), serde_json::json!({"float": -2}), serde_json::json!({"vel_curve": 1})] {
+            assert!(PartRig::new(0).set_layer_json(&bad).is_err(), "{bad} is refused, never defaulted");
+        }
+        let mut sl = sample_setlist();
+        let pr = &mut sl.songs[0].parts[0].rigs[0];
+        (pr.vel_lo, pr.vel_hi, pr.float) = (100, 40, 30);
+        sl.normalize();
+        let pr = sl.songs[0].parts[0].rigs[0];
+        assert_eq!((pr.vel_lo, pr.vel_hi, pr.float), (40, 100, FLOAT_MAX), "a hand-edited session loads ordered and capped");
         let old: PartRig = serde_json::from_str(r#"{"rig":0,"key_lo":0,"key_hi":59,"transpose":0,"level":0.9}"#).unwrap();
         assert_eq!(old.to_zone(), RigZone { key_hi: 59, ..RigZone::OPEN }, "a part saved before #276 plays every velocity, with a fixed split");
     }

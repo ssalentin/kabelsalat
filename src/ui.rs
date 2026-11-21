@@ -8314,8 +8314,7 @@ impl DemoApp {
                             .map(|v| (v as f32).clamp(0.0, 1.0))
                             .unwrap_or_else(|| self.rig_mix[rig].vol);
                         let mut pr = PartRig { rig: rig as u8, key_lo: key_lo.min(key_hi), key_hi: key_lo.max(key_hi), transpose, level, ..PartRig::default() };
-                        let num = |k: &str| r.get(k).and_then(|v| v.as_u64());
-                        pr.set_layer(num("vel_lo"), num("vel_hi"), r.get("vel_curve").and_then(|v| v.as_str()), num("float"))?;
+                        pr.set_layer_json(r)?;
                         part.set_rig(pr);
                     }
                 }

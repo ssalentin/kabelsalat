@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::layer::{VelCurve, ZoneHands};
+use crate::layer::{Hands, VelCurve};
 use crate::matrix::SourceId;
 
 pub type NodeId = u32;
@@ -1045,7 +1045,7 @@ impl RigZone {
 
     /// Does a note-on of `played`, struck at `velocity`, start a note in
     /// this rig, with the hands where `hands` last saw them?
-    pub fn starts(&self, played: u8, velocity: u8, hands: &ZoneHands) -> bool {
+    pub fn starts(&self, played: u8, velocity: u8, hands: &Hands) -> bool {
         self.live && (self.vel_lo..=self.vel_hi).contains(&velocity) && hands.inside(self, played)
     }
 }

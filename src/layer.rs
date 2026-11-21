@@ -2,7 +2,7 @@
 //! part's rig takes besides its key range. A rig plays only note-ons struck
 //! inside its velocity range, through its velocity curve, and the edges of
 //! its key range follow the hands by up to `float` keys. Pure and fixed-size:
-//! the engine keeps one [`ZoneHands`] per rig and calls these on the audio
+//! the engine keeps one [`Hands`] for all rigs and calls these on the audio
 //! thread. Releases are never gated here, so nothing a layer started can hang.
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,9 @@ use crate::control::RigZone;
 
 /// The most keys an edge of a key range floats: an octave.
 pub const FLOAT_MAX: u8 = 12;
+
+/// Floating edges [`Hands`] holds: both edges of every rig zone.
+const MAX_EDGES: usize = 16;
 
 /// How a rig turns the velocity a key was struck with into the velocity it
 /// plays: `Soft` lifts quiet playing, `Hard` asks for a firmer touch.
@@ -107,32 +110,58 @@ impl Edge {
     }
 }
 
-/// The hands around both edges of one rig's key range.
+/// One floating edge: its lowest upper key, how far it floats, and where
+/// the hands last played around it. `float` 0 marks a free slot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ZoneHands {
-    lo: Edge,
-    hi: Edge,
+struct FloatEdge {
+    at: u8,
+    float: u8,
+    hands: Edge,
 }
 
-impl ZoneHands {
+/// Where the hands last played around every floating edge of the rig zones.
+/// Rigs that split at the same key with the same float share one edge, so a
+/// key near it plays on exactly one of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Hands {
+    edges: [FloatEdge; MAX_EDGES],
+}
+
+/// The edges of a zone's key range that exist, by their lowest upper key.
+fn edges_of(zone: &RigZone) -> impl Iterator<Item = u8> {
+    [(zone.key_lo > 0).then_some(zone.key_lo), (zone.key_hi < 127).then(|| zone.key_hi + 1)].into_iter().flatten()
+}
+
+impl Hands {
+    fn edge(&self, at: u8, float: u8) -> Edge {
+        self.edges.iter().find(|e| e.float == float && e.at == at).map_or(Edge::default(), |e| e.hands)
+    }
+
     /// Is a note-on of `played` inside the zone's key range, with its edges
     /// floated toward the hands?
     pub fn inside(&self, zone: &RigZone, played: u8) -> bool {
-        let lo = zone.key_lo == 0 || self.lo.above(zone.key_lo, zone.float, played);
-        let hi = zone.key_hi >= 127 || !self.hi.above(zone.key_hi + 1, zone.float, played);
+        let f = zone.float;
+        let lo = zone.key_lo == 0 || self.edge(zone.key_lo, f).above(zone.key_lo, f, played);
+        let hi = zone.key_hi >= 127 || !self.edge(zone.key_hi + 1, f).above(zone.key_hi + 1, f, played);
         lo && hi
     }
 
-    /// A note-on of `played` was struck (on any rig): move the hands.
+    /// A note-on of `played` reached a rig of `zone`: move the hands around
+    /// its edges. A second rig with the same edge moves it again to the same
+    /// place (the hand that took the note is then on it).
     pub fn play(&mut self, zone: &RigZone, played: u8) {
-        if zone.float == 0 {
+        let f = zone.float;
+        if f == 0 {
             return;
         }
-        if zone.key_lo > 0 {
-            self.lo.play(zone.key_lo, zone.float, played);
-        }
-        if zone.key_hi < 127 {
-            self.hi.play(zone.key_hi + 1, zone.float, played);
+        for at in edges_of(zone) {
+            let slot = self.edges.iter().position(|e| e.float == f && e.at == at)
+                .or_else(|| self.edges.iter().position(|e| e.float == 0));
+            if let Some(i) = slot {
+                let e = &mut self.edges[i];
+                (e.at, e.float) = (at, f);
+                e.hands.play(at, f, played);
+            }
         }
     }
 }
@@ -149,15 +178,15 @@ mod tests {
     /// Play `notes` one by one through both sides; which side took each.
     fn run(float: u8, notes: &[u8]) -> Vec<char> {
         let (low, high) = split(float);
-        let (mut hl, mut hh) = (ZoneHands::default(), ZoneHands::default());
+        let mut hands = Hands::default();
         notes.iter().map(|&n| {
-            let side = match (hl.inside(&low, n), hh.inside(&high, n)) {
+            let side = match (hands.inside(&low, n), hands.inside(&high, n)) {
                 (true, false) => 'L',
                 (false, true) => 'H',
                 both => panic!("note {n} went to {both:?}: a split must give each note one side"),
             };
-            hl.play(&low, n);
-            hh.play(&high, n);
+            hands.play(&low, n);
+            hands.play(&high, n);
             side
         }).collect()
     }
@@ -189,12 +218,28 @@ mod tests {
     #[test]
     fn an_open_edge_never_floats() {
         let open = RigZone { float: 4, ..RigZone::OPEN };
-        let mut h = ZoneHands::default();
+        let mut h = Hands::default();
         for n in [0, 3, 60, 124, 127] {
             assert!(h.inside(&open, n));
             h.play(&open, n);
         }
-        assert_eq!(h, ZoneHands::default(), "a range open at both ends has no edge to move");
+        assert_eq!(h, Hands::default(), "a range open at both ends has no edge to move");
+    }
+
+    #[test]
+    fn a_rig_that_hears_only_one_side_still_shares_the_edge() {
+        // Only the low rig hears the run (the high rig's cable is out), then
+        // both hear again: they still agree which side each key is on.
+        let (low, high) = split(4);
+        let mut hands = Hands::default();
+        for n in [57, 59, 61] {
+            hands.play(&low, n);
+        }
+        for n in [62, 60, 58, 63, 64] {
+            assert_ne!(hands.inside(&low, n), hands.inside(&high, n), "{n} plays on exactly one side");
+            hands.play(&low, n);
+            hands.play(&high, n);
+        }
     }
 
     #[test]

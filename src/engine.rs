@@ -22,7 +22,7 @@ use crate::control::{
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
-use crate::layer::ZoneHands;
+use crate::layer::Hands;
 use crate::matrix::{CcMapping, CcTarget, Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::meter::{MasterMeter, MasterTarget, MeterSnapshot};
@@ -905,11 +905,6 @@ fn zone_of(zones: &[RigZone; 8], graph: &Graph, node: NodeId) -> RigZone {
     graph.node(node).and_then(|n| zones.get(n.rig as usize)).copied().unwrap_or(RigZone::OPEN)
 }
 
-/// The hands around the zone of the rig `node` belongs to (#276), like `zone_of`.
-fn hands_of(hands: &[ZoneHands; 8], graph: &Graph, node: NodeId) -> ZoneHands {
-    graph.node(node).and_then(|n| hands.get(n.rig as usize)).copied().unwrap_or_default()
-}
-
 /// Does `m` return a control to rest? Such a message always reaches a rig
 /// that is not live (#204), so leaving a song never leaves a pedal down, a
 /// note bent or a key pressed: note-off, sustain/sostenuto/soft pedal up,
@@ -1492,9 +1487,9 @@ pub struct GraphEngine {
     show_gates: show_gates::ShowGates,
     /// Show controls and the setlist parts they step through (#261).
     show: crate::show::Show,
-    /// Where the hands last played around each rig zone's key-range edges,
-    /// so a floating split follows them (#276). Moved once per live note-on.
-    zone_hands: [ZoneHands; 8],
+    /// Where the hands last played around the zones' floating edges (#276),
+    /// moved by every live note-on a rig with such an edge hears.
+    zone_hands: Hands,
     /// Per-node strip state (SetStripMix/SetStripBypass): pan/mute/solo on
     /// sources, bypass on FX nodes. Capacity is fixed (MAX_STRIP_MIXES): a
     /// node past it keeps playing at unity. Linear scans, like the rest.
@@ -1732,7 +1727,7 @@ impl GraphEngine {
             rig_zones: [RigZone::OPEN; 8],
             show_gates: show_gates::ShowGates::new(),
             show: crate::show::Show::default(),
-            zone_hands: [ZoneHands::default(); 8],
+            zone_hands: Hands::default(),
             strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
             latency_dirty: false,
@@ -3447,9 +3442,9 @@ impl GraphEngine {
     /// Every rig's zone (SetRigZones, #204). A live zone replaces the rig's,
     /// after releasing the rig when its transpose moves (the release would
     /// take the new pitch, rule 41); one that is not live keeps the range and
-    /// transpose, so what still sounds is released where it started. A zone
-    /// that changes starts its floating split from home (#276); velocity
-    /// and float gate only note-ons, so they need no release.
+    /// transpose, so what still sounds is released where it started. Any
+    /// change starts every floating split from home (#276); velocity and
+    /// float gate only note-ons, so they need no release.
     /// Allocation-free: index loops over the graph.
     fn set_rig_zones(&mut self, zones: [RigZone; 8]) {
         let before = self.rig_zones;
@@ -3468,12 +3463,11 @@ impl GraphEngine {
                     }
                 }
             }
-            if z != self.rig_zones[rig] {
-                self.zone_hands[rig] = ZoneHands::default();
-            }
             self.rig_zones[rig] = z;
         }
         if self.rig_zones != before {
+            // A new part's floating edges start from home.
+            self.zone_hands = Hands::default();
             self.mix_dirty = true;
         }
     }
@@ -3723,6 +3717,17 @@ impl GraphEngine {
         self.keys_route_in_rig(None, dest, played).is_some()
     }
 
+    /// Does a key played on `source` reach `dest`, whatever its rig's zone
+    /// says? Its Keys cable carries the key and the unit takes that source,
+    /// as `deliver_keys_note` decides it.
+    fn hears(&self, dest: NodeId, source: SourceId, played: u8) -> bool {
+        self.keys_gate(dest, played)
+            && match self.voices.iter().find(|s| s.node == dest) {
+                Some(s) => source_accepted(s, source),
+                None => !self.is_midi_fx(dest) || self.fx_accepts(dest, source),
+            }
+    }
+
     /// What a played note picks up on its way from a Keys node to `dest`:
     /// that zone's octave shift, and the Keys node's scale snap (issue #90).
     /// Note-on and note-off take the same answer — the snap is a pure
@@ -3772,11 +3777,8 @@ impl GraphEngine {
         // (floated toward the hands) and velocity range (#276), and its
         // transpose comes last, so the note-off finds the same pitch.
         // A note-off is never gated.
-        let (zone, hands) = match rig {
-            None => (zone_of(&self.rig_zones, &self.graph, dest), hands_of(&self.zone_hands, &self.graph, dest)),
-            Some(_) => (RigZone::OPEN, ZoneHands::default()),
-        };
-        if on && !zone.starts(played, m.velocity(), &hands) {
+        let zone = if rig.is_none() { zone_of(&self.rig_zones, &self.graph, dest) } else { RigZone::OPEN };
+        if on && !zone.starts(played, m.velocity(), &self.zone_hands) {
             return;
         }
         let (m, vel) = if on {
@@ -4404,7 +4406,7 @@ impl GraphEngine {
                 self.master_mute = false;
                 self.rig_zones = [RigZone::OPEN; 8];
                 self.show_gates.reset();
-                self.zone_hands = [ZoneHands::default(); 8];
+                self.zone_hands = Hands::default();
                 self.strips.clear();
                 self.sends.clear();
                 self.bus_outs.clear();
@@ -4489,15 +4491,23 @@ impl GraphEngine {
             Command::NoteOn { note, velocity, source, channel } => {
                 let msg = MidiMsg::note_on(channel & 0x0F, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                 self.matrix.route_into(source, msg, &mut self.route_out);
+                let mut heard = 0u8;
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
+                    if let Some(rig) = self.graph.node(dest).map(|n| n.rig).filter(|&r| r < 8) {
+                        if self.hears(dest, source, note) {
+                            heard |= 1 << rig;
+                        }
+                    }
                     self.deliver_keys_note(dest, note, m, velocity as f64, Some(source), None);
                 }
-                // Every rig's hands move with the key, whichever rig took it,
-                // so two rigs that share a split edge agree where it sits.
+                // The edges of every rig the key reaches move, whichever rig
+                // took it; a keyboard no rig of an edge hears moves nothing.
                 if msg.is_note_on() {
-                    for (hands, zone) in self.zone_hands.iter_mut().zip(&self.rig_zones) {
-                        hands.play(zone, note);
+                    for (rig, zone) in self.rig_zones.iter().enumerate() {
+                        if heard & (1 << rig) != 0 {
+                            self.zone_hands.play(zone, note);
+                        }
                     }
                 }
             }
@@ -8276,6 +8286,64 @@ mod tests {
         for (n, rig) in [(59, bass), (60, keys), (61, keys)] {
             assert_eq!(tap(&mut e, &mut bus, n), vec![(rig, n, true)]);
         }
+    }
+
+    #[test]
+    fn a_key_near_a_floating_split_plays_on_exactly_one_rig_after_a_part_edit_or_a_rig_that_did_not_hear() {
+        use crate::control::RigZone;
+        use crate::layer::VelCurve;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let (bass, keys) = (synth_of(&e, 0), synth_of(&e, 1));
+        let low = RigZone { key_hi: 59, float: 3, ..RigZone::OPEN };
+        let high = RigZone { key_lo: 60, float: 3, ..RigZone::OPEN };
+        let tap = |e: &mut super::GraphEngine, bus: &mut crate::control::CommandBus, cmd: Command, note: u8| {
+            let started = play(e, bus, cmd);
+            play(e, bus, off(note));
+            started
+        };
+        let one = |started: Vec<(u32, u8, bool)>, n: u8| {
+            assert!(started == vec![(bass, n, true)] || started == vec![(keys, n, true)], "{n} must play on exactly one rig: {started:?}");
+        };
+        // A part edit that touches only the high rig (its curve).
+        play(&mut e, &mut bus, zones(low, high));
+        tap(&mut e, &mut bus, on(59), 59);
+        play(&mut e, &mut bus, zones(low, RigZone { curve: VelCurve::Hard, ..high }));
+        one(tap(&mut e, &mut bus, on(60), 60), 60);
+        play(&mut e, &mut bus, zones(low, high));
+        tap(&mut e, &mut bus, on(60), 60);
+        play(&mut e, &mut bus, zones(low, RigZone { curve: VelCurve::Soft, ..high }));
+        one(tap(&mut e, &mut bus, on(59), 59), 59);
+        // The high rig stops hearing the keys while the left hand climbs,
+        // then hears them again: both rigs still agree on the edge.
+        let keys_to = |dest: u32, enabled: bool| Command::MatrixRule {
+            source: SourceId::Keys, dest, channel: None, transpose: 0, key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled,
+        };
+        play(&mut e, &mut bus, zones(low, high));
+        play(&mut e, &mut bus, keys_to(keys, false));
+        for n in [57, 59, 61] {
+            tap(&mut e, &mut bus, on(n), n);
+        }
+        play(&mut e, &mut bus, keys_to(keys, true));
+        for n in [62, 60, 58, 64, 61] {
+            one(tap(&mut e, &mut bus, on(n), n), n);
+        }
+    }
+
+    #[test]
+    fn a_keyboard_no_rig_of_a_floating_split_hears_does_not_move_it() {
+        use crate::control::RigZone;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let (bass, keys) = (synth_of(&e, 0), synth_of(&e, 1));
+        play(&mut e, &mut bus, zones(RigZone { key_hi: 59, float: 4, ..RigZone::OPEN }, RigZone { key_lo: 60, float: 4, ..RigZone::OPEN }));
+        let lead = SourceId::Hardware(1);
+        for dest in [bass, keys] {
+            play(&mut e, &mut bus, Command::MatrixRule {
+                source: lead, dest, channel: None, transpose: 0, key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: false,
+            });
+        }
+        assert!(play(&mut e, &mut bus, Command::NoteOn { note: 60, velocity: 0.8, source: lead, channel: 0 }).is_empty(), "the lead keyboard plays neither rig");
+        play(&mut e, &mut bus, Command::NoteOff { note: 60, source: lead, channel: 0 });
+        assert_eq!(play(&mut e, &mut bus, on(59)), vec![(bass, 59, true)], "the split keyboard's 59 stays on the bass");
     }
 
     #[test]

@@ -228,6 +228,9 @@ and never passed off as tested.**
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `send-test`, `cc-map-test`,
   `levels-test [--save <dir>]` (a show-level vocal rig and reverb bus through
   ten song switches, no gap in the rendered file; no plugins),
+  `setlist-switch-test` (part and song switches under a held chord with real
+  Surge XT: no gap or click, tails ring on, first new note's onset against
+  the 50 ms budget at three block sizes; app path and foot switch),
   `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
   temporary null sinks, so nothing is heard),
   `state-race-test [seconds] [patch.fxp...]`,
@@ -1719,3 +1722,16 @@ Learned so far (2026-11-15, UI polish pass):
     the report is written, then sets `SIG_DFL` and re-raises, and it unwinds
     only where `_dl_find_object` exists. Check a change there with
     `kabelsalat crash-test` (#279).
+202. **A gain a switch moves under a held sound ramps, for a fixed time:** rig
+    faders and an instrument's LEVEL were applied once per block at their new
+    value, so a part that recalls them stepped a held chord's gain in one
+    sample (second difference 0.033 against 0.00014 for the sine itself,
+    #274). Both go through `gain_ramp::GainRamp` (5 ms whatever the block
+    size; a fader pulled to 0, a mute or another rig's solo fades out too,
+    and the rig keeps summing until it is silent, or while a pre-fader send
+    needs it). Find a click by the second difference of a held sine, not by
+    the largest sample step: a saw's own edges hide a step of the same size.
+    Read a level 5 ms after a gain change (rule 133), and a level after a
+    pre-effect gain once the effect's echoes of the old level have faded
+    (`a_rig_fader_a_part_recalls_under_a_held_note_moves_without_a_click`,
+    `a_muted_rig_fades_out_and_back_in`).

@@ -30,6 +30,12 @@ agents are in [AGENTS.md](../AGENTS.md).
   `SetRigZones` + `ClearShowGates` + `SetBusLive` (closed buses take no new
   signal, fading over one block) + `SetBindingLive` (pinned bindings); the app,
   headless MCP and `levels-test` all send that same list.
+  `setlist-switch-test` (#274, `src/engine/setlist_switch_test.rs`) renders
+  part and song switches under a held chord with real Surge XT voices, by the
+  app's list and by the foot switch, and measures the held chord, the tails
+  and the first new note's onset at three block sizes. Nothing loads on a
+  switch, so the first note waits only for the next block: one device buffer
+  plus the instrument's own onset (Surge's saw: 0 to 1 ms).
 - `show.rs` — show controls (#261): `ShowControl` (a MIDI message from a
   device, consumed by a `ShowAction`) in one fixed table the engine checks
   before the matrix, so a foot switch's CC never reaches an instrument. The
@@ -66,7 +72,11 @@ agents are in [AGENTS.md](../AGENTS.md).
   `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`
   all show.
 - `engine.rs` — `GraphEngine`: voices → DSP → LV2 → per-rig mix → master
-  limiter → master saturation. Sums every MasterOut (one per rig). Publishes
+  limiter → master saturation. Sums every MasterOut (one per rig). Rig
+  faders and each voice's LEVEL move through `gain_ramp::GainRamp` (#274):
+  5 ms to a new value whatever the block size, and a rig that goes quiet
+  (fader at 0, mute, another rig's solo) fades out before it stops summing,
+  so a part's recalled levels do not click a held note. Publishes
   `GraphPub` (graph, rules, mix, voice binding) and edge levels to the UI; the
   render path is allocation- and lock-free, structural ops apply at block
   boundaries. One voice per Clap node, any number: the engine binds voices

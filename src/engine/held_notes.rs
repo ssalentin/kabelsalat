@@ -42,6 +42,12 @@
 //! velocity layers, velocity curves and a floating split, whose hands
 //! (where each rig last saw a note-on) are part of the state.
 //!
+//! The pedal scenario (#274) switches songs both ways the app does, with
+//! the whole command list of a `Setlist`'s gates and with its foot switches
+//! stepping in the engine, while the sustain pedal goes down and up: a note
+//! released under the pedal keeps sounding until the pedal comes up at its
+//! instrument. When the last key and the pedal are up, nothing sounds.
+//!
 //! Run + interpret: `.claude/skills/verify-held-notes/SKILL.md`.
 
 use super::GraphEngine;
@@ -49,6 +55,7 @@ use crate::arp::{Scale, ScaleChoice};
 use crate::control::{command_bus, name_bytes, Command, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef, RigZone};
 use crate::layer::VelCurve;
 use crate::matrix::SourceId;
+use crate::setlist::{Part, PartRig, Setlist, Song};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
@@ -95,6 +102,10 @@ enum Step {
     Edit(Edit),
     /// Time passes: every arp steps through a window that holds its next onset.
     Tick,
+    /// The sustain pedal (CC 64 from the hardware keyboard) goes down or up.
+    Pedal(bool),
+    /// A setlist switch to `setlist_switch(n)`.
+    Song(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +174,7 @@ enum Scenario {
     Layers,
     Bypass,
     FootSwitch,
+    Pedal,
 }
 
 /// C# major pentatonic: B (59) snaps down to A#, C (60) up to C#. Two keys
@@ -536,8 +548,57 @@ fn start_graph_for(scn: Scenario) -> Graph {
     match scn {
         Scenario::RoutingWithStrip | Scenario::Fx | Scenario::Bypass => start_graph_with_strip(),
         Scenario::Routing | Scenario::Arp | Scenario::Demo => start_graph(),
-        Scenario::Zones | Scenario::FootSwitch | Scenario::Layers => start_graph_two_rigs(),
+        Scenario::Zones | Scenario::FootSwitch | Scenario::Layers | Scenario::Pedal => start_graph_two_rigs(),
     }
+}
+
+/// The pedal scenario's setlist: both rigs; A; B; A below 60 and B from 60
+/// up, +12; A +2. The foot switches are `NEXT_CC` and `PREV_CC`.
+fn pedal_setlist() -> Setlist {
+    let songs = [
+        vec![PartRig::new(0), PartRig::new(1)],
+        vec![PartRig::new(0)],
+        vec![PartRig::new(1)],
+        vec![PartRig { key_hi: 59, ..PartRig::new(0) }, PartRig { key_lo: 60, transpose: 12, ..PartRig::new(1) }],
+        vec![PartRig { transpose: 2, ..PartRig::new(0) }],
+    ];
+    let mut sl = Setlist::default();
+    sl.songs = songs.into_iter().enumerate().map(|(i, rigs)| Song::new(format!("Song {}", i + 1), vec![Part::new("Main", rigs)])).collect();
+    sl.next_cc = Some(crate::setlist::FootSwitch { cc: NEXT_CC, channel: None });
+    sl.prev_cc = Some(crate::setlist::FootSwitch { cc: PREV_CC, channel: None });
+    sl
+}
+
+/// The pedal scenario's switches as the app sends them: the gates of each
+/// song of `pedal_setlist`, then of no song at all, each with the part the
+/// engine's foot switches step on from.
+fn setlist_switch(n: u8) -> &'static [Command] {
+    static SWITCHES: std::sync::OnceLock<Vec<Vec<Command>>> = std::sync::OnceLock::new();
+    &SWITCHES.get_or_init(|| {
+        let graph = start_graph_two_rigs();
+        let mut sl = pedal_setlist();
+        let switch = |sl: &Setlist| {
+            let mut cmds = sl.gates(&graph).commands();
+            cmds.push(Command::SetShowPart { part: sl.active_index() });
+            cmds
+        };
+        let mut out: Vec<Vec<Command>> = (0..sl.songs.len()).map(|i| {
+            sl.select(i, 0);
+            switch(&sl)
+        }).collect();
+        sl.active = None;
+        out.push(switch(&sl));
+        out
+    })[n as usize]
+}
+
+/// Songs `setlist_switch` knows, the "no song" one included.
+const SETLIST_SWITCHES: u8 = 6;
+
+/// The sustain pedal of the hardware keyboard the foot switches are on, so
+/// it passes `Show::take` like theirs.
+fn sustain(down: bool) -> Command {
+    Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 64, value: if down { 127 } else { 0 } }
 }
 
 /// Engine + the observer's view of what is held and what is sounding.
@@ -547,6 +608,11 @@ struct Run {
     held: BTreeMap<u8, BTreeSet<Kind>>,
     /// (instrument, sounding pitch, key that started it).
     sounding: BTreeSet<(u32, u8, u8)>,
+    /// The pedal scenario: the player's pedal, the instruments whose last
+    /// CC 64 was down, and the (instrument, pitch) released under it.
+    pedal: bool,
+    pedal_at: BTreeSet<u32>,
+    sustained: BTreeSet<(u32, u8)>,
     /// Arp scenario: chords of two held keys can share a pitch (ref-counted
     /// by the arp), so a release is judged only when the LAST key goes up.
     arp_scenario: bool,
@@ -584,8 +650,30 @@ impl Run {
                 engine.apply(cmd);
             }
         }
+        if scn == Scenario::Pedal {
+            let sl = pedal_setlist();
+            engine.apply(Command::SetShowControls { controls: sl.show_controls() });
+            engine.apply(Command::SetShowParts { parts: crate::show::ShowParts::new(sl.show_parts()) });
+        }
         engine.note_log.clear();
-        Run { engine, held: BTreeMap::new(), sounding: BTreeSet::new(), arp_scenario: scn == Scenario::Arp, scn, arp_added: false }
+        Run {
+            engine,
+            held: BTreeMap::new(),
+            sounding: BTreeSet::new(),
+            pedal: false,
+            pedal_at: BTreeSet::new(),
+            sustained: BTreeSet::new(),
+            arp_scenario: scn == Scenario::Arp,
+            scn,
+            arp_added: false,
+        }
+    }
+
+    /// Everything still sounding, held by a key or by the pedal.
+    fn all_sounding(&self) -> Vec<(u32, u8)> {
+        let mut left: BTreeSet<(u32, u8)> = self.sounding.iter().map(|s| (s.0, s.1)).collect();
+        left.extend(&self.sustained);
+        left.into_iter().collect()
     }
 
     fn enabled(&self, step: Step) -> bool {
@@ -593,7 +681,8 @@ impl Run {
             Step::On(k) | Step::Soft(k) => !self.held.contains_key(&k),
             Step::Off(k) => self.held.contains_key(&k),
             Step::Edit(Edit::AddArp) => !self.arp_added,
-            Step::Edit(_) | Step::Tick => true,
+            Step::Pedal(down) => down != self.pedal,
+            Step::Edit(_) | Step::Tick | Step::Song(_) => true,
         }
     }
 
@@ -605,12 +694,19 @@ impl Run {
             Step::Soft(k) => (Some(Command::NoteOn { note: k, velocity: 0.3, source: SourceId::Keys, channel: 0 }), Some(k)),
             Step::Off(k) => (Some(Command::NoteOff { note: k, source: SourceId::Keys, channel: 0 }), Some(k)),
             Step::Edit(e) => (Some(e.command(self.scn)), None),
-            Step::Tick => (None, None),
+            Step::Pedal(down) => (Some(sustain(down)), None),
+            Step::Tick | Step::Song(_) => (None, None),
         };
         self.engine.note_log.clear();
-        match cmd {
-            Some(cmd) => self.engine.apply(cmd),
-            None => self.engine.arp_test_step(),
+        self.engine.cc_passthrough_log.clear();
+        match (cmd, step) {
+            (Some(cmd), _) => self.engine.apply(cmd),
+            (None, Step::Song(n)) => {
+                for cmd in setlist_switch(n) {
+                    self.engine.apply(cmd.clone());
+                }
+            }
+            (None, _) => self.engine.arp_test_step(),
         }
         if let Step::Edit(Edit::Switch(cc)) = step {
             self.engine.apply(switch(cc, 0));
@@ -618,20 +714,46 @@ impl Run {
         // A MIDI-FX unit's queue is processed at the next block: pump it, like
         // `render` does, so what the unit emits reaches the log.
         self.engine.pump_midi_fx(64);
+        for &(dest, cc, value) in &self.engine.cc_passthrough_log {
+            if cc == 64 && value >= 64 {
+                self.pedal_at.insert(dest);
+            } else if cc == 64 && self.pedal_at.remove(&dest) {
+                self.sustained.retain(|s| s.0 != dest);
+            }
+        }
         for &(dest, note, on) in &self.engine.note_log {
             if on {
                 // A note-on from an edit or a tick is generated (chord
                 // re-sound, arp step): no key owns it.
                 self.sounding.insert((dest, note, key.unwrap_or(GENERATED)));
-            } else if note == 255 {
-                self.sounding.retain(|s| s.0 != dest); // release_all marker
-            } else {
-                self.sounding.retain(|s| !(s.0 == dest && s.1 == note));
+                continue;
             }
+            // 255 is release_all's marker. Under the pedal a released note
+            // keeps sounding.
+            let released = |s: &&(u32, u8, u8)| s.0 == dest && (note == 255 || s.1 == note);
+            if self.pedal_at.contains(&dest) {
+                let held: Vec<(u32, u8)> = self.sounding.iter().filter(released).map(|s| (s.0, s.1)).collect();
+                self.sustained.extend(held);
+            }
+            self.sounding.retain(|s| !released(&s));
         }
         match step {
             Step::On(k) | Step::Soft(k) => {
                 self.held.insert(k, BTreeSet::new());
+                Vec::new()
+            }
+            Step::Off(k) if self.scn == Scenario::Pedal => {
+                self.held.remove(&k);
+                if self.held.is_empty() && !self.pedal { self.all_sounding() } else { Vec::new() }
+            }
+            Step::Pedal(down) => {
+                self.pedal = down;
+                if self.held.is_empty() && !down { self.all_sounding() } else { Vec::new() }
+            }
+            Step::Song(_) => {
+                for kinds in self.held.values_mut() {
+                    kinds.insert(Kind::Zone);
+                }
                 Vec::new()
             }
             Step::Off(k) => {
@@ -705,6 +827,7 @@ impl Run {
             self.held, self.sounding, self.arp_added, self.engine.rig_zones, self.engine.show.part(), self.engine.zone_hands,
         )
         .hash(&mut h);
+        (self.pedal, &self.pedal_at, &self.sustained).hash(&mut h);
         h.finish()
     }
 }
@@ -754,6 +877,8 @@ fn describe(step: Step) -> String {
         Step::Edit(Edit::Switch(cc)) => format!("Tap foot switch CC {cc}"),
         Step::Edit(Edit::Program(n)) => format!("Program change {n} from the foot switches' device"),
         Step::Tick => "Tick (time passes)".to_string(),
+        Step::Pedal(down) => format!("Sustain pedal {}", if down { "down" } else { "up" }),
+        Step::Song(n) => format!("Setlist switch {:?}", setlist_switch(n)),
     }
 }
 
@@ -825,6 +950,16 @@ pub(super) fn explore_layers(max_states: usize) -> Report {
     alphabet.extend(LAYER_EDITS.iter().map(|&e| Step::Edit(e)));
     alphabet.push(Step::Edit(Edit::LoadStart));
     explore_with(&alphabet, max_states, Scenario::Layers)
+}
+
+/// Setlist switches under the sustain pedal (#274).
+pub(super) fn explore_pedal(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.extend([Step::Pedal(true), Step::Pedal(false)]);
+    alphabet.extend((0..SETLIST_SWITCHES).map(Step::Song));
+    alphabet.extend([Step::Edit(Edit::Switch(NEXT_CC)), Step::Edit(Edit::Switch(PREV_CC))]);
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, Scenario::Pedal)
 }
 
 /// Unit bypass toggles on an instrument and a MIDI strip (#305).
@@ -955,6 +1090,24 @@ fn held_notes_are_released_across_velocity_layers_and_a_floating_split() {
     }
     assert!(report.stuck.is_empty(), "stuck notes across velocity layers and a floating split (traces above)");
     assert!(report.complete, "state bound hit before fixpoint: the layers alphabet's state space grew");
+}
+
+#[test]
+fn held_notes_are_released_across_setlist_switches_under_the_sustain_pedal() {
+    let mut run = Run::new(Scenario::Pedal);
+    run.step(Step::Pedal(true));
+    assert_eq!(run.pedal_at, BTreeSet::from([SURGE_A, SURGE_B]), "the pedal reaches both synths, or the search proves nothing");
+    let report = explore_pedal(100_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (pedal): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "notes left sounding across setlist switches under the pedal (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the pedal alphabet's state space grew");
 }
 
 #[test]

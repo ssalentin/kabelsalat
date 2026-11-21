@@ -1642,7 +1642,7 @@ Learned so far (2026-11-15, UI polish pass):
     A rack rebuilt from parts carries each synth's `VoiceRow`, device
     included, never only its switches. A new field holding a device index
     goes through `map_session_hw` too (`ui::hw_ports_tests`).
-195. **A header whose right-hand group can grow draws that group first and
+196. **A header whose right-hand group can grow draws that group first and
     truncates its subtitle in what is left:** the Setlist header laid the
     subtitle out in `horizontal_wrapped` and then the buttons right-to-left
     (rule 136's trap), so at 781 px "LIVE 2. Song 2 · Main" ran over the

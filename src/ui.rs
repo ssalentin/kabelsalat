@@ -1159,7 +1159,7 @@ fn hw_indices_in_use(rules: &[SavedRule], rig_devices: &[Option<u32>]) -> std::c
 }
 
 /// `s` with every hardware device index it holds (matrix rule sources, rig
-/// devices) moved through `map` (#227). What is left is in this run's
+/// devices, binding levels) moved through `map` (#227). What is left is in this run's
 /// indices, so its table of port names goes.
 fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndexMap) {
     let rules: Option<Vec<SavedRule>> = s.matrix().and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1179,6 +1179,10 @@ fn map_session_hw(s: &mut crate::session::Session, map: &crate::session::HwIndex
         s.set_matrix(serde_json::to_value(&rules).ok());
     }
     for d in s.rig_devices.iter_mut().flatten() { *d = map.get(*d); }
+    // A pinned binding's level (#273) names its controller's device too.
+    for p in &mut s.setlist.levels.bindings {
+        if let SourceId::Hardware(d) = &mut p.of.source { *d = map.get(*d); }
+    }
     s.set_hw_ports(Default::default());
 }
 

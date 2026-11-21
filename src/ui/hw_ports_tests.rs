@@ -166,6 +166,20 @@ fn an_lv2_device_and_a_cc_binding_follow_their_ports_into_another_scan_order() {
     assert_eq!(engine_cc_sources(&sent, node(&app, "SURGE")), [SourceId::Hardware(1)]);
 }
 
+/// A binding's level (#273) is pinned by its controller's device: it
+/// follows the port into another scan order with the binding itself.
+#[test]
+fn a_pinned_binding_level_follows_its_port_into_another_scan_order() {
+    use crate::setlist::{Binding, Level};
+    let mut loaded = saved_organ_on_the_u6_and_a_cc_from_the_fm1("hw-ports-level");
+    let surge = loaded.graph.nodes.iter().find(|n| crate::control::name_str(&n.name) == "SURGE").unwrap().id;
+    loaded.setlist.pin_binding(Binding { source: SourceId::Hardware(0), dest: surge, cc: 74 }, Level::Show);
+    let (app, _) = opened(&loaded, &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+    let fm1 = index_of(&app, FM1_PORT);
+    assert_eq!(app.setlist.levels.bindings[0].of.source, SourceId::Hardware(fm1), "the pin names the FM-1's index in this run");
+    assert!(app.setlist.binding_pinned(Binding { source: SourceId::Hardware(fm1), dest: node(&app, "SURGE"), cc: 74 }));
+}
+
 /// A device the session depends on but that is not plugged in keeps its
 /// own, unplugged place: its rules never land on another keyboard. One the
 /// session does not depend on is not listed at all.

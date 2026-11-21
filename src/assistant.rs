@@ -719,7 +719,9 @@ fn system_prompt() -> String {
      Levels: every rig, aux bus and CC binding lives at show level (no song switch touches it: \
      a vocal mic, a master reverb, a volume pedal), at the level of a set (a named group of songs, \
      set_setlist_set makes, fills, skips or moves one) or at song level (only where the parts use \
-     it); get_setlist lists sets and levels, set_level changes one.\n\
+     it); get_setlist lists sets and levels, set_level changes one. Before a gig, \
+     preshow_check says what could go wrong (devices, outputs, plugins, silent rigs, backing \
+     tracks, disk, buffer, power) and what to do about each.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
      sound once wired.\n\
@@ -1217,8 +1219,13 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_setlist_song",
-            "description":"Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature (e.g. '4/4', '3/4', '6/8', or null to clear). Optional parts: JSON array string of parts, each {name, rigs: [{rig, key_lo?, key_hi?, transpose?, level?, vel_lo?, vel_hi?, vel_curve?, float?}], buses?: [aux bus node ids that take signal in this part], capture_knobs?}. vel_lo/vel_hi (0-127) make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60); vel_curve is linear | soft | hard; float (0-12 keys) makes the key range's edges a floating split that follows the hand playing across it. When creating a song without parts, one 'Main' part is created from the active rig.",
-            "parameters":{"type":"object","properties":{"song":{"type":"integer"},"name":{"type":"string"},"bpm":{"type":["number","null"]},"time_signature":{"type":["string","null"]},"parts":{"type":"string"},"move_to":{"type":"integer"},"remove":{"type":"boolean"}}}
+            "description":"Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature (e.g. '4/4', '3/4', '6/8', or null to clear). Optional backing: absolute path of a WAV backing track the file player starts when the song is selected (null clears). Optional parts: JSON array string of parts, each {name, rigs: [{rig, key_lo?, key_hi?, transpose?, level?, vel_lo?, vel_hi?, vel_curve?, float?}], buses?: [aux bus node ids that take signal in this part], capture_knobs?}. vel_lo/vel_hi (0-127) make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60); vel_curve is linear | soft | hard; float (0-12 keys) makes the key range's edges a floating split that follows the hand playing across it. When creating a song without parts, one 'Main' part is created from the active rig.",
+            "parameters":{"type":"object","properties":{"song":{"type":"integer"},"name":{"type":"string"},"bpm":{"type":["number","null"]},"time_signature":{"type":["string","null"]},"backing":{"type":["string","null"]},"parts":{"type":"string"},"move_to":{"type":"integer"},"remove":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"preshow_check",
+            "description":"Check everything that could go wrong before the first song, and change nothing: every MIDI device the show binds is plugged in, the chosen audio output and the Audio In devices are connected, every plugin is installed and loads, every rig makes sound when played (an offline probe plays each rig's demo phrase in an engine of its own), every song's backing-track file is there, disk space for recording, buffer size and render headroom, battery and power. Takes a few seconds. Returns summary and checks: [{id, title, status: ok | warning | problem, text}], where text says what to do. Without session it checks the show loaded now; session = a saved session's name (list_sessions) or package path checks that one.",
+            "parameters":{"type":"object","properties":{"session":{"type":"string"}}}
         }},
         {"type":"function","function":{
             "name":"set_level",

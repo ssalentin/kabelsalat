@@ -198,6 +198,10 @@ pub struct Song {
     /// The [`Set`] this song belongs to (#273); a set's songs are consecutive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set: Option<SetId>,
+    /// The backing-track file (absolute path to a WAV) the file player
+    /// starts when the song is selected (#278).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<String>,
 }
 
 impl Song {
@@ -208,6 +212,7 @@ impl Song {
             time_sig: None,
             parts,
             set: None,
+            backing: None,
         }
     }
 }
@@ -675,6 +680,17 @@ impl Setlist {
             }
         }
         Ok(())
+    }
+}
+
+/// A song's backing track as a tool gives it: an absolute path, or
+/// nothing (None or empty clears it). The file need not exist yet: the
+/// pre-show check says when it is missing (#278).
+pub fn backing_path(path: Option<&str>) -> Result<Option<String>, String> {
+    match path.map(str::trim).filter(|p| !p.is_empty()) {
+        None => Ok(None),
+        Some(p) if std::path::Path::new(p).is_absolute() => Ok(Some(p.to_string())),
+        Some(p) => Err(format!("backing must be the absolute path of a WAV file, not '{p}'")),
     }
 }
 

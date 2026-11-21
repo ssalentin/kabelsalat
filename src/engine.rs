@@ -735,6 +735,8 @@ enum Lv2Response {
     Loaded { node: NodeId, gen: u64, slot: Lv2Slot },
     Preset { node: NodeId, preset: crate::lv2::Lv2Preset },
     Restored { node: NodeId, gen: u64, slot: Lv2Slot },
+    /// The plugin could not take a state (`State`): the node keeps its own.
+    Refused,
 }
 
 /// LV2 instances the engine hosts at once: two per rig (an organ and an
@@ -793,9 +795,10 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
                 .into_iter()
                 .find(|p| p.uri == preset_uri)
                 .map(|preset| Lv2Response::Preset { node, preset }),
-            Lv2Request::State { node, uri, gen, state } => {
-                restored_lv2_slot(node, uri.as_str(), &state, sample_rate).map(|slot| Lv2Response::Restored { node, gen, slot })
-            }
+            Lv2Request::State { node, uri, gen, state } => Some(
+                restored_lv2_slot(node, uri.as_str(), &state, sample_rate)
+                    .map_or(Lv2Response::Refused, |slot| Lv2Response::Restored { node, gen, slot }),
+            ),
             Lv2Request::Retire(slot) => {
                 crate::lv2::retire(slot.plugin); // parks never-free plugins (#14)
                 None
@@ -1438,6 +1441,10 @@ pub struct GraphEngine {
     /// Control values that arrived before ANY still-loading LV2 instance
     /// was live (`Lv2Pending`); replayed by `attach_lv2` (rule 113).
     lv2_pending: [Option<Lv2Pending>; MAX_RIGS],
+    /// `LoadLv2State` answers from the loader, and how many of them were a
+    /// restored instance the engine took in.
+    lv2_state_answers: u64,
+    lv2_restores: u64,
     // Song clock handed to every CLAP voice. Its tempo is shared by every
     // transport-capable node (per-node run state lives in each DspSlot's
     // SlotTransport); its playing flag is the MASTER transport only.
@@ -1704,6 +1711,8 @@ impl GraphEngine {
             master_target: MasterTarget::OFF,
             organ_pending: [None; MAX_RIGS],
             lv2_pending: [None; MAX_RIGS],
+            lv2_state_answers: 0,
+            lv2_restores: 0,
             transport: Transport::stopped(96.0),
             master_clock: MasterClock::Stopped,
             count_in: CountInConfig::default(),
@@ -1873,6 +1882,7 @@ impl GraphEngine {
         let live = gen == self.lv2_gen && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }));
         match self.lv2.iter().position(|s| s.node == node) {
             Some(i) if live => {
+                self.lv2_restores += 1;
                 let old = std::mem::replace(&mut self.lv2[i], slot);
                 if old.latency != 0 {
                     self.latency_dirty = true;
@@ -1880,6 +1890,7 @@ impl GraphEngine {
                 self.retire_lv2(old);
             }
             None if live && self.lv2.len() < self.lv2.capacity() => {
+                self.lv2_restores += 1;
                 self.attach_lv2(slot);
                 self.publish_graph();
             }
@@ -1930,7 +1941,11 @@ impl GraphEngine {
                         self.retire_lv2(slot);
                     }
                 }
-                Lv2Response::Restored { node, gen, slot } => self.adopt_restored_lv2(node, gen, slot),
+                Lv2Response::Restored { node, gen, slot } => {
+                    self.lv2_state_answers += 1;
+                    self.adopt_restored_lv2(node, gen, slot);
+                }
+                Lv2Response::Refused => self.lv2_state_answers += 1,
                 Lv2Response::Preset { node, preset } => {
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                         s.plugin.apply_preset(&preset);
@@ -2666,6 +2681,19 @@ impl GraphEngine {
     /// the `meter-test` self-test. Computes on demand from the meter's state.
     pub fn meter_snapshot(&self) -> MeterSnapshot {
         self.meter.snapshot()
+    }
+
+    /// The LV2 nodes whose instance the loader thread has attached, MIDI
+    /// units included.
+    pub fn lv2_attached(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let midi_fx = self.midi_fx.iter().filter(|s| matches!(s.proc, Some(MidiFxProc::Lv2(_)))).map(|s| s.node);
+        self.lv2.iter().map(|s| s.node).chain(midi_fx)
+    }
+
+    /// How many `LoadLv2State`s the loader has answered, and how many of
+    /// those the engine took in as a restored instance.
+    pub fn lv2_states(&self) -> (u64, u64) {
+        (self.lv2_state_answers, self.lv2_restores)
     }
 
     /// Lock-free per-edge audio levels for the UI's breathing/flowing cables.
@@ -6200,7 +6228,7 @@ fn render_metronome(
 
 #[cfg(test)]
 mod held_notes;
-mod latent;
+pub(crate) mod latent;
 mod pdc;
 mod probe;
 mod show_gates;

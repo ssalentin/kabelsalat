@@ -181,6 +181,19 @@ you hold **Esc** until its line fills (a second), then let go.
 
 <p align="center"><img src="docs/shots/show-mode.png" width="85%" alt="Show mode: the song Moonlight Drive in large type with its part Chorus and 118 BPM 4/4, the next song Riders on the Storm, meters for the master and the organ, a clock, the Panic button and the hint to hold Esc to leave"/></p>
 
+### Check the show before the first song
+**Setlist → Check show** finds what could go wrong while there is still time to
+fix it, and changes nothing: every MIDI device the show binds is plugged in,
+the chosen output and every Audio In device are connected, every plugin is
+installed and loads, every rig makes sound (each plays its demo phrase in an
+offline engine of its own), every song's backing track is on disk, there is
+room to record, the buffer has headroom, and the laptop runs on mains power.
+Each check says ok, warning or problem, and what to do about it. Agents get the
+same list from the `preshow_check` tool, and `kabelsalat preshow-check
+<session.ksalat>` prints it in a terminal (exit status 1 on a problem).
+
+<p align="center"><img src="docs/shots/preshow.png" width="85%" alt="Setlist → Check show: nine checks with a tick, a warning mark or a cross — an unplugged FM-1, a missing Odin 2 and a missing backing track are problems, running on battery is a warning, and each row says what to do"/></p>
+
 ### Browse and install plugins by type
 Press **F9** (or **B**) to open **Plugins**, organized by what each unit does
 rather than by plugin format: **Instruments**, **Effects**, **MIDI FX**,
@@ -425,7 +438,8 @@ at the transport tempo from its original BPM (a "120 bpm" in the file name is
 picked up; speed changes, pitch follows, no time-stretch), **beats** sets the loop
 length in beats so an aligned loop never drifts off the metronome, and **offset**
 shifts the start. With sync on and the transport rolling, it starts on the next
-bar line.
+bar line. A setlist song can name its backing track (`set_setlist_song` with
+`backing`): selecting the song starts it, and a song without one stops it.
 
 ### Ask the assistant — or your own AI agent
 The built-in assistant (bring your own [OpenRouter](https://openrouter.ai/keys)

@@ -12,6 +12,7 @@
 //! selection/CTA = tomato · active/playing = teal · clip/danger = red.
 //! Cable jackets: six-color CABLE_PALETTE (shape separates audio/MIDI).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -772,7 +773,7 @@ pub fn use_fonts_of(ctx: &egui::Context) {
     FACES.set(ctx.data(|d| d.get_temp::<Faces>(faces_id())).unwrap_or_default());
 }
 
-fn load_font(fonts: &mut egui::FontDefinitions, name: &str, path: &str) -> bool {
+fn load_font(fonts: &mut egui::FontDefinitions, name: &str, path: &Path) -> bool {
     match std::fs::read(path) {
         Ok(bytes) => {
             fonts.font_data.insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
@@ -791,13 +792,83 @@ const NOTO_DIRS: [&str; 4] = [
     "/usr/share/fonts/google-noto",
 ];
 
-/// Load `file` from `KABELSALAT_FONT_DIR` (if set) or the first Noto
-/// directory that has it.
-fn load_noto(fonts: &mut egui::FontDefinitions, name: &str, file: &str) -> bool {
-    if let Ok(dir) = std::env::var("KABELSALAT_FONT_DIR") {
-        if load_font(fonts, name, &format!("{dir}/{file}")) { return true; }
+/// JetBrains Mono filenames in preference order (Nerd Font first, then plain).
+const MONO_FILES: [&str; 3] = [
+    "JetBrainsMonoNerdFont-Regular.ttf",
+    "JetBrainsMonoNerdFontMono-Regular.ttf",
+    "JetBrainsMono-Regular.ttf",
+];
+
+/// System directories where distributions and Flatpak mount JetBrains Mono:
+/// Arch (`/usr/share/fonts/TTF`), Debian/Ubuntu (`truetype/jetbrains-mono`),
+/// Fedora (`jetbrains-mono-fonts`), `/usr/local/share/fonts`, and Flatpak
+/// `/run/host/...` mounts.
+const MONO_DIRS: [&str; 12] = [
+    "/usr/share/fonts/TTF",
+    "/usr/share/fonts/truetype/jetbrains-mono",
+    "/usr/share/fonts/jetbrains-mono-fonts",
+    "/usr/share/fonts/jetbrains-mono",
+    "/usr/local/share/fonts",
+    "/usr/local/share/fonts/TTF",
+    "/usr/local/share/fonts/truetype/jetbrains-mono",
+    "/usr/local/share/fonts/jetbrains-mono",
+    "/run/host/fonts/TTF",
+    "/run/host/fonts/truetype/jetbrains-mono",
+    "/run/host/fonts/jetbrains-mono-fonts",
+    "/run/host/user-fonts",
+];
+
+fn noto_search_dirs(override_dir: Option<&str>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(dir));
     }
-    NOTO_DIRS.iter().any(|dir| load_font(fonts, name, &format!("{dir}/{file}")))
+    dirs.extend(NOTO_DIRS.iter().map(PathBuf::from));
+    dirs
+}
+
+fn user_font_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+        roots.push(PathBuf::from(xdg).join("fonts"));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        let local = PathBuf::from(home).join(".local/share/fonts");
+        if !roots.contains(&local) {
+            roots.push(local);
+        }
+    }
+    roots
+}
+
+fn mono_search_dirs(override_dir: Option<&str>, user_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs.extend(MONO_DIRS.iter().map(PathBuf::from));
+    for root in user_roots {
+        for sub in ["", "TTF", "JetBrainsMono", "jetbrains-mono", "NerdFonts"] {
+            dirs.push(if sub.is_empty() { root.clone() } else { root.join(sub) });
+        }
+    }
+    dirs
+}
+
+fn load_font_from_dirs(
+    fonts: &mut egui::FontDefinitions,
+    name: &str,
+    dirs: &[PathBuf],
+    files: &[&str],
+) -> bool {
+    for dir in dirs {
+        for file in files {
+            if load_font(fonts, name, &dir.join(file)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Symbol faces behind Noto Sans, which has none of the UI's arrows,
@@ -820,21 +891,24 @@ pub fn install_spacing(ctx: &egui::Context) {
     });
 }
 
-pub fn install_fonts(ctx: &egui::Context) {
+fn build_font_definitions(noto_dirs: &[PathBuf], mono_dirs: &[PathBuf]) -> (egui::FontDefinitions, Faces) {
     let mut fonts = egui::FontDefinitions::default();
-    let reg = load_noto(&mut fonts, "noto", "NotoSans-Regular.ttf");
-    let med = load_noto(&mut fonts, "noto-medium", "NotoSans-Medium.ttf");
-    let bold = load_noto(&mut fonts, "noto-bold", "NotoSans-Bold.ttf");
-    let mono = load_font(&mut fonts, "jbmono", "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf");
+    let reg = load_font_from_dirs(&mut fonts, "noto", noto_dirs, &["NotoSans-Regular.ttf"]);
+    let med = load_font_from_dirs(&mut fonts, "noto-medium", noto_dirs, &["NotoSans-Medium.ttf"]);
+    let bold = load_font_from_dirs(&mut fonts, "noto-bold", noto_dirs, &["NotoSans-Bold.ttf"]);
+    let mono = load_font_from_dirs(&mut fonts, "jbmono", mono_dirs, &MONO_FILES);
     let symbols: Vec<String> = SYMBOL_FONTS
         .iter()
-        .filter(|(name, file)| load_noto(&mut fonts, name, file))
-        .map(|(name, _)| name.to_string())
+        .filter(|(name, file)| load_font_from_dirs(&mut fonts, name, noto_dirs, &[file]))
+        .map(|(name, _)| (*name).to_string())
         .collect();
-    // egui's bundled faces stay last in every family, behind the symbols.
+    // egui's bundled faces stay last in every family, behind the symbols,
+    // except that a true primary face (`Ubuntu-Light` / `Hack`) always sits
+    // ahead of `SYMBOL_FONTS` because NotoSansSymbols2/Math carry ASCII
+    // characters with wide/proportional advances (#327).
     let egui_fallback = fonts.families[&FontFamily::Proportional].clone();
     let family = |first: &[&str]| -> Vec<String> {
-        first.iter().map(|s| s.to_string())
+        first.iter().map(|s| (*s).to_string())
             .chain(symbols.iter().cloned())
             .chain(egui_fallback.iter().cloned())
             .collect()
@@ -842,13 +916,25 @@ pub fn install_fonts(ctx: &egui::Context) {
     if reg {
         fonts.families.insert(FontFamily::Proportional, family(&["noto"]));
     } else {
-        fonts.families.insert(FontFamily::Proportional, family(&[]));
+        let (prop_primary, prop_rest): (Vec<String>, Vec<String>) =
+            egui_fallback.iter().cloned().partition(|f| f == "Ubuntu-Light");
+        fonts.families.insert(
+            FontFamily::Proportional,
+            prop_primary.into_iter().chain(symbols.iter().cloned()).chain(prop_rest).collect(),
+        );
     }
-    let mono_fallback = fonts.families[&FontFamily::Monospace].clone();
+    let egui_mono = fonts.families[&FontFamily::Monospace].clone();
+    let (mono_builtin, mono_rest): (Vec<String>, Vec<String>) =
+        egui_mono.into_iter().partition(|f| f == "Hack");
     let mono_first: Vec<String> = if mono { vec!["jbmono".into()] } else { Vec::new() };
     fonts.families.insert(
         FontFamily::Monospace,
-        mono_first.into_iter().chain(symbols.iter().cloned()).chain(mono_fallback).collect(),
+        mono_first
+            .into_iter()
+            .chain(mono_builtin)
+            .chain(symbols.iter().cloned())
+            .chain(mono_rest)
+            .collect(),
     );
     if bold {
         let fam = if reg { family(&["noto-bold", "noto"]) } else { family(&["noto-bold"]) };
@@ -858,9 +944,21 @@ pub fn install_fonts(ctx: &egui::Context) {
         let fam = if reg { family(&["noto-medium", "noto"]) } else { family(&["noto-medium"]) };
         fonts.families.insert(FontFamily::Name("medium".into()), fam);
     }
+    (fonts, Faces { medium: med, bold })
+}
+
+fn install_fonts_from(ctx: &egui::Context, noto_dirs: &[PathBuf], mono_dirs: &[PathBuf]) {
+    let (fonts, faces) = build_font_definitions(noto_dirs, mono_dirs);
     ctx.set_fonts(fonts);
-    ctx.data_mut(|d| d.insert_temp(faces_id(), Faces { medium: med, bold }));
+    ctx.data_mut(|d| d.insert_temp(faces_id(), faces));
     use_fonts_of(ctx);
+}
+
+pub fn install_fonts(ctx: &egui::Context) {
+    let override_dir = std::env::var("KABELSALAT_FONT_DIR").ok();
+    let noto_dirs = noto_search_dirs(override_dir.as_deref());
+    let mono_dirs = mono_search_dirs(override_dir.as_deref(), &user_font_roots());
+    install_fonts_from(ctx, &noto_dirs, &mono_dirs);
 }
 
 /// Bold proportional face (falls back to the regular proportional face when
@@ -1232,6 +1330,205 @@ mod font_coverage_tests {
             }
         }
         assert!(missing.is_empty(), "symbols without a glyph:\n{}", missing.join("\n"));
+    }
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "kabelsalat-theme-test-{}-{}-{n}",
+                tag,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn monospace_digits_come_from_mono_face_without_jetbrains_mono() {
+        let default_ctx = egui::Context::default();
+        let mut out = default_ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear(); // rule 11
+        let hack_galley = default_ctx.fonts_mut(|f| {
+            f.layout_no_wrap("CC 64".to_owned(), FontId::monospace(12.0), CREAM)
+        });
+        let hack_glyphs = &hack_galley.rows[0].glyphs;
+        assert_eq!(hack_glyphs.len(), 5);
+        let hack_adv = hack_glyphs[0].advance_width;
+        assert!(hack_adv > 0.0);
+        for g in hack_glyphs {
+            assert!(
+                (g.advance_width - hack_adv).abs() < 1e-3,
+                "Hack baseline glyph {:?} advance {} != {}",
+                g.chr,
+                g.advance_width,
+                hack_adv
+            );
+        }
+
+        let system_noto = noto_search_dirs(std::env::var("KABELSALAT_FONT_DIR").ok().as_deref());
+        let empty_noto: Vec<PathBuf> = Vec::new();
+        let mut saw_system_symbols = false;
+
+        for (label, noto_dirs) in [("system_noto", &system_noto), ("no_noto", &empty_noto)] {
+            let (fonts, _) = build_font_definitions(noto_dirs, &[]);
+            assert!(!fonts.font_data.contains_key("jbmono"), "{label}: jbmono must not be loaded");
+            let mono_fam = &fonts.families[&FontFamily::Monospace];
+            assert_eq!(
+                mono_fam.first().map(String::as_str),
+                Some("Hack"),
+                "{label}: Hack must precede fallbacks in Monospace: {mono_fam:?}"
+            );
+            let hack_pos = mono_fam.iter().position(|f| f == "Hack").unwrap();
+            for (sym, _) in SYMBOL_FONTS {
+                if let Some(sym_pos) = mono_fam.iter().position(|f| f == sym) {
+                    assert!(
+                        hack_pos < sym_pos,
+                        "{label}: Hack ({hack_pos}) must precede {sym} ({sym_pos}): {mono_fam:?}"
+                    );
+                    if label == "system_noto" {
+                        saw_system_symbols = true;
+                    }
+                }
+            }
+
+            let ctx = egui::Context::default();
+            install_fonts_from(&ctx, noto_dirs, &[]);
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear(); // rule 11
+            let cc64 = ctx.fonts_mut(|f| {
+                f.layout_no_wrap("CC 64".to_owned(), FontId::monospace(12.0), CREAM)
+            });
+            let digits = ctx.fonts_mut(|f| {
+                f.layout_no_wrap("0123456789".to_owned(), FontId::monospace(12.0), CREAM)
+            });
+            let cc64_chars: Vec<char> = cc64.rows[0].glyphs.iter().map(|g| g.chr).collect();
+            assert_eq!(cc64_chars, vec!['C', 'C', ' ', '6', '4']);
+            let c_adv = cc64.rows[0].glyphs[0].advance_width;
+            assert!((c_adv - hack_adv).abs() < 1e-3);
+            for g in cc64.rows[0].glyphs.iter().chain(digits.rows[0].glyphs.iter()) {
+                assert!(
+                    (g.advance_width - c_adv).abs() < 1e-3,
+                    "{label}: glyph {:?} advance {} != 'C' advance {}",
+                    g.chr,
+                    g.advance_width,
+                    c_adv
+                );
+                assert!(
+                    (g.advance_width - hack_adv).abs() < 1e-3,
+                    "{label}: glyph {:?} advance {} != Hack advance {}",
+                    g.chr,
+                    g.advance_width,
+                    hack_adv
+                );
+            }
+        }
+
+        if std::env::var_os("CI").is_some() {
+            assert!(saw_system_symbols, "CI must have Noto symbol fonts installed");
+        }
+        if saw_system_symbols {
+            // Negative control: reproduce the pre-#327 order (symbols ahead of Hack)
+            // and verify digits/letters no longer match Hack's monospace advance.
+            let (mut broken_fonts, _) = build_font_definitions(&system_noto, &[]);
+            let sym_names: Vec<String> = SYMBOL_FONTS
+                .iter()
+                .filter(|(name, _)| broken_fonts.font_data.contains_key(*name))
+                .map(|(name, _)| (*name).to_string())
+                .collect();
+            let rest: Vec<String> = broken_fonts.families[&FontFamily::Monospace]
+                .iter()
+                .filter(|f| !sym_names.contains(f))
+                .cloned()
+                .collect();
+            broken_fonts.families.insert(
+                FontFamily::Monospace,
+                sym_names.into_iter().chain(rest).collect(),
+            );
+            let broken_ctx = egui::Context::default();
+            broken_ctx.set_fonts(broken_fonts);
+            let mut out = broken_ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear(); // rule 11
+            let broken = broken_ctx.fonts_mut(|f| {
+                f.layout_no_wrap("CC 64".to_owned(), FontId::monospace(12.0), CREAM)
+            });
+            assert!(
+                broken.rows[0]
+                    .glyphs
+                    .iter()
+                    .any(|g| (g.advance_width - hack_adv).abs() > 0.1),
+                "expected pre-#327 symbol-first order to diverge from Hack advance {hack_adv}: {:?}",
+                broken.rows[0]
+                    .glyphs
+                    .iter()
+                    .map(|g| (g.chr, g.advance_width))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Missing NotoSans-Regular with a symbol font present: Proportional must
+        // still put egui's Ubuntu-Light ahead of symbol fallbacks.
+        let sym_only_dir = TempDirGuard::new("sym-only");
+        std::fs::write(sym_only_dir.0.join("NotoSansSymbols2-Regular.ttf"), b"sym2").unwrap();
+        let (prop_fonts, _) = build_font_definitions(&[sym_only_dir.0.clone()], &[]);
+        let prop_fam = &prop_fonts.families[&FontFamily::Proportional];
+        assert_eq!(prop_fam.first().map(String::as_str), Some("Ubuntu-Light"));
+        let ubuntu_pos = prop_fam.iter().position(|f| f == "Ubuntu-Light").unwrap();
+        let sym2_pos = prop_fam.iter().position(|f| f == "noto-symbols2").unwrap();
+        assert!(ubuntu_pos < sym2_pos, "Ubuntu-Light ({ubuntu_pos}) must precede noto-symbols2 ({sym2_pos})");
+    }
+
+    #[test]
+    fn jetbrains_mono_probes_distro_override_and_user_paths() {
+        let dirs = mono_search_dirs(
+            Some("/override/fonts"),
+            &[PathBuf::from("/home/u/.local/share/fonts")],
+        );
+        assert_eq!(dirs.first(), Some(&PathBuf::from("/override/fonts")));
+        for expected in [
+            "/usr/share/fonts/TTF",
+            "/usr/share/fonts/truetype/jetbrains-mono",
+            "/usr/share/fonts/jetbrains-mono-fonts",
+            "/usr/local/share/fonts",
+            "/run/host/fonts/truetype/jetbrains-mono",
+            "/home/u/.local/share/fonts",
+            "/home/u/.local/share/fonts/TTF",
+        ] {
+            assert!(
+                dirs.contains(&PathBuf::from(expected)),
+                "mono_search_dirs missing {expected}: {dirs:?}"
+            );
+        }
+
+        let tmp = TempDirGuard::new("jbmono");
+        std::fs::write(tmp.0.join("JetBrainsMono-Regular.ttf"), b"jbmono-regular").unwrap();
+        let (fonts, _) = build_font_definitions(&[], &[tmp.0.clone()]);
+        assert_eq!(
+            fonts.font_data.get("jbmono").map(|d| d.as_ref()),
+            Some(&egui::FontData::from_static(b"jbmono-regular"))
+        );
+        assert_eq!(
+            fonts.families[&FontFamily::Monospace].iter().take(2).map(String::as_str).collect::<Vec<_>>(),
+            vec!["jbmono", "Hack"]
+        );
+
+        std::fs::write(tmp.0.join("JetBrainsMonoNerdFont-Regular.ttf"), b"jbmono-nerd").unwrap();
+        let (fonts, _) = build_font_definitions(&[], &[tmp.0.clone()]);
+        assert_eq!(
+            fonts.font_data.get("jbmono").map(|d| d.as_ref()),
+            Some(&egui::FontData::from_static(b"jbmono-nerd"))
+        );
     }
 }
 

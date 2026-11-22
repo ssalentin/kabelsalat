@@ -8482,8 +8482,15 @@ impl DemoApp {
     /// its audio half to the engine. The engine binds it to a voiceless Clap
     /// node of that plugin. Returns the hosted index.
     fn host_voice(&mut self, plugin_id: &str) -> Result<usize, String> {
-        let (voice, main) = ClapVoice::new_plugin(self.sample_rate, plugin_id)
-            .map_err(|e| format!("Load {plugin_id} failed: {e}"))?;
+        let (voice, main): (ClapVoice, HostedClapMain) = if crate::host::sandbox_enabled() {
+            let (v, m) = crate::host::spawn_sandboxed_clap(self.sample_rate, plugin_id, None)
+                .map_err(|e| format!("Load {plugin_id} failed: {e}"))?;
+            (v, HostedClapMain::from(m))
+        } else {
+            let (v, m) = ClapVoice::new_plugin(self.sample_rate, plugin_id)
+                .map_err(|e| format!("Load {plugin_id} failed: {e}"))?;
+            (v, HostedClapMain::from(m))
+        };
         let ctrl = voice.controller();
         let id = voice.voice_id();
         let slot = VoiceSlot::new(voice);
@@ -8503,7 +8510,7 @@ impl DemoApp {
             self.engine_voice_cap = cap;
         }
         let _ = tx.push(VoiceMsg::Add(slot));
-        self._surge_main.push(HostedClapMain::from(main));
+        self._surge_main.push(main);
         self.surge_controllers.push(ctrl);
         self.clap_plugin_ids.push(plugin_id.to_string());
         self.clap_voice_ids.push(id);
@@ -29960,6 +29967,26 @@ impl DemoApp {
 
             if let Some(badge) = self.bypass_badge_rect(ui) {
                 self.draw_bypass_badge(painter, badge);
+            } else if matches!(u.node_kind, UnitKind::Clap) {
+                if let Some(rig) = self.rig_of_unit(ui) {
+                    if let Some(idx) = self.clap_pool_idx(rig) {
+                        if let Some(notice) = self._surge_main.get(idx).and_then(|m| m.strip_notice()) {
+                            if r.width() >= 120.0 && r.height() >= 64.0 && self.text_alpha > 0.01 {
+                                let is_crashed = notice.starts_with("CRASHED");
+                                let col = if is_crashed { theme::CLIP_RED } else { theme::CABLE_AMBER };
+                                let bw = (notice.len() as f32 * 5.8 + 14.0).min(r.width() - 24.0);
+                                let badge = Rect::from_min_size(
+                                    Pos2::new(r.right() - 12.0 - bw, r.top() + 8.0),
+                                    Vec2::new(bw, BYPASS_BADGE_H),
+                                );
+                                let sr = self.xf.rect(badge);
+                                painter.rect_filled(sr, 2.0, alpha(theme::DARK_PANEL_HI, self.text_alpha));
+                                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(col, self.text_alpha)), egui::StrokeKind::Inside);
+                                self.face_text(painter, badge.center(), notice, theme::medium_font(9.0), col);
+                            }
+                        }
+                    }
+                }
             }
 
             if Self::agent_badge_alpha(agent_t) > 0.05 {
@@ -34524,6 +34551,9 @@ impl DemoApp {
         self.sync_from_engine();
         self.poll_setlist_window();
         for main in &mut self._surge_main {
+            if let Some(msg) = main.poll_recovery() {
+                self.plugin_msg = msg;
+            }
             main.pump();
         }
         self.adopt_hw_devices();

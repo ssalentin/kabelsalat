@@ -12,7 +12,7 @@ pub const KNOB_LABEL_CHARS: usize = 9;
 
 /// One main control. `id` is what the host sends to move it: the CLAP param
 /// id, or the LV2 control-port ordinal (the engine's `SetParam` id).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MainControl {
     pub id: u32,
     pub name: String,
@@ -34,7 +34,7 @@ impl MainControl {
 }
 
 /// Which rule found the controls (see [`resolve`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum MainSource {
     RemoteControls,
     Designation,
@@ -52,7 +52,7 @@ impl MainSource {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MainControls {
     pub source: MainSource,
     pub controls: Vec<MainControl>,

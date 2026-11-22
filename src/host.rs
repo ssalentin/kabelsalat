@@ -61,8 +61,14 @@ use crate::plugin_window::PluginWindow;
 use crate::transport::Transport;
 
 mod loader;
+pub mod sandbox;
 pub use loader::{ClapLoader, ClapLoaderResp, HostedClapMain};
 pub(crate) use loader::trim_heap;
+pub use sandbox::{
+    run_plugin_worker, run_sandbox_test, sandbox_enabled, spawn_sandboxed_clap,
+};
+
+static NEXT_VOICE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Frames per processing block. Small enough for live latency, big enough for Surge.
 const BLOCK: usize = 256;
@@ -560,6 +566,8 @@ pub struct ClapVoice {
     is_effect: bool,
     /// None while a restart has the set on the main thread: silence.
     live: Option<Box<Live>>,
+    /// Out-of-process worker backend (#209). When `Some`, `live` is `None`.
+    sandbox: Option<Box<sandbox::SandboxVoice>>,
     link: AudioLink,
     cmds_tx: Arc<Mutex<rtrb::Producer<VoiceCmd>>>,
     cmds_rx: rtrb::Consumer<VoiceCmd>,
@@ -709,7 +717,6 @@ impl ClapVoice {
         id_str: String,
         sample_rate: f64,
     ) -> Result<(ClapVoice, ClapVoiceMain)> {
-        static NEXT_VOICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         // Processing starts with the first rendered block, on the thread
         // that renders (`start_processing` is an [audio-thread] call).
         let live = Live::activate(&mut plugin, exts, sample_rate).with_context(|| format!("activating {id_str}"))?;
@@ -729,6 +736,7 @@ impl ClapVoice {
             plugin_id: id_str.clone(),
             is_effect,
             live: Some(live),
+            sandbox: None,
             link: audio_link,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
             cmds_rx,
@@ -770,6 +778,42 @@ impl ClapVoice {
         Ok((voice, main))
     }
 
+    /// Construct a `ClapVoice` backed by an isolated `plugin-worker` process (#209).
+    pub(crate) fn from_sandbox(
+        plugin_id: String,
+        is_effect: bool,
+        sample_rate: f64,
+        latency: Arc<AtomicU32>,
+        sandbox: sandbox::SandboxVoice,
+    ) -> Self {
+        let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let (link, _main_link) = restart_link();
+        Self {
+            voice_id: NEXT_VOICE_ID.fetch_add(1, Ordering::Relaxed),
+            plugin_id,
+            is_effect,
+            live: None,
+            sandbox: Some(Box::new(sandbox)),
+            link,
+            cmds_tx: Arc::new(Mutex::new(cmds_tx)),
+            cmds_rx,
+            rt_cmds: Vec::with_capacity(EVENT_CAP as usize),
+            schedule: Vec::new(),
+            sched_idx: 0,
+            frame: 0,
+            sample_rate,
+            ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
+            ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
+            process_errors: 0,
+            gate: Arc::new(StateGate::default()),
+            latency,
+            tail_ext: None,
+            last_status: ProcessStatus::Continue,
+            tail_length: TailLength::Finite(0),
+            tail_queried: false,
+        }
+    }
+
     /// Unique id for pairing with `ClapVoiceMain` on retirement.
     pub fn voice_id(&self) -> u64 {
         self.voice_id
@@ -804,6 +848,9 @@ impl ClapVoice {
 
     /// Native `(min, max)` range for `id`, if reported by the plugin.
     pub fn param_range(&self, id: u32) -> Option<(f64, f64)> {
+        if let Some(sb) = &self.sandbox {
+            return sb.param_range(id);
+        }
         let ranges = &self.live.as_ref()?.param_ranges;
         ranges.binary_search_by_key(&id, |&(pid, _, _)| pid).ok().map(|idx| (ranges[idx].1, ranges[idx].2))
     }
@@ -852,12 +899,18 @@ impl ClapVoice {
 
     /// Last CLAP `ProcessStatus` returned by `process()`. Allocation- and lock-free.
     pub fn last_process_status(&self) -> ProcessStatus {
+        if let Some(sb) = &self.sandbox {
+            return sb.last_process_status();
+        }
         self.last_status
     }
 
     /// Plugin-reported CLAP tail length (`None` if the plugin does not implement
     /// `clap.tail`). Allocation- and lock-free.
     pub fn tail_length(&self) -> Option<TailLength> {
+        if let Some(sb) = &self.sandbox {
+            return sb.tail_length();
+        }
         self.tail_ext.map(|_| self.tail_length)
     }
 
@@ -865,6 +918,12 @@ impl ClapVoice {
     /// `request_process`/`request_restart`/`request_flush`, main-thread state
     /// load/editor open/restart handoff, or queued events. Allocation- and lock-free.
     pub fn take_wake_request(&mut self) -> bool {
+        if let Some(sb) = &mut self.sandbox {
+            return sb.take_wake_request()
+                || !self.rt_cmds.is_empty()
+                || !self.cmds_rx.is_empty()
+                || self.sched_idx < self.schedule.len();
+        }
         let mut wake = self.gate.take_wake();
         if let Some(live) = self.live.as_ref() {
             wake |= live.processor.access_shared_handler(|h| h.wake_requested.swap(false, Ordering::AcqRel));
@@ -880,6 +939,11 @@ impl ClapVoice {
     /// True while a restart is in progress or queued events wait to be rendered.
     /// Allocation- and lock-free; does not consume `wake_requested`.
     pub fn has_pending_work(&self) -> bool {
+        if self.sandbox.is_some() {
+            return !self.rt_cmds.is_empty()
+                || !self.cmds_rx.is_empty()
+                || self.sched_idx < self.schedule.len();
+        }
         self.live.is_none()
             || self.link.stop.load(Ordering::Acquire)
             || !self.rt_cmds.is_empty()
@@ -890,7 +954,9 @@ impl ClapVoice {
     /// Advance the sample clock across a sleeping block without calling
     /// `process()`, keeping pending restart handoffs responsive. Allocation- and lock-free.
     pub fn sleep_skip(&mut self, frames: usize) {
-        self.hand_over();
+        if self.sandbox.is_none() {
+            self.hand_over();
+        }
         self.frame += frames as u64;
     }
 
@@ -926,6 +992,25 @@ impl ClapVoice {
     }
 
     fn render_block(&mut self, n: usize, inp: Option<&[f32]>, out: &mut [f32], transport: &Transport) {
+        if let Some(sb) = &mut self.sandbox {
+            while let Ok(cmd) = self.cmds_rx.pop() {
+                if self.rt_cmds.len() < self.rt_cmds.capacity() {
+                    self.rt_cmds.push(cmd);
+                }
+            }
+            while self.sched_idx < self.schedule.len()
+                && self.schedule[self.sched_idx].0 < self.frame + n as u64
+            {
+                if self.rt_cmds.len() < self.rt_cmds.capacity() {
+                    self.rt_cmds.push(self.schedule[self.sched_idx].1);
+                }
+                self.sched_idx += 1;
+            }
+            sb.render_block(n, inp, out, transport, &self.rt_cmds);
+            self.rt_cmds.clear();
+            self.frame += n as u64;
+            return;
+        }
         self.hand_over();
         // No set (a restart has it) or a plugin that will not start: silence.
         // The commands wait in their queues for the block that renders.
@@ -2356,7 +2441,7 @@ impl ClapVoiceMain {
 }
 
 /// A plugin parameter description for the native editor (no X11 / plugin GUI).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ParamDesc {
     pub id: u32,
     pub name: String,

@@ -1957,4 +1957,10 @@ Learned so far (2026-11-15, UI polish pass):
     Show an active `■ Stop demo` (compact `■ Demo`, narrow `■`) chip in the top
     bar (accounted for in `right_w`) and in the Assistant panel header whenever
     `self.demo_playing.is_some()` (`demo_stop_buttons_show_in_top_bar_and_assistant_when_playing_and_stop_demo`).
+220. **Plugin worker processes reset `SIGSEGV`/`SIGBUS` to `SIG_DFL` and
+    `RLIMIT_CORE` to 0 (#209):** Rust's `std` stack-overflow `SIGSEGV` handler
+    returns without terminating on an external `kill -SEGV` (`SI_USER`, no
+    faulting instruction to re-execute), and core dumps stall worker exit on
+    stage. `host::sandbox::run_plugin_worker` sets `SIG_DFL` and `RLIMIT_CORE=0`
+    at entry so fatal plugin faults exit immediately for supervisor restart.
 

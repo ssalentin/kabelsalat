@@ -142,6 +142,18 @@ agents are in [AGENTS.md](../AGENTS.md).
   deactivates, activates and sends a new set. `start_processing` and
   `stop_processing` run on the thread that renders. The test plugin in
   `src/host/probe.rs` records the thread of every call.
+- `host/sandbox.rs` — out-of-process CLAP plugin hosting (#209): each hosted
+  plugin runs in its own `kabelsalat plugin-worker <shm_fd> <ctrl_fd>` child
+  process communicating over anonymous Linux shared memory (`memfd_create` +
+  `mmap(MAP_SHARED)` + cross-process futex) for RT audio and a `UnixStream`
+  socketpair for non-RT control RPC (params, state save/restore, X11 plugin
+  editor). On a block deadline miss or worker crash (`SIGSEGV`/`SIGABRT`), the
+  audio thread outputs silence for that strip alone while `SandboxMain::poll_recovery`
+  spawns a fresh worker with the unit's last saved state and hot-swaps its
+  shared-memory mapping into the audio thread over a wait-free `rtrb` ring
+  (old regions return to the main thread for `munmap`). `KABELSALAT_SANDBOX=0`
+  disables sandboxing; `kabelsalat sandbox-test` verifies `SIGSEGV` recovery
+  and measures IPC round-trip latency at 64 and 256 frames.
 - `lv2.rs` — hand-written lilv FFI; LV2 effects and instruments, presets,
   MIDNAM programme names, loader thread, `LILV_LOCK`.
 - `plugins.rs` — what kind of plugin each one is. Every built-in unit, CLAP

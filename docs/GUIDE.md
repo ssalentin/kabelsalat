@@ -250,6 +250,21 @@ mono legato, CC remap). A card says when a plugin has no build for your CPU, and
 links its source code and website. See [PLUGINS.md](PLUGINS.md) for
 which plugins have been tested, what works, and what is still untested.
 
+### Plugin crash isolation
+
+Every hosted CLAP plugin runs in its own isolated `kabelsalat plugin-worker`
+helper process, communicating with the audio engine over an anonymous Linux
+shared-memory block (`memfd_create` + cross-process futex) and a control socket
+for parameters, state and the plugin's X11 editor window. If a plugin crashes
+(`SIGSEGV`, `SIGABRT`) or hangs past its per-block deadline, the engine plays
+silence for that strip while every other rig keeps sounding without an xrun.
+kabelsalat automatically restarts the dead helper with the unit's last saved
+state and shows a `RESTARTED` badge on the strip so you know what happened.
+
+Set `KABELSALAT_SANDBOX=0` to host CLAP plugins in-process instead. Run
+`kabelsalat sandbox-test` to verify `SIGSEGV` recovery across two live rigs and
+measure the shared-memory IPC round-trip time at 64 and 256 frames.
+
 ## Mix
 
 ### Mix

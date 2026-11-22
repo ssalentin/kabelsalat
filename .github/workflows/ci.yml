@@ -48,3 +48,7 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: scripts/ci/test.sh
+      - name: Performance budgets
+        run: |
+          python3 scripts/ci/perf-budget.py --selftest
+          python3 scripts/ci/perf-budget.py --check --binary ./target/debug/kabelsalat

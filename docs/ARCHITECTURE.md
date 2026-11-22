@@ -809,6 +809,83 @@ for" line per check that stays by ear, and with `--save` writes those clips
 (16-bit WAV, read back by the player). With Surge XT installed it also
 measures a played note's pitch, brightness and aliasing.
 
+## Performance budgets
+
+Headless performance budgets live in [perf-budgets.json](perf-budgets.json) and
+are enforced on every pull request and push to `main` by
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on both `x86_64`
+(`ubuntu-24.04`) and `aarch64` (`ubuntu-24.04-arm`) using debug builds
+(`opt-level = 1` for the crate, `opt-level = 2` for dependencies, `Cargo.toml`).
+
+CI has no sound card, display, or Surge XT installed (`setbfree` only), so
+the budget check runs exclusively plugin-free headless benchmarks in an isolated
+`$HOME`:
+
+1. **Audio block render time (`engine-bench render session routing --reps 5 --json`):**
+   the 256-frame demo-shaped rack (`render_256`), the 4-rig 24-unit live rack
+   (`session`), and the plain-gain routing skeleton (`routing`), also verifying
+   that deterministic FNV output hashes match across runs.
+2. **UI frame time and tessellation vertices (`ui-bench 200 --json`):** median
+   layout+paint+tessellation frame time (`frame_median_us`) and frame mesh
+   vertex count (`vertices`) across all 7 headless stages (`rack-front`,
+   `rack-back`, `big-front`, `big-back`, `mixer`, `big-mixer`, `matrix`) at
+   `1600x1000`, `1.6x`.
+3. **Session load time (`session-load-bench --builtin --rounds 5 --json`):**
+   synthesizes a deterministic 4-rig, 35-node, 10-song × 2-part gig package in a
+   temporary directory and measures `Session::load`, `DemoApp::apply_session`,
+   combined `total`, and the slowest of the 16 frames that follow.
+4. **Start-up time to first frame (`startup-bench --json`):** cold subprocess
+   time from `egui::Context` + font/theme initialization through `GraphEngine`
+   + `DemoApp` construction, first audio block render, and first `frame_ui`
+   + tessellation (`to_first_frame_ms`).
+5. **Default-rack memory (`startup-bench --json`):** process resident set size
+   (`rss_mib`, read from `/proc/self/smaps_rollup` with `/proc/self/status`
+   `VmRSS`/`VmHWM` fallback) immediately after the first frame of the default
+   rack.
+
+### Enforcement and tolerances
+
+`scripts/ci/perf-budget.py --selftest` validates the schema and proves
+synthetic `2×` regressions fail; `--check --binary ./target/debug/kabelsalat`
+runs 3 invocations each of `engine-bench`, `ui-bench`, and `session-load-bench`
+plus 5 fresh `startup-bench` subprocesses, takes the trimmed median (dropping
+min and max when `n >= 5`) to absorb shared-runner jitter, and fails CI if any
+metric exceeds `budget × (1 + tolerance)`:
+
+| Area | Tolerance | `aarch64` budgets | `x86_64` budgets |
+| --- | --- | --- | --- |
+| Render time (`render_256` / `session` / `routing`) | +35% | 38.0 / 290.0 / 180.0 µs | 42.0 / 320.0 / 195.0 µs |
+| UI frame time (`rack-front` … `big-back`, `mixer`, `big-mixer`, `matrix`) | +35% | 340–960 µs (per scene) | 380–1050 µs (per scene) |
+| UI vertex count (7 scenes) | +10% | 7,200–44,000 | 7,200–44,000 |
+| Session load (`total` / `apply` / `slowest_frame`) | +40% | 1.5 / 0.8 / 8.0 ms | 2.0 / 1.0 / 10.0 ms |
+| Start-up to first frame | +40% | 55.0 ms | 65.0 ms |
+| Default-rack RSS | +20% | 38.0 MiB | 42.0 MiB |
+
+### Tracking release baselines
+
+`docs/perf-budgets.json` keeps a `releases` array of measured numbers so
+cross-release trends remain visible. Record a release's numbers with:
+
+```sh
+python3 scripts/ci/perf-budget.py --record --binary ./target/debug/kabelsalat --version X.Y.Z --write
+# Add --include-plugins on a machine with Surge XT to also capture idle-sleep & plugin startup RSS
+```
+
+Post-`#206` (`0.3.0-pre`, commit `dbe0fd5`) measured baselines on `aarch64`
+(Apple M1, Asahi Linux, 16 KiB pages):
+
+- **Headless CI metrics:** `render_256 = 27.98 µs` (`fe7cab9d03542447`),
+  `session = 201.22 µs` (`7c30fffef3515e48`), `routing = 126.46 µs`
+  (`769ddb8f5c5982c1`); UI frames `235.59 µs` (`rack-front`, 12,218 verts) to
+  `650.23 µs` (`big-back`, 41,506 verts); built-in 4-rig `session-load-bench`
+  `total = 0.208 ms` (`apply = 0.103 ms`, `slowest_frame = 1.282 ms`);
+  `startup-bench` `to_first_frame = 16.32 ms`, `rss = 30.19 MiB`.
+- **With local Surge XT (`--include-plugins`):** `engine-bench idle` measures
+  `1 live = 165.64 µs/block` (`3.11%`), `1+7 idle = 168.84 µs/block` (`3.17%`,
+  `7/7` sleeping, `+3.21 µs/block` total = `0.46 µs/idle rig`, `1.02×`);
+  `startup-bench --with-plugins` (2 Surge XT voices) measures
+  `to_first_frame = 145.48 ms`, `rss = 93.09 MiB` (`priv_dirty = 62.97 MiB`).
+
 ## 8. Build phases (history)
 
 The phases the project was built in. The current roadmap is the pinned issue

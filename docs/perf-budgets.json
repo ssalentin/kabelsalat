@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "notes": "Headless CI performance budgets and per-release measured baselines (#280). Debug profile uses opt-level=1 for crate and opt-level=2 for dependencies (Cargo.toml).",
+  "runner_reference": {
+    "x86_64": "GitHub Actions ubuntu-24.04 (calibrated from aarch64 baseline; tightened/verified on CI runs)",
+    "aarch64": "Measured locally on Apple M1 Asahi Linux (16 KiB pages); CI runs on GitHub Actions ubuntu-24.04-arm (4 KiB pages)"
+  },
+  "tolerances": {
+    "render_time": 0.35,
+    "ui_frame_time": 0.35,
+    "ui_vertices": 0.10,
+    "session_load_time": 0.40,
+    "startup_time": 0.40,
+    "memory_rss": 0.20
+  },
+  "metric_areas": {
+    "engine.render_256.block_us": {
+      "area": "render_time",
+      "unit": "us"
+    },
+    "engine.session.block_us": {
+      "area": "render_time",
+      "unit": "us"
+    },
+    "engine.routing.block_us": {
+      "area": "render_time",
+      "unit": "us"
+    },
+    "ui.rack-front.frame_median_us": {
+      "area": "ui_frame_time",
+      "unit": "us"
+    },
+    "ui.rack-back.frame_median_us": {
+      "area": "ui_frame_time",
+      "unit": "us"
+    },
+    "ui.big-front.frame_median_us": {
+      "area": "ui_frame_time",
+      "unit": "us"
+    },
+    "ui.big-back.frame_median_us": {
+      "area": "ui_frame_time",
+      "unit": "us"
+    },
+    "ui.mixer.frame_median_us": {
+      "area": "ui_frame_time",
+      "unit": "us"
+    },
+    "ui.big-mixer.frame_median_us": {
+      "area": "ui_frame_time",
+      "unit": "us"
+    },
+    "ui.matrix.frame_median_us": {
+      "area": "ui_frame_time",
+      "unit": "us"
+    },
+    "ui.rack-front.vertices": {
+      "area": "ui_vertices",
+      "unit": "vertices"
+    },
+    "ui.rack-back.vertices": {
+      "area": "ui_vertices",
+      "unit": "vertices"
+    },
+    "ui.big-front.vertices": {
+      "area": "ui_vertices",
+      "unit": "vertices"
+    },
+    "ui.big-back.vertices": {
+      "area": "ui_vertices",
+      "unit": "vertices"
+    },
+    "ui.mixer.vertices": {
+      "area": "ui_vertices",
+      "unit": "vertices"
+    },
+    "ui.big-mixer.vertices": {
+      "area": "ui_vertices",
+      "unit": "vertices"
+    },
+    "ui.matrix.vertices": {
+      "area": "ui_vertices",
+      "unit": "vertices"
+    },
+    "session_load.total_median_ms": {
+      "area": "session_load_time",
+      "unit": "ms"
+    },
+    "session_load.apply_median_ms": {
+      "area": "session_load_time",
+      "unit": "ms"
+    },
+    "session_load.slowest_frame_median_ms": {
+      "area": "session_load_time",
+      "unit": "ms"
+    },
+    "startup.to_first_frame_ms": {
+      "area": "startup_time",
+      "unit": "ms"
+    },
+    "memory.default_rack_rss_mib": {
+      "area": "memory_rss",
+      "unit": "MiB"
+    }
+  },
+  "budgets": {
+    "aarch64": {
+      "engine.render_256.block_us": 38.0,
+      "engine.session.block_us": 290.0,
+      "engine.routing.block_us": 180.0,
+      "ui.rack-front.frame_median_us": 340.0,
+      "ui.rack-back.frame_median_us": 390.0,
+      "ui.big-front.frame_median_us": 740.0,
+      "ui.big-back.frame_median_us": 960.0,
+      "ui.mixer.frame_median_us": 500.0,
+      "ui.big-mixer.frame_median_us": 860.0,
+      "ui.matrix.frame_median_us": 440.0,
+      "ui.rack-front.vertices": 13000,
+      "ui.rack-back.vertices": 17600,
+      "ui.big-front.vertices": 25800,
+      "ui.big-back.vertices": 44000,
+      "ui.mixer.vertices": 16000,
+      "ui.big-mixer.vertices": 22200,
+      "ui.matrix.vertices": 7200,
+      "session_load.total_median_ms": 1.5,
+      "session_load.apply_median_ms": 0.8,
+      "session_load.slowest_frame_median_ms": 8.0,
+      "startup.to_first_frame_ms": 55.0,
+      "memory.default_rack_rss_mib": 38.0
+    },
+    "x86_64": {
+      "engine.render_256.block_us": 42.0,
+      "engine.session.block_us": 320.0,
+      "engine.routing.block_us": 195.0,
+      "ui.rack-front.frame_median_us": 380.0,
+      "ui.rack-back.frame_median_us": 430.0,
+      "ui.big-front.frame_median_us": 820.0,
+      "ui.big-back.frame_median_us": 1050.0,
+      "ui.mixer.frame_median_us": 550.0,
+      "ui.big-mixer.frame_median_us": 960.0,
+      "ui.matrix.frame_median_us": 500.0,
+      "ui.rack-front.vertices": 13000,
+      "ui.rack-back.vertices": 17600,
+      "ui.big-front.vertices": 25800,
+      "ui.big-back.vertices": 44000,
+      "ui.mixer.vertices": 16000,
+      "ui.big-mixer.vertices": 22200,
+      "ui.matrix.vertices": 7200,
+      "session_load.total_median_ms": 2.0,
+      "session_load.apply_median_ms": 1.0,
+      "session_load.slowest_frame_median_ms": 10.0,
+      "startup.to_first_frame_ms": 65.0,
+      "memory.default_rack_rss_mib": 42.0
+    }
+  },
+  "releases": [
+    {
+      "version": "0.3.0-pre",
+      "date": "2026-11-22",
+      "commit": "dbe0fd5",
+      "hashes": {
+        "render_256": "fe7cab9d03542447",
+        "session": "7c30fffef3515e48",
+        "routing": "769ddb8f5c5982c1"
+      },
+      "measured": {
+        "aarch64": {
+          "engine.render_256.block_us": 27.975,
+          "engine.session.block_us": 201.219,
+          "engine.routing.block_us": 126.456,
+          "ui.rack-front.frame_median_us": 235.59,
+          "ui.rack-back.frame_median_us": 265.049,
+          "ui.big-front.frame_median_us": 507.556,
+          "ui.big-back.frame_median_us": 650.226,
+          "ui.mixer.frame_median_us": 340.301,
+          "ui.big-mixer.frame_median_us": 593.808,
+          "ui.matrix.frame_median_us": 303.425,
+          "ui.rack-front.vertices": 12218.0,
+          "ui.rack-back.vertices": 16562.0,
+          "ui.big-front.vertices": 24306.0,
+          "ui.big-back.vertices": 41506.0,
+          "ui.mixer.vertices": 14986.0,
+          "ui.big-mixer.vertices": 20938.0,
+          "ui.matrix.vertices": 6754.0,
+          "session_load.total_median_ms": 0.208,
+          "session_load.apply_median_ms": 0.103,
+          "session_load.slowest_frame_median_ms": 1.282,
+          "startup.to_first_frame_ms": 16.322,
+          "memory.default_rack_rss_mib": 30.188
+        },
+        "aarch64_surge_xt": {
+          "engine_idle": {
+            "one_live_block_us": 165.637,
+            "one_plus_seven_idle_block_us": 168.843,
+            "overhead_us_per_block": 3.206,
+            "overhead_us_per_idle_rig": 0.458,
+            "ratio_vs_one_live": 1.019,
+            "sleeping_rigs": 7,
+            "hash": "b3f210f3e84dacd8"
+          },
+          "startup_with_plugins": {
+            "to_first_frame_ms": 145.481,
+            "rss_mib": 93.094,
+            "priv_dirty_mib": 62.969,
+            "hwm_mib": 93.172,
+            "voices": 2
+          }
+        }
+      }
+    }
+  ]
+}

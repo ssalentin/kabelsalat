@@ -11012,7 +11012,16 @@ impl DemoApp {
             }
             "add_node" => {
                 let kind_str = args.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                let name = name_bytes(args.get("name").and_then(|v| v.as_str()).unwrap_or(&kind_str));
+                let default_name = match kind_str.as_str() {
+                    "clap" => args.get("plugin_id").and_then(|v| v.as_str())
+                        .and_then(|id| self.plugins_clap.iter().find(|p| p.id == id).map(|p| p.name.as_str()))
+                        .unwrap_or(&kind_str),
+                    "lv2" => args.get("uri").and_then(|v| v.as_str())
+                        .and_then(|u| self.plugins_lv2.iter().find(|p| p.uri == u).map(|p| p.name.as_str()))
+                        .unwrap_or(&kind_str),
+                    _ => &kind_str,
+                };
+                let name = name_bytes(args.get("name").and_then(|v| v.as_str()).unwrap_or(default_name));
                 let kind = match kind_str.as_str() {
                     "keys" => Some(NodeKind::Keys),
                     "clap" => Some(NodeKind::Clap { plugin_id: crate::control::ClapId::new(args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("org.surge-synth-team.surge-xt")) }),
@@ -33826,6 +33835,19 @@ const EVAL_TASKS: &[EvalTask] = &[
         check: |app, _, _| {
             let patch = eval_patch(app, 0)?;
             eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
+        },
+    },
+    EvalTask {
+        name: "unsampled_piano", start: EvalStart::OneRig, prompt: "Load Unsampled Piano.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let piano = eval_node(&g, 0, "Unsampled Piano", |k| matches!(k, NodeKind::Clap { plugin_id } if plugin_id.as_str() == "fr.mgth.unsampled-piano"))?;
+            let keys = eval_node(&g, 0, "Keys", |k| matches!(k, NodeKind::Keys))?;
+            let master = eval_node(&g, 0, "Master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_midi_cable(&g, keys, 0, piano), || "Keys do not feed Unsampled Piano".into())?;
+            eval_ensure(eval_audio_path(&g, piano, master), || "Unsampled Piano does not reach Master".into())?;
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && matches!(&n.kind, NodeKind::Clap { plugin_id } if plugin_id.as_str() == SURGE_ID)),
+                || "Surge XT is still in rig 1 alongside Unsampled Piano".into())
         },
     },
     EvalTask {

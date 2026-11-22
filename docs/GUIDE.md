@@ -72,8 +72,7 @@ USB MIDI keyboard — devices are found while the app runs, just plug them in.
 Starter setups (**F5–F7**, **Shift+F5–F7**) give you a cathedral pipe organ,
 a jazz or rock tonewheel organ, an ambient pad, a synth lead or a guitar rig
 with one key. They use a handful of free plugins (Aeolus, setBfree, Surge XT,
-Guitarix); a setup whose plugins are missing is greyed out in Sessions with an
-Install button.
+Guitarix); a setup whose plugins are missing routes straight to **Plugins → Install**.
 
 Every rig is a kind of instrument: piano, e-piano, jazz organ, pipe organ,
 synth, bass, wind or drums. kabelsalat knows it from the plugin (setBfree is an
@@ -477,9 +476,10 @@ and `set_setlist_set`.
 
 ### Go on stage with Show mode
 
-Click **Show mode** in the Setlist header (agents: `set_show_mode`) for a
+Press **F2** or click **Show mode** in the Setlist header (agents: `set_show_mode`) for a
 full-window stage screen you can read from two metres away: the current song
-and part in large type, the next song, tempo and time signature, the master
+and part in large type, the upcoming part and next song, top status pills (`REC`,
+`TRACK`, `CLICK`), tempo and time signature, the master
 meter, one meter per rig that plays in this part, and a clock. Editing is
 locked while it is open: no click or key moves a cable, a fader or a song.
 PageUp / PageDown (Shift for songs) and a foot switch still step the setlist,
@@ -496,7 +496,9 @@ the chosen output and every Audio In device are connected, every plugin is
 installed and loads, every rig makes sound (each plays its demo phrase in an
 offline engine of its own), every song's backing track is on disk, there is
 room to record, the buffer has headroom, and the laptop runs on mains power.
-Each check says ok, warning or problem, and what to do about it. Agents get the
+Each check says ok, warning or problem, what to do about it, and offers a
+one-click quick-fix button (`Matrix →`, `Mixer →`, `Install →`, `Rack →`,
+`Settings →`, `Fix track →`) right on failing rows. Agents get the
 same list from the `preshow_check` tool, and `kabelsalat preshow-check
 <session.ksalat>` prints it in a terminal (exit status 1 on a problem).
 
@@ -513,7 +515,8 @@ then on its press does the action in the next audio block (the tuner and
 recording a frame later), in every song and in Show mode, and it never reaches
 an instrument; a key held while it is learned still gets its release. One
 message does one action: learning it for another moves it there. The devices
-whose program change picks the song are rows of the same list. The tuner shows
+whose program change picks the song are rows of the same list. Press **Ctrl+T**
+or click **TUNE** on Audio In to toggle the tuner; it shows
 the note the first Audio In plays and how many cents it is off; click it to
 close it. Agents list and set the controls with `get_show_controls` and
 `set_show_control`.
@@ -530,8 +533,9 @@ at the transport tempo from its original BPM (a "120 bpm" in the file name is
 picked up; speed changes, pitch follows, no time-stretch), **beats** sets the loop
 length in beats so an aligned loop never drifts off the metronome, and **offset**
 shifts the start. With sync on and the transport rolling, it starts on the next
-bar line. A setlist song can name its backing track (`set_setlist_song` with
-`backing`): selecting the song starts it, and a song without one stops it.
+bar line. Attach a WAV file directly in the Setlist song editor (**Pick WAV…**
+or drop a `.wav` file onto the app), or name one via `set_setlist_song` with
+`backing`: selecting the song starts it, and a song without one stops it.
 
 ### Record your set
 
@@ -604,18 +608,21 @@ terminal.
 
 ### Ask the assistant — or your own AI agent
 
-The built-in assistant (bring your own [OpenRouter](https://openrouter.ai/keys)
-key, entered under **Settings → Agent → API key**) can set things up for you:
+Press **C** to open the built-in assistant (**F12** opens the Setlist; **Shift+R**
+resets the selected unit's or active rig's knobs on the rack). Bring your own
+[OpenRouter](https://openrouter.ai/keys)
+key (entered directly in the dock or under **Settings → Agent → API key**) and
+it can set things up for you:
 "add a reverb to this rig", "split the keys at C4", "load a warm pad". One key
 reaches every model: **Settings → Agent → Models** picks the chat model, the
 decisions model and the listening model, or takes any OpenRouter model id. While
 it works, the assistant says what it is doing ("Planning the next step · after
 Load sound"), and when it listens to your sound a bar shows how long it still
 records, in the dock, on the top bar's button and on the rack's hint line.
-Don't want it? Switch **Assistant** off on the same page and it leaves the top
-bar and the dock. Everything
-an agent changes lights up in the rack, and **Ctrl+Z** undoes the whole request
-in one step. External AI agents (Claude, …) can drive the running app through
+Don't want it? Switch **Assistant** off on the same page (or click **Hide Assistant**)
+and it leaves the top bar and the dock. Everything an agent changes lights up in
+the rack, and **Ctrl+Z** undoes both agent turns and manual rack, setlist,
+template and mixer edits in one step. External AI agents (Claude, …) can drive the running app through
 the built-in MCP server; the top bar shows when one is connected and pauses it
 with one click.
 

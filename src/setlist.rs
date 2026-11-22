@@ -563,6 +563,45 @@ impl Setlist {
         true
     }
 
+    /// Reorder one part inside `song`, keeping `active` on the same part.
+    pub fn move_part(&mut self, song: usize, from: usize, to: usize) -> bool {
+        let Some(s) = self.songs.get_mut(song) else {
+            return false;
+        };
+        if from >= s.parts.len() || to >= s.parts.len() || from == to {
+            return false;
+        }
+        let part = s.parts.remove(from);
+        s.parts.insert(to, part);
+        if let Some(pos) = &mut self.active {
+            if pos.song == song {
+                if pos.part == from {
+                    pos.part = to;
+                } else if from < to && pos.part > from && pos.part <= to {
+                    pos.part -= 1;
+                } else if to < from && pos.part >= to && pos.part < from {
+                    pos.part += 1;
+                }
+            }
+        }
+        true
+    }
+
+    /// Duplicate part `index` in `song` right after the original, keeping `active` on the same part.
+    pub fn duplicate_part(&mut self, song: usize, index: usize) -> Option<usize> {
+        let s = self.songs.get_mut(song)?;
+        let mut copy = s.parts.get(index)?.clone();
+        copy.name = format!("{} copy", copy.name);
+        let at = index + 1;
+        s.parts.insert(at, copy);
+        if let Some(pos) = &mut self.active {
+            if pos.song == song && pos.part > index {
+                pos.part += 1;
+            }
+        }
+        Some(at)
+    }
+
     /// Remove song `index`, updating `active` cleanly.
     pub fn remove_song(&mut self, index: usize) -> Option<Song> {
         if index >= self.songs.len() {
@@ -1072,6 +1111,21 @@ mod tests {
         assert_eq!(sl.active, Some(SetlistPos { song: 1, part: 1 }));
         assert!(sl.remove_song(1).is_some());
         assert_eq!(sl.active, Some(SetlistPos { song: 0, part: 0 }));
+    }
+
+    #[test]
+    fn move_and_duplicate_part_keep_active_cursor_sane() {
+        let mut sl = sample_setlist();
+        sl.songs[0].parts.push(Part::new("Bridge", vec![PartRig::new(1)]));
+        sl.active = Some(SetlistPos { song: 0, part: 1 });
+        assert!(sl.move_part(0, 1, 0));
+        assert_eq!(sl.songs[0].parts[0].name, "Chorus");
+        assert_eq!(sl.active, Some(SetlistPos { song: 0, part: 0 }));
+        assert!(sl.move_part(0, 2, 0));
+        assert_eq!(sl.active, Some(SetlistPos { song: 0, part: 1 }));
+        assert_eq!(sl.duplicate_part(0, 0), Some(1));
+        assert_eq!(sl.songs[0].parts[1].name, "Bridge copy");
+        assert_eq!(sl.active, Some(SetlistPos { song: 0, part: 2 }));
     }
 
     #[test]

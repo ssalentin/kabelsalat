@@ -252,7 +252,12 @@ impl DemoApp {
                 }
                 for (b, target) in self.show_bindings() {
                     let dest = self.units.iter().find(|u| u.node_id == b.dest).map_or_else(|| format!("node {}", b.dest), |u| sentence_case(&u.name));
-                    let label = format!("CC {} · {} → {dest}", b.cc, crate::setlist::source_str(b.source));
+                    let src = match b.source {
+                        crate::matrix::SourceId::Keys => "Keyboard".to_string(),
+                        crate::matrix::SourceId::Hardware(d) => self.hw_device_label(d),
+                        _ => crate::setlist::source_str(b.source),
+                    };
+                    let label = format!("CC {} · {src} → {dest}", b.cc);
                     row(self, ui, label, LevelItem::Binding(b, target));
                 }
             });

@@ -1889,3 +1889,32 @@ Learned so far (2026-11-15, UI polish pass):
     `releases` in `docs/perf-budgets.json` and `docs/ARCHITECTURE.md`, and
     verify changes with `python3 scripts/ci/perf-budget.py --selftest`,
     `engine::bench::tests`, and `ui::bench::tests`.
+212. **Headless click and `Area` tests settle 3 frames after `ui_scale` (`ppp`) changes:**
+    `frame_ui` applies the `1.60` scale mid-frame on frame 1 and lays out frame 2
+    before widgets/ScrollAreas/anchored `Area`s finish sizing, so click coordinates
+    from frame 1–2 miss widgets (`preshow_quick_fix_buttons_route_to_their_views`,
+    `manual_setlist_edits_undo_and_song_delete_needs_two_clicks`,
+    `stage_toast_renders_patch_notice_on_non_rack_views`). Warm up 3 frames with
+    `focused: true` and advancing `raw.time`, then scan settled shapes.
+213. **Do not consume `Key::Escape` in `handle_input` while an `egui::Modal` is open,
+    and render non-Rack `patch_notice` in the stage subtitle instead of a
+    bottom-anchored `Area`:** `handle_input` runs before modals/docks; eating
+    `Escape` prevented `load_rig_modal` (no `TextEdit`) from closing via
+    `modal.should_close()`, and a bottom-anchored toast overlapped open Keyboard
+    / Assistant docks (`rig_preset_saves_from_slot_a_and_loads_into_other_slots_intact`,
+    `every_view_fits_small_windows`). Clear two-step confirms before yielding
+    `Escape`, and draw active notices inline in stage headers (`active_patch_notice`).
+214. **Destructive hotkeys and UI edits push user undo, sync `set_unit_knob` +
+    `node_params`, and honor `rack_locked`:** `Shift+R` (`reset_knobs`) replaces
+    unguarded global `R`, calls `set_unit_knob` + updates `node_params` (instead
+    of `k.set_immediate` alone), and snapshots `push_user_undo()` along with
+    manual cable/template/setlist/bus/rig edits (`bare_r_is_a_noop_while_shift_r_resets_unit_or_active_rig_with_undo`,
+    `manual_setlist_edits_undo_and_song_delete_needs_two_clicks`,
+    `rack_locked_blocks_template_hotkeys_and_aux_bus_edits`). Keep `F12` Setlist-only
+    and `C` for Assistant, `F2` for Show mode, and `Ctrl+T` for the tuner.
+215. **Pin Mixer `Kabelsalat` + `Master out` only once `n >= 4` rigs overflow:**
+    subtracting `pinned_w` on 1–3 rig mixers shrank `left_max_w` under the 1240 px
+    sheet cap enough to clip a 3rd rig's Aux bus strip (`the_mixer_and_the_setlist_show_each_level`,
+    `mixer_pins_kabelsalat_and_master_when_many_rigs_overflow`). Keep dark-surface
+    notices/prompts in `ACCENT_BRIGHT` (never `ACCENT_DEEP` text) and check `760×520`
+    for Show mode (`show_mode_narrow_bottom_bar_and_indicators_fit_without_overlap`).

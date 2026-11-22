@@ -120,13 +120,13 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **A setlist of songs and parts** that switches without cutting held notes
   or reverb tails. → [Setlist](docs/GUIDE.md#play-a-setlist-without-a-gap),
   [show, set and song levels](docs/GUIDE.md#keep-what-stays-through-the-whole-show)
-- **Show mode:** a stage screen readable from two metres, with editing locked.
-  → [Show mode](docs/GUIDE.md#go-on-stage-with-show-mode)
-- **Check the show** before the first song: devices, plugins, sound, power.
-  → [Check show](docs/GUIDE.md#check-the-show-before-the-first-song)
-- **Step songs from a foot switch**, play backing tracks, record the set or
-  save the last two minutes after the fact, and restart by itself after a
-  crash. → [Pedals](docs/GUIDE.md#run-the-show-from-a-pedal),
+- **Show mode (F2):** a stage screen readable from two metres, with editing locked
+  and upcoming part preview. → [Show mode](docs/GUIDE.md#go-on-stage-with-show-mode)
+- **Check the show** before the first song: devices, plugins, sound, power, with
+  one-click quick-fix links. → [Check show](docs/GUIDE.md#check-the-show-before-the-first-song)
+- **Step songs from a foot switch**, attach WAV backing tracks directly to songs,
+  record the set or save the last two minutes with **Retro**, and restart by
+  itself after a crash. → [Pedals](docs/GUIDE.md#run-the-show-from-a-pedal),
   [Backing tracks](docs/GUIDE.md#play-along-with-a-backing-track),
   [Recording](docs/GUIDE.md#record-your-set),
   [Crash recovery](docs/GUIDE.md#get-back-on-stage-after-a-crash)
@@ -142,8 +142,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **See the load per unit** and fix crackles with **Audio Doctor**.
   → [Engine](docs/GUIDE.md#keep-an-eye-on-the-engine),
   [Audio Doctor](docs/GUIDE.md#diagnose-latency-and-xruns-with-audio-doctor)
-- **An optional assistant** ("split the keys at C4", "add a reverb") and an
-  MCP server for your own AI agent. Off with one switch.
+- **An optional assistant (C)** ("split the keys at C4", "add a reverb") and an
+  MCP server for your own AI agent, with **Ctrl+Z** undo for both agent and
+  manual edits. Off with one switch.
   → [Assistant](docs/GUIDE.md#ask-the-assistant--or-your-own-ai-agent)
 
 ## Install

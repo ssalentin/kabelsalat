@@ -219,6 +219,16 @@ impl DemoApp {
         Self::stage_hairline(ui);
         ui.add_space(6.0);
         let mut open_doctor = false;
+        #[derive(Clone, Copy)]
+        enum PreshowFix {
+            Matrix,
+            Mixer,
+            PluginsInstall,
+            Rack,
+            SettingsAudio,
+            PickBacking,
+        }
+        let mut fix: Option<PreshowFix> = None;
         let rows = self.preshow.report.as_ref().map(|r| r.rows.clone()).unwrap_or_default();
         egui::ScrollArea::vertical()
             .id_salt("preshow_scroll")
@@ -237,7 +247,27 @@ impl DemoApp {
                         );
                         ui.vertical(|ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new(row.title).font(theme::medium_font(12.5)).color(theme::INK));
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(row.title).font(theme::medium_font(12.5)).color(theme::INK));
+                                if row.status != Status::Ok {
+                                    let target = match row.id {
+                                        "midi_devices" => Some(("Matrix →", PreshowFix::Matrix)),
+                                        "audio_output" | "audio_inputs" => Some(("Mixer →", PreshowFix::Mixer)),
+                                        "plugins" => Some(("Install →", PreshowFix::PluginsInstall)),
+                                        "rigs_sound" => Some(("Rack →", PreshowFix::Rack)),
+                                        "render" => Some(("Settings →", PreshowFix::SettingsAudio)),
+                                        "backing_tracks" => Some(("Fix track →", PreshowFix::PickBacking)),
+                                        _ => None,
+                                    };
+                                    if let Some((lbl, act)) = target {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if theme::chip_button(ui, lbl, false).clicked() {
+                                                fix = Some(act);
+                                            }
+                                        });
+                                    }
+                                }
+                            });
                             ui.add(egui::Label::new(egui::RichText::new(&row.text).size(12.0).color(theme::INK_2)).wrap());
                             if matches!(row.id, "render" | "audio_output" | "audio_inputs") && row.status != Status::Ok {
                                 ui.add_space(3.0);
@@ -252,6 +282,30 @@ impl DemoApp {
             });
         if open_doctor {
             self.open_audio_doctor();
+        }
+        if let Some(act) = fix {
+            self.preshow.open = false;
+            match act {
+                PreshowFix::Matrix => self.stage_view = StageView::Matrix,
+                PreshowFix::Mixer => self.stage_view = StageView::Mixer,
+                PreshowFix::PluginsInstall => {
+                    self.stage_view = StageView::Plugins;
+                    self.plugin_category = PluginCategory::Install;
+                }
+                PreshowFix::Rack => self.stage_view = StageView::Rack,
+                PreshowFix::SettingsAudio => {
+                    self.stage_view = StageView::Settings;
+                    self.settings_page = SettingsPage::Audio;
+                }
+                PreshowFix::PickBacking => {
+                    if let Some(bad) = self.setlist.songs.iter().position(|s| {
+                        s.backing.as_deref().is_some_and(|p| !std::path::Path::new(p).is_file())
+                    }) {
+                        self.setlist_edit_song = Some(bad);
+                    }
+                    self.setlist_backing_open = self.setlist_edit_song;
+                }
+            }
         }
         if again {
             self.start_preshow();
@@ -388,6 +442,96 @@ pub(super) mod tests {
             assert!(marks.contains(&(mark.into(), colour)), "{mark} in its colour: {marks:?}");
         }
         assert!(!app.preshow.running(), "a report on screen is not checked again by itself");
+    }
+
+    #[test]
+    fn preshow_quick_fix_buttons_route_to_their_views() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        app.stage_view = StageView::Setlist;
+        app.preshow.open = true;
+        let mut rep = a_report();
+        if let Some(r) = rep.rows.iter_mut().find(|r| r.id == "rigs_sound") {
+            r.status = Status::Problem;
+        }
+        app.preshow.report = Some(rep);
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 0.0f64;
+
+        fn frame_at(
+            ctx: &egui::Context,
+            size: Vec2,
+            t: &mut f64,
+            app: &mut DemoApp,
+            events: Vec<egui::Event>,
+        ) -> Vec<egui::epaint::ClippedShape> {
+            *t += 0.25;
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(*t),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            out.shapes
+        }
+        for _ in 0..3 {
+            let _ = frame_at(&ctx, size, &mut t, &mut app, vec![]);
+        }
+        fn text_rect(
+            ctx: &egui::Context,
+            size: Vec2,
+            t: &mut f64,
+            app: &mut DemoApp,
+            label: &str,
+        ) -> Pos2 {
+            let _ = frame_at(ctx, size, t, app, vec![]);
+            let shapes = frame_at(ctx, size, t, app, vec![]);
+            fn find(s: &Shape, label: &str) -> Option<Rect> {
+                match s {
+                    Shape::Text(t) if t.galley.text() == label => Some(t.visual_bounding_rect()),
+                    Shape::Vec(v) => v.iter().find_map(|c| find(c, label)),
+                    _ => None,
+                }
+            }
+            shapes.iter().find_map(|cs| find(&cs.shape, label)).expect(label).center()
+        }
+        fn click_at(
+            ctx: &egui::Context,
+            size: Vec2,
+            t: &mut f64,
+            app: &mut DemoApp,
+            pos: Pos2,
+        ) {
+            for ev in [
+                vec![egui::Event::PointerMoved(pos)],
+                vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }],
+                vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }],
+            ] {
+                let _ = frame_at(ctx, size, t, app, ev);
+            }
+        }
+
+        let p = text_rect(&ctx, size, &mut t, &mut app, "Matrix →");
+        click_at(&ctx, size, &mut t, &mut app, p);
+        assert_eq!(app.stage_view, StageView::Matrix);
+        assert!(!app.preshow.open);
+
+        app.stage_view = StageView::Setlist;
+        app.preshow.open = true;
+        let p = text_rect(&ctx, size, &mut t, &mut app, "Install →");
+        click_at(&ctx, size, &mut t, &mut app, p);
+        assert_eq!(app.stage_view, StageView::Plugins);
+        assert_eq!(app.plugin_category, PluginCategory::Install);
+
+        app.stage_view = StageView::Setlist;
+        app.preshow.open = true;
+        let p = text_rect(&ctx, size, &mut t, &mut app, "Rack →");
+        click_at(&ctx, size, &mut t, &mut app, p);
+        assert_eq!(app.stage_view, StageView::Rack);
     }
 
     /// A 0.1 s stereo float WAV, as the recorder writes them.

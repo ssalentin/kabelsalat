@@ -39,10 +39,12 @@ impl DemoApp {
             }
             self.show_learn = None;
             let what = crate::setlist::msg_label(msg);
-            self.session_msg = match self.setlist.learn(action, Some(device), msg) {
+            let note = match self.setlist.learn(action, Some(device), msg) {
                 Some(other) => format!("Learned {what} for {} (no longer {})", action.label(), other.label()),
                 None => format!("Learned {what} for {}", action.label()),
             };
+            self.session_msg = note.clone();
+            self.notify_patch(&note);
             return true;
         }
         self.setlist.show_controls().iter().flatten().any(|c| c.takes(device, channel, msg))
@@ -91,7 +93,7 @@ impl DemoApp {
             let learning = *learn == Some(action);
             let control = setlist.control_of(action);
             let (text, color) = match (learning, control) {
-                (true, _) => ("Press a control…".to_string(), theme::ACCENT),
+                (true, _) => ("Press a control…".to_string(), theme::ACCENT_BRIGHT),
                 (false, Some(c)) => {
                     let what = crate::setlist::msg_label(c.msg);
                     (c.device.map_or(what.clone(), |d| format!("{what} · {}", device_name(d))), theme::INK)
@@ -191,6 +193,7 @@ impl DemoApp {
     /// Clicking it closes it.
     pub(super) fn tuner_panel(&mut self, ctx: &egui::Context) {
         if !self.tuner_on {
+            self.tuner_rect = Rect::NOTHING;
             return;
         }
         let reading = self.tuner_reading();
@@ -199,47 +202,57 @@ impl DemoApp {
         } else {
             (egui::Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
         };
-        let area = egui::Area::new(egui::Id::new("show_tuner")).order(egui::Order::Foreground).anchor(anchor, offset);
-        let closed = area
-            .show(ctx, |ui| {
-                let (rect, resp) = ui.allocate_exact_size(TUNER_SIZE, egui::Sense::click());
-                let p = ui.painter_at(rect);
-                p.rect(rect, 18.0, theme::DARK_PANEL, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                let inner = rect.shrink2(Vec2::new(22.0, 16.0));
-                let cap = p.fonts_mut(|f| theme::layout_tracked(f, "TUNER", FontId::proportional(12.0), 0.14));
-                theme::paint_tracked(&p, inner.left_top(), &cap, theme::CREAM_DIM);
-                let close = p.layout_no_wrap("click to close".into(), FontId::proportional(11.0), theme::CREAM_DIM);
-                p.galley(Pos2::new(inner.right() - close.size().x, inner.top()), close, theme::CREAM_DIM);
-                let (note, cents, line) = match &reading {
-                    TunerReading::NoInput => (None, None, "No Audio In unit in the rack".to_string()),
-                    TunerReading::Input { name, pitch: None } => (None, None, format!("{name} · play a note")),
-                    TunerReading::Input { name, pitch: Some(pitch) } => (Some(crate::audio_in::note_name(pitch.note)), Some(pitch.cents), name.clone()),
-                };
-                let in_tune = cents.is_some_and(|c| c.abs() <= IN_TUNE_CENTS);
-                let tone = if in_tune { theme::LIVE_TEAL } else { theme::CREAM };
-                let big = p.layout_no_wrap(note.unwrap_or_else(|| "–".into()), theme::medium_font(48.0), tone);
-                let big_top = inner.top() + cap.size.y + 6.0;
-                p.galley(Pos2::new(inner.left(), big_top), big.clone(), tone);
-                if let Some(c) = cents {
-                    let txt = p.layout_no_wrap(format!("{c:+.0} ¢"), theme::medium_font(24.0), tone);
-                    p.galley(Pos2::new(inner.right() - txt.size().x, big_top + big.size().y - txt.size().y - 6.0), txt, tone);
-                }
-                let bar = Rect::from_min_size(Pos2::new(inner.left(), big_top + big.size().y + 8.0), Vec2::new(inner.width(), 8.0));
-                p.rect_filled(bar, 4.0, theme::METER_TRACK);
-                p.rect_filled(Rect::from_center_size(bar.center(), Vec2::new(2.0, 16.0)), 1.0, theme::CREAM_DIM);
-                if let Some(c) = cents {
-                    let x = bar.center().x + (c / TUNER_SPAN_CENTS).clamp(-1.0, 1.0) * bar.width() / 2.0;
-                    p.rect_filled(Rect::from_center_size(Pos2::new(x, bar.center().y), Vec2::new(6.0, 20.0)), 3.0, if in_tune { theme::LIVE_TEAL } else { theme::ACCENT });
-                }
-                let mut job = egui::text::LayoutJob::single_section(line, egui::TextFormat::simple(FontId::proportional(12.0), theme::CREAM_DIM));
-                job.wrap = egui::text::TextWrapping::truncate_at_width(inner.width());
-                let line = p.layout_job(job);
-                p.galley(Pos2::new(inner.left(), inner.bottom() - line.size().y), line, theme::CREAM_DIM);
-                resp.clicked()
-            })
-            .inner;
-        if closed {
+        let area = egui::Area::new(egui::Id::new("show_tuner"))
+            .order(egui::Order::Foreground)
+            .anchor(anchor, offset)
+            .constrain(true);
+        let res = area.show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::PAPER_SINK)
+                .stroke(Stroke::new(1.5, theme::MUTED))
+                .corner_radius(8.0)
+                .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 2, color: Color32::from_black_alpha(120) })
+                .show(ui, |ui| {
+                    let (rect, resp) = ui.allocate_exact_size(TUNER_SIZE, egui::Sense::click());
+                    let p = ui.painter_at(rect);
+                    let inner = rect.shrink2(Vec2::new(22.0, 16.0));
+                    let cap = p.fonts_mut(|f| theme::layout_tracked(f, "TUNER", FontId::proportional(12.0), 0.14));
+                    theme::paint_tracked(&p, inner.left_top(), &cap, theme::CREAM_DIM);
+                    let close = p.layout_no_wrap("click to close".into(), FontId::proportional(11.0), theme::CREAM_DIM);
+                    p.galley(Pos2::new(inner.right() - close.size().x, inner.top()), close, theme::CREAM_DIM);
+                    let (note, cents, line) = match &reading {
+                        TunerReading::NoInput => (None, None, "No Audio In unit in the rack".to_string()),
+                        TunerReading::Input { name, pitch: None } => (None, None, format!("{name} · play a note")),
+                        TunerReading::Input { name, pitch: Some(pitch) } => (Some(crate::audio_in::note_name(pitch.note)), Some(pitch.cents), name.clone()),
+                    };
+                    let in_tune = cents.is_some_and(|c| c.abs() <= IN_TUNE_CENTS);
+                    let tone = if in_tune { theme::LIVE_TEAL } else { theme::CREAM };
+                    let big = p.layout_no_wrap(note.unwrap_or_else(|| "–".into()), theme::medium_font(48.0), tone);
+                    let big_top = inner.top() + cap.size.y + 6.0;
+                    p.galley(Pos2::new(inner.left(), big_top), big.clone(), tone);
+                    if let Some(c) = cents {
+                        let txt = p.layout_no_wrap(format!("{c:+.0} ¢"), theme::medium_font(24.0), tone);
+                        p.galley(Pos2::new(inner.right() - txt.size().x, big_top + big.size().y - txt.size().y - 6.0), txt, tone);
+                    }
+                    let bar = Rect::from_min_size(Pos2::new(inner.left(), big_top + big.size().y + 8.0), Vec2::new(inner.width(), 8.0));
+                    p.rect_filled(bar, 4.0, theme::METER_TRACK);
+                    p.rect_filled(Rect::from_center_size(bar.center(), Vec2::new(2.0, 16.0)), 1.0, theme::CREAM_DIM);
+                    if let Some(c) = cents {
+                        let x = bar.center().x + (c / TUNER_SPAN_CENTS).clamp(-1.0, 1.0) * bar.width() / 2.0;
+                        p.rect_filled(Rect::from_center_size(Pos2::new(x, bar.center().y), Vec2::new(6.0, 20.0)), 3.0, if in_tune { theme::LIVE_TEAL } else { theme::ACCENT_BRIGHT });
+                    }
+                    let mut job = egui::text::LayoutJob::single_section(line, egui::TextFormat::simple(FontId::proportional(12.0), theme::CREAM_DIM));
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(inner.width());
+                    let line = p.layout_job(job);
+                    p.galley(Pos2::new(inner.left(), inner.bottom() - line.size().y), line, theme::CREAM_DIM);
+                    resp.clicked()
+                })
+                .inner
+        });
+        self.tuner_rect = res.response.rect;
+        if res.inner {
             self.tuner_on = false;
+            self.tuner_rect = Rect::NOTHING;
         }
     }
 }

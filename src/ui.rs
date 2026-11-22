@@ -1936,19 +1936,17 @@ fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
 /// Nav item as a real button chip (§4.14, updated 2026-11-15): active/open =
 /// near-black fill + cream text; closed = recessed paper chip. No underlines.
 
-fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
-    // Hover names the shortcut (M / N / C / V / B / ,).
-    let key = match name {
-        "Mixer" => Some("M"),
-        "Matrix" => Some("N"),
-        "Assistant" => Some("C"),
-        "Keyboard" => Some("V"),
-        "Plugins" => Some("B"),
-        "Settings" => Some(","),
-        _ => None,
+fn nav_button(ui: &mut egui::Ui, name: &str, view: StageView, active: bool) -> bool {
+    let tip = match view {
+        StageView::Rack => "Rack · key Tab",
+        StageView::Mixer => "Mixer · key M",
+        StageView::Matrix => "Matrix · key N",
+        StageView::Setlist => "Setlist · key F12",
+        StageView::Plugins => "Plugins · key B",
+        StageView::Settings => "Settings · key ,",
+        StageView::Sessions => "Sessions",
     };
-    let r = theme::chip_button(ui, name, active);
-    match key { Some(k) => r.on_hover_text(format!("{name} · key {k}")).clicked(), None => r.clicked() }
+    theme::chip_button(ui, name, active).on_hover_text(tip).clicked()
 }
 
 /// 1px hairline vertical rule between nav items (§4.14).
@@ -2113,9 +2111,9 @@ fn session_pill_button(
     max_w: f32,
 ) -> egui::Response {
     let font = theme::medium_font(12.0);
-    let label_max = (max_w - 30.0).max(24.0);
+    let label_max = (max_w - 38.0).max(24.0);
     let galley = DemoApp::ellipsized(ui.painter(), name, font, theme::CREAM, label_max);
-    let w = (galley.size().x + 30.0).clamp(62.0, max_w.max(62.0));
+    let w = (galley.size().x + 38.0).clamp(68.0, max_w.max(68.0));
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
@@ -3208,7 +3206,7 @@ impl BrowserCard {
                 let actions = match e.ty() {
                     PluginType::Instrument => vec![
                         ("New rig", NEW_RIG, BrowserAction::NewClapRig(p.id.clone(), name.clone())),
-                        ("Add to rig", RIG, BrowserAction::AddInstrument(kind, name.clone())),
+                        ("Layer in rig", RIG, BrowserAction::AddInstrument(kind, name.clone())),
                     ],
                     PluginType::Effect | PluginType::Utility => effect(kind),
                     PluginType::MidiFx => Vec::new(),
@@ -3229,7 +3227,7 @@ impl BrowserCard {
                     PluginType::MidiFx => vec![("Add MIDI strip", STRIP, BrowserAction::AddMidiFx(Some(p.uri.clone()), name.clone()))],
                     PluginType::Instrument => vec![
                         ("New rig", NEW_RIG, BrowserAction::NewLv2Rig(p.uri.clone(), name.clone())),
-                        ("Add to rig", RIG, BrowserAction::AddInstrument(kind, name.clone())),
+                        ("Layer in rig", RIG, BrowserAction::AddInstrument(kind, name.clone())),
                     ],
                     PluginType::Effect | PluginType::Utility => effect(kind),
                 };
@@ -3355,6 +3353,8 @@ struct UndoSnap {
     active: usize,
     /// Per-voice source switches, device and patch name (not in the session).
     voices: Vec<VoiceRow>,
+    /// True when captured for an assistant/remote step; false for manual edits.
+    is_agent: bool,
 }
 
 /// One CLAP unit's entry of the per-voice slot tables (`rig_sources`,
@@ -4014,8 +4014,19 @@ struct DemoApp {
     show_presses_seen: [u64; crate::show::ShowAction::ALL.len()],
     /// The tuner a show control opens (#277).
     tuner_on: bool,
+    /// Bounding rect of the tuner overlay when open.
+    tuner_rect: Rect,
     /// Song index currently selected for editing in the Setlist view.
     setlist_edit_song: Option<usize>,
+    /// Song index whose Backing Track picker is expanded in Setlist.
+    setlist_backing_open: Option<usize>,
+    /// Input buffer for attaching a backing track path.
+    setlist_backing_input: String,
+    /// Pending two-step delete confirmations.
+    confirm_remove_song: Option<usize>,
+    confirm_remove_part: Option<(usize, usize)>,
+    confirm_remove_bus: Option<u32>,
+    confirm_delete_rig_preset: Option<String>,
     /// Text input for adding a new song in the Setlist view.
     setlist_new_song_name: String,
     /// Text input for adding a new part in the Setlist view.
@@ -4646,7 +4657,14 @@ impl DemoApp {
             show_steps_seen: 0,
             show_presses_seen: [0; crate::show::ShowAction::ALL.len()],
             tuner_on: false,
+            tuner_rect: Rect::NOTHING,
             setlist_edit_song: None,
+            setlist_backing_open: None,
+            setlist_backing_input: String::new(),
+            confirm_remove_song: None,
+            confirm_remove_part: None,
+            confirm_remove_bus: None,
+            confirm_delete_rig_preset: None,
             setlist_new_song_name: String::new(),
             setlist_new_part_name: String::new(),
             setlist_import_open: false,
@@ -5311,7 +5329,7 @@ impl DemoApp {
             FontId::proportional(12.5), theme::CABLE_AMBER, f32::INFINITY));
         self.hint_wire_g = Some(layout(
             "now click a highlighted jack to connect · esc or right-click cancels",
-            FontId::proportional(12.5), theme::ACCENT_DEEP, f32::INFINITY));
+            FontId::proportional(12.5), theme::ACCENT_BRIGHT, f32::INFINITY));
         // Help card (§4.16): Medium 22px title, two columns of key chips +
         // captions under tracked section labels, tracked micro-caps footer.
         self.help_title_g = Some(Arc::new(ctx.fonts_mut(|f| {
@@ -5331,12 +5349,14 @@ impl DemoApp {
                 (&["Tab"], "flip the rack · front plays, back patches"),
                 (&["Space"], "master play / stop (every metronome)"),
                 (&["Shift", "T"], "tap tempo (or TAP on a metronome)"),
+                (&["Ctrl", "T"], "tuner overlay"),
                 (&["drag"], "the BPM on a metronome to set the tempo"),
                 (&["SPLIT"], "on the keys: LOW / HIGH MIDI outs"),
                 (&["drag"], "a knob to shape the sound"),
-                (&["R"], "reset the knobs"),
+                (&["Shift", "R"], "reset selected unit / active rig knobs"),
                 (&["double-click"], "a synth to open its editor"),
                 (&["1–9", "←", "→"], "switch the rig in view"),
+                (&["F2"], "Show mode (locked stage screen)"),
                 (&["F4"], "multi-rig demo"),
                 (&["F5–F7", "Shift"], "starter templates (Shift: the second three)"),
                 (&["F8"], "demo patch"),
@@ -5350,7 +5370,9 @@ impl DemoApp {
                 (&["B", "F9"], "plugin browser"),
                 (&["M", "F10"], "mixer view (sources → rig bus → master)"),
                 (&["N", "F11"], "MIDI matrix view"),
-                (&["C", "F12"], "chat with the assistant"),
+                (&["F12"], "setlist view"),
+                (&["V", "Shift", "V"], "keyboard dock (Shift+V expands)"),
+                (&["C"], "chat with the assistant"),
                 (&["Q"], "left rail (rigs, channels & session library)"),
                 (&["Ctrl", "O"], "quick session switcher & templates"),
                 (&["Ctrl", "S"], "save current session"),
@@ -5591,6 +5613,7 @@ impl DemoApp {
             return Replug::Refused;
         }
         let was_selected = self.selected == Some(id);
+        self.push_user_undo();
         self.unplug_cable(ci, end == Dir::In);
         // A moved plug doesn't fall: drop the old cable outright.
         self.cables.remove(ci);
@@ -5737,6 +5760,9 @@ impl DemoApp {
             return 0;
         };
         let ids: Vec<u32> = self.cables_on_jack(unit, dir, port).into_iter().map(|ci| self.cables[ci].id).collect();
+        if !ids.is_empty() {
+            self.push_user_undo();
+        }
         let detach_dst = dir == Dir::In;
         let mut count = 0;
         for id in ids {
@@ -5789,6 +5815,7 @@ impl DemoApp {
             }
         }
         if moved < 6.0 || far {
+            self.push_user_undo();
             self.unplug_cable(ci, end == Dir::In);
         } else {
             let c = &mut self.cables[ci];
@@ -6102,7 +6129,11 @@ impl DemoApp {
             }
         }
         let Some(off) = Self::laptop_key_offset(key) else { return };
-        let semi = (off as i16 + 12 * (self.octave as i16 + 1)).clamp(0, 127) as usize;
+        let semi = if self.rig_type(self.active_rig) == Some(crate::keyboard::KeyboardType::Drums) {
+            (36 + off as i16).clamp(0, 127) as usize
+        } else {
+            (off as i16 + 12 * (self.octave as i16 + 1)).clamp(0, 127) as usize
+        };
         if pressed {
             if repeat || self.held_keys.iter().any(|(k, _)| *k == key) {
                 return;
@@ -7335,6 +7366,10 @@ impl DemoApp {
 
     fn toggle_stage(&mut self, view: StageView) {
         self.stage_view = if self.stage_view == view { StageView::Rack } else { view };
+        self.scale_menu = None;
+        self.confirm_remove_song = None;
+        self.confirm_remove_part = None;
+        self.confirm_remove_bus = None;
         if self.stage_view != StageView::Sessions {
             self.confirm_session = None;
         }
@@ -7359,6 +7394,7 @@ impl DemoApp {
             arm_rigs: self.arm_rigs,
             active: self.active_rig,
             voices: self.voice_rows(),
+            is_agent: false,
         })
     }
 
@@ -7532,7 +7568,8 @@ impl DemoApp {
             None => false,
         };
         if !same_job {
-            if let Some(snap) = self.capture_undo() {
+            if let Some(mut snap) = self.capture_undo() {
+                snap.is_agent = true;
                 self.undo_past.push(snap);
                 if self.undo_past.len() > UNDO_LIMIT { self.undo_past.remove(0); }
                 self.undo_future.clear();
@@ -8154,19 +8191,25 @@ impl DemoApp {
         Ok(())
     }
 
-    /// Undo (or redo) the last agent job. Returns a line for the agent/UI.
+    /// Undo (or redo) the last edit or agent job. Returns a line for the agent/UI.
     fn undo_agent(&mut self, undo: bool) -> Result<String, String> {
         let from = if undo { &mut self.undo_past } else { &mut self.undo_future };
         let Some(target) = from.pop() else {
-            return Err(if undo { "nothing to undo".into() } else { "nothing to redo".into() });
+            let msg = if undo { "nothing to undo" } else { "nothing to redo" };
+            self.notify_patch(msg);
+            return Err(msg.into());
         };
-        let Some(current) = self.capture_undo() else { return Err("could not capture the current rack".into()) };
+        let mut current = self.capture_undo().ok_or_else(|| "could not capture the current rack".to_string())?;
+        current.is_agent = target.is_agent;
         if undo { self.undo_future.push(current) } else { self.undo_past.push(current) }
+        let kind = if target.is_agent { "agent change" } else { "edit" };
         self.undo_job = None; // the next agent change starts a fresh step
         self.restore_undo(target).map_err(|e| e.to_string())?;
         let what = if undo { "undid" } else { "redid" };
-        self.session_msg = format!("{what} the last agent change");
-        Ok(format!("{what} the last agent change · undo left {} · redo left {}", self.undo_past.len(), self.undo_future.len()))
+        let msg = format!("{what} the last {kind}");
+        self.session_msg = msg.clone();
+        self.notify_patch(&msg);
+        Ok(format!("{msg} · undo left {} · redo left {}", self.undo_past.len(), self.undo_future.len()))
     }
 
     fn undo_agent_tool(&mut self, undo: bool) -> String {
@@ -9241,13 +9284,16 @@ impl DemoApp {
 
     /// Load a starter template (playable pre-wired rack + default knobs).
     fn load_template(&mut self, t: Template) {
+        self.push_user_undo();
         let s = t.session();
         self.open_session = None;
         self.autosave_rebase();
-        match self.apply_session(&s) {
-            Ok(_) => self.session_msg = format!("Loaded template '{}'", t.title()),
-            Err(e) => self.session_msg = format!("Template failed: {e}"),
-        }
+        let msg = match self.apply_session(&s) {
+            Ok(_) => format!("Loaded template '{}'", t.title()),
+            Err(e) => format!("Template failed: {e}"),
+        };
+        self.session_msg = msg.clone();
+        self.notify_patch(&msg);
     }
 
     /// Catalog entries a template needs that this machine has not installed.
@@ -9262,7 +9308,9 @@ impl DemoApp {
         if missing.is_empty() {
             self.load_template(t);
         } else {
-            self.session_msg = format!("{}: {}", t.title(), crate::catalog::install_hint(&missing));
+            let msg = format!("{}: {}", t.title(), crate::catalog::install_hint(&missing));
+            self.session_msg = msg.clone();
+            self.notify_patch(&msg);
         }
     }
 
@@ -9271,24 +9319,33 @@ impl DemoApp {
     fn install_from_template(&mut self, id: &str) {
         match self.start_install(id) {
             Ok(()) => {
-                self.session_msg = format!("Installing {id}…");
+                let msg = format!("Installing {id}…");
+                self.session_msg = msg.clone();
+                self.notify_patch(&msg);
+                self.plugin_category = PluginCategory::Install;
                 if self.stage_view != StageView::Plugins {
                     self.toggle_stage(StageView::Plugins);
                 }
             }
-            Err(e) => self.session_msg = e,
+            Err(e) => {
+                self.session_msg = e.clone();
+                self.notify_patch(&e);
+            }
         }
     }
 
     /// Reload the default two-stack demo patch.
     fn load_demo_patch(&mut self) {
+        self.push_user_undo();
         let s = crate::session::Session::new("Demo patch", Graph::demo_patch());
         self.open_session = None;
         self.autosave_rebase();
-        match self.apply_session(&s) {
-            Ok(_) => self.session_msg = "Loaded demo patch".into(),
-            Err(e) => self.session_msg = format!("Demo failed: {e}"),
-        }
+        let msg = match self.apply_session(&s) {
+            Ok(_) => "Loaded demo patch".to_string(),
+            Err(e) => format!("Demo failed: {e}"),
+        };
+        self.session_msg = msg.clone();
+        self.notify_patch(&msg);
     }
 
     /// Load two independent rigs (AUM operating model): each a
@@ -9296,6 +9353,7 @@ impl DemoApp {
     /// engine as LoadRigs. Rig A: Keys→Surge→Delay→Master; Rig B: Keys→Surge→
     /// Master. Both sound at once; the big view shows one (1–9 / ←→ switch).
     fn load_multi_rig_demo(&mut self) {
+        self.push_user_undo();
         self.open_session = None;
         self.autosave_rebase();
         fn mk_rig(name: &str, with_delay: bool) -> crate::control::Rig {
@@ -9340,7 +9398,9 @@ impl DemoApp {
         self.editor_open = false;
         self.editor_params.clear();
         self.reset_rig_inputs();
-        self.session_msg = "Loaded multi-rig demo — 1–9 / ←→ switch rigs".into();
+        let msg = "Loaded multi-rig demo — 1–9 / ←→ switch rigs";
+        self.session_msg = msg.into();
+        self.notify_patch(msg);
     }
 
     fn set_rack_locked(&mut self, locked: bool) {
@@ -9355,6 +9415,12 @@ impl DemoApp {
             self.knob_menu = None;
             self.scale_menu = None;
             self.cc_learn = None;
+            self.editor_open = false;
+            self.lv2_editor_node = None;
+            self.insert_pick = None;
+            self.strip_rename = None;
+            self.strip_color_pick = None;
+            self.rule_editor = None;
         }
     }
 
@@ -11502,11 +11568,12 @@ impl DemoApp {
                 _ => Some(Vec::new()),
             };
             let mut ctrl_changes: Vec<(usize, f32, f32)> = Vec::new();
+            let max_ed = (ctx.content_rect().size() - Vec2::splat(32.0)).clamp(Vec2::new(280.0, 240.0), Vec2::new(480.0, 700.0));
             egui::Window::new(egui::RichText::new(format!("{} — presets & parameters", self.lv2_editor_name))
                     .font(theme::medium_font(16.0)).color(theme::INK))
                 .open(&mut open)
                 .collapsible(false)
-                .fixed_size([480.0, 700.0])
+                .fixed_size(max_ed)
                 .show(ctx, |ui| {
                     theme::section_label(ui, "Presets");
                     let current = self.lv2_preset_name.clone().unwrap_or_else(|| "Default".into());
@@ -11639,12 +11706,13 @@ impl DemoApp {
         let mut refresh = false;
         let mut changes: Vec<(u32, f64)> = Vec::new();
         let mut pin_req: Option<crate::host::ParamDesc> = None;
+        let max_ed = (ctx.content_rect().size() - Vec2::splat(32.0)).clamp(Vec2::new(280.0, 240.0), Vec2::new(480.0, 700.0));
         egui::Window::new(egui::RichText::new(format!("{name} — sound & parameters"))
                 .font(theme::medium_font(16.0)).color(theme::INK))
             .id(egui::Id::new("param_editor_window"))
             .open(&mut open)
             .collapsible(false)
-            .fixed_size([480.0, 700.0])
+            .fixed_size(max_ed)
             .show(ctx, |ui| {
                 let pool_idx = self.clap_pool_idx(rig);
                 if let Some(main) = pool_idx.and_then(|i| self._surge_main.get_mut(i)) {
@@ -11726,7 +11794,7 @@ impl DemoApp {
                 });
                 ui.separator();
                 if !self.editor_status.is_empty() {
-                    ui.label(egui::RichText::new(&self.editor_status).size(11.5).color(theme::ACCENT_DEEP));
+                    ui.label(egui::RichText::new(&self.editor_status).size(11.5).color(theme::ACCENT_BRIGHT));
                 }
                 let filter = self.editor_filter.to_lowercase();
                 // Which params are pinned on this synth's face (for the toggles).
@@ -12287,13 +12355,21 @@ impl DemoApp {
                     } else {
                         resp
                     };
-                    if resp.hovered() {
+                    let editing = self.rule_editor == Some((s, *row));
+                    if editing {
+                        p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Inside);
+                    } else if resp.hovered() {
                         p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                    }
+                    if resp.hovered() {
                         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                    } else if let Some(src) = row.source() {
-                        let cell_at = self.agent_activity.cell_alpha(src, node, self.ui_time);
-                        if cell_at > 0.01 {
-                            p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.5, theme::alpha(theme::AGENT_COLOR, cell_at)), egui::StrokeKind::Inside);
+                    }
+                    if !editing && !resp.hovered() {
+                        if let Some(src) = row.source() {
+                            let cell_at = self.agent_activity.cell_alpha(src, node, self.ui_time);
+                            if cell_at > 0.01 {
+                                p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.5, theme::alpha(theme::AGENT_COLOR, cell_at)), egui::StrokeKind::Inside);
+                            }
                         }
                     }
                     if resp.clicked() { toggles.push((s, *row, !on)); }
@@ -12314,10 +12390,16 @@ impl DemoApp {
         }
         ui.add_space(18.0);
         self.midi_clock_ui(ui);
-        for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
-        for (d, id) in profile_picks { self.pick_device_profile(d, &id); }
-        for (d, cc, ignore) in cc_ignore_edits { self.set_cc_ignored(d, cc, ignore); }
-        if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
+        if !toggles.is_empty() || !edit_requests.is_empty() || !profile_picks.is_empty() || !cc_ignore_edits.is_empty() {
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
+                for (d, id) in profile_picks { self.pick_device_profile(d, &id); }
+                for (d, cc, ignore) in cc_ignore_edits { self.set_cc_ignored(d, cc, ignore); }
+                if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
+            }
+        }
     }
 
     /// MIDI Clock Send (#85), the matrix view's last block: the master
@@ -12341,11 +12423,11 @@ impl DemoApp {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if theme::chip_button(ui, if cfg.enabled { "CLOCK ON" } else { "CLOCK OFF" }, cfg.enabled)
+            if theme::wrapped_chip_button(ui, if cfg.enabled { "CLOCK ON" } else { "CLOCK OFF" }, cfg.enabled)
                 .on_hover_text("send MIDI clock with the transport (from the next Play)").clicked() {
                 edits.push(serde_json::json!({"enabled": !cfg.enabled}));
             }
-            if theme::chip_button(ui, "SONG POS", cfg.spp)
+            if theme::wrapped_chip_button(ui, "SONG POS", cfg.spp)
                 .on_hover_text("send Song Position Pointer + Continue when resuming mid-song").clicked() {
                 edits.push(serde_json::json!({"song_position": !cfg.spp}));
             }
@@ -12355,22 +12437,22 @@ impl DemoApp {
                 (CompMode::Output, "OUTPUT", "also include the sound device's output latency (gear mixed outside kabelsalat)"),
                 (CompMode::Input, "INPUT", "align to the audio input (gear fed back into kabelsalat)"),
             ] {
-                if theme::chip_button(ui, label, cfg.comp == mode).on_hover_text(tip).clicked() {
+                if theme::wrapped_chip_button(ui, label, cfg.comp == mode).on_hover_text(tip).clicked() {
                     edits.push(serde_json::json!({"latency_mode": mode.as_str()}));
                 }
             }
             ui.add_space(8.0);
             for (label, delta) in [("−10", -10.0f32), ("−1", -1.0)] {
-                if theme::chip_button(ui, label, false).on_hover_text("sync offset, ms (negative = clock earlier)").clicked() {
+                if theme::wrapped_chip_button(ui, label, false).on_hover_text("sync offset, ms (negative = clock earlier)").clicked() {
                     edits.push(serde_json::json!({"offset_ms": cfg.offset_ms + delta}));
                 }
             }
-            if theme::chip_button(ui, &format!("{:+.0} ms", cfg.offset_ms), cfg.offset_ms != 0.0)
+            if theme::wrapped_chip_button(ui, &format!("{:+.0} ms", cfg.offset_ms), cfg.offset_ms != 0.0)
                 .on_hover_text("sync offset (click to reset to 0)").clicked() {
                 edits.push(serde_json::json!({"offset_ms": 0.0}));
             }
             for (label, delta) in [("+1", 1.0f32), ("+10", 10.0)] {
-                if theme::chip_button(ui, label, false).on_hover_text("sync offset, ms (positive = clock later)").clicked() {
+                if theme::wrapped_chip_button(ui, label, false).on_hover_text("sync offset, ms (positive = clock later)").clicked() {
                     edits.push(serde_json::json!({"offset_ms": cfg.offset_ms + delta}));
                 }
             }
@@ -12415,8 +12497,13 @@ impl DemoApp {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::click());
                 let cell = rect.shrink(3.0);
                 if on {
-                    ui.painter().rect_filled(cell, 2.0, theme::LIVE_TEAL);
-                    ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER, "CLK", theme::medium_font(12.5), theme::DARK_PANEL);
+                    let (fill, txt) = if cfg.enabled {
+                        (theme::LIVE_TEAL, theme::DARK_PANEL)
+                    } else {
+                        (theme::DARK_PANEL_HI, theme::CREAM_DIM)
+                    };
+                    ui.painter().rect_filled(cell, 2.0, fill);
+                    ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER, "CLK", theme::medium_font(12.5), txt);
                 } else {
                     ui.painter().rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                 }
@@ -12424,7 +12511,12 @@ impl DemoApp {
                     ui.painter().rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
                     ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 }
-                if resp.on_hover_text("click: send the clock to this port on/off").clicked() {
+                let tip = if on && !cfg.enabled {
+                    "clock is OFF — port stays wired until CLOCK ON (click to unwire)"
+                } else {
+                    "click: send the clock to this port on/off"
+                };
+                if resp.on_hover_text(tip).clicked() {
                     edits.push(serde_json::json!({"output": key, "output_enabled": !on}));
                 }
             }
@@ -12440,9 +12532,13 @@ impl DemoApp {
         };
         ui.add(egui::Label::new(egui::RichText::new(status).size(11.0).color(theme::INK_2)).wrap_mode(egui::TextWrapMode::Extend));
 
-        for e in edits {
-            if let Err(err) = self.set_midi_clock(&e) {
-                self.plugin_msg = format!("MIDI clock: {err}");
+        if !edits.is_empty() && self.rack_locked {
+            self.notify_rack_locked();
+        } else {
+            for e in edits {
+                if let Err(err) = self.set_midi_clock(&e) {
+                    self.plugin_msg = format!("MIDI clock: {err}");
+                }
             }
         }
     }
@@ -14690,7 +14786,14 @@ impl DemoApp {
         let Some(src) = row.source() else { self.rule_editor = None; self.cc_learn = None; return };
         let Some(u) = self.units.get(unit) else { self.rule_editor = None; self.cc_learn = None; return };
         let node = u.node_id;
-        let title = format!("{} → {}", row.label(), sentence_case(&u.name));
+        let rig_tag = if self.rig_count() > 1 {
+            self.rig_of_unit(unit)
+                .map(|r| format!("Rig {} ({}) · ", r + 1, self.rig_name(r)))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let title = format!("{rig_tag}{} → {}", row.label(), sentence_case(&u.name));
         if self.rule_param_cache.as_ref().map(|(id, _)| *id) != Some(node) {
             let choices = self.node_param_choices(node);
             if let Some(&(first_id, _)) = choices
@@ -14765,7 +14868,7 @@ impl DemoApp {
         } else if edit.cc_map.iter().all(|m| matches!(m.target, CcTarget::ChannelPressure)) {
             "breath → channel pressure · other CCs pass through"
         } else {
-            "whitelist active · unmapped CCs filtered"
+            "whitelist active · unmapped CCs filtered (mod, sustain, breath stay active)"
         };
         ui.label(egui::RichText::new(cc_hint).size(11.0).color(theme::INK_2));
         ui.add_space(4.0);
@@ -15148,13 +15251,20 @@ impl DemoApp {
                 }
             });
         self.mixer_bus_out_rects.push((bus, resp.rect));
+        if raw.is_some() && dev.is_none() {
+            ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.5, theme::CABLE_AMBER), egui::StrokeKind::Inside);
+        }
         resp.on_hover_text(match (&raw, dev) {
             (None, _) => "where this bus plays: the master, or a sound card of its own (it then leaves the main mix)".to_string(),
             (Some(_), Some(d)) => format!("plays to {} only, past the master", d.name),
             (Some(r), None) => format!("{r} is not there now: this bus is silent until it returns"),
         });
         if let Some(p) = pick {
-            if let Err(e) = self.set_bus_output(bus, p.as_deref()) { self.session_msg = e; }
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else if let Err(e) = self.set_bus_output(bus, p.as_deref()) {
+                self.session_msg = e;
+            }
         }
     }
 
@@ -16202,12 +16312,13 @@ impl DemoApp {
                                                                         .truncate()
                                                                         .sense(egui::Sense::click()),
                                                                 );
+                                                                let locked = self.rack_locked;
                                                                 lbl.context_menu(|ui| {
-                                                                    if rig_count < Self::MAX_RIGS && ui.button("Add as new rig").clicked() {
+                                                                    if rig_count < Self::MAX_RIGS && ui.add_enabled(!locked, egui::Button::new("Add as new rig")).clicked() {
                                                                         load_rig_preset = Some((name.clone(), None));
                                                                         ui.close();
                                                                     }
-                                                                    if ui.button(format!("Replace rig {} · {}", active_rig + 1, active_rig_name)).clicked() {
+                                                                    if ui.add_enabled(!locked, egui::Button::new(format!("Replace rig {} · {}", active_rig + 1, active_rig_name))).clicked() {
                                                                         load_rig_preset = Some((name.clone(), Some(active_rig)));
                                                                         ui.close();
                                                                     }
@@ -16362,18 +16473,31 @@ impl DemoApp {
             self.save_rig_dialog = Some((active_rig, active_rig_name));
         }
         if let Some((name, target)) = load_rig_preset {
-            match self.load_rig_preset_from_dir(&presets_dir, &name, target) {
-                Ok(slot) => self.session_msg = format!("Loaded rig '{name}' into {}", self.rig_name(slot)),
-                Err(e) => self.session_msg = format!("Load rig failed: {e}"),
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                self.push_user_undo();
+                let msg = match self.load_rig_preset_from_dir(&presets_dir, &name, target) {
+                    Ok(slot) => format!("Loaded rig '{name}' into {}", self.rig_name(slot)),
+                    Err(e) => format!("Load rig failed: {e}"),
+                };
+                self.session_msg = msg.clone();
+                self.notify_patch(&msg);
             }
         }
         if let Some(name) = delete_rig_preset {
             let _ = crate::session::delete_rig_preset(&presets_dir, &name);
         }
-        if let Some(t) = load_tpl { self.try_load_template(t); }
+        if load_tpl.is_some() || load_demo || load_multi {
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                if let Some(t) = load_tpl { self.try_load_template(t); }
+                if load_demo { self.load_demo_patch(); }
+                if load_multi { self.load_multi_rig_demo(); }
+            }
+        }
         if let Some(id) = install_req { self.install_from_template(id); }
-        if load_demo { self.load_demo_patch(); }
-        if load_multi { self.load_multi_rig_demo(); }
     }
 
     /// Floating per-rig `⋯` action menu in the Left Rail: Rename, Save preset,
@@ -16723,10 +16847,16 @@ impl DemoApp {
                 Err(e) => e,
             };
         }
-        if let Some(t) = load_tpl { self.try_load_template(t); self.session_popover_open = false; }
+        if load_tpl.is_some() || load_demo || load_multi {
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                if let Some(t) = load_tpl { self.try_load_template(t); self.session_popover_open = false; }
+                if load_demo { self.load_demo_patch(); self.session_popover_open = false; }
+                if load_multi { self.load_multi_rig_demo(); self.session_popover_open = false; }
+            }
+        }
         if let Some(id) = install_req { self.install_from_template(id); self.session_popover_open = false; }
-        if load_demo { self.load_demo_patch(); self.session_popover_open = false; }
-        if load_multi { self.load_multi_rig_demo(); self.session_popover_open = false; }
         if open_in_rail {
             self.session_popover_open = false;
             self.nav_open = true;
@@ -16977,9 +17107,23 @@ impl DemoApp {
     fn take_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
-            let name = file.path().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let path = file.path();
+            let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
             if [".vital", ".vitalbank", ".vitalbank.zip"].iter().any(|x| name.ends_with(x)) {
-                self.import_vital(file.path());
+                self.import_vital(path);
+            } else if name.ends_with(".wav") && self.stage_view == StageView::Setlist {
+                if let Some(si) = self.setlist_edit_song {
+                    let abs = path.to_string_lossy().into_owned();
+                    if let Ok(Some(checked)) = crate::setlist::backing_path(Some(&abs)) {
+                        self.push_user_undo();
+                        if let Some(song) = self.setlist.songs.get_mut(si) {
+                            song.backing = Some(checked);
+                            let sname = song.name.clone();
+                            self.follow_song_backing();
+                            self.notify_patch(&format!("Attached backing track to '{sname}'"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -17072,6 +17216,9 @@ impl DemoApp {
             }
             Some(r) if r >= n || n <= 1 => return,
             _ => {}
+        }
+        if delete.is_some() && self.undo_job.is_none() {
+            self.push_user_undo();
         }
         let s = match self.capture_session("Rigs") {
             Ok(s) => s,
@@ -17325,21 +17472,25 @@ impl DemoApp {
         let mut decision: Option<bool> = None;
         let modal = egui::Modal::new(egui::Id::unique("delete_rig_modal")).show(ctx, |ui| {
             ui.set_width(340.0);
-            ui.label(egui::RichText::new(format!("Delete {name}?")).size(17.0).strong().color(theme::INK));
+            ui.label(egui::RichText::new(format!("Delete {name}?")).font(theme::medium_font(16.0)).color(theme::INK));
             ui.add_space(6.0);
             ui.label(egui::RichText::new(format!(
                 "Its {units} units, their cables and synth settings are removed. The other rigs keep playing."))
                 .size(13.0).color(theme::INK_2));
             ui.add_space(14.0);
             ui.horizontal(|ui| {
-                if theme::primary_button(ui, "Delete rig").clicked() { decision = Some(true); }
+                if theme::danger_button(ui, "Delete rig", false).clicked() { decision = Some(true); }
                 ui.add_space(8.0);
                 if theme::chip_button(ui, "Cancel", false).clicked() { decision = Some(false); }
             });
         });
         if modal.should_close() && decision.is_none() { decision = Some(false); }
         match decision {
-            Some(true) => { self.confirm_delete_rig = None; self.edit_rigs(Some(rig)); }
+            Some(true) => {
+                self.confirm_delete_rig = None;
+                self.push_user_undo();
+                self.edit_rigs(Some(rig));
+            }
             Some(false) => self.confirm_delete_rig = None,
             None => {}
         }
@@ -17372,7 +17523,7 @@ impl DemoApp {
         let mut decision: Option<bool> = None;
         let modal = egui::Modal::new(egui::Id::new("rename_rig_modal")).show(ctx, |ui| {
             ui.set_width(320.0);
-            ui.label(egui::RichText::new("Rename rig").size(17.0).strong().color(theme::INK));
+            ui.label(egui::RichText::new("Rename rig").font(theme::medium_font(16.0)).color(theme::INK));
             ui.add_space(8.0);
             let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("rename_rig_text").desired_width(300.0).char_limit(24));
             if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
@@ -17652,7 +17803,7 @@ impl DemoApp {
         let rig_label = self.rig_name(rig);
         let modal = egui::Modal::new(egui::Id::unique("save_rig_modal")).show(ctx, |ui| {
             ui.set_width(340.0);
-            ui.label(egui::RichText::new(format!("Save rig {} · {}", rig + 1, rig_label)).size(17.0).strong().color(theme::INK));
+            ui.label(egui::RichText::new(format!("Save rig {} · {}", rig + 1, rig_label)).font(theme::medium_font(16.0)).color(theme::INK));
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Saves units, cables, knobs, sound, matrix routes and mix.").size(12.5).color(theme::INK_2));
             ui.add_space(8.0);
@@ -17698,10 +17849,13 @@ impl DemoApp {
             .into_iter()
             .chain((0..n).map(|r| (Some(r), format!("Replace rig {} · {}", r + 1, self.rig_name(r)))))
             .collect();
+        let avail_h = ctx.content_rect().height();
+        let target_h = (avail_h * 0.25).clamp(72.0, 170.0);
+        let list_h = (avail_h * 0.34).clamp(110.0, 220.0);
         let modal = egui::Modal::new(egui::Id::new("load_rig_modal")).show(ctx, |ui| {
-            ui.set_width(420.0);
-            ui.label(egui::RichText::new("Load rig preset").size(17.0).strong().color(theme::INK));
-            ui.add_space(14.0);
+            ui.set_width((ctx.content_rect().width() - 48.0).clamp(280.0, 420.0));
+            ui.label(egui::RichText::new("Load rig preset").font(theme::medium_font(16.0)).color(theme::INK));
+            ui.add_space(10.0);
             theme::section_label(ui, "Load into");
             ui.add_space(6.0);
             ui.spacing_mut().item_spacing.y = 4.0;
@@ -17709,7 +17863,7 @@ impl DemoApp {
             // presets and Close stay in the window (#205).
             egui::ScrollArea::vertical()
                 .id_salt("load_rig_targets_scroll")
-                .max_height(170.0)
+                .max_height(target_h)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (t, label) in &targets {
@@ -17718,14 +17872,13 @@ impl DemoApp {
                         }
                     }
                 });
-            ui.add_space(16.0);
+            ui.add_space(12.0);
             theme::section_label(ui, "Presets");
             ui.add_space(6.0);
             Self::stage_hairline(ui);
-            let list_h = 220.0;
             egui::ScrollArea::vertical()
                 .id_salt("rig_presets_list_scroll")
-                .min_scrolled_height(list_h)
+                .min_scrolled_height(list_h.min(110.0))
                 .max_height(list_h)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -17744,8 +17897,13 @@ impl DemoApp {
                             ui.set_min_height(26.0);
                             ui.label(egui::RichText::new(name).font(theme::medium_font(14.0)).color(theme::INK));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if theme::danger_button(ui, "Delete", false).clicked() {
-                                    delete_name = Some(name.clone());
+                                if self.confirm_delete_rig_preset.as_deref() == Some(name.as_str()) {
+                                    if theme::danger_button(ui, "Confirm?", false).clicked() {
+                                        delete_name = Some(name.clone());
+                                        self.confirm_delete_rig_preset = None;
+                                    }
+                                } else if theme::danger_button(ui, "Delete", false).clicked() {
+                                    self.confirm_delete_rig_preset = Some(name.clone());
                                 }
                                 ui.add_space(6.0);
                                 if theme::primary_button(ui, "Load").clicked() {
@@ -17757,20 +17915,28 @@ impl DemoApp {
                         Self::stage_hairline(ui);
                     }
                 });
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::chip_button(ui, "Close", false).clicked() { close = true; }
             });
         });
-        if modal.should_close() { close = true; }
+        if modal.should_close() {
+            close = true;
+        }
+        if close {
+            self.confirm_delete_rig_preset = None;
+        }
         if let Some(name) = delete_name {
             let _ = crate::session::delete_rig_preset(&dir, &name);
         }
         if let Some(name) = load_name {
-            match self.load_rig_preset_from_dir(&dir, &name, target) {
-                Ok(slot) => self.session_msg = format!("Loaded rig '{name}' into {}", self.rig_name(slot)),
-                Err(e) => self.session_msg = format!("Load rig failed: {e}"),
-            }
+            self.push_user_undo();
+            let msg = match self.load_rig_preset_from_dir(&dir, &name, target) {
+                Ok(slot) => format!("Loaded rig '{name}' into {}", self.rig_name(slot)),
+                Err(e) => format!("Load rig failed: {e}"),
+            };
+            self.session_msg = msg.clone();
+            self.notify_patch(&msg);
             return;
         }
         if !close {
@@ -17812,6 +17978,8 @@ impl DemoApp {
         let mut switch_rig: Option<usize> = None;
         let mut add_rig = false;
         let mut clone_rig: Option<usize> = None;
+        let mut inline_demo: Option<Command> = None;
+        let mut open_matrix_rig: Option<usize> = None;
         let n = self.rig_count();
         if !self.nav_open {
             self.rig_chip_rects.clear();
@@ -17854,6 +18022,9 @@ impl DemoApp {
                 let show_take = !recording
                     && win_w >= 1180.0
                     && snap.as_ref().is_some_and(|s| s.takes > 0 && s.finalized && s.path.is_some());
+                let show_retro = !recording
+                    && win_w >= 1180.0
+                    && snap.as_ref().is_some_and(|s| retro_save_item(s).1);
 
                 // Estimate fixed widths so the inline rig pills never push the
                 // View tabs or right-aligned controls past the window edge.
@@ -17869,8 +18040,9 @@ impl DemoApp {
                 let rec_w = if recording { 92.0 } else { 64.0 };
                 let sync_w = if show_sync { 52.0 } else { 0.0 };
                 let take_w = if show_take { 180.0 } else { 0.0 };
+                let retro_w = if show_retro { 58.0 + gap } else { 0.0 };
                 let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + (if show_sync { gap } else { 0.0 })
-                    + rec_w + gap + take_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
+                    + rec_w + gap + retro_w + take_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
                 let view_w = (if compact { 240.0 } else { 268.0 }) + 26.0 + gap;
 
                 ui.allocate_ui_with_layout(
@@ -17893,7 +18065,7 @@ impl DemoApp {
                             theme::crossed_wires(ui.painter(), Pos2::new(mark.center().x, body_mid), 16.0, theme::PAPER, theme::MarkStyle::Mono);
                         }
                         if !self.editor_open && !self.editor_status.is_empty() && win_w >= 1120.0 {
-                            ui.label(egui::RichText::new(&self.editor_status).size(11.5).color(theme::ACCENT_DEEP));
+                            ui.label(egui::RichText::new(&self.editor_status).size(11.5).color(theme::ACCENT_BRIGHT));
                         }
                         nav_separator(ui);
 
@@ -17984,6 +18156,21 @@ impl DemoApp {
                                             self.confirm_delete_rig = Some(rig);
                                             ui.close();
                                         }
+                                        if let Some(kind) = self.rig_demo_phrase(rig) {
+                                            let demo_on = self.demo_playing.is_some_and(|d| d.rig == rig as u8);
+                                            if ui.button(if demo_on { "Stop demo phrase" } else { "Play demo phrase" }).clicked() {
+                                                inline_demo = Some(if demo_on {
+                                                    Command::DemoStop
+                                                } else {
+                                                    Command::DemoPlay { rig: rig as u8, phrase: kind }
+                                                });
+                                                ui.close();
+                                            }
+                                        }
+                                        if ui.button("MIDI input → Matrix").clicked() {
+                                            open_matrix_rig = Some(rig);
+                                            ui.close();
+                                        }
                                     });
                                     if active { active_rect = chip.rect; }
                                     self.rig_chip_rects.push(chip.rect);
@@ -18033,7 +18220,7 @@ impl DemoApp {
                         let group = ui.scope(|ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
                             for (name, view) in views {
-                                if nav_button(ui, name, self.stage_view == view) { pick = Some(view); }
+                                if nav_button(ui, name, view, self.stage_view == view) { pick = Some(view); }
                             }
                         }).response.rect;
                         ui.painter().rect_stroke(group.expand(2.0), 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
@@ -18073,14 +18260,15 @@ impl DemoApp {
                             let max_lbl = ((ui.available_width() - right_w) - 62.0).clamp(56.0, 200.0);
                             ui.scope(|ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0;
+                                let shift_step = ui.input(|i| i.modifiers.shift);
                                 if theme::chip_button(ui, "‹", false)
-                                    .on_hover_text("Previous part · PageUp")
+                                    .on_hover_text("Previous part · PageUp (Shift+click: previous song)")
                                     .clicked()
                                 {
-                                    step_act = Some("prev_part");
+                                    step_act = Some(if shift_step { "prev_song" } else { "prev_part" });
                                 }
                                 let mid = ui.add_sized(
-                                    [max_lbl, 22.0],
+                                    [max_lbl, 26.0],
                                     egui::Button::new(
                                         egui::RichText::new(&label)
                                             .size(11.5)
@@ -18093,10 +18281,10 @@ impl DemoApp {
                                 .on_hover_text("Open Setlist view (F12) · PageUp/PageDown step parts");
                                 if mid.clicked() { open_sl = true; }
                                 if theme::chip_button(ui, "›", false)
-                                    .on_hover_text("Next part · PageDown")
+                                    .on_hover_text("Next part · PageDown (Shift+click: next song)")
                                     .clicked()
                                 {
-                                    step_act = Some("next_part");
+                                    step_act = Some(if shift_step { "next_song" } else { "next_part" });
                                 }
                             });
                             if let Some(a) = step_act { let _ = self.step_setlist(a); }
@@ -18176,8 +18364,22 @@ impl DemoApp {
                             });
                             if let Some(err) = rec_err {
                                 if win_w >= 1100.0 {
-                                    ui.label(egui::RichText::new(err).size(11.0).color(theme::ACCENT_DEEP))
+                                    ui.label(egui::RichText::new(err).size(11.0).color(theme::ACCENT_BRIGHT))
                                         .on_hover_text("recording failed to start or write");
+                                }
+                            }
+
+                            if show_retro {
+                                if theme::chip_button(ui, "Retro", false)
+                                    .on_hover_text("save the retrospective audio buffer to disk")
+                                    .clicked()
+                                {
+                                    let msg = match self.save_retro_take(None) {
+                                        Ok(s) => format!("Saved last {s:.0}s retrospective take"),
+                                        Err(e) => e,
+                                    };
+                                    self.session_msg = msg.clone();
+                                    self.notify_patch(&msg);
                                 }
                             }
 
@@ -18270,9 +18472,20 @@ impl DemoApp {
             }
         }
         if let Some(r) = clone_rig {
-            if let Err(e) = self.clone_rig(r, None) {
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else if let Err(e) = self.clone_rig(r, None) {
                 self.session_msg = format!("Clone rig failed: {e}");
             }
+        }
+        if let Some(cmd) = inline_demo {
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(cmd);
+            }
+        }
+        if let Some(r) = open_matrix_rig {
+            self.set_active_rig(r);
+            self.stage_view = StageView::Matrix;
         }
     }
 
@@ -18440,6 +18653,7 @@ impl DemoApp {
             .map(|si| self.song_load_state(si))
             .collect();
         let active_loading_notice = self.active_song_loading_notice();
+        let patch_notice = self.active_patch_notice().map(str::to_owned);
         let instances_badge = if let Some(ahead) = self.setlist.load_ahead {
             format!("{hosted_now}/{} hosted (+{ahead} ahead)", show_instances.hosted)
         } else {
@@ -18482,14 +18696,19 @@ impl DemoApp {
         let mut move_song: Option<(usize, usize)> = None;
         let mut remove_song: Option<usize> = None;
         let mut add_part_for: Option<usize> = None;
+        let mut move_part: Option<(usize, usize, usize)> = None;
+        let mut dup_part: Option<(usize, usize)> = None;
         let mut remove_part: Option<(usize, usize)> = None;
         let mut capture_knobs_for: Option<(usize, usize)> = None;
+        let mut clear_knobs_for: Option<(usize, usize)> = None;
+        let mut set_backing: Option<(usize, Option<String>)> = None;
         let mut vary_rig: Option<u8> = None;
         let mut split_rig: Option<(usize, usize, u8)> = None;
         let mut active_part_dirty = false;
         let mut window_dirty = false;
         let mut enter_show = false;
         let mut toggle_check = false;
+        let mut close_subpanels = false;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
@@ -18503,7 +18722,7 @@ impl DemoApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         if theme::primary_button(ui, "Show mode")
-                            .on_hover_text("the locked stage screen: song, next song, levels and Panic · hold Esc to leave")
+                            .on_hover_text("the locked stage screen (F2): song, next part, next song, levels and Panic · hold Esc to leave")
                             .clicked()
                         {
                             enter_show = true;
@@ -18556,15 +18775,17 @@ impl DemoApp {
                         }
                         if ui.available_width() >= 48.0 {
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let subtitle = if show_instances.hosted > 0 {
-                                    format!("{instances_badge} · PageUp/Dn step · F12: rack")
+                                let (subtitle, sub_col) = if let Some(notice) = &patch_notice {
+                                    (notice.clone(), theme::ACCENT_BRIGHT)
+                                } else if show_instances.hosted > 0 {
+                                    (format!("{instances_badge} · PageUp/Dn step · F12: rack"), theme::INK_2)
                                 } else {
-                                    "songs & parts over loaded rigs · PageUp/Dn step · F12: rack".to_string()
+                                    ("songs & parts over loaded rigs · PageUp/Dn step · F12: rack".to_string(), theme::INK_2)
                                 };
                                 ui.add(egui::Label::new(
                                     egui::RichText::new(subtitle)
                                         .size(12.5)
-                                        .color(theme::INK_2),
+                                        .color(sub_col),
                                 ).truncate()).on_hover_text(&instances_tip);
                             });
                         }
@@ -18586,11 +18807,13 @@ impl DemoApp {
                                  new_song_name: &mut String,
                                  import_open: &mut bool,
                                  learn: &mut Option<crate::show::ShowAction>,
+                                 confirm_remove_song: &mut Option<usize>,
                                  add_song: &mut bool,
                                  import_session: &mut Option<String>,
                                  move_song: &mut Option<(usize, usize)>,
                                  remove_song: &mut Option<usize>,
                                  jump_to: &mut Option<(usize, usize)>,
+                                 close_subpanels: &mut bool,
                                  window_dirty: &mut bool| {
                     const PROGRAM_ROW_H: f32 = 28.0;
                     // Device rows the songs list leaves room for; more scroll.
@@ -18709,8 +18932,16 @@ impl DemoApp {
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                             ui.spacing_mut().item_spacing.x = 3.0;
-                                            if theme::chip_button(ui, "×", false).on_hover_text("Remove song").clicked() {
-                                                *remove_song = Some(si);
+                                            if *confirm_remove_song == Some(si) {
+                                                if theme::danger_button(ui, "Del?", false)
+                                                    .on_hover_text("Click again to delete this song")
+                                                    .clicked()
+                                                {
+                                                    *remove_song = Some(si);
+                                                    *confirm_remove_song = None;
+                                                }
+                                            } else if theme::chip_button(ui, "×", false).on_hover_text("Remove song").clicked() {
+                                                *confirm_remove_song = Some(si);
                                             }
                                             if si + 1 < count && theme::chip_button(ui, "↓", false).on_hover_text("Move down").clicked() {
                                                 *move_song = Some((si, si + 1));
@@ -18725,6 +18956,7 @@ impl DemoApp {
                                                 let mut bits = vec![format!("{} part{}", song.parts.len(), if song.parts.len() == 1 { "" } else { "s" })];
                                                 if let Some(b) = song.bpm { bits.push(format!("{} BPM", b.round() as u32)); }
                                                 if let Some(sig) = song.time_sig { bits.push(sig.to_string()); }
+                                                if song.backing.is_some() { bits.push("♫ Track".into()); }
                                                 if let Some(Some((set, skip))) = song_sets.get(si) {
                                                     bits.push(if *skip { format!("{set} (skipped)") } else { set.clone() });
                                                 }
@@ -18781,7 +19013,11 @@ impl DemoApp {
                                                     }
                                                 },
                                             ).response.interact(egui::Sense::click());
-                                            if r.clicked() { *edit_song = Some(si); }
+                                            if r.clicked() {
+                                                *edit_song = Some(si);
+                                                *confirm_remove_song = None;
+                                                *close_subpanels = true;
+                                            }
                                             if r.double_clicked() { *jump_to = Some((si, 0)); }
                                         });
                                     });
@@ -18808,9 +19044,16 @@ impl DemoApp {
                                   setlist: &mut crate::setlist::Setlist,
                                   edit_song: Option<usize>,
                                   new_part_name: &mut String,
+                                  backing_open: &mut Option<usize>,
+                                  backing_input: &mut String,
+                                  confirm_remove_part: &mut Option<(usize, usize)>,
                                   add_part_for: &mut Option<usize>,
+                                  move_part: &mut Option<(usize, usize, usize)>,
+                                  dup_part: &mut Option<(usize, usize)>,
                                   remove_part: &mut Option<(usize, usize)>,
                                   capture_knobs_for: &mut Option<(usize, usize)>,
+                                  clear_knobs_for: &mut Option<(usize, usize)>,
+                                  set_backing: &mut Option<(usize, Option<String>)>,
                                   vary_rig: &mut Option<u8>,
                                   split_rig: &mut Option<(usize, usize, u8)>,
                                   jump_to: &mut Option<(usize, usize)>,
@@ -18845,7 +19088,7 @@ impl DemoApp {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         Self::recessed_input(ui, &mut song.name, 190.0, "Song title");
                         let mut has_bpm = song.bpm.is_some();
-                        if theme::chip_button(ui, "BPM", has_bpm).clicked() {
+                        if theme::wrapped_chip_button(ui, "BPM", has_bpm).clicked() {
                             has_bpm = !has_bpm;
                             song.bpm = if has_bpm { Some(120.0) } else { None };
                             if is_active_song { *active_part_dirty = true; }
@@ -18856,13 +19099,13 @@ impl DemoApp {
                             }
                         }
                         let has_sig = song.time_sig.is_some();
-                        if theme::chip_button(ui, "Metre", has_sig).clicked() {
+                        if theme::wrapped_chip_button(ui, "Metre", has_sig).clicked() {
                             song.time_sig = if has_sig { None } else { Some(crate::transport::TimeSig::default()) };
                             if is_active_song { *active_part_dirty = true; }
                         }
                         if let Some(sig) = &mut song.time_sig {
                             let label = sig.to_string();
-                            if theme::chip_button(ui, &label, true)
+                            if theme::wrapped_chip_button(ui, &label, true)
                                 .on_hover_text("Cycle common time signatures")
                                 .clicked()
                             {
@@ -18878,7 +19121,72 @@ impl DemoApp {
                             }
                         }
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(egui::RichText::new("Track").size(11.5).color(theme::INK_2));
+                        let track_lbl = song.backing.as_deref()
+                            .and_then(|p| std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()))
+                            .unwrap_or_else(|| "None".into());
+                        let has_track = song.backing.is_some();
+                        ui.label(egui::RichText::new(&track_lbl).size(12.0).color(if has_track { theme::LIVE_TEAL } else { theme::INK_2 }))
+                            .on_hover_text(song.backing.as_deref().unwrap_or("No backing track — drop a WAV file onto Setlist or pick one"));
+                        let picking = *backing_open == Some(si);
+                        if theme::wrapped_chip_button(ui, if picking { "Pick WAV ▴" } else { "Pick WAV…" }, picking).clicked() {
+                            if picking {
+                                *backing_open = None;
+                            } else {
+                                *backing_open = Some(si);
+                                *backing_input = song.backing.clone().unwrap_or_default();
+                            }
+                        }
+                        if has_track && theme::wrapped_chip_button(ui, "Clear", false).clicked() {
+                            *set_backing = Some((si, None));
+                            *backing_open = None;
+                        }
+                    });
+                    if *backing_open == Some(si) {
+                        ui.add_space(4.0);
+                        egui::Frame::new()
+                            .fill(theme::DARK_PANEL_HI)
+                            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let fw = (ui.available_width() - 72.0).clamp(100.0, 320.0);
+                                    let ed = Self::recessed_input(ui, backing_input, fw, "/abs/path/to/track.wav");
+                                    let enter = ed.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                                    if (theme::chip_button(ui, "Apply", false).clicked() || enter) && !backing_input.trim().is_empty() {
+                                        *set_backing = Some((si, Some(backing_input.trim().to_string())));
+                                        *backing_open = None;
+                                    }
+                                });
+                                let wavs: Vec<std::path::PathBuf> = std::fs::read_dir(crate::record::record_dir())
+                                    .ok()
+                                    .into_iter()
+                                    .flatten()
+                                    .flatten()
+                                    .map(|e| e.path())
+                                    .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")))
+                                    .take(8)
+                                    .collect();
+                                if !wavs.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for wav in wavs {
+                                            let lbl = wav.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                            if theme::wrapped_chip_button(ui, &lbl, false).clicked() {
+                                                *set_backing = Some((si, Some(wav.to_string_lossy().into_owned())));
+                                                *backing_open = None;
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                    ui.add_space(8.0);
 
                     // Add part row
                     ui.horizontal(|ui| {
@@ -18895,7 +19203,7 @@ impl DemoApp {
                     });
                     ui.add_space(8.0);
 
-                    let parts_h = (avail_h - 104.0).max(100.0);
+                    let parts_h = ui.available_height().max(100.0);
                     let part_count = song.parts.len();
                     egui::ScrollArea::vertical()
                         .id_salt("setlist_parts_scroll")
@@ -18910,31 +19218,61 @@ impl DemoApp {
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::same(10))
                                     .show(ui, |ui| {
+                                        let name_w = (ui.available_width() * 0.36).clamp(80.0, 140.0);
                                         ui.horizontal(|ui| {
-                                            Self::recessed_input(ui, &mut part.name, 140.0, "Part name");
+                                            Self::recessed_input(ui, &mut part.name, name_w, "Part name");
                                             if is_live {
                                                 ui.label(egui::RichText::new("LIVE").size(11.0).strong().color(theme::LIVE_TEAL));
                                             } else if theme::chip_button(ui, "▶ Play", false).clicked() {
                                                 *jump_to = Some((si, pi));
                                             }
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.spacing_mut().item_spacing.x = 6.0;
-                                                if part_count > 1 && theme::chip_button(ui, "×", false).on_hover_text("Remove part").clicked() {
-                                                    *remove_part = Some((si, pi));
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                if part_count > 1 {
+                                                    if *confirm_remove_part == Some((si, pi)) {
+                                                        if theme::danger_button(ui, "Del?", false)
+                                                            .on_hover_text("Click again to delete this part")
+                                                            .clicked()
+                                                        {
+                                                            *remove_part = Some((si, pi));
+                                                            *confirm_remove_part = None;
+                                                        }
+                                                    } else if theme::chip_button(ui, "×", false).on_hover_text("Remove part").clicked() {
+                                                        *confirm_remove_part = Some((si, pi));
+                                                    }
                                                 }
-                                                let knob_count = part.params.len() + part.plugin_params.len();
-                                                let knob_lbl = if knob_count == 0 {
-                                                    "Save knobs".to_string()
-                                                } else {
-                                                    format!("Save knobs ({knob_count})")
-                                                };
-                                                if theme::chip_button(ui, &knob_lbl, knob_count > 0)
-                                                    .on_hover_text("Snapshot current rack knobs, pinned plugin knobs and effect bypasses of this part's live rigs")
-                                                    .clicked()
-                                                {
-                                                    *capture_knobs_for = Some((si, pi));
+                                                if pi + 1 < part_count && theme::chip_button(ui, "↓", false).on_hover_text("Move part down").clicked() {
+                                                    *move_part = Some((si, pi, pi + 1));
+                                                }
+                                                if pi > 0 && theme::chip_button(ui, "↑", false).on_hover_text("Move part up").clicked() {
+                                                    *move_part = Some((si, pi, pi - 1));
+                                                }
+                                                if theme::chip_button(ui, "Dup", false).on_hover_text("Duplicate part").clicked() {
+                                                    *dup_part = Some((si, pi));
                                                 }
                                             });
+                                        });
+                                        let knob_count = part.params.len() + part.plugin_params.len();
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            let knob_lbl = if knob_count == 0 {
+                                                "Save knobs".to_string()
+                                            } else {
+                                                format!("Save knobs ({knob_count})")
+                                            };
+                                            if theme::wrapped_chip_button(ui, &knob_lbl, knob_count > 0)
+                                                .on_hover_text("Snapshot current rack knobs, pinned plugin knobs and effect bypasses of this part's live rigs")
+                                                .clicked()
+                                            {
+                                                *capture_knobs_for = Some((si, pi));
+                                            }
+                                            if knob_count > 0
+                                                && theme::wrapped_chip_button(ui, "Clear knobs", false)
+                                                    .on_hover_text("Clear saved knob/bypass overrides on this part")
+                                                    .clicked()
+                                            {
+                                                *clear_knobs_for = Some((si, pi));
+                                            }
                                         });
                                         ui.add_space(6.0);
                                         for (ri, rname) in rig_names.iter().enumerate() {
@@ -18944,7 +19282,7 @@ impl DemoApp {
                                             let mut show_fx_row = false;
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                                if theme::chip_button(ui, &format!("{} · {rname}", ri + 1), on).clicked() {
+                                                if theme::wrapped_chip_button(ui, &format!("{} · {rname}", ri + 1), on).clicked() {
                                                     on = !on;
                                                     if on {
                                                         part.set_rig(PartRig::new(r_u8));
@@ -19128,11 +19466,13 @@ impl DemoApp {
                                 &mut self.setlist_new_song_name,
                                 &mut self.setlist_import_open,
                                 &mut self.show_learn,
+                                &mut self.confirm_remove_song,
                                 &mut add_song,
                                 &mut import_session,
                                 &mut move_song,
                                 &mut remove_song,
                                 &mut jump_to,
+                                &mut close_subpanels,
                                 &mut window_dirty,
                             );
                         });
@@ -19151,9 +19491,16 @@ impl DemoApp {
                                 &mut self.setlist,
                                 self.setlist_edit_song,
                                 &mut self.setlist_new_part_name,
+                                &mut self.setlist_backing_open,
+                                &mut self.setlist_backing_input,
+                                &mut self.confirm_remove_part,
                                 &mut add_part_for,
+                                &mut move_part,
+                                &mut dup_part,
                                 &mut remove_part,
                                 &mut capture_knobs_for,
+                                &mut clear_knobs_for,
+                                &mut set_backing,
                                 &mut vary_rig,
                                 &mut split_rig,
                                 &mut jump_to,
@@ -19170,11 +19517,13 @@ impl DemoApp {
                         &mut self.setlist_new_song_name,
                         &mut self.setlist_import_open,
                         &mut self.show_learn,
+                        &mut self.confirm_remove_song,
                         &mut add_song,
                         &mut import_session,
                         &mut move_song,
                         &mut remove_song,
                         &mut jump_to,
+                        &mut close_subpanels,
                         &mut window_dirty,
                     );
                     ui.add_space(12.0);
@@ -19190,9 +19539,16 @@ impl DemoApp {
                             &mut self.setlist,
                             self.setlist_edit_song,
                             &mut self.setlist_new_part_name,
+                            &mut self.setlist_backing_open,
+                            &mut self.setlist_backing_input,
+                            &mut self.confirm_remove_part,
                             &mut add_part_for,
+                            &mut move_part,
+                            &mut dup_part,
                             &mut remove_part,
                             &mut capture_knobs_for,
+                            &mut clear_knobs_for,
+                            &mut set_backing,
                             &mut vary_rig,
                             &mut split_rig,
                             &mut jump_to,
@@ -19205,10 +19561,17 @@ impl DemoApp {
         });
 
         // Apply deferred actions outside the UI borrows.
+        if close_subpanels {
+            self.preshow.open = false;
+            self.setlist_levels_open = false;
+            self.setlist_backing_open = None;
+            self.confirm_remove_part = None;
+        }
         if toggle_check {
             self.toggle_preshow_panel();
         }
         if add_song {
+            self.push_user_undo();
             let name = self.setlist_new_song_name.trim().to_string();
             let title = if name.is_empty() {
                 format!("Song {}", self.setlist.songs.len() + 1)
@@ -19223,11 +19586,13 @@ impl DemoApp {
             window_dirty = true;
         }
         if let Some(sess) = import_session {
+            self.push_user_undo();
             if let Err(e) = self.add_song_from_session_in(sessions_dir, &sess, None) {
                 self.session_msg = e;
             }
         }
         if let Some((from, to)) = move_song {
+            self.push_user_undo();
             if self.setlist.move_song(from, to) {
                 if self.setlist_edit_song == Some(from) {
                     self.setlist_edit_song = Some(to);
@@ -19236,12 +19601,16 @@ impl DemoApp {
             }
         }
         if let Some(idx) = remove_song {
-            self.setlist.remove_song(idx);
+            self.push_user_undo();
+            if let Some(gone) = self.setlist.remove_song(idx) {
+                self.notify_patch(&format!("Removed '{}' · Ctrl+Z to undo", gone.name));
+            }
             self.apply_setlist_part();
             window_dirty = true;
         }
         if let Some(si) = add_part_for {
             if let Some(part_len) = self.setlist.songs.get(si).map(|s| s.parts.len()) {
+                self.push_user_undo();
                 let raw = self.setlist_new_part_name.trim().to_string();
                 let pname = if raw.is_empty() {
                     const DEFAULTS: [&str; 4] = ["Verse", "Chorus", "Bridge", "Solo"];
@@ -19259,14 +19628,31 @@ impl DemoApp {
                 window_dirty = true;
             }
         }
+        if let Some((si, from, to)) = move_part {
+            self.push_user_undo();
+            if self.setlist.move_part(si, from, to) {
+                window_dirty = true;
+            }
+        }
+        if let Some((si, pi)) = dup_part {
+            self.push_user_undo();
+            if let Some(at) = self.setlist.duplicate_part(si, pi) {
+                let name = self.setlist.songs.get(si).and_then(|s| s.parts.get(at)).map(|p| p.name.clone()).unwrap_or_default();
+                self.notify_patch(&format!("Duplicated part '{name}'"));
+                window_dirty = true;
+            }
+        }
         if let Some((si, pi)) = remove_part {
-            if let Some(song) = self.setlist.songs.get_mut(si) {
-                if song.parts.len() > 1 && pi < song.parts.len() {
+            if let Some((song_has_more, pname)) = self.setlist.songs.get(si).and_then(|s| (s.parts.len() > 1).then(|| s.parts.get(pi).map(|p| (true, p.name.clone()))).flatten()) {
+                let _ = song_has_more;
+                self.push_user_undo();
+                if let Some(song) = self.setlist.songs.get_mut(si) {
                     song.parts.remove(pi);
-                    self.setlist.clamp_active();
-                    self.apply_setlist_part();
-                    window_dirty = true;
                 }
+                self.setlist.clamp_active();
+                self.apply_setlist_part();
+                self.notify_patch(&format!("Removed part '{pname}' · Ctrl+Z to undo"));
+                window_dirty = true;
             }
         }
         if let Some((si, pi)) = capture_knobs_for {
@@ -19277,6 +19663,35 @@ impl DemoApp {
                     part.plugin_params = plugin_knobs;
                     part.fx = fx;
                 }
+            }
+        }
+        if let Some((si, pi)) = clear_knobs_for {
+            self.push_user_undo();
+            if let Some(part) = self.setlist.songs.get_mut(si).and_then(|s| s.parts.get_mut(pi)) {
+                part.params.clear();
+                part.plugin_params.clear();
+                part.fx.clear();
+                self.notify_patch("Cleared saved part knobs");
+            }
+        }
+        if let Some((si, path)) = set_backing {
+            match crate::setlist::backing_path(path.as_deref()) {
+                Ok(checked) => {
+                    self.push_user_undo();
+                    if let Some(song) = self.setlist.songs.get_mut(si) {
+                        song.backing = checked.clone();
+                    }
+                    self.follow_song_backing();
+                    let msg = match &checked {
+                        Some(p) => {
+                            let file = std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+                            format!("Attached track '{file}'")
+                        }
+                        None => "Cleared backing track".into(),
+                    };
+                    self.notify_patch(&msg);
+                }
+                Err(e) => self.notify_patch(&e),
             }
         }
         if let Some(r) = vary_rig {
@@ -19326,16 +19741,22 @@ impl DemoApp {
         let help = self.show_help;
         let names = Self::list_saved_sessions(dir);
 
+        let patch_notice = self.active_patch_notice().map(str::to_owned);
+
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Sessions").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
+                    let (sub_txt, sub_col) = match &patch_notice {
+                        Some(n) => (n.as_str(), theme::ACCENT_BRIGHT),
+                        None => ("save and load patches · starter templates · Tab / Esc: back to the rack", theme::INK_2),
+                    };
                     ui.label(
-                        egui::RichText::new("save and load patches · starter templates · Tab / Esc: back to the rack")
+                        egui::RichText::new(sub_txt)
                             .size(13.0)
-                            .color(theme::INK_2),
+                            .color(sub_col),
                     );
                     if !self.session_msg.is_empty() {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -20367,11 +20788,15 @@ impl DemoApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Plugins").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
+                    let (sub_txt, sub_col) = match self.active_patch_notice() {
+                        Some(n) => (n, theme::ACCENT_BRIGHT),
+                        None => ("Instruments, effects, MIDI FX and utilities · Tab / Esc: back to the rack", theme::INK_2),
+                    };
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("Instruments, effects, MIDI FX and utilities · Tab / Esc: back to the rack")
+                            egui::RichText::new(sub_txt)
                                 .size(13.0)
-                                .color(theme::INK_2),
+                                .color(sub_col),
                         )
                         .truncate(),
                     );
@@ -20470,9 +20895,11 @@ impl DemoApp {
                         if theme::wrapped_chip_button(ui, "All catalog", self.plugin_catalog_type.is_none()).clicked() {
                             self.plugin_catalog_type = None;
                         }
-                        for ty in [PluginType::Instrument, PluginType::Effect] {
+                        for ty in [PluginType::Instrument, PluginType::Effect, PluginType::MidiFx] {
+                            let cnt = n_of(ty);
+                            if cnt == 0 { continue; }
                             let on = self.plugin_catalog_type == Some(ty);
-                            if theme::wrapped_chip_button(ui, &format!("{} ({})", ty.label(), n_of(ty)), on).clicked() {
+                            if theme::wrapped_chip_button(ui, &format!("{} ({cnt})", ty.label()), on).clicked() {
                                 self.plugin_catalog_type = if on { None } else { Some(ty) };
                             }
                         }
@@ -20658,6 +21085,12 @@ impl DemoApp {
                                                 ui.spacing_mut().item_spacing.x = 8.0;
                                                 if is_inst {
                                                     ui.label(egui::RichText::new("Installed").size(12.0).color(theme::LIVE_TEAL));
+                                                    if theme::chip_button(ui, "Show in Plugins →", false)
+                                                        .on_hover_text("switch to the installed plugins tab filtered to this plugin")
+                                                        .clicked()
+                                                    {
+                                                        action = Some(BrowserAction::ShowType(e.plugin_type));
+                                                    }
                                                 } else if running {
                                                     ui.label(egui::RichText::new("Installing…").size(12.0).color(theme::AGENT_COLOR));
                                                 } else if let Some(err) = failed {
@@ -20708,7 +21141,16 @@ impl DemoApp {
                             } else {
                                 format!("No plugins match '{filter}'.")
                             };
-                            ui.label(egui::RichText::new(empty).size(13.0).color(theme::INK_2));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(egui::RichText::new(empty).size(13.0).color(theme::INK_2));
+                                if !filter.is_empty()
+                                    && theme::wrapped_chip_button(ui, "Search Install catalog →", false).clicked()
+                                {
+                                    self.plugin_category = PluginCategory::Install;
+                                    self.plugin_catalog_type = None;
+                                }
+                            });
                             return;
                         }
 
@@ -20900,7 +21342,10 @@ impl DemoApp {
                 // The last change's outcome, on a row of its own that is
                 // always reserved, so nothing moves when it appears (rule 136).
                 let (msg_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
-                if !self.settings_msg.is_empty() {
+                if let Some(notice) = self.active_patch_notice() {
+                    let g = Self::ellipsized(ui.painter(), notice, FontId::proportional(12.5), theme::ACCENT_BRIGHT, msg_rect.width());
+                    ui.painter().galley(Pos2::new(msg_rect.left(), msg_rect.center().y - g.size().y * 0.5), g, theme::ACCENT_BRIGHT);
+                } else if !self.settings_msg.is_empty() {
                     let col = if self.settings_msg.contains("failed") { theme::CLIP_BRIGHT } else { theme::LIVE_TEAL };
                     let g = Self::ellipsized(ui.painter(), &self.settings_msg, FontId::proportional(12.5), col, msg_rect.width());
                     ui.painter().galley(Pos2::new(msg_rect.left(), msg_rect.center().y - g.size().y * 0.5), g, col);
@@ -21895,35 +22340,37 @@ impl DemoApp {
                         ui.label(egui::RichText::new("Assistant").font(theme::medium_font(15.0)).color(theme::INK));
                         if header_w >= 560.0 {
                             ui.add_space(6.0);
-                            ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::CREAM_META));
+                            ui.label(egui::RichText::new("C hides").size(11.5).color(theme::CREAM_META));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
+                            if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (C)").clicked() {
                                 self.dock = DockView::None;
                             }
-                            ui.add_space(6.0);
-                            let cur = self.assistant.model();
-                            let mut pick: Option<String> = None;
-                            theme::Dropdown::new("dd_assistant_model", format!("chat: {cur}"))
-                                .text_size(12.0)
-                                .popup_min_width(220.0)
-                                .show_ui(ui, |menu| {
-                                    for m in self.assistant.models.clone() {
-                                        if menu.item(m == cur, &m) {
-                                            pick = Some(m);
+                            if self.assistant.key_set {
+                                ui.add_space(6.0);
+                                let cur = self.assistant.model();
+                                let mut pick: Option<String> = None;
+                                theme::Dropdown::new("dd_assistant_model", format!("chat: {cur}"))
+                                    .text_size(12.0)
+                                    .popup_min_width(220.0)
+                                    .show_ui(ui, |menu| {
+                                        for m in self.assistant.models.clone() {
+                                            if menu.item(m == cur, &m) {
+                                                pick = Some(m);
+                                            }
                                         }
-                                    }
-                                })
-                                .on_hover_text(if self.assistant.decides_first() {
-                                    "chat model for what Jev does not settle (questions, multi-step wiring) — switch any time, the conversation stays"
-                                } else {
-                                    "chat model — switch any time, the conversation stays"
-                                });
-                            if let Some(m) = pick { self.switch_model(&m); }
-                            if self.assistant.decides_first() && header_w >= 560.0 {
-                                ui.add_space(8.0);
-                                ui.label(egui::RichText::new("Jev decides first").size(11.5).color(theme::AGENT_TEXT))
-                                    .on_hover_text("Jev answers clear requests itself in about 0.3 s; everything else goes to the chat model. No need to select it.");
+                                    })
+                                    .on_hover_text(if self.assistant.decides_first() {
+                                        "chat model for what Jev does not settle (questions, multi-step wiring) — switch any time, the conversation stays"
+                                    } else {
+                                        "chat model — switch any time, the conversation stays"
+                                    });
+                                if let Some(m) = pick { self.switch_model(&m); }
+                                if self.assistant.decides_first() && header_w >= 560.0 {
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new("Jev decides first").size(11.5).color(theme::AGENT_TEXT))
+                                        .on_hover_text("Jev answers clear requests itself in about 0.3 s; everything else goes to the chat model. No need to select it.");
+                                }
                             }
                             if self.demo_agent_hold {
                                 ui.add_space(6.0);
@@ -21978,11 +22425,12 @@ impl DemoApp {
                                  input_rect: &mut Rect,
                                  focus_chat: &mut bool| {
                     if !assistant.key_set {
+                        let mut hide_dock = false;
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new("Connect OpenRouter (bring your own key)").font(theme::medium_font(13.5)).color(theme::INK));
                             ui.add_space(4.0);
                             let row = ui.horizontal(|ui| {
-                                let field_w = (ui.available_width() - 104.0).clamp(120.0, 380.0);
+                                let field_w = (ui.available_width() - 210.0).clamp(110.0, 340.0);
                                 let key_resp = ui.add(
                                     egui::TextEdit::singleline(key_input)
                                         .id_salt("assistant_key_input")
@@ -21991,7 +22439,8 @@ impl DemoApp {
                                         .hint_text("sk-or-…"),
                                 );
                                 if *focus_chat { key_resp.request_focus(); *focus_chat = false; }
-                                if theme::primary_button(ui, "Save key").clicked() && !key_input.trim().is_empty() {
+                                let enter = key_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                                if (theme::primary_button(ui, "Save key").clicked() || enter) && !key_input.trim().is_empty() {
                                     let k = key_input.trim().to_string();
                                     match assistant.save_api_key(&k) {
                                         Ok(()) => key_input.clear(),
@@ -22001,10 +22450,17 @@ impl DemoApp {
                                         }),
                                     }
                                 }
+                                if theme::chip_button(ui, "Hide Assistant", false).clicked() {
+                                    hide_dock = true;
+                                }
                             });
                             *input_rect = row.response.rect;
                             ui.add_space(4.0);
                             ui.add(egui::Label::new(egui::RichText::new(OPENROUTER_KEY_HELP).size(11.5).color(theme::INK_2)).wrap());
+                            ui.hyperlink_to(
+                                egui::RichText::new("Get a key at openrouter.ai/keys").size(11.5).color(theme::LIVE_TEAL),
+                                "https://openrouter.ai/keys",
+                            );
                             if assistant.retired_key {
                                 ui.add(egui::Label::new(egui::RichText::new(RETIRED_KEY_NOTE).size(11.5).color(theme::ACCENT_BRIGHT)).wrap());
                             }
@@ -22012,7 +22468,7 @@ impl DemoApp {
                                 ui.label(egui::RichText::new(&line.text).size(12.0).color(theme::CLIP_BRIGHT));
                             }
                         });
-                        return;
+                        return hide_dock;
                     }
 
                     let col_h = ui.available_height().max(40.0);
@@ -22039,7 +22495,7 @@ impl DemoApp {
                                         "Load a warm pad",
                                         "Add a new rig",
                                     ] {
-                                        if theme::chip_button(ui, prompt, false).clicked() {
+                                        if theme::wrapped_chip_button(ui, prompt, false).clicked() {
                                             *starter_prompt = Some(prompt.to_string());
                                         }
                                     }
@@ -22188,15 +22644,17 @@ impl DemoApp {
                     });
                     *input_rect = row.response.rect;
                     *assistant_input_h = ((ui.cursor().top() - row_top).max(28.0) + ui.spacing().item_spacing.y).max(34.0);
+                    false
                 };
 
+                let mut close_dock = false;
                 if two_col {
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(main_w, avail_h),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
-                                draw_main(
+                                if draw_main(
                                     ui,
                                     &mut self.key_input,
                                     &mut self.chat_input,
@@ -22207,7 +22665,9 @@ impl DemoApp {
                                     &mut submit_text,
                                     &mut input_rect,
                                     &mut focus_chat,
-                                );
+                                ) {
+                                    close_dock = true;
+                                }
                             },
                         );
                         ui.add_space(12.0);
@@ -22276,7 +22736,7 @@ impl DemoApp {
                         );
                     });
                 } else {
-                    draw_main(
+                    if draw_main(
                         ui,
                         &mut self.key_input,
                         &mut self.chat_input,
@@ -22287,7 +22747,12 @@ impl DemoApp {
                         &mut submit_text,
                         &mut input_rect,
                         &mut focus_chat,
-                    );
+                    ) {
+                        close_dock = true;
+                    }
+                }
+                if close_dock {
+                    self.dock = DockView::None;
                 }
             });
         self.dock_rect = resp.response.rect;
@@ -26239,14 +26704,17 @@ impl DemoApp {
     // -- input ----------------------------------------------------------
 
     fn handle_input(&mut self, ctx: &egui::Context, rect: Rect) {
-        // The "Delete rig?" modal owns all input (Esc/Del must reach it, not
-        // the rack's cable shortcuts).
+        // The "Delete rig?" / preset / rename modals own all input (Esc/Del
+        // must reach them, not the rack's cable shortcuts).
         if self.confirm_delete_rig.is_some()
             || self.save_rig_dialog.is_some()
             || self.load_rig_dialog.is_some()
+            || self.rename_rig_dialog.is_some()
+            || self.strip_rename.is_some()
         {
             return;
         }
+        let expanded_console = self.dock == DockView::Keyboard && self.kb_expanded;
         let mut toggle_play = false;
         let mut tap_tempo = false;
         let mut flip = false;
@@ -26255,13 +26723,15 @@ impl DemoApp {
         let mut load_demo = false;
         let mut load_multi = false;
         let mut toggle_cpu_overlay = false;
+        let mut toggle_tuner = false;
+        let mut enter_show_mode = false;
         let mut rig_switch: Option<usize> = None;
         let mut rig_cycle: i8 = 0;
         let mut setlist_step: Option<&'static str> = None;
         // Pan an overflowing rack with the wheel / trackpad — only over the
         // bare stage (never over a panel or window that scrolls itself).
         let ov = self.rack_overflow;
-        if !self.show_help && self.stage_view == StageView::Rack && (ov.x > 0.0 || ov.y > 0.0) {
+        if !self.show_help && !expanded_console && self.stage_view == StageView::Rack && (ov.x > 0.0 || ov.y > 0.0) {
             let over_stage = ctx.pointer_hover_pos().is_some_and(|p| self.stage_rect.contains(p)
                 && ctx.layer_id_at(p).map_or(true, |l| l.order == egui::Order::Background));
             let d = ctx.input(|i| i.smooth_scroll_delta());
@@ -26276,6 +26746,20 @@ impl DemoApp {
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) { toggle_play = true; }
             if i.consume_key(Modifiers::SHIFT, Key::T) { tap_tempo = true; }
+            if i.consume_key(Modifiers::COMMAND, Key::T) { toggle_tuner = true; }
+            if i.consume_key(Modifiers::NONE, Key::F2) { enter_show_mode = true; }
+            // Setlist stepping (#204): page-turner pedals send PageUp/PageDown;
+            // Shift+PageUp/PageDown jump whole songs. Check Shift BEFORE NONE.
+            if i.consume_key(Modifiers::SHIFT, Key::PageUp) { setlist_step = Some("prev_song"); }
+            if i.consume_key(Modifiers::SHIFT, Key::PageDown) { setlist_step = Some("next_song"); }
+            if i.consume_key(Modifiers::NONE, Key::PageUp) { setlist_step = Some("prev_part"); }
+            if i.consume_key(Modifiers::NONE, Key::PageDown) { setlist_step = Some("next_part"); }
+            if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
+                self.show_help = !self.show_help;
+            }
+            if expanded_console {
+                return;
+            }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
             // Unit shortcuts (Ctrl+E bypass, Ctrl+D duplicate, Ctrl+R randomize;
             // checked BEFORE plain R so egui never swallows Ctrl+R as R — rule 143).
@@ -26284,7 +26768,7 @@ impl DemoApp {
                 if i.consume_key(Modifiers::COMMAND, Key::D) { unit_shortcut = Some("duplicate"); }
                 if i.consume_key(Modifiers::COMMAND, Key::R) { unit_shortcut = Some("randomize"); }
             }
-            if i.consume_key(Modifiers::NONE, Key::R) { reset_knobs = true; }
+            if self.stage_view == StageView::Rack && i.consume_key(Modifiers::SHIFT, Key::R) { reset_knobs = true; }
             // I = info (MIDI + performance). Not D: D is a laptop note key.
             if i.consume_key(Modifiers::NONE, Key::I) { self.show_stats = !self.show_stats; }
             // Multi-rig big-view switching (visual only): 1–9 select, ←→ cycle.
@@ -26294,12 +26778,6 @@ impl DemoApp {
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowLeft) { rig_cycle = -1; }
             if i.consume_key(Modifiers::NONE, Key::ArrowRight) { rig_cycle = 1; }
-            // Setlist stepping (#204): page-turner pedals send PageUp/PageDown;
-            // Shift+PageUp/PageDown jump whole songs. Check Shift BEFORE NONE.
-            if i.consume_key(Modifiers::SHIFT, Key::PageUp) { setlist_step = Some("prev_song"); }
-            if i.consume_key(Modifiers::SHIFT, Key::PageDown) { setlist_step = Some("next_song"); }
-            if i.consume_key(Modifiers::NONE, Key::PageUp) { setlist_step = Some("prev_part"); }
-            if i.consume_key(Modifiers::NONE, Key::PageDown) { setlist_step = Some("next_part"); }
             // Per-unit live CPU meter overlay on the rack (issue #302).
             if i.consume_key(Modifiers::NONE, Key::F3) { toggle_cpu_overlay = true; }
             // Multi-rig demo (two independent rigs), F4.
@@ -26361,16 +26839,22 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::Comma) {
                 self.toggle_stage(StageView::Settings);
             }
-            if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
-                self.show_help = !self.show_help;
-            }
             if self.cc_learn.as_ref().is_some_and(|l| l.capture.is_some())
                 && i.consume_key(Modifiers::NONE, Key::Enter)
             {
                 self.cc_learn = None;
             }
-            if !(self.popup_open_at_start && !self.show_help) && i.consume_key(Modifiers::NONE, Key::Escape) {
+            let modal_open = self.confirm_delete_rig.is_some()
+                || self.rename_rig_dialog.is_some()
+                || self.save_rig_dialog.is_some()
+                || self.load_rig_dialog.is_some();
+            if !(self.popup_open_at_start && !self.show_help)
+                && (!modal_open || self.confirm_delete_rig_preset.is_some())
+                && i.consume_key(Modifiers::NONE, Key::Escape)
+            {
                 if self.show_help { self.show_help = false; }
+                else if self.confirm_delete_rig_preset.is_some() { self.confirm_delete_rig_preset = None; }
+                else if self.tuner_on { self.tuner_on = false; self.tuner_rect = Rect::NOTHING; }
                 else if self.engine_info_open { self.engine_info_open = false; }
                 else if self.nav_rig_menu.is_some() { self.nav_rig_menu = None; }
                 else if self.session_popover_open {
@@ -26384,9 +26868,19 @@ impl DemoApp {
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.show_learn.is_some() { self.show_learn = None; }
+                else if self.insert_pick.is_some() { self.insert_pick = None; }
+                else if self.strip_color_pick.is_some() { self.strip_color_pick = None; }
+                else if self.confirm_remove_bus.is_some() { self.confirm_remove_bus = None; }
+                else if self.confirm_remove_song.is_some() { self.confirm_remove_song = None; }
+                else if self.confirm_remove_part.is_some() { self.confirm_remove_part = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
+                else if self.stage_view == StageView::Setlist && self.setlist_backing_open.is_some() { self.setlist_backing_open = None; }
+                else if self.stage_view == StageView::Setlist && self.setlist_import_open { self.setlist_import_open = false; }
+                else if self.stage_view == StageView::Setlist && self.preshow.open { self.preshow.open = false; }
+                else if self.stage_view == StageView::Setlist && self.setlist_levels_open { self.setlist_levels_open = false; }
                 else if self.confirm_session.is_some() { self.confirm_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
+                else if self.assistant_open() { self.dock = DockView::None; }
                 else { self.selected = None; self.selected_unit = None; }
             }
             if i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace) {
@@ -26394,6 +26888,7 @@ impl DemoApp {
                     if self.rack_locked {
                         self.notify_rack_locked();
                     } else if let Some(ci) = self.cables.iter().position(|c| c.id == sel) {
+                        self.push_user_undo();
                         self.unplug_cable(ci, true);
                         self.selected = None;
                     }
@@ -26401,11 +26896,18 @@ impl DemoApp {
             }
         });
         if quick_save {
-            let dir = self.effective_sessions_dir();
-            self.save_current_session(&dir);
-            let msg = self.session_msg.clone();
-            self.notify_patch(&msg);
+            if self.open_session.is_none() && self.session_name.trim().is_empty() {
+                self.session_popover_open = true;
+                self.notify_patch("Name your session to save it");
+            } else {
+                let dir = self.effective_sessions_dir();
+                self.save_current_session(&dir);
+                let msg = self.session_msg.clone();
+                self.notify_patch(&msg);
+            }
         }
+        if toggle_tuner { self.tuner_on = !self.tuner_on; }
+        if enter_show_mode { self.set_show_mode(true); }
         if toggle_play { self.toggle_play(); }
         if toggle_cpu_overlay { self.set_cpu_overlay(!self.show_cpu_overlay); }
         if tap_tempo {
@@ -26413,9 +26915,15 @@ impl DemoApp {
             self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
         }
         if flip { self.on_tab(); }
-        if let Some(t) = load_tpl { self.try_load_template(t); }
-        if load_demo { self.load_demo_patch(); }
-        if load_multi { self.load_multi_rig_demo(); }
+        if load_tpl.is_some() || load_demo || load_multi {
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                if let Some(t) = load_tpl { self.try_load_template(t); }
+                if load_demo { self.load_demo_patch(); }
+                if load_multi { self.load_multi_rig_demo(); }
+            }
+        }
         if (rig_switch.is_some() || rig_cycle != 0) && self.rig_count() <= 1 {
             // Not a silent no-op: say why nothing switched.
             self.notify_patch("one rig loaded — its stacks share a master · F4 loads two independent rigs, then 1–9 / ←→ switch");
@@ -26437,8 +26945,38 @@ impl DemoApp {
             if self.rack_locked {
                 self.notify_rack_locked();
             } else {
-                for u in &mut self.units {
-                    for k in &mut u.knobs { k.set_immediate(k.default); }
+                self.push_user_undo();
+                let target_ui = self.selected_unit.and_then(|nid| self.units.iter().position(|u| u.node_id == nid)).filter(|&ui| self.visible(ui));
+                if let Some(ui) = target_ui {
+                    let node_id = self.units[ui].node_id;
+                    let name = self.unit_display_name(node_id);
+                    for ki in 0..self.units[ui].knobs.len() {
+                        let (def, param) = (self.units[ui].knobs[ki].default, self.units[ui].knobs[ki].param);
+                        self.set_unit_knob(ui, ki, def);
+                        if let Some(p) = param {
+                            self.node_params.insert((node_id, p), def);
+                        }
+                    }
+                    self.notify_patch(&format!("Reset knobs on {name} · Ctrl+Z to undo"));
+                } else {
+                    let single_rig = self.rig_count() <= 1;
+                    let active = self.active_rig as u8;
+                    let targets: Vec<usize> = self.units.iter().enumerate()
+                        .filter(|(_, u)| single_rig || u.rig == active)
+                        .map(|(ui, _)| ui)
+                        .collect();
+                    for ui in targets {
+                        let node_id = self.units[ui].node_id;
+                        for ki in 0..self.units[ui].knobs.len() {
+                            let (def, param) = (self.units[ui].knobs[ki].default, self.units[ui].knobs[ki].param);
+                            self.set_unit_knob(ui, ki, def);
+                            if let Some(p) = param {
+                                self.node_params.insert((node_id, p), def);
+                            }
+                        }
+                    }
+                    let rig = self.rig_name(self.active_rig);
+                    self.notify_patch(&format!("Reset knobs on {rig} · Ctrl+Z to undo"));
                 }
             }
         }
@@ -26476,6 +27014,7 @@ impl DemoApp {
         if (self.engine_info_open && self.engine_info_rect.contains(s))
             || (self.session_popover_open && self.session_popover_rect.contains(s))
             || (self.nav_rig_menu.is_some() && self.nav_rig_menu_rect.contains(s))
+            || (self.tuner_on && self.tuner_rect.contains(s))
             || self.crash_notice_covers(s)
             || (self.stage_view == StageView::Rack && self.side == Side::Back && self.back_controls_rect.contains(s))
         {
@@ -26757,9 +27296,11 @@ impl DemoApp {
                         // Tug near an end → unplug.
                         if let Some((a, b)) = ends {
                             if u < 0.16 && (l - a).length() > 48.0 {
+                                self.push_user_undo();
                                 self.unplug_cable(ci, false);
                                 self.drag = Drag::None;
                             } else if u > 0.84 && (l - b).length() > 48.0 {
+                                self.push_user_undo();
                                 self.unplug_cable(ci, true);
                                 self.drag = Drag::None;
                             }
@@ -26878,6 +27419,10 @@ impl DemoApp {
                             }
                         }
                         Some(Hit::Unit(ui)) if self.side == Side::Front
+                            && self.audio_in_tuner_rect(ui).is_some_and(|c| c.contains(l.to_pos2())) => {
+                            self.tuner_on = !self.tuner_on;
+                        }
+                        Some(Hit::Unit(ui)) if self.side == Side::Front
                             && (self.split_rects(ui).map_or(false, |(c, f)| c.contains(l.to_pos2()) || f.contains(l.to_pos2()))
                                 || self.zone_rects(ui).map_or(false, |z| z.iter().any(|z| z.minus.contains(l.to_pos2()) || z.plus.contains(l.to_pos2())))
                                 || self.scale_rects(ui).map_or(false, |(c, r)| c.contains(l.to_pos2()) || r.contains(l.to_pos2()))
@@ -26917,17 +27462,21 @@ impl DemoApp {
                     }
                     Some(Hit::Play) => self.toggle_play(),
                     Some(Hit::Jack { unit, jack }) if self.side == Side::Back => {
-                        let j = &self.units[unit].jacks[jack];
-                        let fan_out = shift && j.dir == Dir::Out;
+                        let (j_port, j_dir, j_kind) = {
+                            let j = &self.units[unit].jacks[jack];
+                            (j.port, j.dir, self.units[unit].kind(j.dir, j.port))
+                        };
+                        let fan_out = shift && j_dir == Dir::Out;
                         if let Some(p) = &self.pending {
                             let from = (p.unit, self.units[p.unit].jacks[p.jack].port, p.dir, p.kind);
                             if unit == p.unit && jack == p.jack {
                                 self.pending = None;
-                            } else if self.try_connect(from, (unit, j.port, j.dir, self.units[unit].kind(j.dir, j.port))) {
+                            } else if self.try_connect(from, (unit, j_port, j_dir, j_kind)) {
                                 self.pending = None;
                             }
-                        } else if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port).filter(|_| !fan_out) {
-                            self.unplug_cable(ci, j.dir == Dir::In);
+                        } else if let Some(ci) = self.cable_at_jack(unit, j_dir, j_port).filter(|_| !fan_out) {
+                            self.push_user_undo();
+                            self.unplug_cable(ci, j_dir == Dir::In);
                         } else {
                             self.start_pending(unit, jack, l);
                         }
@@ -27012,6 +27561,10 @@ impl DemoApp {
                         let (node, playing) = (self.units[ui].node_id, self.units[ui].playing);
                         self.ui_node_grace.insert(node, self.ui_time + 0.6);
                         self.set_node_playing(node, !playing);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.audio_in_tuner_rect(ui).is_some_and(|c| c.contains(l.to_pos2())) => {
+                        self.tuner_on = !self.tuner_on;
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.audio_in_monitor_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
@@ -27303,11 +27856,14 @@ impl DemoApp {
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("MIDI Matrix").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("any source → any rig · click: route · right-click: shape the rule · Tab / Esc: back to the rack")
-                        .size(13.0).color(theme::INK_2));
+                    let (sub_txt, sub_col) = match self.active_patch_notice() {
+                        Some(n) => (n, theme::ACCENT_BRIGHT),
+                        None => ("any source → any rig · click: route · right-click: shape the rule · Tab / Esc: back to the rack", theme::INK_2),
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(sub_txt).size(13.0).color(sub_col)).truncate());
                 });
                 ui.add_space(12.0);
                 let editor_w = if self.rule_editor.is_some() { 320.0 } else { 0.0 };
@@ -27476,11 +28032,14 @@ impl DemoApp {
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Mixer").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("every source → its rig bus → Master out · dB faders · inserts = the cable chain · Tab / Esc: back to the rack")
-                        .size(13.0).color(theme::INK_2));
+                    let (sub_txt, sub_col) = match self.active_patch_notice() {
+                        Some(n) => (n, theme::ACCENT_BRIGHT),
+                        None => ("every source → its rig bus → Master out · dB faders · inserts = the cable chain · Tab / Esc: back to the rack", theme::INK_2),
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(sub_txt).size(13.0).color(sub_col)).truncate());
                 });
                 ui.add_space(14.0);
                 // Strip height: name + meta + source slot + inserts + fader +
@@ -27523,9 +28082,14 @@ impl DemoApp {
                             }).sum::<f32>()
                         };
                         let kabelsalat_w = 15.0 + gap + STRIP_W + gap;
-                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + kabelsalat_w + 152.0 + gap;
-                        let pad = ((scroll_w - content_w) / 2.0).max(0.0);
-                        egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
+                        let master_w = 15.0 + gap + 152.0;
+                        let pinned_w = kabelsalat_w + master_w;
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + pinned_w;
+                        let pin_master = n >= 4 && scroll_w >= 640.0 && content_w > scroll_w;
+                        let left_max_w = if pin_master { (scroll_w - pinned_w - 8.0).max(200.0) } else { scroll_w };
+                        let pad = if pin_master { 0.0 } else { ((scroll_w - content_w) / 2.0).max(0.0) };
+                        let any_bus_ext = buses.iter().any(|&u| self.bus_output_of(SendSource::Node(self.units[u].node_id)).is_some());
+                        egui::ScrollArea::both().id_salt("mixer_scroll").max_width(left_max_w).auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
                                 ui.add_space(pad);
                                 for rig in 0..n {
@@ -27572,7 +28136,7 @@ impl DemoApp {
                                     });
                                 }
                                 // Aux buses (issue #5): what the sends feed, each a
-                                // full strip, returning to Master out.
+                                // full strip, returning to Master out or an external card.
                                 if !buses.is_empty() {
                                     let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                     ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
@@ -27584,7 +28148,7 @@ impl DemoApp {
                                         }).sum::<f32>() - gap;
                                         ui.allocate_ui_with_layout(egui::vec2(group_w, 36.0), egui::Layout::top_down(egui::Align::Center), |ui| {
                                             ui.label(egui::RichText::new("Aux buses").font(theme::medium_font(14.0)).color(theme::INK));
-                                            theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.14, theme::CREAM_DIM);
+                                            theme::tracked_label(ui, if any_bus_ext { "ROUTED PER BUS" } else { "→ MASTER OUT" }, 9.0, 0.14, theme::CREAM_DIM);
                                         });
                                         let (rule, _) = ui.allocate_exact_size(egui::vec2(group_w, 5.0), egui::Sense::hover());
                                         ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
@@ -27649,41 +28213,66 @@ impl DemoApp {
                                         });
                                     });
                                 }
-                                // Kabelsalat master mix: one strip for everything coming
-                                // from kabelsalat to Master out, right after System audio.
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
-                                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
-                                self.kabelsalat_strip_ui(ui, fader_h);
-                                // Master out sits right after the last rig bus
-                                // (the sum they feed) — not pinned far away.
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
-                                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
-                                self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
+                                if !pin_master {
+                                    // Kabelsalat master mix + Master out inline when everything fits.
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
+                                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                                    self.kabelsalat_strip_ui(ui, fader_h);
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
+                                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
+                                    self.master_strip_ui(ui, fader_h, (outputs.clone(), out_current.clone(), out_wanted.clone()), &mut out_pick, &mut edits);
+                                }
                             });
                         });
+                        if pin_master {
+                            egui::ScrollArea::vertical().id_salt("mixer_master_scroll").max_width(pinned_w).max_height(view_h).auto_shrink([false, false]).show(ui, |ui| {
+                                ui.horizontal_top(|ui| {
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
+                                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
+                                    self.kabelsalat_strip_ui(ui, fader_h);
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
+                                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
+                                    self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
+                                });
+                            });
+                        }
                     });
                 });
             });
         });
         // Insert edits apply after the frame's layout (rule 32) and answer
         // in the same place the rack's own messages go.
-        for e in edits.drain(..) {
-            let res = match e.source {
-                Some(s) => self.strip_insert_edit(s, e.edit),
-                None => self.master_insert_edit(e.edit),
-            };
-            if let Ok(msg) = res {
-                self.session_msg = msg;
-            } else if let Err(msg) = res {
-                self.session_msg = msg;
+        if !edits.is_empty() && self.rack_locked {
+            edits.clear();
+            self.notify_rack_locked();
+        } else if !edits.is_empty() {
+            self.push_user_undo();
+            for e in edits.drain(..) {
+                let res = match e.source {
+                    Some(s) => self.strip_insert_edit(s, e.edit),
+                    None => self.master_insert_edit(e.edit),
+                };
+                match res {
+                    Ok(msg) | Err(msg) => {
+                        self.session_msg = msg.clone();
+                        self.notify_patch(&msg);
+                    }
+                }
             }
         }
         if let Some(e) = self.pending_bus_edit.take() {
-            self.session_msg = match e {
-                BusEdit::Add => self.add_bus(None, self.active_rig as u8)
-                    .map(|node| format!("Added {} — send to it from any strip", self.unit_display_name(node))),
-                BusEdit::Remove(node) => self.remove_bus(node),
-            }.unwrap_or_else(|e| e);
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                self.push_user_undo();
+                let msg = match e {
+                    BusEdit::Add => self.add_bus(None, self.active_rig as u8)
+                        .map(|node| format!("Added {} — send to it from any strip", self.unit_display_name(node))),
+                    BusEdit::Remove(node) => self.remove_bus(node),
+                }.unwrap_or_else(|e| e);
+                self.session_msg = msg.clone();
+                self.notify_patch(&msg);
+            }
         }
         if let Some(r) = switch { self.set_active_rig(r); }
         for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
@@ -27813,7 +28402,10 @@ impl DemoApp {
                 } else {
                     ui.painter().circle_stroke(dr.center(), 4.0, Stroke::new(1.2, theme::CREAM_DIM));
                 }
-                if dresp.clicked() { self.strip_color_pick = Some(node); }
+                if dresp.clicked() {
+                    if self.rack_locked { self.notify_rack_locked(); }
+                    else { self.strip_color_pick = Some(node); }
+                }
                 dresp.on_hover_text("strip colour");
                 let cr = Rect::from_center_size(Pos2::new(inner_r - 9.0, nr.center().y), egui::vec2(18.0, 18.0));
                 if strip_collapse_chip(ui, cr, egui::Id::new(("strip_collapse", node)))
@@ -27828,7 +28420,10 @@ impl DemoApp {
             };
             let name_resp = ui.interact(name_rect, egui::Id::new(("strip_name", node)), egui::Sense::click_and_drag());
             if name_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::Grab); }
-            if name_resp.clicked() { self.strip_rename = Some((node, name)); }
+            if name_resp.clicked() {
+                if self.rack_locked { self.notify_rack_locked(); }
+                else { self.strip_rename = Some((node, name)); }
+            }
             if name_resp.dragged() {
                 self.mixer_strip_drag = Some((node, rig));
                 if let Some(p) = name_resp.interact_pointer_pos() {
@@ -27876,23 +28471,34 @@ impl DemoApp {
                 let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
                 let (knob_rect, plate_rect) = strip_slot_rects(sr);
                 ui.painter().rect_filled(plate_rect, 2.0, theme::DARK_PANEL_HI);
-                let plate_label = if is_bus { "Aux bus".to_string() } else { source_patch.clone().unwrap_or_else(|| sentence_case(&sub)) };
-                // A bus's plate removes it (× on hover), like an insert row.
+                let confirming = is_bus && self.confirm_remove_bus == Some(node);
+                let plate_label = if confirming { "Remove?".to_string() } else if is_bus { "Aux bus".to_string() } else { source_patch.clone().unwrap_or_else(|| sentence_case(&sub)) };
+                // A bus's plate removes it (2-step confirm, × on hover), like a destructive action.
                 let plate = ui.interact(plate_rect, egui::Id::new(("strip_src_plate", node)), egui::Sense::click());
-                let removing = is_bus && plate.hovered();
+                let removing = is_bus && (plate.hovered() || confirming);
                 let caption = if removing { None } else { self.quick_knob_caption(unit) };
                 paint_slot_texts(ui.painter(), plate_rect, plate_rect.left() + PLATE_PAD_X + 2.0, &plate_label,
-                    caption.as_deref(), theme::CREAM, theme::CREAM_MID);
+                    caption.as_deref(), if confirming { theme::CLIP_BRIGHT } else { theme::CREAM }, theme::CREAM_MID);
                 self.strip_quick_knob_ui(ui, knob_rect, unit, false);
                 let tip = match &source_patch {
+                    _ if confirming => "click again to remove this aux bus, its inserts and its sends".to_string(),
                     _ if is_bus => "fed by the SENDS rows of the other strips · click: remove this bus, its inserts and its sends".to_string(),
                     Some(p) => format!("{} · {p}", sentence_case(&sub)),
                     None => sentence_case(&sub),
                 };
                 if removing {
                     ui.painter().text(Pos2::new(plate_rect.right() - 9.0, plate_rect.center().y), egui::Align2::CENTER_CENTER,
-                        "×", egui::FontId::proportional(13.0), theme::CREAM_DIM);
-                    if plate.clicked() { self.pending_bus_edit = Some(BusEdit::Remove(node)); }
+                        "×", egui::FontId::proportional(13.0), if confirming { theme::CLIP_BRIGHT } else { theme::CREAM_DIM });
+                    if plate.clicked() {
+                        if self.rack_locked {
+                            self.notify_rack_locked();
+                        } else if confirming {
+                            self.confirm_remove_bus = None;
+                            self.pending_bus_edit = Some(BusEdit::Remove(node));
+                        } else {
+                            self.confirm_remove_bus = Some(node);
+                        }
+                    }
                 }
                 plate.on_hover_text(tip);
                 if is_bus {
@@ -27931,7 +28537,10 @@ impl DemoApp {
                         .custom_formatter(|v, _| pan_text(v as f32))
                         .custom_parser(parse_pan)));
                     self.mixer_learn_ui(ui, &r, r.rect, Some(pan_dest));
-                    if r.on_hover_text("source pan (L −1 … +1 R) · drag · right-click: MIDI learn").changed() {
+                    let dbl = r.double_clicked();
+                    let chg = r.on_hover_text("source pan (L −1 … +1 R) · drag · double-click: center · right-click: MIDI learn").changed();
+                    if chg || dbl {
+                        if dbl { p = 0.0; }
                         self.with_strip_row(node, |rw| rw.pan = p);
                         self.send_strip_mix(node);
                     }
@@ -27939,7 +28548,7 @@ impl DemoApp {
                 ui.add_space(3.0);
                 let mut ms = row;
                 ui.horizontal(|ui| {
-                    ui.add_space(((w - 46.0) * 0.5).max(4.0));
+                    ui.add_space(((w - 52.0) * 0.5).max(4.0));
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let mr = strip_ms_button(ui, &mut ms, 'M');
                     self.mixer_learn_ui(ui, &mr, mr.rect, Some(mute_dest));
@@ -28017,7 +28626,9 @@ impl DemoApp {
                     .custom_formatter(|v, _| pan_text(v as f32))
                     .custom_parser(parse_pan)));
                 self.mixer_learn_ui(ui, &r, r.rect, pan_dest);
-                if r.on_hover_text("rig pan (L −1 … +1 R) · drag · right-click: MIDI learn").changed() { m.pan = p; }
+                let dbl = r.double_clicked();
+                if r.on_hover_text("rig pan (L −1 … +1 R) · drag · double-click: center · right-click: MIDI learn").changed() { m.pan = p; }
+                if dbl { m.pan = 0.0; }
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -28077,7 +28688,12 @@ impl DemoApp {
         let mut gain = old_gain;
         let fader_dest: Option<CcDest> = master_knob
             .and_then(|(mi, k)| self.units[mi].knobs[k].cc_target().map(|(p, t)| (self.units[mi].node_id, p, t)));
-        let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+        let rigs = if n == 1 {
+            if self.bus_output_of(SendSource::Rig(0)).is_none() { "1 rig".to_string() } else { "routed away".to_string() }
+        } else {
+            let on_master = (0..n).filter(|&r| self.bus_output_of(SendSource::Rig(r as u8)).is_none()).count();
+            if on_master == n { format!("sum of {n} rigs") } else { format!("{on_master} of {n} rigs") }
+        };
         ui.vertical(|ui| {
             ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 36.0), egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new("Kabelsalat").font(theme::medium_font(14.0)).color(theme::INK));
@@ -28185,7 +28801,11 @@ impl DemoApp {
                 .on_hover_text("add an aux bus: rigs and sources send into it, its inserts run on the sum, and it returns to Master out past the rig faders")
                 .clicked()
             {
-                self.pending_bus_edit = Some(BusEdit::Add);
+                if self.rack_locked {
+                    self.notify_rack_locked();
+                } else {
+                    self.pending_bus_edit = Some(BusEdit::Add);
+                }
             }
             // Loudness target (#12) sits right below Master out's controls now
             // that the master fader lives in the Kabelsalat strip.
@@ -28541,7 +29161,11 @@ impl DemoApp {
             .on_hover_text("add an effect to this strip's chain (built-in or an installed LV2 effect)")
             .clicked()
         {
-            self.insert_pick = Some(source);
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                self.insert_pick = Some(source);
+            }
         }
     }
 
@@ -28553,10 +29177,11 @@ impl DemoApp {
         let mut decided: Option<Option<String>> = None;
         let modal = egui::Modal::new(egui::Id::new("strip_rename_modal")).show(ctx, |ui| {
             ui.set_width(320.0);
-            ui.label(egui::RichText::new("Rename strip").size(16.0).strong().color(theme::INK));
+            ui.label(egui::RichText::new("Rename strip").font(theme::medium_font(16.0)).color(theme::INK));
             ui.add_space(8.0);
             let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("strip_rename_text").desired_width(300.0).char_limit(24));
             if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { decided = Some(Some(text.clone())); }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if theme::primary_button(ui, "Rename").clicked() { decided = Some(Some(text.clone())); }
@@ -28566,10 +29191,14 @@ impl DemoApp {
         });
         if modal.should_close() && decided.is_none() { decided = Some(None); }
         match decided {
-            Some(Some(t)) => match self.apply_strip_name(node, &t) {
-                Ok(n) => self.session_msg = format!("Renamed the strip → {n}"),
-                Err(e) => self.session_msg = e,
-            },
+            Some(Some(t)) => {
+                let msg = match self.apply_strip_name(node, &t) {
+                    Ok(n) => format!("Renamed the strip → {n}"),
+                    Err(e) => e,
+                };
+                self.session_msg = msg.clone();
+                self.notify_patch(&msg);
+            }
             Some(None) => {}
             None => self.strip_rename = Some((node, text)),
         }
@@ -30202,12 +30831,20 @@ impl DemoApp {
     /// (short units show device/channel in the subtitle instead).
     fn audio_in_chips_y(&self, unit: usize) -> Option<f32> {
         let r = *self.unit_rects.get(unit)?;
-        let y = (r.top() + 60.0).max(r.center().y - 8.0).min(r.bottom() - FACE_PAD_B - FACE_CTL_H - 8.0);
+        let y = (r.top() + 58.0).max(r.center().y - 8.0).min(r.bottom() - FACE_PAD_B - FACE_CTL_H - 8.0);
         // Clear of the input meter, which starts 20 px above the knob row.
         if y + FACE_CTL_H + 4.0 > self.knob_row_y(unit) - 20.0 {
             return None;
         }
         Some(y)
+    }
+
+    fn audio_in_tuner_rect(&self, unit: usize) -> Option<Rect> {
+        if !matches!(self.units.get(unit)?.node_kind, UnitKind::AudioIn) { return None; }
+        let (start, width) = self.display_area(unit);
+        if width < 40.0 { return None; }
+        let y = self.knob_row_y(unit);
+        Some(Rect::from_center_size(Pos2::new(start + width * 0.5, y - 22.0), Vec2::new(width.clamp(56.0, 120.0), 18.0)))
     }
 
     fn draw_audio_in_face(&self, painter: &egui::Painter, unit: usize) {
@@ -30226,13 +30863,20 @@ impl DemoApp {
             if level >= 0.92 {
                 painter.rect_filled(self.xf.rect(Rect::from_min_size(Pos2::new(start, y - 12.0), Vec2::new(5.0, 8.0))), 1.0, theme::CLIP_RED);
             }
-            // Tuner readout above the meter: note + cents (no signal → hint).
+            // Tuner readout above the meter: note + cents (no signal → hint); clicking opens the tuner.
             let pitch = self.audio_in_tuners.get(&node).and_then(|(_, _, p)| *p);
             let text = match pitch {
                 Some(p) => format!("{} {:+.0}¢", crate::audio_in::note_name(p.note), p.cents),
                 None => "TUNE".into(),
             };
-            self.face_text(painter, Pos2::new(start + width * 0.5, y - 22.0), &text, theme::medium_font(12.0), SUBTEXT);
+            let tcol = if self.tuner_on {
+                theme::LIVE_TEAL
+            } else if self.audio_in_tuner_rect(unit).is_some_and(|tr| self.face_hovered(painter, unit, tr)) {
+                theme::ACCENT_BRIGHT
+            } else {
+                SUBTEXT
+            };
+            self.face_text(painter, Pos2::new(start + width * 0.5, y - 22.0), &text, theme::medium_font(12.0), tcol);
         }
 
         // MON / DEV / CH chips (only when the face is tall AND wide enough;
@@ -31263,6 +31907,7 @@ impl DemoApp {
             UnplugAll,
             NativeGui,
             ParamEditor,
+            Tuner,
             Remove,
         }
         let mut chosen: Option<Action> = None;
@@ -31379,6 +32024,10 @@ impl DemoApp {
                         if has_param_ed {
                             if menu_row(ui, "param_editor", "Parameters & presets…", "", true, false) { chosen = Some(Action::ParamEditor); }
                         }
+                        if matches!(self.units[ui_idx].node_kind, UnitKind::AudioIn) {
+                            let lbl = if self.tuner_on { "Close tuner" } else { "Open tuner" };
+                            if menu_row(ui, "tuner", lbl, "Ctrl+T", true, false) { chosen = Some(Action::Tuner); }
+                        }
                         if can_remove {
                             ui.add_space(2.0);
                             Self::stage_hairline(ui);
@@ -31406,6 +32055,10 @@ impl DemoApp {
             }
             Action::ParamEditor => {
                 self.open_unit_param_editor(node_id);
+                Ok(())
+            }
+            Action::Tuner => {
+                self.tuner_on = !self.tuner_on;
                 Ok(())
             }
             Action::Remove => self.remove_unit_action(node_id, true).map(|_| ()),
@@ -31798,7 +32451,7 @@ impl DemoApp {
     fn draw_hint(&self, painter: &egui::Painter, rect: Rect) {
         // Plain caption line on paper (§4.15) — no pill container.
         let (g, col) = if self.pending.is_some() {
-            (&self.hint_wire_g, theme::ACCENT_DEEP)
+            (&self.hint_wire_g, theme::ACCENT_BRIGHT)
         } else if self.rack_locked {
             (
                 if self.side == Side::Front { &self.hint_front_locked_g } else { &self.hint_back_locked_g },
@@ -31814,11 +32467,17 @@ impl DemoApp {
         // the STAGE's left, never over the rail (rule 5: no decoration over
         // function).
         let pos = Pos2::new(rect.left() + 16.0, rect.bottom() - 24.0);
-        // A refused patch (duplicate, cable limit) replaces the hint briefly.
+        let hint_limit = if self.back_controls_rect.is_positive() {
+            self.back_controls_rect.left() - 12.0
+        } else {
+            rect.right() - 16.0
+        };
+        let hint_clip = Rect::from_min_max(Pos2::new(pos.x, pos.y - 4.0), Pos2::new(hint_limit.max(pos.x), pos.y + 22.0));
+        // A refused patch (duplicate, cable limit) or feedback replaces the hint briefly.
         if let Some((msg, until)) = &self.patch_notice {
             if *until > self.ui_time {
-                let ng = painter.layout_no_wrap(msg.clone(), FontId::proportional(12.5), theme::ACCENT_DEEP);
-                painter.galley(pos, ng, theme::ACCENT_DEEP);
+                let ng = painter.layout_no_wrap(msg.clone(), FontId::proportional(12.5), theme::ACCENT_BRIGHT);
+                painter.with_clip_rect(hint_clip).galley(pos, ng, theme::ACCENT_BRIGHT);
                 return;
             }
         }
@@ -31827,15 +32486,9 @@ impl DemoApp {
         if let Some(stage) = crate::listen::stage() {
             let live = LiveStatus::of_listen(Some(&stage), std::time::Instant::now(), self.master_meter.momentary_lufs > SOUNDING_LUFS);
             let ng = painter.layout_no_wrap(format!("{} · {}", live.doing, live.detail), FontId::proportional(12.5), theme::AGENT_TEXT);
-            painter.galley(pos, ng, theme::AGENT_TEXT);
+            painter.with_clip_rect(hint_clip).galley(pos, ng, theme::AGENT_TEXT);
             return;
         }
-        let hint_limit = if self.back_controls_rect.is_positive() {
-            self.back_controls_rect.left() - 12.0
-        } else {
-            rect.right() - 16.0
-        };
-        let hint_clip = Rect::from_min_max(Pos2::new(pos.x, pos.y - 4.0), Pos2::new(hint_limit.max(pos.x), pos.y + 22.0));
         let hint_right = (pos.x + g.size().x).min(hint_clip.right());
         painter.with_clip_rect(hint_clip).galley(pos, g.clone(), col);
         // Info line fallback (narrow window): right-aligned on the hint row,
@@ -31848,6 +32501,42 @@ impl DemoApp {
                 painter.with_clip_rect(clip).galley(Pos2::new(x, pos.y + 1.0), ig, theme::INK_2);
             }
         }
+    }
+
+    /// Show recent feedback (`patch_notice`) on views without the Rack hint footer.
+    fn active_patch_notice(&self) -> Option<&str> {
+        self.patch_notice
+            .as_ref()
+            .filter(|(_, until)| *until > self.ui_time)
+            .map(|(m, _)| m.as_str())
+    }
+
+    fn draw_stage_toast(&self, ctx: &egui::Context) {
+        if !(self.dock == DockView::Keyboard && self.kb_expanded) || self.show_mode.is_some() {
+            return;
+        }
+        let Some(msg) = self.active_patch_notice() else { return };
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("stage_toast"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 8.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(12, 6))
+                    .show(ui, |ui| {
+                        ui.set_max_width((screen.width() - 48.0).max(160.0));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(msg).size(12.5).color(theme::ACCENT_BRIGHT),
+                            )
+                            .wrap(),
+                        );
+                    });
+            });
     }
 
     /// Build tooltip data for jack `(unit, jack)` on the back panel (#303).
@@ -32163,6 +32852,7 @@ impl DemoApp {
             }
             // Keep menu open so repeated clicks cycle cleanly through the family palette.
         } else if unplug {
+            self.push_user_undo();
             match menu.target {
                 CableMenuTarget::Cable(id) => {
                     if let Some(ci) = self.live_cable(id) {
@@ -33249,7 +33939,7 @@ fn strip_ms_button(ui: &mut egui::Ui, row: &mut StripUiRow, which: char) -> egui
     ui.add(egui::Button::new(egui::RichText::new(which.to_string()).size(11.0).color(txt))
         .fill(fill)
         .corner_radius(2.0)
-        .min_size(egui::vec2(20.0, 18.0)))
+        .min_size(egui::vec2(24.0, 20.0)))
 }
 
 /// Meter-table key of an app-stream strip (they share the strip peak table;
@@ -33366,20 +34056,22 @@ impl DemoApp {
             self.flip_requested = false;
             self.on_tab();
         }
-        // Dock toggles (F12 / C / V) — handled before the panels so they work
+        // Dock toggles (C / V) — handled before the panels so they work
         // even while the chat field has keyboard focus. The dock occupant owns
         // the computer keyboard, but its own close/swap shortcuts never yield.
         if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F12)) {
             self.replay_agent_rack_animations();
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
-            self.toggle_dock(DockView::Assistant);
         }
         // Letter shortcuts yield to a focused text field (rule 12): 'c' / 'v'
         // typed into the chat must land in the chat, not swap the dock.
         if !typing(&ctx) {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
                 self.toggle_dock(DockView::Assistant);
+            }
+            if self.dock == DockView::Keyboard && self.kb_expanded
+                && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
+            {
+                self.tuner_on = !self.tuner_on;
             }
             // Shift+V before plain V (rule 143): expand/fullscreen the keyboard dock.
             if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::V)) {
@@ -33396,7 +34088,9 @@ impl DemoApp {
             if self.dock == DockView::Keyboard && self.kb_expanded
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
             {
-                if self.knob_menu.is_some() {
+                if self.show_help {
+                    self.show_help = false;
+                } else if self.knob_menu.is_some() {
                     self.knob_menu = None;
                 } else if self.cc_learn.is_some() {
                     self.cc_learn = None;
@@ -33516,6 +34210,16 @@ impl DemoApp {
             }
         } else {
             self.back_controls_rect = Rect::NOTHING;
+            if self.show_help {
+                let r = ctx.content_rect();
+                egui::Area::new(egui::Id::new("expanded_help"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(r.min)
+                    .show(&ctx, |ui| {
+                        ui.set_min_size(r.size());
+                        self.draw_help(ui, r);
+                    });
+            }
         }
         self.knob_menu_ui(&ctx);
         self.scale_menu_ui(&ctx);
@@ -33531,6 +34235,7 @@ impl DemoApp {
         self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
         self.tuner_panel(&ctx);
+        self.draw_stage_toast(&ctx);
 
         self.frame_end(&ctx);
     }
@@ -39050,15 +39755,15 @@ mod split_bpm_tests {
         rclick(&mut app, &ctx, ucenter);
         assert!(app.unit_menu.is_none(), "unit context menu blocked while locked");
 
-        // R (reset knobs) and Ctrl+E/D/R are blocked.
+        // Shift+R (reset knobs) and Ctrl+E/D/R are blocked while locked.
         app.units[surge_unit].knobs[level_idx].set_immediate(0.25);
         app.selected_unit = Some(app.units[surge_unit].node_id);
         let unit_count = app.units.len();
         frame(&mut app, &ctx, vec![
-            egui::Event::Key { key: Key::R, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
-            egui::Event::Key { key: Key::R, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::R, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::SHIFT },
+            egui::Event::Key { key: Key::R, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::SHIFT },
         ]);
-        assert!((app.units[surge_unit].knobs[level_idx].value - 0.25).abs() < 1e-6, "R reset knobs blocked while locked");
+        assert!((app.units[surge_unit].knobs[level_idx].value - 0.25).abs() < 1e-6, "Shift+R reset knobs blocked while locked");
         frame(&mut app, &ctx, vec![
             egui::Event::Key { key: Key::D, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND },
             egui::Event::Key { key: Key::D, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND },
@@ -44426,10 +45131,11 @@ mod settings_and_dropdown_tests {
         assert!(!app.assistant_chip_rect.is_positive(), "no top-bar button");
         assert!(texts.iter().any(|(t, _)| t == "assistant off"), "the rail says so: {texts:?}");
         app.stage_view = StageView::Rack;
-        for k in [Key::C, Key::F12] {
-            run_frame(&mut app, &ctx, size, key(k));
-            assert_eq!(app.dock, DockView::None, "{k:?} does not open a switched-off assistant");
-        }
+        run_frame(&mut app, &ctx, size, key(Key::C));
+        assert_eq!(app.dock, DockView::None, "Key::C does not open a switched-off assistant");
+        run_frame(&mut app, &ctx, size, key(Key::F12));
+        assert_eq!(app.stage_view, StageView::Setlist, "Key::F12 opens Setlist even when assistant is off");
+        app.stage_view = StageView::Rack;
         run_frame(&mut app, &ctx, size, key(Key::V));
         assert_eq!(app.dock, DockView::Keyboard, "the keyboard dock is untouched");
 
@@ -51990,5 +52696,319 @@ mod precision_knob_tests {
         let oos_dots = circles_in(&shapes, app.rig_chip_rects[2]);
         assert_eq!(oos_dots.len(), 1, "out-of-song collapsed rig shows one muted zone dot, got {oos_dots:?}");
         assert_eq!(oos_dots[0].fill, theme::MUTED);
+    }
+
+    #[test]
+    fn f2_enters_show_mode_and_ctrl_t_toggles_tuner() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let run_ev = |app: &mut DemoApp, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(app.ui_time as f64 + 0.1),
+                events,
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+        };
+        let tap = |app: &mut DemoApp, k: Key, m: Modifiers| {
+            run_ev(app, vec![egui::Event::ModifiersChanged(m), egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }]);
+            run_ev(app, vec![egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m }, egui::Event::ModifiersChanged(Modifiers::NONE)]);
+        };
+
+        tap(&mut app, Key::F2, Modifiers::NONE);
+        assert!(app.show_mode.is_some(), "F2 enters Show mode");
+        app.set_show_mode(false);
+        run_ev(&mut app, vec![]);
+
+        assert!(!app.tuner_on);
+        tap(&mut app, Key::T, Modifiers::COMMAND);
+        assert!(app.tuner_on, "Ctrl+T opens tuner");
+        tap(&mut app, Key::T, Modifiers::COMMAND);
+        assert!(!app.tuner_on, "Ctrl+T closes tuner");
+    }
+
+    #[test]
+    fn bare_r_is_a_noop_while_shift_r_resets_unit_or_active_rig_with_undo() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 0.0f64;
+        fn run_ev(ctx: &egui::Context, size: Vec2, t: &mut f64, app: &mut DemoApp, events: Vec<egui::Event>) {
+            *t += 0.25;
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(*t),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+        }
+        fn tap(ctx: &egui::Context, size: Vec2, t: &mut f64, app: &mut DemoApp, k: Key, m: Modifiers) {
+            run_ev(ctx, size, t, app, vec![egui::Event::ModifiersChanged(m), egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }]);
+            run_ev(ctx, size, t, app, vec![egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m }, egui::Event::ModifiersChanged(Modifiers::NONE)]);
+        }
+        for _ in 0..3 { run_ev(&ctx, size, &mut t, &mut app, vec![]); }
+
+        let u0 = app.units.iter().position(|u| u.rig == 0 && u.knobs.iter().any(|k| k.param.is_some())).unwrap();
+        let k0 = app.units[u0].knobs.iter().position(|k| k.param.is_some()).unwrap();
+        let u1 = app.units.iter().position(|u| u.rig == 1 && u.knobs.iter().any(|k| k.param.is_some())).unwrap();
+        let k1 = app.units[u1].knobs.iter().position(|k| k.param.is_some()).unwrap();
+        let (n0, p0) = (app.units[u0].node_id, app.units[u0].knobs[k0].param.unwrap());
+        let (n1, p1) = (app.units[u1].node_id, app.units[u1].knobs[k1].param.unwrap());
+        app.set_unit_knob(u0, k0, 0.25);
+        app.node_params.insert((n0, p0), 0.25);
+        app.set_unit_knob(u1, k1, 0.15);
+        app.node_params.insert((n1, p1), 0.15);
+        let def0 = app.units[u0].knobs[k0].default;
+        assert!((def0 - 0.25).abs() > 0.01);
+        app.selected_unit = Some(n0);
+
+        let val_of = |app: &DemoApp, nid: u32, ki: usize| {
+            let ui = app.units.iter().position(|u| u.node_id == nid).unwrap();
+            app.units[ui].knobs[ki].value
+        };
+
+        // Bare R is a no-op even unlocked.
+        tap(&ctx, size, &mut t, &mut app, Key::R, Modifiers::NONE);
+        assert!((val_of(&app, n0, k0) - 0.25).abs() < 1e-6);
+
+        // Shift+R resets selected unit (not rig 1) and supports Ctrl+Z undo.
+        tap(&ctx, size, &mut t, &mut app, Key::R, Modifiers::SHIFT);
+        assert!((val_of(&app, n0, k0) - def0).abs() < 1e-6);
+        assert!((val_of(&app, n1, k1) - 0.15).abs() < 1e-6);
+        assert!(app.patch_notice.as_ref().is_some_and(|(m, _)| m.contains("Ctrl+Z")));
+
+        tap(&ctx, size, &mut t, &mut app, Key::Z, Modifiers::COMMAND);
+        assert!((val_of(&app, n0, k0) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn manual_setlist_edits_undo_and_song_delete_needs_two_clicks() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.exec_tool("set_setlist_song", &serde_json::json!({"name": "Opener"}));
+        app.exec_tool("set_setlist_song", &serde_json::json!({"name": "Closer"}));
+        app.stage_view = StageView::Setlist;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 0.0f64;
+
+        fn frame_at(
+            ctx: &egui::Context,
+            size: Vec2,
+            t: &mut f64,
+            app: &mut DemoApp,
+            events: Vec<egui::Event>,
+        ) -> Vec<egui::epaint::ClippedShape> {
+            *t += 0.25;
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(*t),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            out.shapes
+        }
+        for _ in 0..3 {
+            let _ = frame_at(&ctx, size, &mut t, &mut app, vec![]);
+        }
+        fn find_all(
+            ctx: &egui::Context,
+            size: Vec2,
+            t: &mut f64,
+            app: &mut DemoApp,
+            label: &str,
+        ) -> Vec<Rect> {
+            let _ = frame_at(ctx, size, t, app, vec![]);
+            let shapes = frame_at(ctx, size, t, app, vec![]);
+            fn walk(s: &egui::Shape, label: &str, acc: &mut Vec<Rect>) {
+                match s {
+                    egui::Shape::Text(t) if t.galley.text() == label => acc.push(t.visual_bounding_rect()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|c| walk(c, label, acc)),
+                    _ => {}
+                }
+            }
+            let mut acc = Vec::new();
+            shapes.iter().for_each(|cs| walk(&cs.shape, label, &mut acc));
+            acc
+        }
+        fn click_at(
+            ctx: &egui::Context,
+            size: Vec2,
+            t: &mut f64,
+            app: &mut DemoApp,
+            pos: Pos2,
+        ) {
+            for ev in [
+                vec![egui::Event::PointerMoved(pos)],
+                vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+                vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+            ] {
+                let _ = frame_at(ctx, size, t, app, ev);
+            }
+        }
+
+        let mut xs = find_all(&ctx, size, &mut t, &mut app, "×");
+        xs.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        click_at(&ctx, size, &mut t, &mut app, xs[0].center());
+        assert_eq!(app.setlist.songs.len(), 2, "first × click arms confirmation");
+        assert_eq!(app.confirm_remove_song, Some(0));
+
+        let del = find_all(&ctx, size, &mut t, &mut app, "Del?");
+        assert_eq!(del.len(), 1);
+        click_at(&ctx, size, &mut t, &mut app, del[0].center());
+        assert_eq!(app.setlist.songs.len(), 1, "second click removes song");
+
+        assert!(app.undo_agent(true).is_ok());
+        assert_eq!(app.setlist.songs.len(), 2, "Ctrl+Z restores deleted song");
+    }
+
+    #[test]
+    fn rack_locked_blocks_template_hotkeys_and_aux_bus_edits() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.set_rack_locked(true);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut t = 0.0f64;
+        let mut run_ev = |app: &mut DemoApp, events: Vec<egui::Event>| -> Vec<(String, Rect)> {
+            t += 0.05;
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::Shape::Text(t) => acc.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                    egui::Shape::Vec(v) => v.iter().for_each(|c| walk(c, acc)),
+                    _ => {}
+                }
+            }
+            let mut acc = Vec::new();
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+            acc
+        };
+        run_ev(&mut app, vec![
+            egui::Event::Key { key: Key::F4, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::F4, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert_eq!(app.rig_count(), 1, "F4 blocked while rack is locked");
+        assert!(app.patch_notice.as_ref().is_some_and(|(m, _)| m.contains("locked")));
+
+        app.stage_view = StageView::Mixer;
+        let _ = run_ev(&mut app, vec![]);
+        let texts = run_ev(&mut app, vec![]);
+        let add_bus = texts.iter().find(|(t, _)| t == "+ Aux bus").unwrap().1.center();
+        for ev in [
+            vec![egui::Event::PointerMoved(add_bus)],
+            vec![egui::Event::PointerButton { pos: add_bus, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: add_bus, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+        ] {
+            run_ev(&mut app, ev);
+        }
+        assert!(app.bus_units().is_empty(), "+ Aux bus blocked while rack is locked");
+    }
+
+    #[test]
+    fn mixer_pins_kabelsalat_and_master_when_many_rigs_overflow() {
+        let mut app = DemoApp::new_with_sink(None);
+        while app.rig_count() < 6 { app.edit_rigs(None); }
+        app.stage_view = StageView::Mixer;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut acc = Vec::new();
+        for step in 1..=3 {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(step as f64 * 0.05),
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            acc.clear();
+            fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::Shape::Text(t) => acc.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                    egui::Shape::Vec(v) => v.iter().for_each(|c| walk(c, acc)),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|cs| walk(&cs.shape, &mut acc));
+        }
+        let km = acc.iter().find(|(t, _)| t == "Kabelsalat").expect("Kabelsalat strip pinned on screen");
+        let mo = acc.iter().find(|(t, _)| t == "System default" || t == "+ Aux bus").expect("Master out pinned on screen");
+        assert!(km.1.right() <= size.x && km.1.left() >= 800.0, "{km:?}");
+        assert!(mo.1.right() <= size.x && mo.1.left() >= 800.0, "{mo:?}");
+    }
+
+    #[test]
+    fn drums_rig_maps_laptop_keys_to_gm_c2_36() {
+        let events = std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
+        let copy = events.clone();
+        let mut app = DemoApp::new_with_sink(Some(Box::new(move |ev| {
+            copy.lock().unwrap().push(ev.note);
+        })));
+        app.rig_types = vec![Some(crate::keyboard::KeyboardType::Drums)];
+        app.octave = 4;
+        app.handle_laptop_key(Key::A, true, false);
+        assert_eq!(*events.lock().unwrap(), vec![36], "Drums rig maps laptop C key (A) to GM C2 (36)");
+    }
+
+    #[test]
+    fn stage_toast_renders_patch_notice_on_non_rack_views() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Setlist;
+        app.notify_patch("Attached track 'click.wav'");
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        fn has(s: &egui::Shape, want: &str) -> bool {
+            match s {
+                egui::Shape::Text(t) => t.galley.text().contains(want),
+                egui::Shape::Vec(v) => v.iter().any(|c| has(c, want)),
+                _ => false,
+            }
+        }
+        let mut found = false;
+        for step in 1..=3 {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                time: Some(step as f64 * 0.2),
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            found = out.shapes.iter().any(|cs| has(&cs.shape, "Attached track 'click.wav'"));
+        }
+        assert!(found, "stage_toast renders patch_notice on non-Rack views");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat pinned_mixer_v03_shots -- --ignored"]
+    fn pinned_mixer_v03_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = DemoApp::new_with_sink(None);
+        while app.rig_count() < 6 { app.edit_rigs(None); }
+        let names = ["Piano", "Warm Pad", "Lead", "Organ", "Bass", "Strings"];
+        for (i, n) in names.iter().enumerate() { let _ = app.rename_rig(i, n); }
+        app.stage_view = StageView::Mixer;
+        super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("pinned-mixer-6rigs.png"));
     }
 }

@@ -17,6 +17,12 @@ pub(super) struct Recovery {
     notice_rect: Option<Rect>,
 }
 
+impl Recovery {
+    pub(super) fn has_notice(&self) -> bool {
+        self.notice.is_some()
+    }
+}
+
 struct Notice {
     report: Option<std::path::PathBuf>,
     /// What was reopened, e.g. "'Gig' at Encore · Outro".
@@ -52,21 +58,28 @@ impl DemoApp {
     }
 
     fn restore(&mut self, m: &Marker) -> Result<Option<String>, String> {
-        let Some(name) = &m.session else { return Ok(None) };
-        let dir = self.effective_sessions_dir();
-        self.open_saved_session(&dir, name)?;
-        // A part added after the last save is not in the file: the session
-        // stays open at the part it saved.
-        let moved = match m.pos {
-            Some(pos) => self.select_setlist(pos.song, pos.part).map(|_| ()),
-            None if self.setlist.active.is_some() => self.step_setlist("clear").map(|_| ()),
-            None => Ok(()),
+        let restored = if let Some(name) = &m.session {
+            let dir = self.effective_sessions_dir();
+            self.open_saved_session(&dir, name)?;
+            // A part added after the last save is not in the file: the session
+            // stays open at the part it saved.
+            let moved = match m.pos {
+                Some(pos) => self.select_setlist(pos.song, pos.part).map(|_| ()),
+                None if self.setlist.active.is_some() => self.step_setlist("clear").map(|_| ()),
+                None => Ok(()),
+            };
+            if let Err(e) = moved {
+                eprintln!("recovery: {e}");
+            }
+            let at = self.setlist.current().map(|(s, p, _)| format!(" at {} · {}", s.name, p.name)).unwrap_or_default();
+            Some(format!("'{name}'{at}"))
+        } else {
+            None
         };
-        if let Err(e) = moved {
-            eprintln!("recovery: {e}");
+        if m.show_mode {
+            self.set_show_mode(true);
         }
-        let at = self.setlist.current().map(|(s, p, _)| format!(" at {} · {}", s.name, p.name)).unwrap_or_default();
-        Ok(Some(format!("'{name}'{at}")))
+        Ok(restored)
     }
 
     /// Per frame: write the marker when what it should say changed.
@@ -78,10 +91,13 @@ impl DemoApp {
             self.recovery.autosaved = None;
         }
         let session = self.open_session.as_deref().or(self.recovery.autosaved.as_deref());
-        if self.recovery.written.as_ref().is_some_and(|w| w.session.as_deref() == session && w.pos == self.setlist.active) {
+        let show_mode = self.show_mode.is_some();
+        if self.recovery.written.as_ref().is_some_and(|w| {
+            w.session.as_deref() == session && w.pos == self.setlist.active && w.show_mode == show_mode
+        }) {
             return;
         }
-        let now = Marker { pid: std::process::id(), session: session.map(str::to_string), pos: self.setlist.active };
+        let now = Marker { pid: std::process::id(), session: session.map(str::to_string), pos: self.setlist.active, show_mode };
         match now.write(path) {
             Ok(()) => self.recovery.written = Some(now),
             Err(e) => {
@@ -225,13 +241,23 @@ mod tests {
         before.select_setlist(1, 1).unwrap();
         before.track_recovery();
         let marker = Marker::read(&dir.join("recover.json")).unwrap();
-        assert_eq!(marker, Marker { pid: std::process::id(), session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 1 }) });
+        assert_eq!(marker, Marker { pid: std::process::id(), session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 1 }), show_mode: false });
 
         // The file still holds part (0, 0): the switch was never autosaved.
         let mut after = supervised_app(&dir);
         assert_eq!(after.restore(&marker).unwrap().as_deref(), Some("'Gig' at Encore · Outro"));
         assert_eq!(after.open_session.as_deref(), Some("Gig"));
         assert_eq!(after.setlist.active, Some(SetlistPos { song: 1, part: 1 }));
+        assert!(after.show_mode.is_none());
+
+        // Show mode survives a crash marker too.
+        before.set_show_mode(true);
+        before.track_recovery();
+        let show_marker = Marker::read(&dir.join("recover.json")).unwrap();
+        assert!(show_marker.show_mode);
+        let mut back_on_stage = supervised_app(&dir);
+        back_on_stage.restore(&show_marker).unwrap();
+        assert!(back_on_stage.show_mode.is_some());
 
         // A song added after the last save: the session still opens.
         let mut later = supervised_app(&dir);

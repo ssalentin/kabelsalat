@@ -48,6 +48,8 @@ pub struct Marker {
     pub pid: u32,
     pub session: Option<String>,
     pub pos: Option<SetlistPos>,
+    #[serde(default)]
+    pub show_mode: bool,
 }
 
 impl Marker {
@@ -209,7 +211,7 @@ mod tests {
     fn the_marker_round_trips_in_a_folder_of_the_test_process() {
         let path = Marker::path();
         assert!(path.starts_with(crate::crash::crash_dir()), "{}", path.display());
-        let m = Marker { pid: 42, session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 2 }) };
+        let m = Marker { pid: 42, session: Some("Gig".into()), pos: Some(SetlistPos { song: 1, part: 2 }), show_mode: true };
         m.write(&path).unwrap();
         assert_eq!(Marker::read(&path), Some(m));
         let _ = std::fs::remove_file(&path);

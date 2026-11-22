@@ -4,17 +4,22 @@ How kabelsalat is tested on GitHub, which packages a release ships and how to
 cut one. Workflows live in `.github/workflows/`, and every packaging step is a
 script that also runs on a developer machine (in docker).
 
-## CI on every pull request and on main
+## CI on pull requests and releases
 
-`.github/workflows/ci.yml` runs once per pull request push (`pull_request`) and
-again on `main` after each merge, on x86_64 (`ubuntu-24.04`) and aarch64
-(`ubuntu-24.04-arm`). A PR waits about 4 minutes for it. CI is the technical
-sanity check that lets agents merge on their own: build, unit suite, images,
-changelog fragments. Packaging is checked by the nightly build, not per PR.
+`.github/workflows/ci.yml` runs on every pull request (`pull_request`), when
+called by `release.yml` on a `v*` tag release (`workflow_call`), or by hand
+(`workflow_dispatch`). Regular PRs run only the fast non-build `ci` check
+(`scripts/check-images.sh` and `scripts/release.py check`), which finishes in
+seconds. The full cross-arch build, unit suite and performance budget checks
+(`test (x86_64)` on `ubuntu-24.04` and `test (aarch64)` on `ubuntu-24.04-arm`,
+gating `ci`) run only for releases (`release-*` PRs, `v*` tag releases via
+`release.yml`, and manual `workflow_dispatch`). Packaging is checked by the
+nightly build and tag releases, not per PR.
 
-- `cargo build --locked`, then `scripts/ci/test.sh`: `cargo test --bin
-  kabelsalat`, green only when cargo exits 0 and prints `test result: ok`
-  (AGENTS.md rule 50).
+- On release and manual runs, `test` runs `cargo build --locked`, then
+  `scripts/ci/test.sh` (`cargo test --bin kabelsalat`, green only when cargo
+  exits 0 and prints `test result: ok`, AGENTS.md rule 50), and then
+  `scripts/ci/perf-budget.py --selftest` and `--check`.
 - The runners have no sound card, display, MIDI device or plugin, and the
   suite needs none (rule 37). Ubuntu's `setbfree` package is installed so
   `lv2::tests::setbfree_plays_a_note` plays a real LV2 instrument through
@@ -73,16 +78,13 @@ A bench session on a machine with the devices works the queue
 opens a bug labelled `bench-failed` on a fail. Merges do not wait for any of
 this; releases do (below).
 
-### Branch protection and a red main
+### Branch protection
 
-`main` requires `test (x86_64)` and `test (aarch64)`, but not that a branch
-is up to date: with several agents' PRs open, "up to date" made every merge
-re-run every other PR's CI, one after another. A PR merges as soon as its own run is green.
-
-The price is that two PRs, green on their own, can break `main` together.
-CI on `main` catches that within minutes, and `.github/workflows/main-health.yml`
-opens one issue labelled `main-red` with the failing run (and closes it when
-`main` is green again). Fix forward with a PR, or revert the breaking merge.
+`main` requires `ci`, but not that a branch is up to date: with several
+agents' PRs open, "up to date" made every merge re-run every other PR's checks,
+one after another. Regular PRs run only the fast `ci` hygiene checks
+(images and changelog fragments) and merge as soon as `ci` is green;
+`release-*` PRs also gate `ci` on `test (x86_64)` and `test (aarch64)`.
 
 ### Conflicts between parallel PRs
 
@@ -276,9 +278,9 @@ gh workflow run prepare-release.yml -f bump=minor   # patch | minor | major | X.
    `main` touching `Cargo.toml` (manual merges), and via `workflow_dispatch`
    as a manual fallback.
 3. `release.yml` checks that the tag matches `Cargo.toml`, that the CHANGELOG
-   has notes for it and that the metainfo lists it, then builds every package
-   and publishes the release. Check it with `gh release view vX.Y.Z --json
-   assets`.
+   has notes for it and that the metainfo lists it, runs `ci.yml` build tests
+   on both architectures in parallel with packaging, and publishes the release.
+   Check it with `gh release view vX.Y.Z --json assets`.
 
 The same works without the workflow: run `scripts/release.py prepare minor`
 on a `release-X.Y.Z` branch, open the PR and queue it; step 2 follows on

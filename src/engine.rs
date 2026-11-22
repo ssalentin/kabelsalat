@@ -7389,7 +7389,7 @@ pub(crate) mod latent;
 mod pdc;
 mod probe;
 mod show_gates;
-mod bench;
+pub(crate) mod bench;
 pub use bench::bench;
 pub mod analysis_test;
 pub mod setlist_test;

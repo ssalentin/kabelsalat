@@ -236,11 +236,13 @@ and never passed off as tested.**
   `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
   temporary null sinks, so nothing is heard),
   `state-race-test [seconds] [patch.fxp...]`,
-  `main-controls-test`, `engine-bench [render|session|routing|units]` (offline render timing
+  `main-controls-test`, `engine-bench [render|session|routing|units|shared|idle] [--reps N] [--json]` (offline render timing
   and output hashes: the demo rack, a full rack of 4 rigs and 20 effects, the
   same rack with plain gains, every built-in unit and the master meter),
-  `ui-bench [frames] [scene]` (time and vertices per UI frame, headless: rack
+  `ui-bench [frames] [scene...] [--json]` (time and vertices per UI frame, headless: rack
   front and back, mixer and matrix, small and full racks),
+  `session-load-bench (--builtin | <package.ksalat>...) [--rounds N] [--json]`,
+  `startup-bench [--with-plugins] [--json]`,
   `meter-test`, `target-test` (the master's loudness target on a real phrase),
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
@@ -1876,3 +1878,14 @@ Learned so far (2026-11-15, UI polish pass):
     modal cards to the stage `rect`, switch to a stacked, wrapped, scrollable
     layout when narrow or short, and cover both Navigator-closed and
     Navigator-open frames in `window_size_layout_tests::every_view_fits_small_windows`.
+211. **CI checks performance budgets on both architectures (`#280`):** headless
+    budgets for reference rack render time (`engine-bench render session routing`),
+    UI frame time and vertex counts (`ui-bench`), built-in 4-rig session load
+    (`session-load-bench --builtin`), start-up to first frame, and default-rack
+    RSS (`startup-bench`) live in `docs/perf-budgets.json` and are enforced in
+    `.github/workflows/ci.yml` via `scripts/ci/perf-budget.py --selftest` and
+    `--check` (using isolated `$HOME` and no external plugins so local and CI
+    runs match). Keep `--with-plugins` / Surge XT baselines separate under
+    `releases` in `docs/perf-budgets.json` and `docs/ARCHITECTURE.md`, and
+    verify changes with `python3 scripts/ci/perf-budget.py --selftest`,
+    `engine::bench::tests`, and `ui::bench::tests`.

@@ -48249,39 +48249,12 @@ mod voice_host_tests {
 }
 
 mod bench;
-pub use bench::run as run_ui_bench;
+pub use bench::{run as run_ui_bench, run_session_load as run_session_load_bench, run_startup as run_startup_bench};
 mod headless;
 pub use headless::run as run_headless;
 mod recovery;
 #[cfg(test)]
 mod hw_ports_tests;
-
-/// Times loading saved session packages (args: package paths) on the
-/// offline-engine app with real plugins: the UI-thread `apply_session`, and
-/// the slowest of the frames that follow while plugins load.
-pub fn run_session_load_bench(paths: &[String]) -> anyhow::Result<()> {
-    anyhow::ensure!(!paths.is_empty(), "usage: kabelsalat session-load-bench <package.ksalat>...");
-    let mut rig = EvalRig::new(Assistant::new(), &(Vec::new(), crate::lv2::discover()))?;
-    rig.settle();
-    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-    for round in 0..2 {
-        for p in paths {
-            let s = crate::session::Session::load(std::path::Path::new(p))?;
-            let t = std::time::Instant::now();
-            rig.app.apply_session(&s)?;
-            let apply = ms(t.elapsed());
-            let mut worst = 0.0f64;
-            for _ in 0..100 {
-                let f = std::time::Instant::now();
-                rig.frame();
-                worst = worst.max(ms(f.elapsed()));
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            println!("session-load-bench round {round} {p}: apply_session {apply:.1} ms, slowest next frame {worst:.1} ms");
-        }
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod window_size_layout_tests {

@@ -501,18 +501,17 @@ fn sh(args: &[&str]) -> Option<String> {
 }
 
 /// Normalized cross-correlation of `marker` against `rec` at every offset
-/// (coefficient in −1..=1, amplitude-invariant), then the offsets of the
-/// local maxima above `threshold × best`, at least `min_gap` apart.
-fn marker_arrivals(rec: &[f32], marker: &[f32], threshold: f32, min_gap: usize) -> Vec<usize> {
+/// (coefficient in −1..=1, amplitude-invariant).
+fn marker_correlations(rec: &[f32], marker: &[f32]) -> Vec<f32> {
     let m = marker.len();
-    if rec.len() <= m + 1 {
+    if m == 0 || rec.len() < m {
         return Vec::new();
     }
     let m_norm = marker.iter().map(|x| x * x).sum::<f32>().sqrt();
     if m_norm < 1e-9 {
         return Vec::new();
     }
-    let mut vals = vec![0.0f32; rec.len() - m];
+    let mut vals = vec![0.0f32; rec.len() - m + 1];
     for (off, v) in vals.iter_mut().enumerate() {
         let (mut dot, mut energy) = (0.0f32, 0.0f32);
         for i in 0..m {
@@ -521,6 +520,42 @@ fn marker_arrivals(rec: &[f32], marker: &[f32], threshold: f32, min_gap: usize) 
             energy += s * s;
         }
         *v = if energy > 1e-12 { dot / (energy.sqrt() * m_norm) } else { 0.0 };
+    }
+    vals
+}
+
+/// Best `(offset_samples, correlation)` of `marker` inside `rec`.
+pub(crate) fn best_marker_correlation(rec: &[f32], marker: &[f32]) -> Option<(usize, f32)> {
+    let vals = marker_correlations(rec, marker);
+    vals.into_iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+/// 6 ms Hann-windowed 1 kHz → 3 kHz linear chirp at peak 0.35 (sharp single
+/// autocorrelation peak for acoustic or cabled round-trip latency probes).
+pub(crate) fn chirp_burst(rate: u32) -> Vec<f32> {
+    let rate = rate.max(8000);
+    let len = ((rate as usize) / 160).max(32);
+    let (f0, f1) = (1000.0f32, 3000.0f32);
+    let dur = len as f32 / rate as f32;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let t = i as f32 / rate as f32;
+        let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / len as f32).cos();
+        let phase = 2.0 * std::f32::consts::PI * (f0 * t + 0.5 * (f1 - f0) * t * t / dur);
+        out.push(phase.sin() * 0.35 * w);
+    }
+    out
+}
+
+/// Normalized cross-correlation of `marker` against `rec` at every offset
+/// (coefficient in −1..=1, amplitude-invariant), then the offsets of the
+/// local maxima above `threshold × best`, at least `min_gap` apart.
+pub(crate) fn marker_arrivals(rec: &[f32], marker: &[f32], threshold: f32, min_gap: usize) -> Vec<usize> {
+    let vals = marker_correlations(rec, marker);
+    if vals.len() < 3 {
+        return Vec::new();
     }
     let best = vals.iter().cloned().fold(0.0f32, f32::max);
     let cut = best * threshold;

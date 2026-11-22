@@ -218,6 +218,7 @@ impl DemoApp {
         ui.add_space(8.0);
         Self::stage_hairline(ui);
         ui.add_space(6.0);
+        let mut open_doctor = false;
         let rows = self.preshow.report.as_ref().map(|r| r.rows.clone()).unwrap_or_default();
         egui::ScrollArea::vertical()
             .id_salt("preshow_scroll")
@@ -238,11 +239,20 @@ impl DemoApp {
                             ui.set_width(ui.available_width());
                             ui.label(egui::RichText::new(row.title).font(theme::medium_font(12.5)).color(theme::INK));
                             ui.add(egui::Label::new(egui::RichText::new(&row.text).size(12.0).color(theme::INK_2)).wrap());
+                            if matches!(row.id, "render" | "audio_output" | "audio_inputs") && row.status != Status::Ok {
+                                ui.add_space(3.0);
+                                if theme::chip_button(ui, "Open Audio Doctor", false).clicked() {
+                                    open_doctor = true;
+                                }
+                            }
                         });
                     });
                     ui.add_space(6.0);
                 }
             });
+        if open_doctor {
+            self.open_audio_doctor();
+        }
         if again {
             self.start_preshow();
         }

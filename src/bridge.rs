@@ -82,10 +82,13 @@ pub fn now_ms() -> u64 {
 
 /// While paused: commands and changing UI tools are refused; queries and
 /// read-only UI tools (get_/list_/search_) still answer.
-fn refused_while_paused(req: &Value) -> bool {
+pub(crate) fn refused_while_paused(req: &Value) -> bool {
     let op = req.get("op").and_then(Value::as_str);
     let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
-    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_") || tool == "preshow_check";
+    let reads = tool.starts_with("get_")
+        || tool.starts_with("list_")
+        || tool.starts_with("search_")
+        || matches!(tool, "preshow_check" | "audio_doctor");
     op == Some("cmd") || (op == Some("ui") && !reads)
 }
 
@@ -103,6 +106,9 @@ pub const BUFFER_SIZE_CHOICES: &[u32] = &[64, 128, 256, 512, 1024, 2048];
 pub static CONFIGURED_BUFFER_FRAMES: AtomicU32 = AtomicU32::new(BUFFER_FRAMES);
 /// Active audio backend (0 = none, 1 = PipeWire, 2 = JACK, 3 = ALSA).
 pub static ACTIVE_AUDIO_BACKEND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Live audio render thread realtime scheduling state:
+/// 0 = unknown / no stream callback yet, 1 = realtime (SCHED_FIFO/SCHED_RR), 2 = normal.
+pub static AUDIO_THREAD_RT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn active_audio_backend() -> Option<crate::audio_backend::ActiveBackend> {
     crate::audio_backend::ActiveBackend::from_u8(ACTIVE_AUDIO_BACKEND.load(Ordering::Relaxed))
@@ -110,6 +116,29 @@ pub fn active_audio_backend() -> Option<crate::audio_backend::ActiveBackend> {
 
 pub fn set_active_audio_backend(backend: Option<crate::audio_backend::ActiveBackend>) {
     ACTIVE_AUDIO_BACKEND.store(backend.map_or(0, |b| b.to_u8()), Ordering::Relaxed);
+}
+
+pub fn audio_thread_rt() -> Option<bool> {
+    match AUDIO_THREAD_RT.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// Record whether the calling (audio render) thread runs under a realtime
+/// scheduling policy. Call once on the first callback of a stream (one-shot,
+/// lock-free, allocation-free).
+pub fn record_current_thread_rt() {
+    #[cfg(target_os = "linux")]
+    {
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        if policy >= 0 {
+            let base = policy & !libc::SCHED_RESET_ON_FORK;
+            let is_rt = base == libc::SCHED_FIFO || base == libc::SCHED_RR;
+            AUDIO_THREAD_RT.store(if is_rt { 1 } else { 2 }, Ordering::Relaxed);
+        }
+    }
 }
 
 pub fn valid_buffer_frames(frames: u32) -> bool {
@@ -402,12 +431,18 @@ fn handle_line_with_pub(
             json!({"ok": true})
         }
         // UI-owned tools (synth patches live on the app's main thread):
-        // queued for the app frame, answered within 5 s (the pre-show check: 60 s).
+        // queued for the app frame, answered within 5 s (pre-show: 60 s, audio doctor: 15 s).
         Some("ui") => {
             let tool = req.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
             let args = req.get("args").cloned().unwrap_or(json!({}));
             // The pre-show check probes every rig: seconds, not a frame.
-            let wait = Duration::from_secs(if tool == "preshow_check" { 60 } else { 5 });
+            let wait = Duration::from_secs(if tool == "preshow_check" {
+                60
+            } else if tool == "audio_doctor" {
+                15
+            } else {
+                5
+            });
             match ui_call_within(tool, args, wait) {
                 Ok(text) => json!({"ok": true, "data": text}),
                 Err(e) => err_reply(e),

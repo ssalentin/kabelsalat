@@ -510,6 +510,7 @@ extern "C" fn pw_process_cb(data: *mut c_void) {
     if !st.pinned {
         st.pinned = true;
         pin_current_thread_to_p_cores();
+        crate::bridge::record_current_thread_rt();
     }
     unsafe {
         let pw_buf = (st.api.pw_stream_dequeue_buffer)(st.stream);
@@ -859,6 +860,7 @@ extern "C" fn jack_process_cb(nframes: u32, arg: *mut c_void) -> c_int {
     if !st.pinned {
         st.pinned = true;
         pin_current_thread_to_p_cores();
+        crate::bridge::record_current_thread_rt();
     }
     let n = nframes as usize;
     if n == 0 {
@@ -1201,6 +1203,7 @@ fn open_alsa(
                         }
                     }
                 }
+                crate::bridge::record_current_thread_rt();
             }
             render(data, ch, lat_ns);
         },

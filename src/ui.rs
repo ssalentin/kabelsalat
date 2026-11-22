@@ -180,6 +180,7 @@ mod levels;
 mod show_controls;
 mod show_mode;
 mod preshow;
+mod audio_doctor;
 mod shared;
 mod window_load;
 use levels::LevelItem;
@@ -1620,6 +1621,8 @@ enum Waiting {
     Listen(std::sync::mpsc::Receiver<String>),
     /// preshow_check: the check thread probing the show.
     Check(std::sync::mpsc::Receiver<String>),
+    /// audio_doctor: checking PipeWire, realtime, governor and USB audio.
+    AudioDoctor(std::sync::mpsc::Receiver<String>),
 }
 
 /// The tools that read an instrument's sound library.
@@ -3402,7 +3405,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo", "set_show_mode", "set_rack_locked", "panic",
-    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check",
+    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check", "audio_doctor",
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
     "record_save_last",
@@ -3416,7 +3419,7 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_") || name.starts_with("inspect_")
-        || matches!(name, "record_status" | "measure_mix" | "listen" | "preshow_check" | "undo" | "redo")
+        || matches!(name, "record_status" | "measure_mix" | "listen" | "preshow_check" | "audio_doctor" | "undo" | "redo")
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
@@ -4029,6 +4032,8 @@ struct DemoApp {
     rack_lock_btn_rect: Rect,
     /// The pre-show check (#278): its panel, last report and running check.
     preshow: preshow::PreshowState,
+    /// Audio Doctor (#211): diagnostics, fixes, latency probe and xrun test.
+    audio_doctor: audio_doctor::AudioDoctorState,
     /// The song and backing track the player was started with last (#278).
     setlist_backing_song: Option<(usize, String)>,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
@@ -4648,6 +4653,7 @@ impl DemoApp {
             rack_locked: false,
             rack_lock_btn_rect: Rect::NOTHING,
             preshow: Default::default(),
+            audio_doctor: Default::default(),
             setlist_backing_song: None,
             strips: Vec::new(),
             sends: Vec::new(),
@@ -6965,6 +6971,7 @@ impl DemoApp {
             ),
             "get_setlist" => "Read setlist".into(),
             "preshow_check" => "Check the show".into(),
+            "audio_doctor" => "Run Audio Doctor".into(),
             "get_show_controls" => "Read show controls".into(),
             "set_setlist_song" => match args.get("name").and_then(|v| v.as_str()) {
                 Some(n) if !n.trim().is_empty() => format!("Setlist · {n}"),
@@ -7044,6 +7051,7 @@ impl DemoApp {
                 Waiting::Engine(_) => LiveStatus::new(doing, &["waiting for the engine"]),
                 Waiting::SoundScan { .. } => LiveStatus::new(doing, &["reading the sound library"]),
                 Waiting::Check(_) => LiveStatus::new(doing, &["checking devices, plugins and every rig"]),
+                Waiting::AudioDoctor(_) => LiveStatus::new(doing, &["checking PipeWire, realtime, governor and USB audio"]),
             });
         }
         let after = self.active_run_user_idx
@@ -7141,6 +7149,11 @@ impl DemoApp {
                         Err(std::sync::mpsc::TryRecvError::Empty) => None,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("error: the pre-show check ended without an answer".into()),
                     },
+                    Waiting::AudioDoctor(answer) => match answer.try_recv() {
+                        Ok(text) => Some(text),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("error: Audio Doctor ended without an answer".into()),
+                    },
                 };
                 match outcome {
                     Some(result) => {
@@ -7173,6 +7186,11 @@ impl DemoApp {
                 }
                 if let Some(answer) = self.preshow.answer.take().filter(|_| call.name == "preshow_check") {
                     batch.waiting = Some((Waiting::Check(answer), chip_idx));
+                    self.tool_batch = Some(batch);
+                    return;
+                }
+                if let Some(answer) = self.audio_doctor.answer.take().filter(|_| call.name == "audio_doctor") {
+                    batch.waiting = Some((Waiting::AudioDoctor(answer), chip_idx));
                     self.tool_batch = Some(batch);
                     return;
                 }
@@ -10872,6 +10890,7 @@ impl DemoApp {
             }
             "get_setlist" => self.setlist_json().to_string(),
             "preshow_check" => self.preshow_tool(args),
+            "audio_doctor" => self.audio_doctor_tool(),
             "set_level" => match self.exec_set_level(args) {
                 Ok(val) => {
                     self.agent_activity.record(origin, "Level set", Vec::new(), now);
@@ -16776,6 +16795,10 @@ impl DemoApp {
                 self.preshow_request(&args, reply);
                 continue;
             }
+            if tool == "audio_doctor" {
+                self.audio_doctor_request(reply);
+                continue;
+            }
             let out = match tool.as_str() {
                 t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
@@ -21270,6 +21293,8 @@ impl DemoApp {
                     }
                 });
         });
+        Self::settings_gap(ui);
+        self.settings_audio_doctor_section(ui);
     }
 
     fn settings_session_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
@@ -33323,6 +33348,7 @@ impl DemoApp {
         self.poll_assistant();
         self.serve_ui_inbox();
         self.poll_preshow();
+        self.poll_audio_doctor();
         self.sync_from_engine();
         self.poll_setlist_window();
         for main in &mut self._surge_main {
@@ -33335,6 +33361,7 @@ impl DemoApp {
         if self.plugin_scan.is_some()
             || self.install.as_ref().is_some_and(|i| i.running)
             || self.setlist_window.is_active_work()
+            || self.audio_doctor.is_busy()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -48083,7 +48110,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 44] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 45] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("rack cpu overlay", &|a| {
@@ -48151,6 +48178,11 @@ mod window_size_layout_tests {
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("sessions-installed", &|a| { a.stage_view = StageView::Sessions; template_plugins_installed(a) }),
             ("settings", &|a| a.stage_view = StageView::Settings),
+            ("settings-audio-doctor", &|a| {
+                a.stage_view = StageView::Settings;
+                a.settings_page = SettingsPage::Audio;
+                a.audio_doctor = super::audio_doctor::tests::sample_state();
+            }),
             ("piano keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::Piano)]),
             ("jazz organ keyboard", &|a| { a.rig_types = vec![Some(crate::keyboard::KeyboardType::JazzOrgan)]; a.kb_dual_manual = true }),
             ("pipe organ keyboard", &|a| a.rig_types = vec![Some(crate::keyboard::KeyboardType::PipeOrgan)]),
@@ -48918,7 +48950,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 20] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 21] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
@@ -48947,6 +48979,11 @@ mod offline_shots {
                     .collect();
             }),
             ("settings", &|a| a.stage_view = StageView::Settings),
+            ("settings-audio-doctor", &|a| {
+                a.stage_view = StageView::Settings;
+                a.settings_page = SettingsPage::Audio;
+                a.audio_doctor = super::audio_doctor::tests::sample_state();
+            }),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),

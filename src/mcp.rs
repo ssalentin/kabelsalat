@@ -4897,6 +4897,35 @@ impl McpServer {
         }
     }
 
+    /// Audio Doctor (#211): read-only Linux audio diagnostic (PipeWire quantum/rate,
+    /// realtime priority, CPU governor, USB audio autosuspend, buffer/xruns).
+    #[tool(name = "audio_doctor", description = "Run the read-only Audio Doctor diagnostic on Linux audio health: checks PipeWire quantum and sample rate vs kabelsalat's configured buffer, realtime audio priority (rtkit / RLIMIT_RTPRIO / live audio thread), CPU governor / power profile, USB audio autosuspend, and current buffer load / xrun causes. Changes nothing; returns summary, checks, and raw facts.")]
+    fn audio_doctor(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool_within("audio_doctor", json!({}), std::time::Duration::from_secs(20));
+        }
+        let choice = crate::assistant::load_audio_backend();
+        let c = crate::engine_info::EngineCounters::load();
+        let cfg_frames = crate::bridge::configured_buffer_frames();
+        let stats = crate::engine_info::EngineStats::build(c, st.node_times.as_deref(), 0, |node| {
+            st.graph.node(node).map(|n| name_str(&n.name).to_string())
+        });
+        let engine_facts = crate::audio_doctor::EngineFacts::from_stats(
+            choice,
+            crate::bridge::active_audio_backend(),
+            cfg_frames,
+            &stats,
+            st.sample_rate,
+        );
+        drop(st);
+        let t = std::time::Instant::now();
+        let facts = crate::audio_doctor::gather_facts(engine_facts);
+        let report = crate::audio_doctor::DoctorReport::from_facts(facts, t.elapsed());
+        ok_json(report.json())
+    }
+
     /// Select or step the active setlist song/part without a gap (#204).
     #[tool(name = "select_setlist_part", description = "Switch the active setlist song/part without changing routing: held notes on outgoing rigs keep sounding until released and effect tails ring out, while new notes play only the new part's rigs. Pass action ('next_part' | 'prev_part' | 'next_song' | 'prev_song' | 'clear') OR song (0-based index) with optional part (default 0).")]
     fn select_setlist_part(&self, Parameters(args): Parameters<SelectSetlistPartArgs>) -> Result<CallToolResult, McpError> {

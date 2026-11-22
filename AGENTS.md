@@ -1785,3 +1785,10 @@ Learned so far (2026-11-15, UI polish pass):
     (fallback `rdfs:label`) in `read_control_infos`
     (`lv2_blank_node_units_resolve_to_symbol_or_label`).
 
+205. **Centre plugin windows on the active RandR monitor, never the combined X11
+    root screen:** with multiple monitors or `xwayland:force_zero_scaling`
+    (Omarchy/Hyprland), `screen.width_in_pixels` spans every output, so
+    `screen / 2` lands on the wrong monitor and Hyprland shoves the floating
+    dialog to the edge of the active screen. `PluginWindow::open` queries RandR
+    `GetMonitors` and picks the focused Hyprland monitor (or pointer/primary
+    monitor) before centring (`plugin_window::tests`).

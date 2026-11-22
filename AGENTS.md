@@ -53,8 +53,9 @@
   never `git push --force` without `--with-lease`, and never rebase or
   force-push a branch that is not your session's own.
 - **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
-  (admins included), and the required checks `test (x86_64)` and
-  `test (aarch64)` must pass.
+  (admins included), and the required check `ci` must pass (fast image and
+  changelog hygiene on regular PRs; `release-*` PRs also gate `ci` on
+  `test (x86_64)` and `test (aarch64)`).
   Branches need not be up to date, so a green PR merges at once. GitHub merges a queued auto-merge PR once they
   do; never merge by hand around a red or pending check, and never
   `gh pr merge` without `--auto`. Everything merges on green CI, so the
@@ -65,8 +66,7 @@
   before every push (previous rule); `resolve-conflicts.yml` checks
   conflicting PRs read-only and labels them `merge-conflict` for the
   session to rebase with `scripts/sync-branch.sh --push`, so a
-  `git pull` is never needed. An open `main-red` issue means `main` is broken: fixing it comes
-  before new work (`docs/PACKAGING.md`, "Branch protection and a red main").
+  `git pull` is never needed.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).
@@ -111,16 +111,17 @@ scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transp
 - Non-visual changes: the unit tests of the code you changed (filtered
   `cargo test --bin kabelsalat <filter>`) plus the relevant CLI self-test
   (`session-test`, `multi-rig-test`, `rig-mix-test`, … — list below). The
-  full suite runs in CI, not here (next section).
+  full suite runs in CI on releases, not per PR (next section).
 
 ## Test locally what only this machine can test (user, 2026-11-18)
 
-**CI builds and tests everything; this machine tests what CI cannot, as far
-as it has the hardware (next section).** The
-full unit suite runs on every push in CI (`test (x86_64)`, `test (aarch64)`),
-and release builds and packages run in the release workflows. Running them
-locally too only doubles the time and the machine's load. This holds for
-every agent and subagent.
+**CI runs build tests and packages for releases; this machine tests what you
+changed and what CI cannot, as far as it has the hardware (next section).**
+The full cross-arch build, unit suite (`test (x86_64)`, `test (aarch64)`), and
+performance budget checks run in CI only on releases (`release-*` PRs, `v*`
+tag releases via `release.yml`, and manual `workflow_dispatch`), not on every
+regular PR push. Running them locally too only doubles the time and the
+machine's load. This holds for every agent and subagent.
 
 - **Never run locally:** the whole unit suite (`cargo test --bin kabelsalat`
   with no filter, `scripts/ci/test.sh`), `cargo build --release`, or
@@ -135,10 +136,11 @@ every agent and subagent.
   (`docs/PACKAGING.md`), `agent-eval`, and, where the machine has them,
   audio and MIDI hardware and screenshots of the real app. What it cannot
   do becomes the PR's bench test (next section).
-- **CI is the gate for the rest:** push once the targeted tests are green
-  (rule 50); a PR merges only on green required checks. When CI goes red,
-  read its log (`gh run view --log-failed`) and fix that failure; do not
-  answer it with a local full-suite run.
+- **CI gates merges (`ci`) and releases (`test (x86_64)`, `test (aarch64)`):**
+  push once the targeted tests are green (rule 50); a PR merges only when `ci`
+  is green, and release runs gate on the full cross-arch build and test suite.
+  When CI goes red, read its log (`gh run view --log-failed`) and fix that
+  failure; do not answer it with a local full-suite run.
 
 ## Bench tests: hand over what this machine cannot test (user, 2026-11-19)
 
@@ -1878,17 +1880,19 @@ Learned so far (2026-11-15, UI polish pass):
     modal cards to the stage `rect`, switch to a stacked, wrapped, scrollable
     layout when narrow or short, and cover both Navigator-closed and
     Navigator-open frames in `window_size_layout_tests::every_view_fits_small_windows`.
-211. **CI checks performance budgets on both architectures (`#280`):** headless
+211. **CI checks performance budgets on releases across both architectures (`#280`):** headless
     budgets for reference rack render time (`engine-bench render session routing`),
     UI frame time and vertex counts (`ui-bench`), built-in 4-rig session load
     (`session-load-bench --builtin`), start-up to first frame, and default-rack
-    RSS (`startup-bench`) live in `docs/perf-budgets.json` and are enforced in
-    `.github/workflows/ci.yml` via `scripts/ci/perf-budget.py --selftest` and
-    `--check` (using isolated `$HOME` and no external plugins so local and CI
-    runs match). Keep `--with-plugins` / Surge XT baselines separate under
-    `releases` in `docs/perf-budgets.json` and `docs/ARCHITECTURE.md`, and
-    verify changes with `python3 scripts/ci/perf-budget.py --selftest`,
-    `engine::bench::tests`, and `ui::bench::tests`.
+    RSS (`startup-bench`) live in `docs/perf-budgets.json` and are enforced on
+    releases (`release-*` PRs, `v*` tag releases via `release.yml`, and manual
+    `workflow_dispatch`) in `.github/workflows/ci.yml` via
+    `scripts/ci/perf-budget.py --selftest` and `--check` (using isolated `$HOME`
+    and no external plugins so local and CI runs match). Keep `--with-plugins` /
+    Surge XT baselines separate under `releases` in `docs/perf-budgets.json` and
+    `docs/ARCHITECTURE.md`, and verify changes with
+    `python3 scripts/ci/perf-budget.py --selftest`, `engine::bench::tests`, and
+    `ui::bench::tests`.
 212. **Headless click and `Area` tests settle 3 frames after `ui_scale` (`ppp`) changes:**
     `frame_ui` applies the `1.60` scale mid-frame on frame 1 and lays out frame 2
     before widgets/ScrollAreas/anchored `Area`s finish sizing, so click coordinates

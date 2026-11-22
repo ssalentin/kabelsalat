@@ -812,10 +812,12 @@ measures a played note's pitch, brightness and aliasing.
 ## Performance budgets
 
 Headless performance budgets live in [perf-budgets.json](perf-budgets.json) and
-are enforced on every pull request and push to `main` by
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on both `x86_64`
-(`ubuntu-24.04`) and `aarch64` (`ubuntu-24.04-arm`) using debug builds
-(`opt-level = 1` for the crate, `opt-level = 2` for dependencies, `Cargo.toml`).
+are enforced on releases (`release-*` PRs, `v*` tag releases via
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), and manual
+`workflow_dispatch`) by [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+on both `x86_64` (`ubuntu-24.04`) and `aarch64` (`ubuntu-24.04-arm`) using debug
+builds (`opt-level = 1` for the crate, `opt-level = 2` for dependencies,
+`Cargo.toml`).
 
 CI has no sound card, display, or Surge XT installed (`setbfree` only), so
 the budget check runs exclusively plugin-free headless benchmarks in an isolated

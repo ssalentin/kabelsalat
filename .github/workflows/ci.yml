@@ -1,16 +1,18 @@
 name: CI
 
-# PRs run once (pull_request); main runs again after each merge, because main
-# does not require branches to be up to date (docs/PACKAGING.md, "CI").
+# Regular PRs run only fast non-build checks (`scripts/check-images.sh` and
+# `scripts/release.py check`) via the `ci` gate job. Full builds, the unit
+# suite and performance budgets (`test (x86_64)` and `test (aarch64)`) run only
+# for releases (`release-*` PRs, `workflow_call` from `release.yml` on `v*`
+# tags) or manual `workflow_dispatch`.
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -18,6 +20,7 @@ permissions:
 jobs:
   test:
     name: test (${{ matrix.arch }})
+    if: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-') }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,3 +55,30 @@ jobs:
         run: |
           python3 scripts/ci/perf-budget.py --selftest
           python3 scripts/ci/perf-budget.py --check --binary ./target/debug/kabelsalat
+
+  ci:
+    name: ci
+    needs: [test]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every image is reviewed (AGENTS.md rule 108)
+        run: scripts/check-images.sh
+      - name: Changelog fragments are well-formed
+        run: python3 scripts/release.py check
+      - name: Verify build tests on release runs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request ] || [[ "$HEAD_REF" == release-* ]]; then
+            if [ "$TEST_RESULT" != success ]; then
+              echo "::error::build tests did not succeed (result: $TEST_RESULT)"
+              exit 1
+            fi
+          elif [ "$TEST_RESULT" != skipped ] && [ "$TEST_RESULT" != success ]; then
+            echo "::error::unexpected build test result: $TEST_RESULT"
+            exit 1
+          fi

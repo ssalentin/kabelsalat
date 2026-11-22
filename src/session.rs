@@ -1249,6 +1249,7 @@ impl RigPreset {
                 mix: self.mix,
                 midi_device: self.midi_device,
                 clap_meta: self.clap_meta.clone(),
+                midi_sources: self.session.midi_sources().to_vec(),
                 strip_knobs: self.session.strip_knobs().clone(),
                 rig_type: self.session.rig_types.first().copied().flatten(),
                 hw_ports: self.session.hw_ports().clone(),
@@ -1290,6 +1291,9 @@ impl RigPreset {
         }
         session.rig_types = manifest.rig_type.map(|t| vec![Some(t)]).unwrap_or_default();
         session.set_hw_ports(manifest.hw_ports);
+        for m in manifest.midi_sources {
+            session.set_midi_sources(m);
+        }
         let preset = RigPreset {
             name: manifest.name,
             rig_name: manifest.rig_name,
@@ -1322,6 +1326,9 @@ struct RigPresetFile {
     midi_device: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     clap_meta: Vec<RigClapMeta>,
+    /// Input selection of CLAP synths (#124, #322); older presets have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    midi_sources: Vec<MidiSources>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     strip_knobs: BTreeMap<NodeId, String>,
     /// The rig's instrument-type mark (#198); absent while it follows its instrument.
@@ -2741,6 +2748,53 @@ mod tests {
         let loaded = Session::load(&gig).unwrap();
         assert_eq!(loaded.setlist.rig_level(0), Level::Song, "the rig its song plays stays song by song, as it played");
         assert_eq!(loaded.setlist.bus_level(bus), Level::Show);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rig_preset_midi_sources_round_trip_and_legacy_compat() {
+        let dir = test_dir("rig-preset-midi-sources");
+        let mut s = sample_session();
+        s.name = "Lead Preset".into();
+        let row = MidiSources {
+            node: 1,
+            keyboard: false,
+            hardware: true,
+            device: Some("FM-1:FM-1 MIDI 1".into()),
+        };
+        s.set_midi_sources(row.clone());
+
+        let mut preset = RigPreset::new("Lead Preset", "Lead", s);
+        preset.clap_meta = vec![RigClapMeta {
+            node: 1,
+            keyboard: false,
+            hardware: true,
+            patch_name: Some("Wurli".into()),
+        }];
+
+        let pkg = RigPreset::package_path(&dir, "Lead Preset").unwrap();
+        preset.save(&pkg).unwrap();
+        let raw = fs::read_to_string(pkg.join(RIG_PRESET_FILE)).unwrap();
+        assert!(raw.contains("midi_sources"), "rig.json must persist midi_sources");
+
+        let loaded = RigPreset::load(&pkg).unwrap();
+        assert_eq!(loaded.session.midi_sources(), [row]);
+        assert_eq!(content(&loaded.session), content(&preset.session));
+
+        // Legacy .ksalat-rig without `midi_sources` loads cleanly with empty midi_sources.
+        let mut json: Value = serde_json::from_str(&raw).unwrap();
+        json.as_object_mut().unwrap().remove("midi_sources");
+        fs::write(pkg.join(RIG_PRESET_FILE), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        let legacy = RigPreset::load(&pkg).unwrap();
+        assert!(legacy.session.midi_sources().is_empty());
+        assert_eq!(legacy.clap_meta, preset.clap_meta);
+
+        // A preset with default synth inputs omits `midi_sources`.
+        let plain = RigPreset::new("Plain Preset", "Plain", sample_session());
+        let plain_pkg = RigPreset::package_path(&dir, "Plain Preset").unwrap();
+        plain.save(&plain_pkg).unwrap();
+        assert!(!fs::read_to_string(plain_pkg.join(RIG_PRESET_FILE)).unwrap().contains("midi_sources"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

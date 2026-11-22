@@ -321,3 +321,165 @@ fn a_rig_preset_keeps_its_device_and_the_other_rigs_synths_keep_theirs() {
     let slot = app.voice_slot_of_node(bass).unwrap();
     assert_eq!(app.rig_device[slot].map(|d| port_of(&app, d)), Some(U6_PORT.into()), "the preset's synth follows its rig");
 }
+
+fn engine_inputs_sources(sent: &[Command], node: u32) -> Option<(bool, bool)> {
+    after_load(sent).iter().rev().find_map(|c| match c {
+        Command::SetRigSource { node: n, keyboard, hardware } if *n == node => Some((*keyboard, *hardware)),
+        _ => None,
+    })
+}
+
+/// #322: a CLAP synth bound to one keyboard in the MIDI matrix (not through
+/// rig-level `midi_device`) keeps that binding across a rig preset save/load,
+/// in a different port scan order, when unplugged, and when the device list is full.
+#[test]
+fn a_rig_preset_keeps_each_clap_synths_own_midi_device() {
+    let rigs = [rig("Lead", surge(), "LEAD"), rig("Bass", surge(), "BASS")];
+    let (mut app, _) = opened(&session_of(&rigs), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+    app.matrix_toggle(unit(&app, "BASS"), MatrixRow::Keys, false);
+    app.matrix_toggle(unit(&app, "BASS"), MatrixRow::HwDev(1), true);
+    assert_eq!(synth_inputs(&app, "BASS"), (false, true, Some(U6_PORT.into())));
+
+    let dir = app.rig_presets_dir.clone();
+    let pkg = app.save_rig_preset_to_dir(&dir, 1, "Bass matrix U6").unwrap();
+    let raw = std::fs::read_to_string(pkg.join(crate::session::RIG_PRESET_FILE)).unwrap();
+    assert!(raw.contains("midi_sources"));
+    assert!(!raw.contains("midi_device"));
+
+    // Load into another scan order (both replacing rig 1 and adding as new rig 2).
+    let (mut app, _) = opened(&session_of(&rigs), &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+    app.matrix_toggle(unit(&app, "LEAD"), MatrixRow::HwDev(1), true);
+    assert_eq!(synth_inputs(&app, "LEAD"), (true, true, Some(FM1_PORT.into())));
+    let (tx, mut drain) = crate::control::command_bus();
+    app.bus = Some(Arc::new(Mutex::new(tx)));
+    for (target, rig) in [(Some(1), 1), (None, 2)] {
+        assert_eq!(app.load_rig_preset_from_dir(&dir, "Bass matrix U6", target).unwrap(), rig);
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        let bass = app.units.iter().find(|u| u.rig as usize == rig && u.name == "BASS").unwrap().node_id;
+        let slot = app.voice_slot_of_node(bass).unwrap();
+        assert_eq!(app.rig_sources[slot], (false, true), "target {target:?}");
+        assert_eq!(app.rig_device[slot].map(|d| port_of(&app, d)), Some(U6_PORT.into()), "target {target:?}");
+        assert_eq!(engine_inputs_sources(&sent, bass), Some((false, true)), "target {target:?}");
+        assert_eq!(engine_inputs_device(&sent, bass), Some(0), "U6MIDI Pro is device 0 now, target {target:?}");
+        assert_eq!(synth_inputs(&app, "LEAD"), (true, true, Some(FM1_PORT.into())));
+    }
+
+    // Load when the U6MIDI Pro is unplugged: it keeps an unplugged slot of its own.
+    let (mut app, _) = opened(&session_of(&rigs), &[(FM1_PORT, "24:0")]);
+    let (tx, mut drain) = crate::control::command_bus();
+    app.bus = Some(Arc::new(Mutex::new(tx)));
+    let rig = app.load_rig_preset_from_dir(&dir, "Bass matrix U6", Some(1)).unwrap();
+    let mut sent = Vec::new();
+    drain.drain(|c| sent.push(c));
+    let u6 = index_of(&app, U6_PORT);
+    assert_ne!(u6, 0);
+    assert_eq!(app.hw_live.get(u6 as usize), Some(&false));
+    let bass = app.units.iter().find(|u| u.rig as usize == rig && u.name == "BASS").unwrap().node_id;
+    let slot = app.voice_slot_of_node(bass).unwrap();
+    assert_eq!(app.rig_sources[slot], (false, true));
+    assert_eq!(app.rig_device[slot].map(|d| port_of(&app, d)), Some(U6_PORT.into()));
+    assert_eq!(engine_inputs_device(&sent, bass), Some(u6));
+
+    // Full device list: the synth hears no hardware, never all of it (and clap_meta
+    // must not re-enable hardware).
+    let others: Vec<String> = (0..crate::engine::MAX_HW_DEVICES).map(|i| format!("Port {i}:Port {i} MIDI 1")).collect();
+    let full: Vec<(&str, &str)> = others.iter().map(|n| (n.as_str(), "20:0")).collect();
+    let (mut app, _) = opened(&session_of(&rigs), &full);
+    let (tx, mut drain) = crate::control::command_bus();
+    app.bus = Some(Arc::new(Mutex::new(tx)));
+    let rig = app.load_rig_preset_from_dir(&dir, "Bass matrix U6", Some(1)).unwrap();
+    let mut sent = Vec::new();
+    drain.drain(|c| sent.push(c));
+    let bass = app.units.iter().find(|u| u.rig as usize == rig && u.name == "BASS").unwrap().node_id;
+    let slot = app.voice_slot_of_node(bass).unwrap();
+    assert_eq!(app.rig_sources[slot], (false, false));
+    assert_eq!(app.rig_device[slot], None);
+    assert_eq!(engine_inputs_sources(&sent, bass), Some((false, false)));
+    assert_eq!(engine_inputs_device(&sent, bass), None);
+}
+
+/// #322: a legacy `.ksalat-rig` without `midi_sources` still restores `clap_meta`
+/// keyboard/hardware switches and patch name cleanly.
+#[test]
+fn a_legacy_rig_preset_without_midi_sources_loads_clap_meta_switches() {
+    let rigs = [rig("Lead", surge(), "LEAD"), rig("Bass", surge(), "BASS")];
+    let (mut app, _) = opened(&session_of(&rigs), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+    app.matrix_toggle(unit(&app, "BASS"), MatrixRow::Keys, false);
+    let bass_slot = app.voice_slot_of_node(node(&app, "BASS")).unwrap();
+    app.patch_names[bass_slot] = Some("Wurli".into());
+
+    let dir = app.rig_presets_dir.clone();
+    let pkg = app.save_rig_preset_to_dir(&dir, 1, "Legacy Bass").unwrap();
+    let manifest = pkg.join(crate::session::RIG_PRESET_FILE);
+    let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("midi_sources");
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+    let (mut app, _) = opened(&session_of(&[rig("Lead", surge(), "LEAD")]), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+    let (tx, mut drain) = crate::control::command_bus();
+    app.bus = Some(Arc::new(Mutex::new(tx)));
+    let rig = app.load_rig_preset_from_dir(&dir, "Legacy Bass", None).unwrap();
+    let mut sent = Vec::new();
+    drain.drain(|c| sent.push(c));
+    let bass = app.units.iter().find(|u| u.rig as usize == rig && u.name == "BASS").unwrap().node_id;
+    let slot = app.voice_slot_of_node(bass).unwrap();
+    assert_eq!(app.rig_sources[slot], (false, true));
+    assert_eq!(app.rig_device[slot], None);
+    assert_eq!(app.patch_names[slot].as_deref(), Some("Wurli"));
+    assert_eq!(engine_inputs_sources(&sent, bass), Some((false, true)));
+}
+
+/// #322: "Add song from session" carries each imported CLAP synth's own
+/// `midi_sources` (bound MIDI device + switches) into the gig, across scan
+/// orders, when unplugged, and without being clobbered by rig-level `adopt_rig_devices`.
+#[test]
+fn an_imported_song_keeps_each_clap_synths_own_midi_device() {
+    let (mut app, _) = opened(&session_of(&[rig("Lead", surge(), "LEAD")]), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+    app.matrix_toggle(unit(&app, "LEAD"), MatrixRow::Keys, false);
+    app.matrix_toggle(unit(&app, "LEAD"), MatrixRow::HwDev(1), true);
+    assert_eq!(synth_inputs(&app, "LEAD"), (false, true, Some(U6_PORT.into())));
+    saved_and_loaded(&mut app, "hw-ports-322-synth-import");
+
+    // 1. Different scan order: LEAD follows U6MIDI Pro to device 0.
+    let (mut gig, _) = opened(&session_of(&[rig("Organ", organ(), "ORGAN")]), &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+    let (tx, mut drain) = crate::control::command_bus();
+    gig.bus = Some(Arc::new(Mutex::new(tx)));
+    gig.add_song_from_session_in(&DemoApp::sessions_dir(), "hw-ports-322-synth-import", None).unwrap();
+    let mut sent = Vec::new();
+    drain.drain(|c| sent.push(c));
+    assert_eq!(synth_inputs(&gig, "LEAD"), (false, true, Some(U6_PORT.into())));
+    assert_eq!(engine_inputs_sources(&sent, node(&gig, "LEAD")), Some((false, true)));
+    assert_eq!(engine_inputs_device(&sent, node(&gig, "LEAD")), Some(0));
+
+    // 2. Unplugged device: LEAD keeps an unplugged slot for U6MIDI Pro.
+    let (mut gig, _) = opened(&session_of(&[rig("Organ", organ(), "ORGAN")]), &[(FM1_PORT, "24:0")]);
+    let (tx, mut drain) = crate::control::command_bus();
+    gig.bus = Some(Arc::new(Mutex::new(tx)));
+    gig.add_song_from_session_in(&DemoApp::sessions_dir(), "hw-ports-322-synth-import", None).unwrap();
+    let mut sent = Vec::new();
+    drain.drain(|c| sent.push(c));
+    let u6 = index_of(&gig, U6_PORT);
+    assert_ne!(u6, 0);
+    assert_eq!(gig.hw_live.get(u6 as usize), Some(&false));
+    assert_eq!(synth_inputs(&gig, "LEAD"), (false, true, Some(U6_PORT.into())));
+    assert_eq!(engine_inputs_device(&sent, node(&gig, "LEAD")), Some(u6));
+
+    // 3. Rig-level device + per-synth keyboard=true override: post-apply_session
+    // must not clobber keyboard=true with adopt_rig_devices().
+    let (mut app, _) = opened(&session_of(&[rig("Lead", surge(), "LEAD")]), &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+    bind_rig(&mut app, 0, Some(1));
+    app.matrix_toggle(unit(&app, "LEAD"), MatrixRow::Keys, true);
+    assert_eq!(synth_inputs(&app, "LEAD"), (true, true, Some(U6_PORT.into())));
+    saved_and_loaded(&mut app, "hw-ports-322-synth-override-import");
+
+    let (mut gig, _) = opened(&session_of(&[rig("Organ", organ(), "ORGAN")]), &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+    let (tx, mut drain) = crate::control::command_bus();
+    gig.bus = Some(Arc::new(Mutex::new(tx)));
+    gig.add_song_from_session_in(&DemoApp::sessions_dir(), "hw-ports-322-synth-override-import", None).unwrap();
+    let mut sent = Vec::new();
+    drain.drain(|c| sent.push(c));
+    assert_eq!(synth_inputs(&gig, "LEAD"), (true, true, Some(U6_PORT.into())));
+    assert_eq!(engine_inputs_sources(&sent, node(&gig, "LEAD")), Some((true, true)));
+    assert_eq!(engine_inputs_device(&sent, node(&gig, "LEAD")), Some(0));
+}

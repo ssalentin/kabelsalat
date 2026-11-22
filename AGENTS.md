@@ -1918,3 +1918,13 @@ Learned so far (2026-11-15, UI polish pass):
     `mixer_pins_kabelsalat_and_master_when_many_rigs_overflow`). Keep dark-surface
     notices/prompts in `ACCENT_BRIGHT` (never `ACCENT_DEEP` text) and check `760×520`
     for Show mode (`show_mode_narrow_bottom_bar_and_indicators_fit_without_overlap`).
+216. **Pre-measure variable-height multi-column cards per row (`catalog_card`):**
+    never render variable-line `wrap()` descriptions, metadata, and `ui.horizontal`
+    button strips independently inside `ui.horizontal_top`: long `about` prose,
+    2-line metadata, or un-wrapped button strips (`"Installed"` + `"Plugins →"` +
+    `"Source code"` + `"Website"`) cause stair-stepped row heights, floating buttons,
+    and column stretch. Measure `desc`/`about`/`meta` galleys and pack action lines
+    against `inner_w` per row chunk before painting each card with shared band
+    heights and `ui.set_min_height(action_line_h)` before labels (Rule 117;
+    `catalog_cards_align_per_row_and_stay_within_columns`).
+

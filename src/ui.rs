@@ -3679,6 +3679,7 @@ struct DemoApp {
     meter_peak: f32,
 
     show_help: bool,
+    help_card_rect: Rect,
     show_stats: bool,
     session_name: String,
     /// The saved session the rack came from or was last saved as; autosave
@@ -4447,6 +4448,7 @@ impl DemoApp {
             meter: 0.0,
             meter_peak: 0.0,
             show_help: false,
+            help_card_rect: Rect::NOTHING,
             show_stats: false,
             session_name: String::new(),
             open_session: None,
@@ -19305,6 +19307,7 @@ impl DemoApp {
         if window_dirty {
             self.sync_setlist_window();
         }
+        if self.show_help { self.draw_help(ui, rect); }
     }
 
     fn sessions_stage(&mut self, ui: &mut egui::Ui) {
@@ -19716,7 +19719,7 @@ impl DemoApp {
             });
         });
 
-        if self.show_help { self.draw_help(&painter, rect); }
+        if self.show_help { self.draw_help(ui, rect); }
     }
 
     // -- plugin browser (task-18) -------------------------------------------
@@ -20859,7 +20862,7 @@ impl DemoApp {
             });
         });
 
-        if self.show_help { self.draw_help(&painter, rect); }
+        if self.show_help { self.draw_help(ui, rect); }
     }
 
     fn settings_role_input_mut(&mut self, role: crate::llm::Role) -> &mut String {
@@ -20936,7 +20939,7 @@ impl DemoApp {
             self.apply_settings_action(act);
         }
 
-        if self.show_help { self.draw_help(&painter, rect); }
+        if self.show_help { self.draw_help(ui, rect); }
     }
 
     /// One line per page for the rail: what is set there now, and a warning
@@ -26258,7 +26261,7 @@ impl DemoApp {
         // Pan an overflowing rack with the wheel / trackpad — only over the
         // bare stage (never over a panel or window that scrolls itself).
         let ov = self.rack_overflow;
-        if self.stage_view == StageView::Rack && (ov.x > 0.0 || ov.y > 0.0) {
+        if !self.show_help && self.stage_view == StageView::Rack && (ov.x > 0.0 || ov.y > 0.0) {
             let over_stage = ctx.pointer_hover_pos().is_some_and(|p| self.stage_rect.contains(p)
                 && ctx.layer_id_at(p).map_or(true, |l| l.order == egui::Order::Background));
             let d = ctx.input(|i| i.smooth_scroll_delta());
@@ -26489,7 +26492,7 @@ impl DemoApp {
             };
             self.hover = Some(hit);
             if self.show_help {
-                if pressed { self.show_help = false; }
+                if pressed && !self.help_card_rect.contains(s) { self.show_help = false; }
                 return;
             }
             if pressed { self.press = Some((hit, s)); }
@@ -26647,7 +26650,7 @@ impl DemoApp {
         let l = self.xf.inv(s);
 
         if self.show_help {
-            if pressed { self.show_help = false; }
+            if pressed && !self.help_card_rect.contains(s) { self.show_help = false; }
             return;
         }
 
@@ -27190,7 +27193,7 @@ impl DemoApp {
             self.back_controls_rect = Rect::NOTHING;
         }
         self.draw_hint(&painter, rect);
-        if self.show_help { self.draw_help(&painter, rect); }
+        if self.show_help { self.draw_help(ui, rect); }
     }
 
     /// Compact inline opacity & tension strip in the bottom-right margin of the
@@ -27353,7 +27356,7 @@ impl DemoApp {
             });
         });
 
-        if self.show_help { self.draw_help(&painter, rect); }
+        if self.show_help { self.draw_help(ui, rect); }
     }
 
     /// Audio sources of a rig, with the knob that sets each one's level:
@@ -27685,7 +27688,7 @@ impl DemoApp {
         if let Some(r) = switch { self.set_active_rig(r); }
         for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
         if let Some(o) = out_pick { self.set_audio_output(o); }
-        if self.show_help { self.draw_help(&painter, rect); }
+        if self.show_help { self.draw_help(ui, rect); }
     }
 
     /// Loudness target of the master (#12): the target menu, one-LU steps,
@@ -32207,67 +32210,252 @@ impl DemoApp {
         self.stats_line.clone()
     }
 
-    fn draw_help(&self, painter: &egui::Painter, rect: Rect) {
+    fn draw_help(&mut self, ui: &mut egui::Ui, rect: Rect) {
         // Help modal (§4.16): ink scrim over paper, a second appearance of
         // the hero-panel motif — flat near-black card, radius 28, no border.
+        let painter = ui.painter().clone();
         painter.rect_filled(rect, 0.0, alpha(theme::SCRIM, 0.62));
-        let (Some(title), Some(foot)) = (&self.help_title_g, &self.help_foot_g) else { return };
-        const PAD: f32 = 32.0;
-        const GUTTER: f32 = 44.0;
+        let (Some(title), Some(foot)) = (self.help_title_g.clone(), self.help_foot_g.clone()) else {
+            self.help_card_rect = Rect::NOTHING;
+            return;
+        };
+        const ROOMY_PAD: f32 = 32.0;
+        const TIGHT_PAD_X: f32 = 20.0;
+        const TIGHT_PAD_Y: f32 = 18.0;
+        const GUTTER_MAX: f32 = 44.0;
+        const GUTTER_MIN: f32 = 24.0;
+        const SECTION_GAP: f32 = 18.0;
+        const ROW_GAP: f32 = 6.0;
+
+        let scroll_style = egui::style::ScrollStyle::solid();
+        let scrollbar_w = (scroll_style.bar_inner_margin + scroll_style.bar_width + scroll_style.bar_outer_margin).max(14.0);
+
+        let tight = rect.width() < 960.0 || rect.height() < 600.0;
+        let outer_x = (if tight { 10.0_f32 } else { 16.0 }).min((rect.width() * 0.05).max(0.0));
+        let outer_y = (if tight { 8.0_f32 } else { 16.0 }).min((rect.height() * 0.05).max(0.0));
+        let max_card_w = (rect.width() - 2.0 * outer_x).max(1.0);
+        let max_card_h = (rect.height() - 2.0 * outer_y).max(1.0);
+        let pad_x = if tight { TIGHT_PAD_X } else { ROOMY_PAD }.min((max_card_w * 0.1).max(8.0));
+        let pad_y = if tight { TIGHT_PAD_Y } else { ROOMY_PAD }.min((max_card_h * 0.1).max(8.0));
+        let radius = if tight { 20.0 } else { 28.0 };
+        let max_inner_w = (max_card_w - 2.0 * pad_x).max(80.0);
+
+        let title_fallback = if title.size.x + 34.0 <= max_inner_w {
+            None
+        } else {
+            Some(Self::ellipsized(
+                &painter,
+                "kabelsalat — the cables are the show",
+                theme::medium_font(18.0),
+                TEXT,
+                (max_inner_w - 34.0).max(40.0),
+            ))
+        };
+        let (title_w, title_h) = match &title_fallback {
+            None => (title.size.x + 34.0, title.size.y.max(26.0)),
+            Some(g) => (g.size().x + 34.0, g.size().y.max(26.0)),
+        };
+
         let chip_h = self.help_cols.iter()
             .flat_map(|c| c.rows.iter().flat_map(|r| r.keys.iter().map(|g| g.size().y)))
             .fold(0.0, f32::max) + 2.0 * HELP_CHIP_PAD.y;
-        let n_rows = self.help_cols.iter().map(|c| c.rows.len()).max().unwrap_or(0) as f32;
-        let cols_w: f32 = self.help_cols.iter().map(|c| c.width).sum::<f32>()
-            + GUTTER * self.help_cols.len().saturating_sub(1) as f32;
-        // Vertical rhythm: title row, hairline, section header, rows, hairline, footer.
-        let title_h = title.size.y.max(26.0);
         let head_h = self.help_cols.iter().map(|c| c.header.size.y).fold(0.0, f32::max);
-        let fixed_h = PAD + title_h + 20.0 + head_h + 14.0 + 18.0 + foot.size.y + PAD - 6.0;
-        // Generous leading (≥ 6px between chips); compress toward that floor
-        // only if the window is too short for the natural pitch.
-        let room = (rect.height() - 32.0 - fixed_h).max(0.0);
-        let pitch = (chip_h + 10.0).min((room / n_rows.max(1.0)).max(chip_h + 6.0));
-        let card_w = (cols_w.max(title.size.x + 34.0) + 2.0 * PAD).max(560.0);
-        let card_h = fixed_h + pitch * n_rows;
-        let card = Rect::from_center_size(rect.center(), Vec2::new(card_w, card_h));
-        painter.rect_filled(card, 28.0, theme::DARK_PANEL);
+        let n_rows_max = self.help_cols.iter().map(|c| c.rows.len()).max().unwrap_or(0) as f32;
+        let sum_cols_w: f32 = self.help_cols.iter().map(|c| c.width).sum();
+        let n_gutters = self.help_cols.len().saturating_sub(1) as f32;
 
-        // Title row: crossed-wires mark + display title.
-        let mut y = card.top() + PAD;
-        let mark_c = Pos2::new(card.left() + PAD + 11.0, y + title_h * 0.5);
-        theme::crossed_wires(painter, mark_c, 22.0, theme::DARK_PANEL, theme::MarkStyle::Brand);
-        theme::paint_tracked(painter, Pos2::new(card.left() + PAD + 34.0, y + (title_h - title.size.y) * 0.5), title, TEXT);
-        y += title_h + 10.0;
-        let rule = Stroke::new(1.0, theme::HAIRLINE);
-        painter.hline(card.left() + PAD..=card.right() - PAD, y, rule);
-        y += 10.0;
+        // Vertical rhythm: title row, hairline, scrollable/fitted body, hairline, footer.
+        let foot_bottom_pad = (pad_y - 6.0).max(8.0);
+        let foot_area_h = 20.0 + foot.size.y + foot_bottom_pad;
+        let chrome_h = pad_y + title_h + 20.0 + foot_area_h;
+        let max_body_h = (max_card_h - chrome_h).max(40.0);
 
-        // Columns.
-        let mut x = card.left() + PAD + ((card_w - 2.0 * PAD - cols_w) * 0.5).max(0.0);
-        for c in &self.help_cols {
-            theme::paint_tracked(painter, Pos2::new(x, y), &c.header, SUBTEXT);
-            let mut ry = y + head_h + 14.0;
-            for r in &c.rows {
-                let mut kx = x;
-                for g in &r.keys {
-                    let chip = Rect::from_min_size(Pos2::new(kx, ry), Vec2::new(HelpRow::chip_w(g), chip_h));
-                    painter.rect_filled(chip, 5.0, theme::PAPER_SINK);
-                    painter.rect_stroke(chip, 5.0, rule, egui::StrokeKind::Inside);
-                    painter.galley(chip.center() - g.size() * 0.5, g.clone(), theme::CREAM);
-                    kx = chip.right() + HELP_CHIP_GAP;
-                }
-                let dy = ry + (chip_h - r.desc.size().y) * 0.5;
-                painter.galley(Pos2::new(x + c.keys_w + HELP_KEY_GAP, dy), r.desc.clone(), theme::CREAM_MID);
-                ry += pitch;
-            }
-            x += c.width + GUTTER;
+        let two_col_min_w = sum_cols_w + GUTTER_MIN * n_gutters;
+        let min_two_col_body_h = head_h + 14.0 + (chip_h + 6.0) * n_rows_max;
+        let two_col_scrolls = min_two_col_body_h > max_body_h;
+        let two_col_sb = if two_col_scrolls { scrollbar_w } else { 0.0 };
+        let two_col = self.help_cols.len() > 1 && two_col_min_w + two_col_sb <= max_inner_w;
+
+        struct StackedSection {
+            header: Arc<theme::TrackedLabel>,
+            rows: Vec<(Vec<Arc<Galley>>, Arc<Galley>, f32, f32)>,
         }
 
+        let (card_w, card_h, content_h, scrolls, two_col_layout, stacked_sections) = if two_col {
+            let gutter = if n_gutters > 0.0 {
+                ((max_inner_w - two_col_sb - sum_cols_w) / n_gutters).clamp(GUTTER_MIN, GUTTER_MAX)
+            } else {
+                0.0
+            };
+            let cols_w = sum_cols_w + gutter * n_gutters;
+            let pitch = if two_col_scrolls {
+                chip_h + 8.0
+            } else {
+                (chip_h + 10.0).min(((max_body_h - head_h - 14.0) / n_rows_max.max(1.0)).max(chip_h + 6.0))
+            };
+            let content_h = head_h + 14.0 + pitch * n_rows_max;
+            let inner_w = (cols_w + two_col_sb).max(title_w).max(foot.size.x).min(max_inner_w);
+            let card_w = (inner_w + 2.0 * pad_x).max(560.0_f32.min(max_card_w)).min(max_card_w);
+            let body_h = content_h.min(max_body_h);
+            let card_h = (chrome_h + body_h).min(max_card_h);
+            (card_w, card_h, content_h, two_col_scrolls, Some((cols_w, gutter, pitch)), Vec::new())
+        } else {
+            let single_keys_w = self.help_cols.iter().map(|c| c.keys_w).fold(0.0, f32::max);
+            let max_desc_w = self.help_cols.iter()
+                .flat_map(|c| c.rows.iter().map(|r| r.desc.size().x))
+                .fold(0.0, f32::max);
+            let single_natural_w = single_keys_w + HELP_KEY_GAP + max_desc_w;
+
+            let build_stacked = |sb_w: f32| -> (f32, f32, Vec<StackedSection>) {
+                let target_inner_w = (single_natural_w + sb_w).max(title_w).max(foot.size.x).min(max_inner_w);
+                let row_content_w = (target_inner_w - sb_w).max(80.0);
+                let desc_avail_w = (row_content_w - single_keys_w - HELP_KEY_GAP).max(40.0);
+                let mut total_h = 0.0f32;
+                let mut sections = Vec::with_capacity(self.help_cols.len());
+                for (ci, c) in self.help_cols.iter().enumerate() {
+                    if ci > 0 { total_h += SECTION_GAP; }
+                    total_h += head_h + 10.0;
+                    let mut rows = Vec::with_capacity(c.rows.len());
+                    for (ri, r) in c.rows.iter().enumerate() {
+                        if ri > 0 { total_h += ROW_GAP; }
+                        let desc_g = if r.desc.size().x <= desc_avail_w + 0.5 {
+                            r.desc.clone()
+                        } else {
+                            painter.layout(
+                                r.desc.text().to_owned(),
+                                FontId::proportional(13.5),
+                                theme::CREAM_MID,
+                                desc_avail_w,
+                            )
+                        };
+                        let dy_off = if desc_g.rows.len() > 1 {
+                            let first_h = desc_g.rows.first().map_or(desc_g.size().y, |row| row.height());
+                            (chip_h - first_h).max(0.0) * 0.5
+                        } else {
+                            (chip_h - desc_g.size().y) * 0.5
+                        };
+                        let row_h = chip_h.max(dy_off + desc_g.size().y);
+                        total_h += row_h;
+                        rows.push((r.keys.clone(), desc_g, dy_off, row_h));
+                    }
+                    sections.push(StackedSection { header: c.header.clone(), rows });
+                }
+                (target_inner_w, total_h, sections)
+            };
+
+            let (mut inner_w, mut total_h, mut sections) = build_stacked(0.0);
+            let stacked_scrolls = total_h > max_body_h;
+            if stacked_scrolls {
+                (inner_w, total_h, sections) = build_stacked(scrollbar_w);
+            }
+            let card_w = (inner_w + 2.0 * pad_x).min(max_card_w);
+            let body_h = total_h.min(max_body_h);
+            let card_h = (chrome_h + body_h).min(max_card_h);
+            (card_w, card_h, total_h, stacked_scrolls, None, sections)
+        };
+
+        let card = Rect::from_center_size(rect.center(), Vec2::new(card_w, card_h));
+        self.help_card_rect = card;
+        painter.rect_filled(card, radius, theme::DARK_PANEL);
+
+        // Title row: crossed-wires mark + display title.
+        let mut y = card.top() + pad_y;
+        let mark_c = Pos2::new(card.left() + pad_x + 11.0, y + title_h * 0.5);
+        theme::crossed_wires(&painter, mark_c, 22.0, theme::DARK_PANEL, theme::MarkStyle::Brand);
+        match &title_fallback {
+            None => theme::paint_tracked(
+                &painter,
+                Pos2::new(card.left() + pad_x + 34.0, y + (title_h - title.size.y) * 0.5),
+                &title,
+                TEXT,
+            ),
+            Some(g) => {
+                painter.galley(
+                    Pos2::new(card.left() + pad_x + 34.0, y + (title_h - g.size().y) * 0.5),
+                    g.clone(),
+                    TEXT,
+                );
+            }
+        }
+        y += title_h + 10.0;
+        let rule = Stroke::new(1.0, theme::HAIRLINE);
+        painter.hline(card.left() + pad_x..=card.right() - pad_x, y, rule);
+        y += 10.0;
+
         // Footer: hairline + tracked micro-caps close hint.
-        let fy = card.bottom() - PAD + 6.0 - foot.size.y;
-        painter.hline(card.left() + PAD..=card.right() - PAD, fy - 12.0, rule);
-        theme::paint_tracked(painter, Pos2::new(card.left() + PAD, fy), foot, SUBTEXT);
+        let fy = card.bottom() - foot_bottom_pad - foot.size.y;
+        painter.hline(card.left() + pad_x..=card.right() - pad_x, fy - 12.0, rule);
+        theme::paint_tracked(&painter, Pos2::new(card.left() + pad_x, fy), &foot, SUBTEXT);
+
+        let body_bottom = (fy - 20.0).max(y + 1.0);
+        let body_rect = Rect::from_min_max(
+            Pos2::new(card.left() + pad_x, y),
+            Pos2::new(card.right() - pad_x, body_bottom),
+        );
+
+        let paint_body = |p: &egui::Painter, origin: Pos2, body_w: f32| {
+            if let Some((cols_w, gutter, pitch)) = two_col_layout {
+                let mut x = origin.x + ((body_w - cols_w) * 0.5).max(0.0);
+                for c in &self.help_cols {
+                    theme::paint_tracked(p, Pos2::new(x, origin.y), &c.header, SUBTEXT);
+                    let mut ry = origin.y + head_h + 14.0;
+                    for r in &c.rows {
+                        let mut kx = x;
+                        for g in &r.keys {
+                            let chip = Rect::from_min_size(Pos2::new(kx, ry), Vec2::new(HelpRow::chip_w(g), chip_h));
+                            p.rect_filled(chip, 5.0, theme::PAPER_SINK);
+                            p.rect_stroke(chip, 5.0, rule, egui::StrokeKind::Inside);
+                            p.galley(chip.center() - g.size() * 0.5, g.clone(), theme::CREAM);
+                            kx = chip.right() + HELP_CHIP_GAP;
+                        }
+                        let dy = ry + (chip_h - r.desc.size().y) * 0.5;
+                        p.galley(Pos2::new(x + c.keys_w + HELP_KEY_GAP, dy), r.desc.clone(), theme::CREAM_MID);
+                        ry += pitch;
+                    }
+                    x += c.width + gutter;
+                }
+            } else {
+                let single_keys_w = self.help_cols.iter().map(|c| c.keys_w).fold(0.0, f32::max);
+                let mut sy = origin.y;
+                for (ci, sec) in stacked_sections.iter().enumerate() {
+                    if ci > 0 { sy += SECTION_GAP; }
+                    theme::paint_tracked(p, Pos2::new(origin.x, sy), &sec.header, SUBTEXT);
+                    let mut ry = sy + head_h + 10.0;
+                    for (keys, desc_g, dy_off, row_h) in &sec.rows {
+                        let mut kx = origin.x;
+                        for g in keys {
+                            let chip = Rect::from_min_size(Pos2::new(kx, ry), Vec2::new(HelpRow::chip_w(g), chip_h));
+                            p.rect_filled(chip, 5.0, theme::PAPER_SINK);
+                            p.rect_stroke(chip, 5.0, rule, egui::StrokeKind::Inside);
+                            p.galley(chip.center() - g.size() * 0.5, g.clone(), theme::CREAM);
+                            kx = chip.right() + HELP_CHIP_GAP;
+                        }
+                        p.galley(Pos2::new(origin.x + single_keys_w + HELP_KEY_GAP, ry + dy_off), desc_g.clone(), theme::CREAM_MID);
+                        ry += row_h + ROW_GAP;
+                    }
+                    sy = if sec.rows.is_empty() { ry } else { ry - ROW_GAP };
+                }
+            }
+        };
+
+        if scrolls {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+                ui.spacing_mut().scroll = scroll_style;
+                egui::ScrollArea::vertical()
+                    .id_salt("help_overlay_scroll")
+                    .min_scrolled_height(body_rect.height())
+                    .max_height(body_rect.height())
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
+                        let alloc_w = ui.available_width().max(80.0);
+                        let (r, _) = ui.allocate_exact_size(Vec2::new(alloc_w, content_h), egui::Sense::hover());
+                        paint_body(ui.painter(), r.min, alloc_w);
+                    });
+            });
+        } else {
+            paint_body(&painter, body_rect.min, body_rect.width());
+        }
     }
 }
 
@@ -33310,6 +33498,9 @@ impl DemoApp {
         self.refresh_knob_readouts();
 
         self.tessellate();
+        if !self.show_help || (self.dock == DockView::Keyboard && self.kb_expanded) {
+            self.help_card_rect = Rect::NOTHING;
+        }
         if !(self.dock == DockView::Keyboard && self.kb_expanded) {
             if self.stage_view != StageView::Rack {
                 self.back_controls_rect = Rect::NOTHING;
@@ -37301,6 +37492,127 @@ mod rig_switch_tests {
         assert!(descs.iter().any(|d| d.contains("BPM") && d.contains("metronome")), "help says where tempo lives");
         frame(&mut app, &ctx, key(Key::Escape));
         assert!(!app.show_help, "Esc closes help");
+    }
+
+    #[test]
+    fn help_overlay_fits_small_windows_and_stays_two_columns_when_wide() {
+        fn collect(shape: &Shape, modal_card: Rect, seen_scrim: &mut bool, seen_card: &mut bool, out: &mut Vec<(String, Rect, bool)>) {
+            match shape {
+                Shape::Rect(r) => {
+                    if !*seen_scrim && r.fill == alpha(theme::SCRIM, 0.62) {
+                        *seen_scrim = true;
+                    } else if *seen_scrim && !*seen_card
+                        && r.fill == theme::DARK_PANEL
+                        && (r.rect.min - modal_card.min).length() < 1.0
+                        && (r.rect.max - modal_card.max).length() < 1.0
+                    {
+                        *seen_card = true;
+                    }
+                }
+                Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => {
+                    let r = Rect::from_min_size(t.pos, t.galley.size());
+                    out.push((t.galley.text().to_owned(), r, *seen_card));
+                }
+                Shape::Vec(v) => for s in v { collect(s, modal_card, seen_scrim, seen_card, out) },
+                _ => {}
+            }
+        }
+        let run_at = |app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>| -> egui::FullOutput {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.events = events;
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear(); // rule 11
+            out
+        };
+        let header_rect = |texts: &[(String, Rect, bool)], label: &str| -> Rect {
+            let mut r = Rect::NOTHING;
+            let chars: Vec<String> = label.chars().filter(|c| !c.is_whitespace()).map(|c| c.to_string()).collect();
+            let modal: Vec<&(String, Rect, bool)> = texts.iter().filter(|(_, _, m)| *m).collect();
+            for win in modal.windows(chars.len()) {
+                if win.iter().zip(&chars).all(|((t, _, _), ch)| t == ch)
+                    && win.iter().all(|(_, cr, _)| (cr.top() - win[0].1.top()).abs() < 4.0)
+                {
+                    for (_, cr, _) in win { r = r.union(*cr); }
+                    return r;
+                }
+            }
+            panic!("header {label:?} not found in modal texts");
+        };
+
+        // Wide windows keep the two-column layout.
+        for (w, h) in [(1280.0, 800.0), (1600.0, 1000.0)] {
+            let (mut app, ctx) = two_rigs();
+            app.show_help = true;
+            let size = Vec2::new(w, h);
+            let out = run_at(&mut app, &ctx, size, vec![]);
+            let card = app.help_card_rect;
+            let screen = Rect::from_min_size(Pos2::ZERO, size);
+            assert!(card.is_positive() && screen.expand(0.5).contains_rect(card), "{w}x{h}: card {card:?} outside {screen:?}");
+            let mut texts = Vec::new();
+            let (mut seen_scrim, mut seen_card) = (false, false);
+            for cs in &out.shapes {
+                collect(&cs.shape, card, &mut seen_scrim, &mut seen_card, &mut texts);
+            }
+            assert!(seen_card, "{w}x{h}: help card rect painted");
+            let play = header_rect(&texts, "PLAY");
+            let patch = header_rect(&texts, "PATCH & VIEWS");
+            assert!((play.top() - patch.top()).abs() < 1.0 && patch.left() > play.right(),
+                "{w}x{h}: expected two side-by-side columns: play={play:?}, patch={patch:?}");
+        }
+
+        // Minimum 760x520 (both Navigator closed and Navigator open) stacks and fits inside [0, w] x [0, h].
+        for nav_open in [false, true] {
+            let (mut app, ctx) = two_rigs();
+            app.nav_open = nav_open;
+            app.show_help = true;
+            let size = Vec2::new(760.0, 520.0);
+            let screen = Rect::from_min_size(Pos2::ZERO, size);
+            let mut out = run_at(&mut app, &ctx, size, vec![]);
+            for _ in 0..2 { out = run_at(&mut app, &ctx, size, vec![]); }
+            let card = app.help_card_rect;
+            assert!(card.is_positive() && screen.expand(0.5).contains_rect(card),
+                "nav={nav_open}: card {card:?} outside {screen:?}");
+            if nav_open {
+                assert!(!card.intersects(app.nav_panel_rect.shrink(0.5)),
+                    "nav=true: card {card:?} overlaps Navigator {:?}", app.nav_panel_rect);
+            }
+            let mut texts = Vec::new();
+            let (mut seen_scrim, mut seen_card) = (false, false);
+            for cs in &out.shapes {
+                collect(&cs.shape, card, &mut seen_scrim, &mut seen_card, &mut texts);
+            }
+            assert!(seen_card, "nav={nav_open}: help card rect painted");
+            let play = header_rect(&texts, "PLAY");
+            let patch = header_rect(&texts, "PATCH & VIEWS");
+            assert!(patch.top() > play.bottom(),
+                "nav={nav_open}: expected stacked columns at 760x520: play={play:?}, patch={patch:?}");
+            for (txt, r, in_modal) in &texts {
+                if *in_modal {
+                    assert!(r.left() >= card.left() - 0.5 && r.right() <= card.right() + 0.5,
+                        "nav={nav_open}: modal text {txt:?} {r:?} escapes card {card:?}");
+                    assert!(r.left() >= -0.5 && r.right() <= 760.5,
+                        "nav={nav_open}: modal text {txt:?} {r:?} outside [0, 760]");
+                }
+            }
+
+            // Pressing inside the card keeps help open (for scrollbar/selection); pressing the scrim closes it.
+            let inside = card.center();
+            run_at(&mut app, &ctx, size, vec![
+                egui::Event::PointerMoved(inside),
+                egui::Event::PointerButton { pos: inside, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+                egui::Event::PointerButton { pos: inside, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+            ]);
+            assert!(app.show_help, "nav={nav_open}: click inside card keeps help open");
+            let scrim = Pos2::new(card.left() - 4.0, card.center().y);
+            run_at(&mut app, &ctx, size, vec![
+                egui::Event::PointerMoved(scrim),
+                egui::Event::PointerButton { pos: scrim, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+                egui::Event::PointerButton { pos: scrim, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+            ]);
+            assert!(!app.show_help, "nav={nav_open}: click on scrim closes help");
+        }
     }
 
     #[test]
@@ -47980,16 +48292,41 @@ mod window_size_layout_tests {
     pub(super) const SIZES: [(f32, f32); 6] =
         [(1600.0, 1000.0), (1280.0, 800.0), (781.0, 950.0), (1576.0, 468.0), (781.0, 468.0), (760.0, 520.0)];
 
-    struct Text { s: String, rect: Rect, clip: Rect }
+    struct Text { s: String, rect: Rect, clip: Rect, in_modal: bool }
 
-    fn walk(shape: &Shape, clip: Rect, out: &mut Vec<Text>) {
+    fn walk(
+        shape: &Shape,
+        clip: Rect,
+        modal_card: Option<Rect>,
+        seen_scrim: &mut bool,
+        seen_card: &mut bool,
+        out: &mut Vec<Text>,
+    ) {
         match shape {
-            Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => out.push(Text {
-                s: t.galley.text().replace('\n', "⏎"),
-                rect: ink_rect(&t.galley).translate(t.pos.to_vec2()),
-                clip,
-            }),
-            Shape::Vec(v) => for s in v { walk(s, clip, out) },
+            Shape::Rect(r) if modal_card.is_some() => {
+                if !*seen_scrim && r.fill == alpha(theme::SCRIM, 0.62) {
+                    *seen_scrim = true;
+                } else if *seen_scrim && !*seen_card {
+                    if let Some(card) = modal_card {
+                        if r.fill == theme::DARK_PANEL
+                            && (r.rect.min - card.min).length() < 1.0
+                            && (r.rect.max - card.max).length() < 1.0
+                        {
+                            *seen_card = true;
+                        }
+                    }
+                }
+            }
+            Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => {
+                let rect = ink_rect(&t.galley).translate(t.pos.to_vec2());
+                out.push(Text {
+                    s: t.galley.text().replace('\n', "⏎"),
+                    rect,
+                    clip,
+                    in_modal: *seen_card,
+                });
+            }
+            Shape::Vec(v) => for s in v { walk(s, clip, modal_card, seen_scrim, seen_card, out) },
             _ => {}
         }
     }
@@ -48019,7 +48356,15 @@ mod window_size_layout_tests {
             let mut frame = ctx.run_ui(raw, |ui| app.frame_ui(ui));
             frame.textures_delta.clear(); // rule 11
             out.clear();
-            for cs in &frame.shapes { walk(&cs.shape, cs.clip_rect, &mut out); }
+            let modal_card = app.show_help.then_some(app.help_card_rect);
+            let mut seen_scrim = false;
+            let mut seen_card = false;
+            for cs in &frame.shapes {
+                walk(&cs.shape, cs.clip_rect, modal_card, &mut seen_scrim, &mut seen_card, &mut out);
+            }
+            if app.show_help && i == 3 {
+                assert!(seen_card, "expected help modal card {:?} in painted shapes at {size:?}", app.help_card_rect);
+            }
         }
         out
     }
@@ -48027,7 +48372,7 @@ mod window_size_layout_tests {
     /// Text that leaves the window, is cut by its clip, or overlaps other
     /// text. Text a scroll area clips at its edge is scrolled, not broken,
     /// so a clip cut only counts outside `scrolled` regions.
-    fn audit(texts: &[Text], size: Vec2, scroll_x_clip: Option<f32>) -> Vec<String> {
+    fn audit(texts: &[Text], size: Vec2, scroll_x_clip: Option<f32>, modal_card: Option<Rect>) -> Vec<String> {
         let screen = Rect::from_min_size(Pos2::ZERO, size);
         let mut bad = Vec::new();
         let vis: Vec<(&Text, Rect)> = texts.iter()
@@ -48045,6 +48390,8 @@ mod window_size_layout_tests {
             });
             if !screen.expand(0.5).contains_rect(t.rect) && !clipped_in_scroll_x {
                 bad.push(format!("{:?} {:?} leaves the window", t.s, t.rect));
+            } else if t.in_modal && modal_card.is_some_and(|c| t.rect.left() < c.left() - 0.5 || t.rect.right() > c.right() + 0.5) {
+                bad.push(format!("{:?} {:?} leaves the window (escapes modal card {:?})", t.s, t.rect, modal_card));
             } else if v.width() < t.rect.width() - 1.0 || v.height() < t.rect.height() - 1.0 {
                 bad.push(format!("{:?} {:?} cut by its clip {:?}", t.s, t.rect, t.clip));
             }
@@ -48053,6 +48400,11 @@ mod window_size_layout_tests {
             for j in i + 1..vis.len() {
                 let o = vis[i].1.intersect(vis[j].1);
                 if o.width() > 1.0 && o.height() > 1.0 {
+                    if vis[i].0.in_modal != vis[j].0.in_modal
+                        && modal_card.is_some_and(|c| c.expand(0.5).contains_rect(o))
+                    {
+                        continue;
+                    }
                     bad.push(format!("{:?} {:?} overlaps {:?} {:?}", vis[i].0.s, vis[i].1, vis[j].0.s, vis[j].1));
                 }
             }
@@ -48077,7 +48429,8 @@ mod window_size_layout_tests {
                     StageView::Matrix => Some(app.stage_sheet_rects(Rect::from_min_size(Pos2::ZERO, size), 160.0).0.right()),
                     _ => None,
                 };
-                for v in audit(&t, size, scroll_x_clip) { all.push(format!("[{w}x{h} {dname}] {v}")); }
+                let modal_card = app.show_help.then_some(app.help_card_rect);
+                for v in audit(&t, size, scroll_x_clip, modal_card) { all.push(format!("[{w}x{h} {dname}] {v}")); }
                 if app.stage_view == StageView::Rack && app.rack_overflow != Vec2::ZERO {
                     let what = if app.rack_overflow.x > 0.0 { "rack overflows sideways" } else { "rack pans vertically" };
                     all.push(format!("[{w}x{h} {dname}] {what}: {:?}", app.rack_overflow));
@@ -48113,12 +48466,53 @@ mod window_size_layout_tests {
                 }
             }
         }
+        // Help overlay with Navigator open (#111): verify help fits inside the narrowed stage.
+        for (w, h) in [(760.0f32, 520.0), (781.0, 950.0), (781.0, 468.0), (1280.0, 800.0), (1600.0, 1000.0)] {
+            for (dock, dname) in [(DockView::None, "no dock"), (DockView::Keyboard, "keyboard"), (DockView::Assistant, "assistant")] {
+                let mut app = DemoApp::new_with_sink(None);
+                app.nav_open = true;
+                app.show_help = true;
+                app.dock = dock;
+                let ctx = egui::Context::default();
+                let size = Vec2::new(w, h);
+                let screen = Rect::from_min_size(Pos2::ZERO, size);
+                let t = texts(&mut app, &ctx, size);
+                let card = app.help_card_rect;
+                if !card.is_positive() || !screen.expand(0.5).contains_rect(card) {
+                    bad.push(format!("help-nav: [{w}x{h} {dname}] card {card:?} leaves window {screen:?}"));
+                }
+                if card.intersects(app.nav_panel_rect.shrink(0.5)) {
+                    bad.push(format!("help-nav: [{w}x{h} {dname}] card {card:?} overlaps Navigator {:?}", app.nav_panel_rect));
+                }
+                let modal_only: Vec<Text> = t.iter().filter(|tx| tx.in_modal)
+                    .map(|tx| Text { s: tx.s.clone(), rect: tx.rect, clip: tx.clip, in_modal: tx.in_modal })
+                    .collect();
+                for l in audit(&modal_only, size, None, Some(card)) {
+                    if l.contains(" overlaps ") || l.contains("leaves the window") {
+                        bad.push(format!("help-nav: [{w}x{h} {dname}] {l}"));
+                    }
+                }
+                for l in audit(&t, size, None, Some(card)) {
+                    if l.contains(" overlaps ") {
+                        bad.push(format!("help-nav: [{w}x{h} {dname}] {l}"));
+                    }
+                }
+                for tx in t.iter().filter(|tx| tx.in_modal) {
+                    if tx.rect.left() < card.left() - 0.5 || tx.rect.right() > card.right() + 0.5
+                        || tx.rect.left() < -0.5 || tx.rect.right() > w + 0.5
+                    {
+                        bad.push(format!("help-nav: [{w}x{h} {dname}] modal text {:?} {:?} outside card {card:?}", tx.s, tx.rect));
+                    }
+                }
+            }
+        }
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 45] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 46] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
+            ("help", &|a| a.show_help = true),
             ("rack cpu overlay", &|a| {
                 a.show_cpu_overlay = true;
                 a.test_counters = Some(crate::engine_info::EngineCounters {
@@ -48956,9 +49350,11 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 21] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 23] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
+            ("help", &|a| a.show_help = true),
+            ("help-nav", &|a| { a.nav_open = true; a.show_help = true; }),
             ("tworigs", &|a| a.load_multi_rig_demo()),
             ("twentyrigs", &|a| while a.rig_count() < 20 { a.edit_rigs(None) }),
             ("twentyrigs-rail", &|a| { while a.rig_count() < 20 { a.edit_rigs(None) } a.nav_open = true }),

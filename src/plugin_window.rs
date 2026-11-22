@@ -50,8 +50,10 @@ impl PluginWindow {
     pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Result<Self> {
         ensure_display();
         ensure_x11_egl_platform();
-        let (conn, screen_num) =
-            x11rb::connect(None).context("no X server for plugin windows (is XWayland running?)")?;
+        let display_desc = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".into());
+        let (conn, screen_num) = x11rb::connect(None).with_context(|| {
+            format!("no X server for plugin windows (DISPLAY={display_desc}; is XWayland running?)")
+        })?;
         let screen = &conn.setup().roots[screen_num];
         let (w, h) = (clamp16(width), clamp16(height));
         // Centred on the active monitor in X11/XWayland coordinates: Hyprland
@@ -103,6 +105,10 @@ impl PluginWindow {
         window.set_size_hints(resizable, true)?;
         window.conn.map_window(win)?;
         window.conn.flush()?;
+        // Sync with the X server before returning the window id so the
+        // plugin's own X11 connection never races CreateWindow/MapWindow and
+        // hits BadWindow during `set_parent`.
+        let _ = window.conn.get_input_focus()?.reply();
         Ok(window)
     }
 
@@ -124,6 +130,7 @@ impl PluginWindow {
             &ConfigureWindowAux::new().width(self.size.0).height(self.size.1),
         )?;
         self.conn.flush()?;
+        let _ = self.conn.get_input_focus()?.reply();
         Ok(())
     }
 
@@ -293,21 +300,39 @@ fn center_in_rect(mx: i16, my: i16, mw: u16, mh: u16, w: u16, h: u16) -> (i16, i
     )
 }
 
+/// Parse `/tmp/.X11-unix` entry names (`X0`, `X1`, …) into sorted `:N` display strings.
+fn candidate_displays<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut nums: Vec<u32> = names
+        .into_iter()
+        .filter_map(|name| name.strip_prefix('X')?.parse().ok())
+        .collect();
+    nums.sort_unstable();
+    nums.dedup();
+    nums.into_iter().map(|n| format!(":{n}")).collect()
+}
+
 /// A shell started outside the desktop session may lack DISPLAY while
-/// XWayland is running: point it at the first X socket. Plugins open their
-/// own X connections from DISPLAY, so it must be set before they create a GUI.
-fn ensure_display() {
+/// XWayland is running: point it at the first reachable X socket. Plugins open
+/// their own X connections from DISPLAY, so it must be set before `gui.create`.
+///
+/// Probing each socket avoids picking a greeter's `:0` (which rejects this
+/// user's auth) when the active XWayland session is on `:1` or higher.
+pub fn ensure_display() {
     if std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()) {
         return;
     }
     let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") else { return };
-    let mut displays: Vec<u32> = entries
+    let names: Vec<String> = entries
         .flatten()
-        .filter_map(|e| e.file_name().to_str()?.strip_prefix('X')?.parse().ok())
+        .filter_map(|e| e.file_name().into_string().ok())
         .collect();
-    displays.sort_unstable();
-    if let Some(n) = displays.first() {
-        std::env::set_var("DISPLAY", format!(":{n}"));
+    let candidates = candidate_displays(names.iter().map(String::as_str));
+    let chosen = candidates
+        .iter()
+        .find(|d| x11rb::connect(Some(d.as_str())).is_ok())
+        .or_else(|| candidates.first());
+    if let Some(disp) = chosen {
+        std::env::set_var("DISPLAY", disp);
     }
 }
 
@@ -390,5 +415,11 @@ mod tests {
         assert!(!should_set_x11_egl_platform(Some(s("wayland-1")), Some(s("x11"))));
         assert!(!should_set_x11_egl_platform(None, None));
         assert!(!should_set_x11_egl_platform(Some(s("")), None));
+    }
+
+    #[test]
+    fn candidate_displays_sorts_numerically_and_skips_non_sockets() {
+        let got = candidate_displays(["X10", "X1", "X0", "X1", "lock", "Xabc", "Y2"]);
+        assert_eq!(got, vec![":0", ":1", ":10"]);
     }
 }

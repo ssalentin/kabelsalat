@@ -672,8 +672,22 @@ pub fn run_plugin_worker(shm_fd: RawFd, ctrl_fd: RawFd) -> Result<()> {
     send_msg(&mut ctrl, &init_resp)?;
 
     // Main thread: serve control RPC and pump CLAP main-thread callbacks/editor.
+    // Pump on every loop turn once 16 ms have elapsed, NOT only on read timeout:
+    // while an editor is open the UI polls `EditorOpen` every frame (<=16 ms),
+    // which would otherwise prevent `recv_msg` from ever timing out and starve
+    // the plugin's X11/timer/posix_fd event loop.
     ctrl.set_read_timeout(Some(Duration::from_millis(16)))?;
     let mut last_pump = Instant::now();
+    let pump_due = |worker_main: &mut WorkerMain, shm: &ShmRegion, last_pump: &mut Instant| {
+        if last_pump.elapsed() >= Duration::from_millis(16) {
+            if let WorkerMain::Clap(m) = worker_main {
+                m.pump();
+                let lat = m.poll_latency();
+                shm.block().latency_frames.store(lat, Ordering::Release);
+            }
+            *last_pump = Instant::now();
+        }
+    };
     loop {
         match recv_msg::<CtrlReq>(&mut ctrl) {
             Ok(CtrlReq::Shutdown) => {
@@ -685,18 +699,12 @@ pub fn run_plugin_worker(shm_fd: RawFd, ctrl_fd: RawFd) -> Result<()> {
                 if send_msg(&mut ctrl, &resp).is_err() {
                     break;
                 }
+                pump_due(&mut worker_main, &shm, &mut last_pump);
             }
             Err(e) => {
                 if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
                     if matches!(ioe.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
-                        if last_pump.elapsed() >= Duration::from_millis(16) {
-                            if let WorkerMain::Clap(m) = &mut worker_main {
-                                m.pump();
-                                let lat = m.poll_latency();
-                                shm.block().latency_frames.store(lat, Ordering::Release);
-                            }
-                            last_pump = Instant::now();
-                        }
+                        pump_due(&mut worker_main, &shm, &mut last_pump);
                         continue;
                     }
                 }
@@ -831,7 +839,12 @@ fn handle_worker_req(main: &mut WorkerMain, req: CtrlReq) -> CtrlResp {
                 m.close_editor();
                 CtrlResp::Ok
             }
-            CtrlReq::EditorOpen => CtrlResp::Bool(m.editor_open()),
+            CtrlReq::EditorOpen => {
+                if m.editor_open() {
+                    m.pump();
+                }
+                CtrlResp::Bool(m.editor_open())
+            }
             CtrlReq::Pump => {
                 m.pump();
                 CtrlResp::Ok
@@ -1219,6 +1232,24 @@ impl SandboxMain {
         }
     }
 
+    fn rpc_with_timeout(&mut self, req: CtrlReq, timeout: Duration) -> Option<CtrlResp> {
+        let ctrl = self.ctrl.as_mut()?;
+        let _ = ctrl.set_read_timeout(Some(timeout));
+        let res = if send_msg(ctrl, &req).is_err() {
+            Err(())
+        } else {
+            recv_msg::<CtrlResp>(ctrl).map_err(|_| ())
+        };
+        let _ = ctrl.set_read_timeout(Some(Duration::from_secs(3)));
+        match res {
+            Ok(r) => Some(r),
+            Err(()) => {
+                self.mark_dead("control socket error");
+                None
+            }
+        }
+    }
+
     fn mark_dead(&mut self, reason: &str) {
         self.ctrl = None;
         self.editor_open = false;
@@ -1315,7 +1346,12 @@ impl SandboxMain {
     }
 
     pub fn open_editor(&mut self, title: &str) -> Result<()> {
-        match self.rpc(CtrlReq::OpenEditor { title: title.to_string() }) {
+        // First-time X11/OpenGL editor initialization in heavy plugins can
+        // exceed the 3 s control RPC timeout; give it the same 15 s budget as Init.
+        match self.rpc_with_timeout(
+            CtrlReq::OpenEditor { title: title.to_string() },
+            Duration::from_secs(15),
+        ) {
             Some(CtrlResp::Ok) => {
                 self.editor_open = true;
                 Ok(())

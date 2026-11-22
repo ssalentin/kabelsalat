@@ -11522,7 +11522,10 @@ impl DemoApp {
                 if let Some(n) = self.patch_names.get_mut(rig) { *n = Some(name); }
             }
         }
-        self.editor_open = !self.editor_params.is_empty();
+        let has_native_gui = pool_idx
+            .and_then(|i| self._surge_main.get_mut(i))
+            .is_some_and(|m| m.has_editor());
+        self.editor_open = !self.editor_params.is_empty() || has_native_gui;
         self.editor_status = if self.editor_open {
             String::new()
         } else {
@@ -11739,6 +11742,7 @@ impl DemoApp {
                                 main.close_editor();
                             } else if let Err(e) = main.open_editor(&format!("{name} · kabelsalat")) {
                                 self.plugin_window_error = Some(format!("{e:#}"));
+                                self.session_msg = format!("Plugin GUI failed: {e:#}");
                             }
                         }
                         if let Some(e) = &self.plugin_window_error {

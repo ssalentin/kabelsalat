@@ -1658,10 +1658,49 @@ mod transport_event_tests {
         assert_eq!((e.time_signature_numerator, e.time_signature_denominator), (3, 4));
         assert_eq!((e.bar_number, e.bar_start.to_float()), (2, 6.0));
     }
+
+    #[test]
+    fn choose_gui_config_prefers_x11_embedded_then_floating_fallbacks() {
+        let all = choose_gui_config(|_| true).unwrap();
+        assert_eq!(all.api_type, GuiApiType::X11);
+        assert!(!all.is_floating);
+
+        let x11_float_only = choose_gui_config(|c| c.api_type == GuiApiType::X11 && c.is_floating).unwrap();
+        assert_eq!(x11_float_only.api_type, GuiApiType::X11);
+        assert!(x11_float_only.is_floating);
+
+        let wl_float_only = choose_gui_config(|c| c.api_type == GuiApiType::WAYLAND && c.is_floating).unwrap();
+        assert_eq!(wl_float_only.api_type, GuiApiType::WAYLAND);
+        assert!(wl_float_only.is_floating);
+
+        assert!(choose_gui_config(|_| false).is_none());
+    }
 }
 
 fn x11_embedded() -> GuiConfiguration<'static> {
     GuiConfiguration { api_type: GuiApiType::X11, is_floating: false }
+}
+
+fn x11_floating() -> GuiConfiguration<'static> {
+    GuiConfiguration { api_type: GuiApiType::X11, is_floating: true }
+}
+
+fn wayland_floating() -> GuiConfiguration<'static> {
+    GuiConfiguration { api_type: GuiApiType::WAYLAND, is_floating: true }
+}
+
+/// Choose the best CLAP GUI configuration supported by a plugin:
+/// prefer embedded X11 (host-managed `PluginWindow`), then fall back to
+/// floating X11 and floating Wayland for plugins that manage their own window.
+fn choose_gui_config(
+    mut supports: impl FnMut(GuiConfiguration<'static>) -> bool,
+) -> Option<GuiConfiguration<'static>> {
+    for cfg in [x11_embedded(), x11_floating(), wayland_floating()] {
+        if supports(cfg) {
+            return Some(cfg);
+        }
+    }
+    None
 }
 
 /// The registered descriptors that are ready now (never blocks).
@@ -1739,10 +1778,14 @@ pub fn run_editor_test(ids: &[String]) -> Result<()> {
                 main.pump();
                 std::thread::sleep(Duration::from_millis(15));
             }
+            if !main.editor_open() {
+                return Err(anyhow!("the editor closed by itself"));
+            }
             match main.editor_children() {
                 Some(n) if n > 0 => Ok(n),
                 Some(_) => Err(anyhow!("the plugin attached no window to the editor window")),
-                None => Err(anyhow!("the editor closed by itself")),
+                // Floating editor: plugin manages its own toplevel window.
+                None => Ok(0),
             }
         });
         main.close_editor();
@@ -1751,7 +1794,7 @@ pub fn run_editor_test(ids: &[String]) -> Result<()> {
                 main.pump();
                 std::thread::sleep(Duration::from_millis(15));
             }
-            main.editor_children().is_some_and(|n| n > 0)
+            main.editor_open() && main.editor_children().map_or(true, |n| n > 0)
         };
         main.close_editor();
         match (result, reopened) {
@@ -1890,11 +1933,13 @@ pub struct ClapVoiceMain {
     _entry: PluginEntry,
 }
 
-/// An open plugin editor: the plugin's GUI embedded in a host toplevel.
-/// The window must outlive the GUI, so `close_editor` destroys the GUI first.
+/// An open plugin editor: either embedded in a host-owned [`PluginWindow`]
+/// (`window: Some(...)`) or a plugin-managed floating window (`window: None`).
+/// When embedded, the window must outlive the GUI, so `close_editor` destroys
+/// the GUI first.
 struct ClapEditor {
     gui: PluginGui,
-    window: PluginWindow,
+    window: Option<PluginWindow>,
     resizable: bool,
 }
 
@@ -1905,10 +1950,16 @@ impl Drop for ClapVoiceMain {
 }
 
 impl ClapVoiceMain {
+    fn select_gui_config(&mut self) -> Option<(PluginGui, GuiConfiguration<'static>)> {
+        let gui = self.exts.gui?;
+        let handle = self.instance.plugin_handle();
+        let cfg = choose_gui_config(|c| gui.is_api_supported(&handle, c))?;
+        Some((gui, cfg))
+    }
+
     /// Whether the plugin has its own editor kabelsalat can open.
     pub fn has_editor(&mut self) -> bool {
-        let Some(gui) = self.exts.gui else { return false };
-        gui.is_api_supported(&self.instance.plugin_handle(), x11_embedded())
+        self.select_gui_config().is_some()
     }
 
     pub fn editor_open(&self) -> bool {
@@ -1922,19 +1973,40 @@ impl ClapVoiceMain {
             return Ok(());
         }
         let gui = self.exts.gui.ok_or_else(|| anyhow!("this plugin has no editor of its own"))?;
-        let cfg = x11_embedded();
-        if !gui.is_api_supported(&self.instance.plugin_handle(), cfg) {
-            bail!("this plugin's editor does not run on X11");
+        let cfg = {
+            let handle = self.instance.plugin_handle();
+            choose_gui_config(|c| gui.is_api_supported(&handle, c))
+                .ok_or_else(|| anyhow!("this plugin's editor does not support X11 or floating Wayland"))?
+        };
+        // Set DISPLAY and EGL_PLATFORM before `gui.create`: some plugins open
+        // their X11/EGL connection inside `create`, before `set_parent`.
+        if cfg.api_type == GuiApiType::X11 {
+            crate::plugin_window::ensure_display();
+            crate::plugin_window::ensure_x11_egl_platform();
         }
         self.instance.access_shared_handler(|h| {
             h.gui_closed.store(false, Ordering::SeqCst);
             h.gui_resize.lock().unwrap().take();
         });
-        gui.create(&self.instance.plugin_handle(), cfg).map_err(|e| anyhow!("the plugin could not create its editor: {e:?}"))?;
+        gui.create(&self.instance.plugin_handle(), cfg)
+            .map_err(|e| anyhow!("the plugin could not create its editor: {e:?}"))?;
         let handle = self.instance.plugin_handle();
+        if cfg.is_floating {
+            let safe_title = title.replace('\0', " ");
+            if let Ok(c_title) = std::ffi::CString::new(safe_title) {
+                gui.suggest_title(&handle, &c_title);
+            }
+            if let Err(e) = gui.show(&handle) {
+                gui.destroy(&handle);
+                bail!("the plugin could not show its floating editor: {e:?}");
+            }
+            self.editor = Some(ClapEditor { gui, window: None, resizable: false });
+            self.gate.request_wake();
+            return Ok(());
+        }
         let size = gui.get_size(&handle).unwrap_or(GuiSize { width: 800, height: 600 });
         let resizable = gui.can_resize(&handle);
-        let window = match PluginWindow::open(title, size.width, size.height, resizable) {
+        let mut window = match PluginWindow::open(title, size.width, size.height, resizable) {
             Ok(w) => w,
             Err(e) => {
                 gui.destroy(&handle);
@@ -1951,7 +2023,13 @@ impl ClapVoiceMain {
         // Odin 2 answers false here yet shows its editor; whether it attached
         // is what `editor-test` checks, not this answer.
         let _ = gui.show(&handle);
-        self.editor = Some(ClapEditor { gui, window, resizable });
+        // Some plugins only compute their real size after `set_parent`/`show`.
+        if let Some(post) = gui.get_size(&handle) {
+            if (post.width, post.height) != window.size() {
+                let _ = window.resize(post.width, post.height, resizable);
+            }
+        }
+        self.editor = Some(ClapEditor { gui, window: Some(window), resizable });
         self.gate.request_wake();
         Ok(())
     }
@@ -2094,21 +2172,24 @@ impl ClapVoiceMain {
 
     /// Windows the plugin attached inside its editor window, while it is open.
     pub fn editor_children(&self) -> Option<usize> {
-        self.editor.as_ref().and_then(|ed| ed.window.child_count().ok())
+        self.editor
+            .as_ref()
+            .and_then(|ed| ed.window.as_ref().and_then(|w| w.child_count().ok()))
     }
 
     fn pump_editor(&mut self) {
         let plugin_closed = self.instance.access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst));
         let requested = self.instance.access_shared_handler(|h| h.gui_resize.lock().unwrap().take());
         let Some(ed) = self.editor.as_mut() else { return };
-        let events = ed.window.poll();
+        let events = ed.window.as_mut().map(PluginWindow::poll).unwrap_or_default();
         if plugin_closed || events.close_requested {
             self.close_editor();
             return;
         }
+        let Some(window) = ed.window.as_mut() else { return };
         let handle = self.instance.plugin_handle();
         if let Some(size) = requested {
-            let _ = ed.window.resize(size.width, size.height, ed.resizable);
+            let _ = window.resize(size.width, size.height, ed.resizable);
             let _ = ed.gui.set_size(&handle, size);
         } else if let Some((w, h)) = events.resized.filter(|_| ed.resizable) {
             let size = ed.gui.adjust_size(&handle, GuiSize { width: w, height: h }).unwrap_or(GuiSize { width: w, height: h });

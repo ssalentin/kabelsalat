@@ -347,12 +347,18 @@ pub(super) mod tests {
 
     /// Frames until the check thread answered (it probes no plugin here:
     /// the test rack's plugins are not in the scan of a machine without them).
+    /// Always runs at least 2 frames so Frame 1 triggers `set_pixels_per_point`
+    /// and Frame 2 absorbs egui's one-frame scale-transition pass (rule 222).
     fn wait_for_report(app: &mut DemoApp, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while app.preshow.running() {
+        let mut frames = 0usize;
+        while app.preshow.running() || frames < 2 {
             assert!(std::time::Instant::now() < deadline, "the check never answered");
             frame_texts(app, ctx, Vec2::new(1280.0, 800.0));
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            frames += 1;
+            if app.preshow.running() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
     }
 
@@ -390,6 +396,7 @@ pub(super) mod tests {
         assert!(!app.setlist_levels_open, "one panel at a time");
         wait_for_report(&mut app, &ctx);
         let texts = frame_texts(&mut app, &ctx, Vec2::new(1280.0, 800.0));
+        assert!(texts.iter().any(|t| t == "Setlist"), "settled at full 1280x800 width: {texts:?}");
         let report = app.preshow.report.clone().expect("a report");
         assert_eq!(report.rows.len(), crate::preshow::CHECKS.len());
         for row in &report.rows {

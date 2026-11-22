@@ -886,7 +886,6 @@ pub(crate) struct SandboxVoice {
     latency: Arc<AtomicU32>,
     last_status: ProcessStatus,
     tail_length: Option<TailLength>,
-    total_misses: u64,
 }
 
 impl SandboxVoice {
@@ -904,14 +903,6 @@ impl SandboxVoice {
 
     pub(crate) fn take_wake_request(&mut self) -> bool {
         self.shm.block().wake_requested.swap(0, Ordering::AcqRel) != 0
-    }
-
-    pub(crate) fn is_crashed(&self) -> bool {
-        self.crashed.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn deadline_misses(&self) -> u64 {
-        self.total_misses
     }
 
     /// Adopt any restarted worker's shared memory region without blocking or
@@ -1012,7 +1003,6 @@ impl SandboxVoice {
             self.consecutive_misses = 0;
         } else {
             out[..n2].fill(0.0);
-            self.total_misses += 1;
             self.consecutive_misses += 1;
             if blk.worker_alive.load(Ordering::Acquire) == 0
                 || self.consecutive_misses >= DEAD_MISS_THRESHOLD
@@ -1177,7 +1167,6 @@ pub fn spawn_sandboxed_clap(
         latency: latency_atom.clone(),
         last_status: ProcessStatus::Continue,
         tail_length: None,
-        total_misses: 0,
     };
 
     let voice = ClapVoice::from_sandbox(plugin_id.to_string(), w.is_effect, sample_rate, latency_atom, sv);
@@ -1213,10 +1202,6 @@ impl SandboxMain {
 
     pub fn strip_notice(&self) -> Option<&str> {
         self.strip_notice.as_deref()
-    }
-
-    pub fn clear_strip_notice(&mut self) {
-        self.strip_notice = None;
     }
 
     fn rpc(&mut self, req: CtrlReq) -> Option<CtrlResp> {

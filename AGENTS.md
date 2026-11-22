@@ -1784,6 +1784,15 @@ Learned so far (2026-11-15, UI polish pass):
     Check `lilv_node_is_blank` and query `lilv_world_get` for `units:symbol`
     (fallback `rdfs:label`) in `read_control_infos`
     (`lv2_blank_node_units_resolve_to_symbol_or_label`).
+208. **Keep a true monospace face ahead of symbol fallbacks in `FontFamily::Monospace`:**
+    `NotoSansSymbols2` and `NotoSansMath` carry ASCII digits (with wide/proportional
+    advances); when JetBrains Mono was absent on non-Arch paths, placing
+    `SYMBOL_FONTS` before egui's bundled `Hack` turned `"CC 64"` into `"CC 6 4"`
+    (#327). Probe JetBrains Mono across distro, `/usr/local`, Flatpak and user
+    font directories (`MONO_DIRS`/`MONO_FILES`), and always place `Hack` ahead
+    of `SYMBOL_FONTS` in `FontFamily::Monospace` (and `Ubuntu-Light` ahead of
+    `SYMBOL_FONTS` in `Proportional` when Noto Sans Regular is absent;
+    `monospace_digits_come_from_mono_face_without_jetbrains_mono`).
 
 205. **Centre plugin windows on the active RandR monitor, never the combined X11
     root screen:** with multiple monitors or `xwayland:force_zero_scaling`

@@ -25,7 +25,8 @@ check() { # <labels> <changed-files>; prints annotations, returns the verdict
   if ! grep -qx 'README.md' <<<"$files"; then
     msg="labelled 'enhancement' (new feature) but README.md is not updated."
     msg+=" A new feature ships its README entry in the same PR: add or update"
-    msg+=" its entry under \"What you can do\" (or \"Install\")."
+    msg+=" its short line under \"What you can do\" (or \"Install\"), linking"
+    msg+=" its section in docs/GUIDE.md, which holds the details."
     if [[ -n $ui && -z $shots ]]; then
       msg+=" This PR changes UI code, so also re-capture the screenshots that"
       msg+=" entry shows (scripts/shot.sh into docs/shots/, AGENTS.md rule 108)."

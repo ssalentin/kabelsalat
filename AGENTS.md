@@ -205,9 +205,11 @@ and never passed off as tested.**
   becomes an issue, not a note in a doc.
 - **New features (user, 2026-11-18):** a feature is an issue labelled
   `enhancement`, and the PR that implements it carries the label too. That
-  PR updates `README.md` in the same change — the feature's entry under
-  "What you can do" (or "Install") — and, when it changes what users see,
-  fresh screenshots for that entry (`scripts/shot.sh`, rule 108 review).
+  PR updates `README.md` in the same change — a short line under "What you
+  can do" (or "Install") that links its section in `docs/GUIDE.md`, where the
+  details go (user, 2026-11-22: the README stays a short entry point) — and,
+  when it changes what users see, fresh screenshots for that entry
+  (`scripts/shot.sh`, rule 108 review).
   The `readme-check` workflow (rule 132) fails it otherwise and warns when
   UI code changed without a screenshot.
 - **Releases:** SemVer tags `vX.Y.Z` on `main`, cut with
@@ -1033,8 +1035,9 @@ Learned so far (2026-11-15, UI polish pass):
 132. **A feature PR ships its README entry, and fresh shots when users can
     see the difference:** the plugin-editor windows (#71) merged without a
     line in "What you can do", and the README's feature list quietly went
-    stale. A PR labelled `enhancement` updates `README.md` (its entry under
-    "What you can do", or "Install") in the same change, and when the feature
+    stale. A PR labelled `enhancement` updates `README.md` (a short line under
+    "What you can do", or "Install", linking its `docs/GUIDE.md` section,
+    which holds the details) in the same change, and when the feature
     changes what the app shows or how it is played, re-captures the
     screenshots that entry shows (`scripts/shot.sh` into `docs/shots/`,
     rule 108 review). `.github/workflows/readme-check.yml`

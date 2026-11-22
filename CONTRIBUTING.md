@@ -41,7 +41,8 @@ You need Rust (rustup), `alsa-lib`, `lilv` and PipeWire or ALSA. Surge XT
   machine that has the devices
   ([AGENTS.md](AGENTS.md#bench-tests-hand-over-what-this-machine-cannot-test-user-2026-11-19)).
 - **Its README entry.** A new feature updates [README.md](README.md) in the
-  same PR — its entry under "What you can do" (or "Install"), plus fresh
+  same PR — a short line under "What you can do" (or "Install") that links
+  its section in [docs/GUIDE.md](docs/GUIDE.md), where the details go, plus fresh
   screenshots when it changes what users see (captured with
   [scripts/shot.sh](scripts/shot.sh), so nothing else on your screen is in
   them). PRs labelled

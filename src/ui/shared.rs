@@ -553,6 +553,11 @@ impl DemoApp {
                 ns.set_strip_knob(node, label.clone());
             }
         }
+        for m in imported.midi_sources() {
+            if let Some(node) = remap_imp_appended(m.node) {
+                ns.set_midi_sources(crate::session::MidiSources { node, ..m.clone() });
+            }
+        }
 
         let mut song = Song::new(title, vec![main_part]);
         song.time_sig = imported.time_sig;
@@ -571,7 +576,6 @@ impl DemoApp {
                 .collect();
             snap.active = active;
         }
-        self.adopt_rig_devices();
         let voice_rows: Vec<VoiceRow> = voice_rows
             .into_iter()
             .filter_map(|r| remap_cur(r.node).map(|node| VoiceRow { node, ..r }))

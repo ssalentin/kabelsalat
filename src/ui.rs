@@ -17548,6 +17548,11 @@ impl DemoApp {
                 combined.set_strip_knob(node, label.clone());
             }
         }
+        // Per-synth input selection and bound MIDI device of the loaded preset (#124, #322).
+        // Existing rigs' synths are restored from `voice_rows` after `apply_session`.
+        for m in ns_preset.midi_sources() {
+            combined.set_midi_sources(m.clone());
+        }
         let mut rules: Vec<SavedRule> = Vec::new();
         for src_sess in [&ns_existing, &ns_preset] {
             if let Some(v) = src_sess.matrix() {
@@ -17590,16 +17595,17 @@ impl DemoApp {
             }).collect();
             snap.active = active;
         }
-        self.adopt_rig_devices();
         // Restore per-voice inputs and patch names AFTER apply_session (rule
         // 20/59): every other rig's synths keep their device too (#227).
         self.restore_voice_rows(&voice_rows);
         for (slot, nid) in self.clap_rigs() {
-            if let Some(&src) = new_sources_by_node.get(&nid) {
-                if let Some(s) = self.rig_sources.get_mut(slot) {
-                    *s = src;
+            if !ns_preset.midi_sources().iter().any(|m| m.node == nid) {
+                if let Some(&src) = new_sources_by_node.get(&nid) {
+                    if let Some(s) = self.rig_sources.get_mut(slot) {
+                        *s = src;
+                    }
+                    self.send_rig_source(nid);
                 }
-                self.send_rig_source(nid);
             }
             if let Some(p) = new_patches_by_node.get(&nid) {
                 if let Some(pn) = self.patch_names.get_mut(slot) {

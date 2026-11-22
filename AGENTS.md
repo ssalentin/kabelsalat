@@ -1848,3 +1848,13 @@ Learned so far (2026-11-15, UI polish pass):
     conflicts read-only instead of pushing bot commits). In `sync-branch.sh`,
     sort and compare paths under `LC_ALL=C` and persist overlaps across plain
     rebases so `--push` still exits 3.
+208. **Rig presets and song imports persist and remap `midi_sources` alongside
+    `clap_meta` / matrix rules:** `RigPresetFile` omitted `midi_sources` and
+    `add_song_from_session_shared` dropped `imported.midi_sources()`, so a
+    CLAP synth bound to one keyboard in the MIDI matrix fell back to all
+    hardware after preset load or song import (#322). Write `midi_sources`
+    (port names, `#[serde(default)]`) in `RigPresetFile`, merge remapped
+    `midi_sources` into the `Session` passed to `apply_session` (skipping any
+    redundant post-`apply_session` `adopt_rig_devices()` that would clobber
+    per-synth overrides), and use `clap_meta` switches only as a legacy
+    fallback for nodes absent from `midi_sources` (`ui::hw_ports_tests`).

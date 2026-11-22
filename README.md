@@ -106,6 +106,10 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **Install 23 tested plugins with one click** (Surge XT, Dexed, Vitalium,
   setBfree, Aeolus, Guitarix, …). → [Catalog](docs/GUIDE.md#install-instruments-from-the-catalog),
   [tested plugins](docs/PLUGINS.md)
+- **Out-of-process plugin sandboxing:** each CLAP plugin runs in its own helper
+  process over shared memory — a crash silences only that strip and restarts it
+  with its last saved state while every other rig keeps playing.
+  → [Plugin crash isolation](docs/GUIDE.md#plugin-crash-isolation)
 
 **Mix**
 - **A channel strip per source** with inserts, sends, aux buses and a

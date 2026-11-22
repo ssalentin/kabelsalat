@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
+use super::sandbox::SandboxMain;
 use super::{ClapVoice, ClapVoiceMain, ParamDesc, VoiceController};
 use crate::control::NodeId;
 use crate::engine::VoiceSlot;
@@ -422,16 +423,24 @@ impl BgClapMain {
     }
 }
 
-/// Either a local (UI-thread) `ClapVoiceMain` or a proxy to one hosted on the
-/// background `kabelsalat-clap-loader` thread (#207).
+/// Either a local (UI-thread) `ClapVoiceMain`, a proxy to one hosted on the
+/// background `kabelsalat-clap-loader` thread (#207), or an isolated
+/// out-of-process `plugin-worker` supervisor (#209).
 pub enum HostedClapMain {
     Local(ClapVoiceMain),
     Bg(BgClapMain),
+    Sandbox(SandboxMain),
 }
 
 impl From<ClapVoiceMain> for HostedClapMain {
     fn from(m: ClapVoiceMain) -> Self {
         HostedClapMain::Local(m)
+    }
+}
+
+impl From<SandboxMain> for HostedClapMain {
+    fn from(m: SandboxMain) -> Self {
+        HostedClapMain::Sandbox(m)
     }
 }
 
@@ -444,8 +453,25 @@ impl HostedClapMain {
     /// Periodic UI polls skip when busy so the UI thread never waits on a load.
     pub fn is_bg_busy(&self) -> bool {
         match self {
-            HostedClapMain::Local(_) => false,
+            HostedClapMain::Local(_) | HostedClapMain::Sandbox(_) => false,
             HostedClapMain::Bg(bg) => bg.busy.load(Ordering::Acquire),
+        }
+    }
+
+    /// Check for an out-of-process worker crash and restart it with its last
+    /// saved state (#209). Returns a user-facing notice when a restart occurs.
+    pub fn poll_recovery(&mut self) -> Option<String> {
+        match self {
+            HostedClapMain::Sandbox(sb) => sb.poll_recovery(),
+            _ => None,
+        }
+    }
+
+    /// Short strip-level crash/restart notice if the sandboxed worker died.
+    pub fn strip_notice(&self) -> Option<&str> {
+        match self {
+            HostedClapMain::Sandbox(sb) => sb.strip_notice(),
+            _ => None,
         }
     }
 
@@ -453,6 +479,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.has_editor(),
             HostedClapMain::Bg(bg) => bg.has_editor,
+            HostedClapMain::Sandbox(sb) => sb.has_editor(),
         }
     }
 
@@ -460,6 +487,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.editor_open(),
             HostedClapMain::Bg(bg) => bg.editor_open,
+            HostedClapMain::Sandbox(sb) => sb.editor_open(),
         }
     }
 
@@ -477,6 +505,7 @@ impl HostedClapMain {
                 bg.editor_open = res.1;
                 res.0
             }
+            HostedClapMain::Sandbox(sb) => sb.open_editor(title),
         }
     }
 
@@ -487,6 +516,7 @@ impl HostedClapMain {
                 let _ = bg.call(|m| m.close_editor());
                 bg.editor_open = false;
             }
+            HostedClapMain::Sandbox(sb) => sb.close_editor(),
         }
     }
 
@@ -501,6 +531,7 @@ impl HostedClapMain {
                     }
                 }
             }
+            HostedClapMain::Sandbox(sb) => sb.pump(),
         }
     }
 
@@ -508,6 +539,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.poll_latency(),
             HostedClapMain::Bg(bg) => bg.try_call(UI_POLL_TIMEOUT, |m| m.poll_latency()).unwrap_or(0),
+            HostedClapMain::Sandbox(sb) => sb.poll_latency(),
         }
     }
 
@@ -517,6 +549,7 @@ impl HostedClapMain {
             HostedClapMain::Bg(bg) => bg
                 .call(|m| m.save_state())
                 .ok_or_else(|| anyhow!("plugin loader unavailable"))?,
+            HostedClapMain::Sandbox(sb) => sb.save_state(),
         }
     }
 
@@ -528,6 +561,7 @@ impl HostedClapMain {
                 bg.call(move |m| m.load_state(&data))
                     .ok_or_else(|| anyhow!("plugin loader unavailable"))?
             }
+            HostedClapMain::Sandbox(sb) => sb.load_state(data),
         }
     }
 
@@ -548,6 +582,10 @@ impl HostedClapMain {
                     save_state: false,
                 });
             }
+            HostedClapMain::Sandbox(mut sb) => {
+                drop(voice);
+                sb.shutdown();
+            }
         }
     }
 
@@ -555,6 +593,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.param_list(),
             HostedClapMain::Bg(bg) => bg.call(|m| m.param_list()).unwrap_or_default(),
+            HostedClapMain::Sandbox(sb) => sb.param_list(),
         }
     }
 
@@ -562,6 +601,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.main_controls(),
             HostedClapMain::Bg(bg) => &bg.main_controls,
+            HostedClapMain::Sandbox(sb) => sb.main_controls(),
         }
     }
 
@@ -581,6 +621,7 @@ impl HostedClapMain {
                     false
                 }
             }
+            HostedClapMain::Sandbox(sb) => sb.poll_main_controls(),
         }
     }
 
@@ -588,6 +629,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.param_desc(id),
             HostedClapMain::Bg(bg) => bg.call(move |m| m.param_desc(id)).flatten(),
+            HostedClapMain::Sandbox(sb) => sb.param_desc(id),
         }
     }
 
@@ -595,6 +637,7 @@ impl HostedClapMain {
         match self {
             HostedClapMain::Local(m) => m.param_value(id),
             HostedClapMain::Bg(bg) => bg.try_call(UI_POLL_TIMEOUT, move |m| m.param_value(id)).flatten(),
+            HostedClapMain::Sandbox(sb) => sb.param_value(id),
         }
     }
 
@@ -604,6 +647,7 @@ impl HostedClapMain {
             HostedClapMain::Bg(bg) => bg
                 .try_call(UI_POLL_TIMEOUT, move |m| m.param_text(id, value))
                 .unwrap_or_else(|| format!("{value:.3}")),
+            HostedClapMain::Sandbox(sb) => sb.param_text(id, value),
         }
     }
 
@@ -613,6 +657,7 @@ impl HostedClapMain {
             HostedClapMain::Bg(bg) => bg
                 .try_call(UI_POLL_TIMEOUT, move |m| m.param_text_opt(id, value))
                 .flatten(),
+            HostedClapMain::Sandbox(sb) => sb.param_text_opt(id, value),
         }
     }
 
@@ -623,6 +668,7 @@ impl HostedClapMain {
                 let text = text.to_string();
                 bg.call(move |m| m.param_text_to_value(id, &text)).flatten()
             }
+            HostedClapMain::Sandbox(sb) => sb.param_text_to_value(id, text),
         }
     }
 
@@ -633,6 +679,7 @@ impl HostedClapMain {
                 let p = p.clone();
                 bg.call(move |m| m.param_options(&p)).unwrap_or_default()
             }
+            HostedClapMain::Sandbox(sb) => sb.param_options(p),
         }
     }
 
@@ -644,6 +691,7 @@ impl HostedClapMain {
                 let text = text.to_string();
                 bg.call(move |m| m.resolve_param_text(&p, &text)).flatten()
             }
+            HostedClapMain::Sandbox(sb) => sb.resolve_param_text(p, text),
         }
     }
 }

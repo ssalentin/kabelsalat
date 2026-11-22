@@ -1947,4 +1947,10 @@ Learned so far (2026-11-15, UI polish pass):
     retires the previous engine after 0.1 s of quiet output. Tests that measure
     sound/DSP changes after `load_state` (such as `sound-library-test`) must
     pump ~2.5 s of `render` + wall time before sampling the new engine.
+220. **Always keep an on-screen Stop button while a demo phrase plays (#398):**
+    the Left Rail is collapsed by default, so the per-rig `■` button in the rail
+    is hidden whenever the Assistant (or another frontend) triggers `play_demo`.
+    Show an active `■ Stop demo` (compact `■ Demo`, narrow `■`) chip in the top
+    bar (accounted for in `right_w`) and in the Assistant panel header whenever
+    `self.demo_playing.is_some()` (`demo_stop_buttons_show_in_top_bar_and_assistant_when_playing_and_stop_demo`).
 

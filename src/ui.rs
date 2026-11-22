@@ -4127,6 +4127,9 @@ struct DemoApp {
     /// Currently running rig demo phrase mirrored from `GraphPub::demo` (#200).
     demo_playing: Option<crate::engine::DemoPub>,
     last_demo_rev: u64,
+    /// Top-bar and Assistant-header `■ Stop demo` button rects (hit targets for tests).
+    top_demo_stop_rect: Rect,
+    assistant_demo_stop_rect: Rect,
     nav_filter_rects: [Rect; 3],
     rail_tab_rects: [Rect; 2],
     /// Open per-rig `⋯` menu in the Left Rail: `(rig_index, anchor_pos)`.
@@ -4715,6 +4718,8 @@ impl DemoApp {
             nav_rig_demo_rects: Vec::new(),
             demo_playing: None,
             last_demo_rev: 0,
+            top_demo_stop_rect: Rect::NOTHING,
+            assistant_demo_stop_rect: Rect::NOTHING,
             nav_filter_rects: [Rect::NOTHING; 3],
             rail_tab_rects: [Rect::NOTHING; 2],
             nav_rig_menu: None,
@@ -18008,6 +18013,7 @@ impl DemoApp {
         self.session_pill_rect = Rect::NOTHING;
         self.settings_btn_rect = Rect::NOTHING;
         self.rack_lock_btn_rect = Rect::NOTHING;
+        self.top_demo_stop_rect = Rect::NOTHING;
 
         egui::Panel::top("rig_inputs")
             .resizable(false)
@@ -18060,8 +18066,14 @@ impl DemoApp {
                 let sync_w = if show_sync { 52.0 } else { 0.0 };
                 let take_w = if show_take { 180.0 } else { 0.0 };
                 let retro_w = if show_retro { 58.0 + gap } else { 0.0 };
+                let demo_lbl = if narrow { "■" } else if compact { "■ Demo" } else { "■ Stop demo" };
+                let demo_w = if self.demo_playing.is_some() {
+                    theme::chip_button_width(ui, demo_lbl) + gap
+                } else {
+                    0.0
+                };
                 let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + (if show_sync { gap } else { 0.0 })
-                    + rec_w + gap + retro_w + take_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
+                    + rec_w + gap + retro_w + take_w + demo_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
                 let view_w = (if compact { 240.0 } else { 268.0 }) + 26.0 + gap;
 
                 ui.allocate_ui_with_layout(
@@ -18414,6 +18426,21 @@ impl DemoApp {
                                     {
                                         self.toggle_take_playback(&path, secs);
                                     }
+                                }
+                            }
+
+                            if let Some(demo) = self.demo_playing {
+                                let rig_idx = demo.rig as usize;
+                                let tip = format!(
+                                    "Stop demo phrase on Rig {} ({} · {})",
+                                    rig_idx + 1,
+                                    self.rig_name(rig_idx),
+                                    demo.phrase.name()
+                                );
+                                let r = theme::chip_button(ui, demo_lbl, true).on_hover_text(tip);
+                                self.top_demo_stop_rect = r.rect;
+                                if r.clicked() {
+                                    inline_demo = Some(Command::DemoStop);
                                 }
                             }
 
@@ -22384,6 +22411,7 @@ impl DemoApp {
     /// One bottom dock: exactly one occupant at a time (None / Keyboard /
     /// Assistant). The occupant owns the computer keyboard.
     fn dock_panel_ui(&mut self, root: &mut egui::Ui) {
+        self.assistant_demo_stop_rect = Rect::NOTHING;
         match self.dock {
             DockView::None => {
                 self.dock_rect = Rect::NOTHING;
@@ -22538,6 +22566,7 @@ impl DemoApp {
         let mut starter_prompt: Option<String> = None;
         let mut submit_text: Option<String> = None;
         let mut clear_chat = false;
+        let mut stop_demo = false;
         let mut input_rect = Rect::NOTHING;
         let mut focus_chat = self.focus_chat_request;
         let confirm_choice: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
@@ -22562,6 +22591,21 @@ impl DemoApp {
                         if header_w >= 560.0 {
                             ui.add_space(6.0);
                             ui.label(egui::RichText::new("C hides").size(11.5).color(theme::CREAM_META));
+                        }
+                        if let Some(demo) = self.demo_playing {
+                            let rig_idx = demo.rig as usize;
+                            let tip = format!(
+                                "Stop demo phrase on Rig {} ({} · {})",
+                                rig_idx + 1,
+                                self.rig_name(rig_idx),
+                                demo.phrase.name()
+                            );
+                            ui.add_space(10.0);
+                            let r = theme::chip_button(ui, "■ Stop demo", true).on_hover_text(tip);
+                            self.assistant_demo_stop_rect = r.rect;
+                            if r.clicked() {
+                                stop_demo = true;
+                            }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (C)").clicked() {
@@ -22980,6 +23024,11 @@ impl DemoApp {
         self.assistant_rect = resp.response.rect;
         self.assistant_input_rect = input_rect;
         self.focus_chat_request = focus_chat;
+        if stop_demo {
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::DemoStop);
+            }
+        }
         if clear_chat {
             self.assistant.history.clear();
             self.transcript_runs.clear();
@@ -51567,6 +51616,114 @@ mod navigator_tests {
             app.set_rig_mark(1, Some(crate::keyboard::KeyboardType::Drums));
             super::offline_shots::shot(&mut app, size, &dir.join(format!("rail-rig-types-{}x{}.png", size.x, size.y)));
         }
+        // #398: on-screen Stop demo chip in top bar & Assistant header with Left Rail closed.
+        for (name, size, dock) in [
+            ("topbar-demo-assistant", Vec2::new(1280.0, 800.0), DockView::Assistant),
+            ("topbar-demo-compact", Vec2::new(820.0, 640.0), DockView::None),
+        ] {
+            let (mut app, _) = two_rigs_with_inserts(true);
+            app.nav_open = false;
+            app.dock = dock;
+            app.demo_playing = Some(DemoPub { rig: 0, phrase: PhraseKind::Keys });
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
+        }
+    }
+
+    #[test]
+    fn demo_stop_buttons_show_in_top_bar_and_assistant_when_playing_and_stop_demo() {
+        use crate::engine::{GraphEngine, GraphPub};
+
+        let (mut app, _) = two_rigs_with_inserts(false);
+        let (bus, drain) = crate::control::command_bus();
+        let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(GraphPub {
+            graph: app.base_graph.clone(),
+            ..Default::default()
+        }));
+        engine.set_graph_pub(pub_.clone());
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        app.graph_pub = Some(pub_.clone());
+        app.nav_open = false;
+        app.dock = DockView::None;
+
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut buf = vec![0.0f32; 256 * 2];
+
+        // Idle: neither stop button is drawn.
+        for _ in 0..2 {
+            run_frame_at(&mut app, &ctx, size, vec![]);
+            engine.render(&mut buf, 2);
+        }
+        assert_eq!(app.top_demo_stop_rect, Rect::NOTHING);
+        assert_eq!(app.assistant_demo_stop_rect, Rect::NOTHING);
+
+        // 1. Assistant triggers play_demo while Left Rail & Assistant dock are closed:
+        //    the top-bar "■ Stop demo" button appears and clicking it stops the demo.
+        let res = app.exec_tool("play_demo", &serde_json::json!({"rig": 0}));
+        assert!(res.contains("\"playing\":true"), "play_demo succeeded: {res}");
+        for _ in 0..4 {
+            engine.render(&mut buf, 2);
+            run_frame_at(&mut app, &ctx, size, vec![]);
+        }
+        assert!(app.demo_playing.is_some(), "engine published running demo");
+        assert!(app.top_demo_stop_rect.is_positive(), "top-bar Stop demo button is visible with Left Rail closed");
+        assert!(app.view_group_rect.right() < app.dock_group_rect.left(), "view and dock groups stay separate");
+        assert!(app.dock_group_rect.right() < app.top_demo_stop_rect.left(), "Stop demo sits cleanly to the right of Dock");
+        assert!(app.top_demo_stop_rect.right() <= size.x, "Stop demo stays inside window");
+
+        let top_pos = app.top_demo_stop_rect.center();
+        click_at(&mut app, &ctx, size, top_pos);
+        for _ in 0..3 {
+            engine.render(&mut buf, 2);
+            run_frame_at(&mut app, &ctx, size, vec![]);
+        }
+        assert_eq!(app.demo_playing, None, "clicking top-bar Stop demo stops the demo");
+        assert_eq!(app.top_demo_stop_rect, Rect::NOTHING, "top-bar Stop demo hides once stopped");
+
+        // 2. With Assistant panel open, both the top-bar and Assistant-header Stop demo
+        //    buttons appear, and clicking the Assistant-header button stops the demo.
+        app.dock = DockView::Assistant;
+        let res = app.exec_tool("play_demo", &serde_json::json!({"rig": 1}));
+        assert!(res.contains("\"playing\":true"), "play_demo on rig 1 succeeded: {res}");
+        for _ in 0..4 {
+            engine.render(&mut buf, 2);
+            run_frame_at(&mut app, &ctx, size, vec![]);
+        }
+        assert!(app.top_demo_stop_rect.is_positive(), "top-bar Stop demo visible");
+        assert!(app.assistant_demo_stop_rect.is_positive(), "Assistant-header Stop demo visible");
+        assert!(app.assistant_rect.contains_rect(app.assistant_demo_stop_rect), "Assistant Stop demo stays inside panel");
+
+        let assistant_pos = app.assistant_demo_stop_rect.center();
+        click_at(&mut app, &ctx, size, assistant_pos);
+        for _ in 0..3 {
+            engine.render(&mut buf, 2);
+            run_frame_at(&mut app, &ctx, size, vec![]);
+        }
+        assert_eq!(app.demo_playing, None, "clicking Assistant-header Stop demo stops the demo");
+        assert_eq!(app.top_demo_stop_rect, Rect::NOTHING);
+        assert_eq!(app.assistant_demo_stop_rect, Rect::NOTHING);
+
+        // 3. Compact width (820x640): compact "■ Demo" button stays inside the window without overlapping View/Dock.
+        app.dock = DockView::None;
+        let _ = app.exec_tool("play_demo", &serde_json::json!({"rig": 0}));
+        let narrow = Vec2::new(820.0, 640.0);
+        for _ in 0..4 {
+            engine.render(&mut buf, 2);
+            run_frame_at(&mut app, &ctx, narrow, vec![]);
+        }
+        assert!(app.top_demo_stop_rect.is_positive(), "compact Stop demo button visible at 820px");
+        assert!(
+            app.view_group_rect.right() < app.dock_group_rect.left(),
+            "compact view/dock stay separate: view={:?} dock={:?} demo={:?}",
+            app.view_group_rect, app.dock_group_rect, app.top_demo_stop_rect
+        );
+        assert!(
+            app.dock_group_rect.right() < app.top_demo_stop_rect.left(),
+            "compact Stop demo does not overlap dock: view={:?} dock={:?} demo={:?}",
+            app.view_group_rect, app.dock_group_rect, app.top_demo_stop_rect
+        );
+        assert!(app.top_demo_stop_rect.right() <= narrow.x, "compact Stop demo fits within 820px");
     }
 
     #[test]

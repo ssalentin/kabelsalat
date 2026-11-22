@@ -405,7 +405,7 @@ you hear.
 
 ### Play a setlist without a gap
 
-Click **Setlist** in the top bar to organize a gig into songs and parts
+Press **F12** or click **Setlist** in the top bar to organize a gig into songs and parts
 (Verse, Chorus, Solo) over the loaded rigs. By default every rig stays loaded;
 for long gigs on small machines (like a Raspberry Pi), turn on **Load ahead**
 on the setlist to keep only the current song and the next few playable songs

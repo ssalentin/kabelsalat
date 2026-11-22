@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/shots/back.png" width="100%" alt="The back of the kabelsalat rack: patch cables run from the keys to two Surge XT synths, through their delays to the master; hovering a jack traces its cables and shows a live level"/>
+  <img src="docs/shots/front.png" width="100%" alt="The front of the kabelsalat rack: keys feed Surge XT and a delay into the master bus with live signal meters, session and rig pills and view tabs in the top bar"/>
 </p>
 
 kabelsalat is a host for playing live. Synths and effects sit in a rack,

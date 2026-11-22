@@ -210,7 +210,9 @@ impl DemoApp {
 
     pub(super) fn kb_arp_toggle(&mut self) {
         let Some(on) = self.kb_arp_on() else {
-            self.plugin_msg = "No Arp unit in this rig — add one from the Plugins view or ask the agent.".into();
+            let msg = "No Arp unit in this rig — add one from the Plugins view or ask the agent.";
+            self.plugin_msg = msg.into();
+            self.notify_patch(msg);
             return;
         };
         let a = self.units.iter().position(|u| u.rig == self.active_rig as u8 && matches!(u.node_kind, UnitKind::Arp));

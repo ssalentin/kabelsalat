@@ -36,9 +36,11 @@ struct Board {
     caption: String,
     song: String,
     part: Option<String>,
+    next_part: Option<String>,
     next: Option<String>,
     tempo: String,
     loading: bool,
+    indicators: Vec<(&'static str, Color32)>,
     /// Live rigs: name and level (`rig_levels`, −48…0 dBFS).
     rigs: Vec<(String, f32)>,
     master: f32,
@@ -287,13 +289,29 @@ impl DemoApp {
             .filter(|&r| self.rig_zones.get(r).is_none_or(|z| z.live))
             .map(|r| (self.rig_name(r), self.rig_levels.get(r).copied().unwrap_or(0.0)))
             .collect();
+        let next_part = sl.current().and_then(|(s, _, pos)| s.parts.get(pos.part + 1).map(|p| p.name.clone()));
+        let mut indicators = Vec::new();
+        if self.recorder.as_ref().is_some_and(|r| r.is_recording()) {
+            indicators.push(("● REC", theme::CLIP_BRIGHT));
+        }
+        if self.player.playing || self.player.pending {
+            indicators.push(("♫ TRACK", theme::LIVE_TEAL));
+        }
+        if self.playing {
+            indicators.push(("CLICK", theme::CREAM_META));
+        }
+        if self.recovery.has_notice() {
+            indicators.push(("Restarted after crash", theme::ACCENT_BRIGHT));
+        }
         Board {
             caption,
             song,
             part,
+            next_part,
             next: sl.upcoming_song().map(|i| sl.songs[i].name.clone()),
             tempo: format!("{} BPM · {}", self.bpm.round() as u32, self.time_sig),
             loading,
+            indicators,
             rigs,
             master: meter_db_pos(self.meter),
             master_peak: meter_db_pos(self.meter_peak),
@@ -314,10 +332,25 @@ impl DemoApp {
             .collect();
         let reg = regions(screen, meters.len().div_ceil(cols));
 
-        // Top: what this screen is, and the clock.
-        caption(&p, reg.top.left_center() - Vec2::new(0.0, 9.0), "Show mode · editing locked", 18.0, theme::INK_2);
+        // Top: what this screen is, live status indicators, and the clock.
+        let top_cap = caption(&p, reg.top.left_center() - Vec2::new(0.0, 9.0), "Show mode · editing locked", 18.0, theme::INK_2);
         let clock = p.layout_no_wrap(clock_now(), theme::medium_font(40.0), theme::INK);
-        p.galley(Pos2::new(reg.top.right() - clock.size().x, reg.top.center().y - clock.size().y / 2.0), clock, theme::INK);
+        let clock_x = reg.top.right() - clock.size().x;
+        p.galley(Pos2::new(clock_x, reg.top.center().y - clock.size().y / 2.0), clock, theme::INK);
+        if !board.indicators.is_empty() {
+            let mut ix = reg.top.left() + top_cap.x + 18.0;
+            for &(text, col) in &board.indicators {
+                let g = p.layout_no_wrap(text.into(), theme::medium_font(14.0), col);
+                let pw = g.size().x + 16.0;
+                if ix + pw > clock_x - 16.0 {
+                    break;
+                }
+                let pill = Rect::from_min_size(Pos2::new(ix, reg.top.center().y - 13.0), Vec2::new(pw, 26.0));
+                p.rect_filled(pill, 4.0, theme::DARK_PANEL);
+                p.galley(pill.center() - g.size() / 2.0, g, col);
+                ix = pill.right() + 8.0;
+            }
+        }
 
         // The hero: song, part and tempo, as large as the panel allows,
         // centred in it.
@@ -350,16 +383,41 @@ impl DemoApp {
         };
         p.galley(tempo_pos, tempo, theme::CREAM_META);
 
-        // Next song.
+        // Next part / next song.
         let next = reg.next;
-        let label = caption(&p, Pos2::new(next.left(), next.center().y - 11.0), "Next", 20.0, theme::INK_2);
-        let name_x = next.left() + label.x + 20.0;
-        let (text, color) = match &board.next {
-            Some(n) => (n.as_str(), theme::INK),
-            None => ("End of the setlist", theme::INK_2),
-        };
-        let name = fitted(&p, text, 44.0, 24.0, next.right() - name_x, color);
-        p.galley(Pos2::new(name_x, next.center().y - name.size().y / 2.0), name, color);
+        match (&board.next_part, &board.next) {
+            (Some(np), Some(ns)) => {
+                let split_x = next.left() + (next.width() * 0.44).round();
+                let l_cap = caption(&p, Pos2::new(next.left(), next.center().y - 9.0), "Next part", 16.0, theme::INK_2);
+                let np_x = next.left() + l_cap.x + 12.0;
+                let np_w = (split_x - 16.0 - np_x).max(40.0);
+                let np_g = fitted(&p, np, 38.0, 20.0, np_w, theme::LIVE_TEAL);
+                p.galley(Pos2::new(np_x, next.center().y - np_g.size().y / 2.0), np_g, theme::LIVE_TEAL);
+
+                let r_x = split_x + 8.0;
+                let r_cap = caption(&p, Pos2::new(r_x, next.center().y - 9.0), "Next song", 16.0, theme::INK_2);
+                let ns_x = r_x + r_cap.x + 12.0;
+                let ns_w = (next.right() - ns_x).max(40.0);
+                let ns_g = fitted(&p, ns, 38.0, 20.0, ns_w, theme::INK);
+                p.galley(Pos2::new(ns_x, next.center().y - ns_g.size().y / 2.0), ns_g, theme::INK);
+            }
+            (Some(np), None) => {
+                let label = caption(&p, Pos2::new(next.left(), next.center().y - 11.0), "Next part", 20.0, theme::INK_2);
+                let name_x = next.left() + label.x + 20.0;
+                let name = fitted(&p, np, 44.0, 24.0, (next.right() - name_x).max(40.0), theme::LIVE_TEAL);
+                p.galley(Pos2::new(name_x, next.center().y - name.size().y / 2.0), name, theme::LIVE_TEAL);
+            }
+            (None, _) => {
+                let label = caption(&p, Pos2::new(next.left(), next.center().y - 11.0), "Next", 20.0, theme::INK_2);
+                let name_x = next.left() + label.x + 20.0;
+                let (text, color) = match &board.next {
+                    Some(n) => (n.as_str(), theme::INK),
+                    None => ("End of the setlist", theme::INK_2),
+                };
+                let name = fitted(&p, text, 44.0, 24.0, next.right() - name_x, color);
+                p.galley(Pos2::new(name_x, next.center().y - name.size().y / 2.0), name, color);
+            }
+        }
 
         // Meters: the master, then every rig that plays in this part.
         let col_w = (reg.meters.width() - (cols - 1) as f32 * 24.0) / cols as f32;
@@ -379,7 +437,9 @@ impl DemoApp {
 
         // Panic (destructive, rule 85) and the way out.
         let bottom = reg.bottom;
-        let panic_rect = Rect::from_min_size(bottom.left_top(), Vec2::new((bottom.width() * 0.4).min(300.0), bottom.height()));
+        let narrow = (bottom.width() / 900.0).clamp(0.72, 1.0);
+        let qsize = |v: f32| ((v * narrow) * 2.0).round() / 2.0;
+        let panic_rect = Rect::from_min_size(bottom.left_top(), Vec2::new((bottom.width() * 0.34).clamp(180.0, 300.0), bottom.height()));
         let resp = ui.interact(panic_rect, egui::Id::unique("show_mode_panic"), egui::Sense::click());
         let (fill, edge) = if resp.hovered() {
             (mix(theme::DANGER_BG, theme::PAPER_SINK, 0.25), theme::CLIP_BRIGHT)
@@ -388,7 +448,7 @@ impl DemoApp {
         };
         p.rect_filled(panic_rect, 4.0, fill);
         p.rect_stroke(panic_rect, 4.0, Stroke::new(2.0, edge), egui::StrokeKind::Inside);
-        let word = p.layout_no_wrap("Panic".into(), theme::medium_font(36.0), theme::CLIP_BRIGHT);
+        let word = p.layout_no_wrap("Panic".into(), theme::medium_font(qsize(36.0)), theme::CLIP_BRIGHT);
         p.galley(panic_rect.center() - word.size() / 2.0, word, theme::CLIP_BRIGHT);
         if resp.clicked() {
             self.panic();
@@ -396,15 +456,18 @@ impl DemoApp {
         let now = self.ui_time;
         let Some(show) = &mut self.show_mode else { return };
         show.panic_rect = Some(panic_rect);
-        if show.panic_at.is_some_and(|t| now - t < PANIC_NOTE_SECS) {
-            let note = p.layout_no_wrap("All notes off".into(), theme::medium_font(28.0), theme::CREAM_META);
-            p.galley(Pos2::new(panic_rect.right() + 24.0, panic_rect.center().y - note.size().y / 2.0), note, theme::CREAM_META);
-        }
         let held_out = show.esc_since.is_some_and(|t| now - t >= LEAVE_HOLD_SECS);
-        let hint = if held_out { "Let go of Esc to leave" } else { "Hold Esc to leave" };
-        let hint = p.layout_no_wrap(hint.into(), theme::medium_font(28.0), theme::INK_2);
+        let hint_str = if held_out { "Let go of Esc to leave" } else { "Hold Esc to leave" };
+        let hint = p.layout_no_wrap(hint_str.into(), theme::medium_font(qsize(28.0)), theme::INK_2);
         let hint_w = hint.size().x;
         let hint_pos = Pos2::new(bottom.right() - hint_w, bottom.center().y - hint.size().y / 2.0 - 4.0);
+        if show.panic_at.is_some_and(|t| now - t < PANIC_NOTE_SECS) {
+            let note_avail = hint_pos.x - panic_rect.right() - 28.0;
+            if note_avail >= 60.0 {
+                let note = fitted(&p, "All notes off", qsize(28.0), 14.0, note_avail, theme::INK_2);
+                p.galley(Pos2::new(panic_rect.right() + 16.0, panic_rect.center().y - note.size().y / 2.0), note, theme::INK_2);
+            }
+        }
         let track = Rect::from_min_size(Pos2::new(hint_pos.x, hint_pos.y + hint.size().y + 6.0), Vec2::new(hint_w, 4.0));
         p.galley(hint_pos, hint, theme::INK_2);
         p.rect_filled(track, 2.0, theme::METER_TRACK);
@@ -421,6 +484,7 @@ impl DemoApp {
             "show_mode": self.show_mode.is_some(),
             "song": b.song,
             "part": b.part,
+            "next_part": b.next_part,
             "next_song": b.next,
             "tempo": b.tempo,
             "loading": b.loading,
@@ -616,7 +680,7 @@ mod tests {
             settle(&mut app, &ctx, size);
             let texts = frame(&mut app, &ctx, size, vec![]);
             let has = |want: &str| texts.iter().any(|(t, _)| t == want);
-            for want in ["Moonlight Drive", "Verse", "Riders on the Storm", "118 BPM · 4/4", "Master", "Piano", "Panic", "Hold Esc to leave"] {
+            for want in ["Moonlight Drive", "Verse", "Chorus", "Riders on the Storm", "118 BPM · 4/4", "Master", "Piano", "Panic", "Hold Esc to leave"] {
                 assert!(has(want), "{size:?}: the screen shows {want}: {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
             }
             assert!(!has("Organ"), "{size:?}: the organ does not play in the verse, so it has no meter");
@@ -631,6 +695,35 @@ mod tests {
                     let letters = a.chars().count() == 1 && b.chars().count() == 1;
                     assert!(letters || !ra.shrink(1.0).intersects(rb.shrink(1.0)), "{size:?}: '{a}' {ra:?} overlaps '{b}' {rb:?}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn show_mode_narrow_bottom_bar_and_indicators_fit_without_overlap() {
+        let size = Vec2::new(760.0, 520.0);
+        let mut app = gig();
+        let ctx = egui::Context::default();
+        app.playing = true;
+        app.player.playing = true;
+        app.set_show_mode(true);
+        settle(&mut app, &ctx, size);
+        app.panic();
+        if let Some(s) = &mut app.show_mode {
+            s.esc_since = Some(app.ui_time - LEAVE_HOLD_SECS - 0.1);
+        }
+        let texts = frame(&mut app, &ctx, size, vec![]);
+        let has = |want: &str| texts.iter().any(|(t, _)| t == want);
+        for want in ["♫ TRACK", "CLICK", "Moonlight Drive", "Verse", "Chorus", "Riders on the Storm", "Master", "Panic", "All notes off", "Let go of Esc to leave"] {
+            assert!(has(want), "narrow show mode shows {want}: {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        }
+        let window = Rect::from_min_size(Pos2::ZERO, size);
+        let inked: Vec<&(String, Rect)> = texts.iter().filter(|(t, _)| !t.trim().is_empty()).collect();
+        for (i, (a, ra)) in inked.iter().enumerate() {
+            assert!(window.contains_rect(*ra), "'{a}' at {ra:?} leaves the window");
+            for (b, rb) in &inked[i + 1..] {
+                let letters = a.chars().count() == 1 && b.chars().count() == 1;
+                assert!(letters || !ra.shrink(1.0).intersects(rb.shrink(1.0)), "'{a}' {ra:?} overlaps '{b}' {rb:?}");
             }
         }
     }

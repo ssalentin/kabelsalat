@@ -759,7 +759,9 @@ fn system_prompt() -> String {
      set_setlist_window keeps only the current song and the next load_ahead songs hosted (loading \
      upcoming songs in the background without blocking audio). Before a gig, \
      preshow_check says what could go wrong (devices, outputs, plugins, silent rigs, backing \
-     tracks, disk, buffer, power) and what to do about each.\n\
+     tracks, disk, buffer, power) and what to do about each. audio_doctor checks PipeWire \
+     quantum/rate, realtime priority (rtkit/RLIMIT_RTPRIO), CPU governor, USB audio \
+     autosuspend, and buffer xruns.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
      sound once wired.\n\
@@ -1289,6 +1291,11 @@ pub(crate) fn tools() -> Value {
             "name":"preshow_check",
             "description":"Check everything that could go wrong before the first song, and change nothing: every MIDI device the show binds is plugged in, the chosen audio output and the Audio In devices are connected, every plugin is installed and loads, every rig makes sound when played (an offline probe plays each rig's demo phrase in an engine of its own), every song's backing-track file is there, disk space for recording, buffer size and render headroom, battery and power. Takes a few seconds. Returns summary and checks: [{id, title, status: ok | warning | problem, text}], where text says what to do. Without session it checks the show loaded now; session = a saved session's name (list_sessions) or package path checks that one.",
             "parameters":{"type":"object","properties":{"session":{"type":"string"}}}
+        }},
+        {"type":"function","function":{
+            "name":"audio_doctor",
+            "description":"Run the read-only Audio Doctor diagnostic on Linux audio health: checks PipeWire quantum and sample rate vs kabelsalat's configured buffer, realtime audio priority (rtkit / RLIMIT_RTPRIO / live audio thread), CPU governor / power profile, USB audio autosuspend, and current buffer load / xrun causes. Changes nothing; returns summary, checks: [{id, title, status, text, fix_label}], and raw facts.",
+            "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_level",
@@ -2665,9 +2672,10 @@ mod tests {
             .iter()
             .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()))
             .collect();
-        for want in ["inspect_plugin", "list_params", "set_param", "reset_params"] {
+        for want in ["inspect_plugin", "list_params", "set_param", "reset_params", "audio_doctor"] {
             assert!(names.contains(&want), "missing tool {want}");
         }
+        assert_eq!(parse_tool_call(&all, "audio_doctor", "").unwrap(), json!({}));
         assert_eq!(
             parse_tool_call(&all, "set_param", r#"{"node":2,"name":"time","text":"300 ms"}"#).unwrap(),
             json!({"node": 2, "name": "time", "text": "300 ms"})

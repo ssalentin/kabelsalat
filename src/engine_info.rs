@@ -191,6 +191,7 @@ pub fn reset_counter_peaks() {
 pub fn reset_for_buffer_change() {
     bridge::RENDER_LAST_FRAMES.store(0, Ordering::Relaxed);
     bridge::RENDER_AVG_NS.store(0, Ordering::Relaxed);
+    bridge::AUDIO_THREAD_RT.store(0, Ordering::Relaxed);
     reset_counter_peaks();
 }
 

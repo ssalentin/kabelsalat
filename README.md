@@ -424,6 +424,25 @@ larger prevents xruns — and the choice is remembered across restarts. The
 assistant and MCP agents read and adjust the same engine settings
 (`get_engine_info`, `set_buffer_size`).
 
+### Diagnose latency and xruns with Audio Doctor
+Under **Settings → Audio**, **Audio Doctor** checks the Linux settings that
+most often cause crackles or unexpected delay: PipeWire's active quantum and
+sample rate compared with kabelsalat's buffer, realtime audio priority
+(`rtkit` / `RLIMIT_RTPRIO` and whether the live render thread runs realtime),
+the CPU frequency governor (`powersave` / `powerprofilesctl`), USB audio
+autosuspend (`auto` vs `on`), and current buffer load / xruns. Every finding
+comes in plain language with a non-blocking **Fix** button (or the exact
+one-line command when administrator permission is needed). You can also run a
+guided **Round-trip latency** measurement (via a loopback cable or speakers
+and microphone) and a cancellable 60-second **Live xrun check** that plays a
+test rig and explains the likely cause of any late buffers. Whenever
+**Setlist → Check show** flags a buffer or audio warning, **Open Audio Doctor**
+jumps straight here. Agents can run the same read-only diagnostic with the
+`audio_doctor` tool, and `kabelsalat audio-doctor [--json]` prints it in a
+terminal.
+
+<p align="center"><img src="docs/shots/audio-doctor.png" width="85%" alt="Settings → Audio → Audio Doctor showing PipeWire, realtime priority, CPU governor, USB autosuspend, buffer and xrun checks with one-click Fix buttons, round-trip latency readout, and live xrun check"/></p>
+
 ### Route MIDI anywhere
 The MIDI matrix decides which keyboard plays which rig. Each connection can be
 shaped: only some keys (keyboard splits), another MIDI channel, transposed, or

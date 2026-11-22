@@ -1831,3 +1831,10 @@ Learned so far (2026-11-15, UI polish pass):
     post-attach re-sync, and calls `engine.clear_lv2_last_events()` so
     `lv2_last_note` records only events sent during the turn
     (`organ_no_pad_ignores_load_time_face_sync_and_catches_agent_events`).
+210. **Audio Doctor runs checks and fixes off the UI thread and never blocks on
+    interactive `sudo`:** system probes (`pw-metadata`, `systemctl`, sysfs,
+    round-trip chirp measurement) and fixes (`apply_fix`, `sudo -n` with null
+    stdin) run on background threads (`audio_doctor::tests`,
+    `ui::audio_doctor::tests`); `bridge::record_current_thread_rt` runs once
+    per audio stream callback (reset on reopen) so `audio_doctor` stays
+    read-only across UI, assistant, MCP, and CLI.

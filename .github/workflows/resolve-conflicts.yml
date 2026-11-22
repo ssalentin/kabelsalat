@@ -1,20 +1,22 @@
 name: Resolve conflicts
 
-# After every merge to main, open PRs that now conflict get main merged in
-# when the conflicts are only insertions on both sides of a Markdown file
-# (AGENTS.md rules appended by parallel PRs, older CHANGELOG entries):
-# scripts/ci/resolve_appends.py keeps both. Any other conflict, or a merge
-# GITHUB_TOKEN may not push (it touches .github/workflows), gets the label
-# `merge-conflict` for the PR's author (an agent) to resolve by hand.
+# After every merge to main, inspect open PRs that now conflict.
+#
+# GitHub holds `pull_request` workflows triggered by a `GITHUB_TOKEN` push in
+# `action_required` awaiting manual approval, and ignores `workflow_dispatch`
+# check runs for required PR status checks — so pushing a bot merge commit
+# strands PRs in `BLOCKED` without required checks. Instead, check conflicts
+# read-only with `scripts/ci/resolve_appends.py`, apply the `merge-conflict`
+# label with instructions to run `scripts/sync-branch.sh --push`, and remove
+# the label once the PR is mergeable again.
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
-  actions: write
 
 concurrency:
   group: resolve-conflicts
@@ -28,17 +30,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Merge main into conflicting PRs
+      - name: Check open PRs for conflicts
         run: |
           cp scripts/ci/resolve_appends.py "$RUNNER_TEMP/"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           gh label create merge-conflict --color D93F0B \
             --description "Conflicts with main that need a hand (resolve-conflicts.yml)" 2>/dev/null || true
-          flag() { # <pr> <why>
+          flag() { # <pr> <body_message>
             if ! gh pr view "$1" --json labels -q '.labels[].name' | grep -qx merge-conflict; then
               gh pr edit "$1" --add-label merge-conflict
-              gh pr comment "$1" --body "This PR conflicts with \`main\` and could not be merged automatically: $2. Merge \`main\` into the branch, resolve, and push."
+              gh pr comment "$1" --body "$2"
             fi
           }
           for pr in $(gh pr list --state open --json number,isCrossRepository -q '.[] | select(.isCrossRepository | not) | .number'); do
@@ -57,20 +59,18 @@ jobs:
               continue
             fi
             git fetch -q origin "$branch"
-            git checkout -q -B work FETCH_HEAD
-            if ! git merge -q --no-edit origin/main; then
-              if ! python3 "$RUNNER_TEMP/resolve_appends.py"; then
-                git merge --abort
-                flag "$pr" "conflicts other than insertions into Markdown files"
-                continue
-              fi
-              git commit -q --no-edit
+            git checkout -q --detach FETCH_HEAD
+            append_only=0
+            if git merge -q --no-commit --no-ff origin/main; then
+              append_only=1
+            elif python3 "$RUNNER_TEMP/resolve_appends.py"; then
+              append_only=1
             fi
-            if ! git push -q origin "HEAD:$branch"; then
-              flag "$pr" "the bot may not push this merge (it changes .github/workflows, or the branch moved)"
-              continue
+            git merge --abort 2>/dev/null || git reset --hard -q FETCH_HEAD
+            git clean -fdq
+            if [ "$append_only" -eq 1 ]; then
+              flag "$pr" "This PR conflicts with \`main\` (append-only Markdown conflict). Because a bot push with \`GITHUB_TOKEN\` cannot trigger required PR checks without manual approval, the bot no longer pushes merge commits. Run \`scripts/sync-branch.sh --push\` to rebase, auto-resolve the Markdown conflict, and run CI."
+            else
+              flag "$pr" "This PR conflicts with \`main\` (conflicts other than insertions into Markdown files). Run \`scripts/sync-branch.sh --push\`, resolve the conflicts, rerun gate tests, and push."
             fi
-            # A push with GITHUB_TOKEN starts no workflow; dispatch the required checks.
-            gh workflow run ci.yml --ref "$branch"
-            gh pr comment "$pr" --body "Merged \`main\` into this branch: the conflicts were insertions on both sides of Markdown files, both kept (\`scripts/ci/resolve_appends.py\`). Pull before your next push."
           done

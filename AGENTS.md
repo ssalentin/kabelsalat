@@ -47,7 +47,7 @@
   the gate tests again and rerun the script; when main changed a file you
   changed too (exit 3), run that file's test modules (rule 155) and rerun
   it. Once the PR is open, keep it rebased until it merges: watch it, and on
-  the `merge-conflict` label, a `resolve-conflicts` bot merge, or a red CI
+  the `merge-conflict` label or a red CI
   run caused by a newer `main`, run the script again at once. Never merge
   `main` into a branch by hand (a rebase keeps the PR diff to your change),
   never `git push --force` without `--with-lease`, and never rebase or
@@ -62,9 +62,9 @@
   and audio do not run in CI, so their output belongs in every PR body that
   changes the code they cover; what this machine could not run goes under
   `## Bench test` ("Bench tests" below). Branches are rebased onto `main`
-  before every push (previous rule); `resolve-conflicts.yml` still merges
-  `main` into open PRs whose conflicts are appended Markdown lines, and
-  `scripts/sync-branch.sh` drops that bot merge on your next push, so a
+  before every push (previous rule); `resolve-conflicts.yml` checks
+  conflicting PRs read-only and labels them `merge-conflict` for the
+  session to rebase with `scripts/sync-branch.sh --push`, so a
   `git pull` is never needed. An open `main-red` issue means `main` is broken: fixing it comes
   before new work (`docs/PACKAGING.md`, "Branch protection and a red main").
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
@@ -1838,3 +1838,13 @@ Learned so far (2026-11-15, UI polish pass):
     `ui::audio_doctor::tests`); `bridge::record_current_thread_rt` runs once
     per audio stream callback (reset on reopen) so `audio_doctor` stays
     read-only across UI, assistant, MCP, and CLI.
+208. **Never rely on `GITHUB_TOKEN` pushes/merges to satisfy required PR checks
+    or trigger `push` workflows, and set `LC_ALL=C` around `sort`/`comm`:**
+    a push or auto-merge made with `GITHUB_TOKEN` suppresses `push` workflows
+    (leaving `tag-release.yml` unrun until `workflow_run` on `CI` for
+    `release-*` catches it), holds `pull_request` workflows in
+    `action_required`, and `workflow_dispatch` check runs do not satisfy
+    required branch-protection checks (`resolve-conflicts.yml` therefore flags
+    conflicts read-only instead of pushing bot commits). In `sync-branch.sh`,
+    sort and compare paths under `LC_ALL=C` and persist overlaps across plain
+    rebases so `--push` still exits 3.

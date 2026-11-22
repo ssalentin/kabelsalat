@@ -87,24 +87,30 @@ opens one issue labelled `main-red` with the failing run (and closes it when
 ### Conflicts between parallel PRs
 
 Parallel PRs append to the same lists, above all the AGENTS.md rules. After
-every merge to `main`, `.github/workflows/resolve-conflicts.yml` merges `main`
-into each open PR that now conflicts, when every conflict is an insertion on
-both sides of a Markdown file: `scripts/ci/resolve_appends.py` keeps both
-(two rules may then share a number; refer to rules by their test name too).
-It pushes the merge and dispatches CI. Any other conflict, including every
-conflict in code, gets the label `merge-conflict` and a comment; the branch's
-author resolves it (the script also works locally inside a conflicted
-`git merge` or `git rebase`). Changelog entries are fragments (below), so they
-never conflict.
+every merge to `main`, `.github/workflows/resolve-conflicts.yml` inspects each
+open PR that now conflicts by dry-running a merge with
+`scripts/ci/resolve_appends.py` (which checks whether every conflict is an
+insertion on both sides of a Markdown file) without pushing a bot commit:
+GitHub holds `pull_request` workflows from `GITHUB_TOKEN` pushes in
+`action_required` awaiting manual approval and ignores `workflow_dispatch`
+check runs for required PR status checks. Instead, `resolve-conflicts.yml`
+applies the `merge-conflict` label and posts a comment instructing the
+author (or agent) to run `scripts/sync-branch.sh --push`, and removes the
+label once the PR is mergeable again. Changelog entries are fragments
+(below), so they never conflict.
 
 Agents do not wait for the bot: every push goes through
 `scripts/sync-branch.sh --push`, which fetches, rebases the branch onto
-`origin/main` (append-only Markdown conflicts resolved with the same script),
-and pushes with `--force-with-lease`. It stops with exit 2 on a conflict it
-cannot resolve and with exit 3 when `main` changed a file the branch changes
-too, so the author re-runs those tests before the push (AGENTS.md, "Rebase
-before every push"). A bot merge already on the branch is dropped by the
-rebase; its content is in `main`.
+`origin/main` (append-only Markdown conflicts resolved with
+`scripts/ci/resolve_appends.py`), and pushes with `--force-with-lease`. It
+stops with exit 2 on a conflict it cannot resolve and records any
+non-Markdown overlap in `$(git rev-parse --git-path sync-branch-overlap)`
+so that `--push` stops once with exit 3 naming those files — whether the
+rebase happened in the same `--push` invocation or an earlier plain
+`scripts/sync-branch.sh` run — until the author reruns those tests and
+runs `--push` again (AGENTS.md, "Rebase before every push"). Any older
+merge commit on the branch is dropped by the rebase; its content is in
+`main`.
 
 ## Release packages
 
@@ -260,10 +266,15 @@ gh workflow run prepare-release.yml -f bump=minor   # patch | minor | major | X.
    `Cargo.toml` and `Cargo.lock`, folds the fragments and the Unreleased
    block into `## [X.Y.Z] — <date>` (with compare links), adds the metainfo
    `<release>` entry and deletes the fragments. It opens the PR
-   `release-X.Y.Z`, queues it for auto-merge and dispatches CI on it (a PR
-   opened with `GITHUB_TOKEN` starts no workflow by itself).
-2. When it merges, `tag-release.yml` sees a `Cargo.toml` version without a
-   tag, tags the merge commit `vX.Y.Z` and dispatches `release.yml` on it.
+   `release-X.Y.Z` and queues it for auto-merge; because it is opened with
+   `GITHUB_TOKEN`, a maintainer clicks **Approve and run** on its
+   `pull_request` workflow runs so CI runs and satisfies the required checks.
+2. When it merges, `tag-release.yml` tags the merge commit `vX.Y.Z` and
+   dispatches `release.yml` on it. It triggers via `workflow_run` when `CI`
+   completes on `release-*` (waiting for auto-merge to land, including bot
+   auto-merges where GitHub suppresses the `push` event), on `push` to
+   `main` touching `Cargo.toml` (manual merges), and via `workflow_dispatch`
+   as a manual fallback.
 3. `release.yml` checks that the tag matches `Cargo.toml`, that the CHANGELOG
    has notes for it and that the metainfo lists it, then builds every package
    and publishes the release. Check it with `gh release view vX.Y.Z --json

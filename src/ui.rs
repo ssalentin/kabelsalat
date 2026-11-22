@@ -18043,7 +18043,7 @@ impl DemoApp {
                 let retro_w = if show_retro { 58.0 + gap } else { 0.0 };
                 let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + (if show_sync { gap } else { 0.0 })
                     + rec_w + gap + retro_w + take_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
-                let view_w = (if compact { 286.0 } else { 332.0 }) + 26.0 + gap;
+                let view_w = (if compact { 240.0 } else { 268.0 }) + 26.0 + gap;
 
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), ROW_H),
@@ -18315,7 +18315,7 @@ impl DemoApp {
                             let gear = settings_icon_button(ui, self.stage_view == StageView::Settings)
                                 .on_hover_text("Settings · key ,");
                             self.settings_btn_rect = gear.rect;
-                            if gear.clicked() {
+                            if gear.clicked() && self.stage_view != StageView::Settings {
                                 self.toggle_stage(StageView::Settings);
                             }
 

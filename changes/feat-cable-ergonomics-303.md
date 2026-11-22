@@ -1,2 +1,0 @@
-### Added
-- **Back-panel cable ergonomics (#303):** Hovering a jack on the back of the rack now traces all cables connected to it while dimming unrelated routes, and shows a live port tooltip with connected source/destination labels and signal readouts (dBFS for audio, active/recent notes for MIDI). Added persistent **Cable opacity** (30–100%) and **Cable tension** controls in **Settings → Display** and on the back panel, plus a right-click menu on cables and occupied jacks to cycle family-safe jacket colors or unplug all cables on a jack.

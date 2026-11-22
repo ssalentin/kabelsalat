@@ -1,2 +1,0 @@
-### Fixed
-- **Ignore chattering hardware MIDI CCs during learn and per port:** continuously oscillating or stuck hardware CCs (such as a scratchy potentiometer) no longer hijack knob, switch, or show-control MIDI learn. In the MIDI Matrix, any chattering CC offers a one-click `Ignore CC N` chip on its hardware port row that drops that CC at hardware MIDI intake (saved per port in `config.json` as `ignored_ccs`) so it never reaches plugins, knobs, or MIDI learn.

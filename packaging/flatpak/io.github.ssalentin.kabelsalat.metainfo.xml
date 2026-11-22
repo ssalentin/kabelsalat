@@ -53,6 +53,9 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.0" date="2026-11-22">
+      <url type="details">https://github.com/ssalentin/kabelsalat/releases/tag/v0.3.0</url>
+    </release>
     <release version="0.2.0" date="2026-11-20">
       <url type="details">https://github.com/ssalentin/kabelsalat/releases/tag/v0.2.0</url>
     </release>

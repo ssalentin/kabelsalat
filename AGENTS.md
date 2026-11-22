@@ -1867,3 +1867,9 @@ Learned so far (2026-11-15, UI polish pass):
     (updating `node_t0` before the next awake unit), and gate away stray
     `NoteOff` / `at_rest` messages when a non-live rig is already asleep
     (`idle_sleep_tests`).
+209. **Modal overlays fit inside the stage rect and stack/scroll when tight:**
+    `draw_help` laid out fixed-width columns wider than a `760×520` window,
+    clipping `"kabelsalat"` and left-column chips at `x < 0` (#111). Bound
+    modal cards to the stage `rect`, switch to a stacked, wrapped, scrollable
+    layout when narrow or short, and cover both Navigator-closed and
+    Navigator-open frames in `window_size_layout_tests::every_view_fits_small_windows`.

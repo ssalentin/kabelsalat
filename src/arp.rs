@@ -870,6 +870,11 @@ impl ArpState {
         (0..128u8).filter(|&n| self.down[n as usize] > 0).collect()
     }
 
+    /// True while any key is held or any generated note is sounding. Allocation-free.
+    pub fn is_active(&self) -> bool {
+        self.held_n > 0 || self.down.iter().any(|&c| c > 0)
+    }
+
     /// Everything that decides this arp's future behaviour, as a comparable
     /// string (the held-notes check's state key). The step counter only
     /// matters modulo the pattern length (≤ 4 here); the clock itself is

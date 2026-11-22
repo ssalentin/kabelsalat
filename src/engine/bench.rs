@@ -9,6 +9,7 @@
 //!   through the real input rings, publishing to a `GraphPub` like the app.
 //! - `routing`: the same rack with every effect a Gain: what the engine
 //!   itself costs around the units (routing, strips, publication, master).
+//! - `idle`: 1 live rig vs 1 live + 7 idle rigs (real Surge XT + Reverb, #206).
 //! - one line per built-in unit, the master meter and the master limiter.
 //!
 //! Times are per frame (median of `REPS` runs, with the range) and per block:
@@ -188,6 +189,198 @@ fn bench_meter() {
     println!("meter   {:<12} median={med:7.2} ns/frame  range={lo:.2}..{hi:.2}  hash={hash:016x}", "master");
 }
 
+struct IdleRep {
+    ns_per_frame: f64,
+    p999_ns: f64,
+    worst_ns: f64,
+    peak: f32,
+    hash: u64,
+    sleeping_after_settle: u32,
+    sleeping_after_play: u32,
+}
+
+struct IdleStats {
+    med_ns: f64,
+    lo_ns: f64,
+    hi_ns: f64,
+    p999_ns: f64,
+    worst_ns: f64,
+    peak: f32,
+    hash: u64,
+    sleeping_after_settle: u32,
+    sleeping_after_play: u32,
+}
+
+fn run_idle_rep(total_rigs: usize, state: Option<&[u8]>, frames: usize) -> anyhow::Result<IdleRep> {
+    use crate::control::{ClapId, RigZone, MAX_RIGS, SURGE_PLUGIN_ID};
+    use crate::host::{ClapVoice, ClapVoiceMain};
+    use crate::matrix::SourceId;
+
+    const IDLE_SECONDS: usize = 3;
+    let settle_blocks = (2.5 * SR / frames as f64).ceil() as usize;
+    let blocks = IDLE_SECONDS * SR as usize / frames;
+    let cycle_blocks = (0.75 * SR / frames as f64).round() as usize;
+    let on_blocks = (0.50 * SR / frames as f64).round() as usize;
+
+    let mut g = Graph::default();
+    g.reserve(total_rigs * 4, total_rigs * 4);
+    let mut voices: Vec<(NodeId, ClapVoice)> = Vec::with_capacity(total_rigs);
+    let mut mains: Vec<ClapVoiceMain> = Vec::with_capacity(total_rigs);
+    let mut eid = 1u32;
+    for rig in 0..total_rigs {
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(NodeKind::Clap { plugin_id: ClapId::new(SURGE_PLUGIN_ID) }, name_bytes("SURGE"));
+        let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        for id in [keys, synth, verb, master] {
+            g.set_rig(id, rig as u8);
+        }
+        g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+        g.connect_with_id(eid + 1, PortRef { node: synth, port: 0 }, PortRef { node: verb, port: 0 }, PortKind::Audio);
+        g.connect_with_id(eid + 2, PortRef { node: verb, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g.connect_with_id(eid + 3, PortRef { node: verb, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+        eid += 4;
+        let (v, mut m) = ClapVoice::new_plugin(SR, SURGE_PLUGIN_ID)?;
+        if let Some(blob) = state {
+            m.load_state(blob)?;
+        }
+        voices.push((synth, v));
+        mains.push(m);
+    }
+
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g, drain, SR, voices);
+    engine.set_graph_pub(Arc::new(Mutex::new(GraphPub::default())));
+
+    let mut out = vec![0.0f32; frames * 2];
+    for _ in 0..4 {
+        engine.render(&mut out, 2);
+    }
+    let mut zones = [RigZone { live: false, ..RigZone::OPEN }; MAX_RIGS];
+    zones[0] = RigZone::OPEN;
+    assert!(bus.send(Command::SetRigZones { zones }));
+    for _ in 0..settle_blocks {
+        engine.render(&mut out, 2);
+    }
+    let sleeping_after_settle = engine.sleeping_rigs_mask().count_ones();
+    if total_rigs > 1 && sleeping_after_settle != (total_rigs - 1) as u32 {
+        anyhow::bail!(
+            "expected {} sleeping idle rigs after settle, got {sleeping_after_settle} (mask={:#b})",
+            total_rigs - 1,
+            engine.sleeping_rigs_mask()
+        );
+    }
+
+    let mut times = vec![0u64; blocks];
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut peak = 0.0f32;
+    for (b, t) in times.iter_mut().enumerate() {
+        let phase = b % cycle_blocks;
+        if phase == 0 {
+            for note in [60u8, 64, 67] {
+                let _ = bus.send(Command::NoteOn { note, velocity: 0.85, source: SourceId::Keys, channel: 0 });
+            }
+        } else if phase == on_blocks {
+            for note in [60u8, 64, 67] {
+                let _ = bus.send(Command::NoteOff { note, source: SourceId::Keys, channel: 0 });
+            }
+        }
+        let t0 = std::time::Instant::now();
+        engine.render(std::hint::black_box(&mut out), 2);
+        *t = t0.elapsed().as_nanos() as u64;
+        for &s in &out {
+            fnv(&mut hash, s);
+            peak = peak.max(s.abs());
+        }
+    }
+    let sleeping_after_play = engine.sleeping_rigs_mask().count_ones();
+    if total_rigs > 1 && sleeping_after_play != (total_rigs - 1) as u32 {
+        anyhow::bail!(
+            "expected {} sleeping idle rigs after play, got {sleeping_after_play} (mask={:#b})",
+            total_rigs - 1,
+            engine.sleeping_rigs_mask()
+        );
+    }
+    let ns_per_frame = times.iter().sum::<u64>() as f64 / (blocks * frames) as f64;
+    times.sort_unstable();
+    let p999_ns = times[blocks * 999 / 1000] as f64;
+    let worst_ns = times[blocks - 1] as f64;
+    drop(engine);
+    drop(mains);
+    Ok(IdleRep { ns_per_frame, p999_ns, worst_ns, peak, hash, sleeping_after_settle, sleeping_after_play })
+}
+
+fn summarize_idle(reps: &[IdleRep]) -> IdleStats {
+    let (med_ns, lo_ns, hi_ns) = median(reps.iter().map(|r| r.ns_per_frame).collect());
+    let (p999_ns, _, _) = median(reps.iter().map(|r| r.p999_ns).collect());
+    let worst_ns = reps.iter().map(|r| r.worst_ns).fold(f64::MAX, f64::min);
+    let last = reps.last().expect("at least one rep");
+    IdleStats {
+        med_ns,
+        lo_ns,
+        hi_ns,
+        p999_ns,
+        worst_ns,
+        peak: last.peak,
+        hash: last.hash,
+        sleeping_after_settle: last.sleeping_after_settle,
+        sleeping_after_play: last.sleeping_after_play,
+    }
+}
+
+/// 1 live rig vs 1 live + 7 idle rigs (real Surge XT + built-in Reverb each, #206).
+fn bench_idle() -> anyhow::Result<()> {
+    if let Err(e) = crate::host::ClapVoice::new(SR) {
+        println!("idle    SKIP — Surge XT is not installed ({e})");
+        return Ok(());
+    }
+    const IDLE_REPS: usize = 5;
+    let frames = crate::bridge::BUFFER_FRAMES as usize;
+    let block_us = frames as f64 / SR * 1e6;
+    let state = surge_piano_state();
+    // Warm up plugin library once before alternating runs.
+    let _ = run_idle_rep(1, state.as_deref(), frames)?;
+    let mut one_reps = Vec::with_capacity(IDLE_REPS);
+    let mut eight_reps = Vec::with_capacity(IDLE_REPS);
+    for _ in 0..IDLE_REPS {
+        one_reps.push(run_idle_rep(1, state.as_deref(), frames)?);
+        eight_reps.push(run_idle_rep(8, state.as_deref(), frames)?);
+    }
+    let one = summarize_idle(&one_reps);
+    let eight = summarize_idle(&eight_reps);
+
+    for (label, st, sleep_info) in [
+        ("1 live", &one, String::new()),
+        ("1+7 idle", &eight, format!("  sleeping={}/7", eight.sleeping_after_play.min(eight.sleeping_after_settle))),
+    ] {
+        let bus = st.med_ns * frames as f64 / 1000.0;
+        println!(
+            "idle    {label:<10} median={:7.2} ns/frame  range={:.2}..{:.2}  block={bus:6.2} us ({:.2}% of {frames})  p99.9={:6.2} us  worst={:6.2} us  peak={:.3}  hash={:016x}{sleep_info}",
+            st.med_ns,
+            st.lo_ns,
+            st.hi_ns,
+            bus / block_us * 100.0,
+            st.p999_ns / 1000.0,
+            st.worst_ns / 1000.0,
+            st.peak,
+            st.hash,
+        );
+    }
+    if one.hash != eight.hash {
+        anyhow::bail!("1+7 idle hash {:016x} diverged from 1 live {:016x}", eight.hash, one.hash);
+    }
+    let one_us = one.med_ns * frames as f64 / 1000.0;
+    let eight_us = eight.med_ns * frames as f64 / 1000.0;
+    let extra_us = eight_us - one_us;
+    println!(
+        "idle    overhead   +{extra_us:6.2} us/block (+{:.2}% of {frames})  {:.2} us/idle rig  ({:.2}x of 1 live)",
+        extra_us / block_us * 100.0,
+        extra_us / 7.0,
+        eight_us / one_us.max(0.001),
+    );
+    Ok(())
+}
+
 pub fn bench() -> anyhow::Result<()> {
     // `engine-bench session` / `routing` / `units` / `shared`: only that part.
     let only = std::env::args().nth(2);
@@ -216,6 +409,9 @@ pub fn bench() -> anyhow::Result<()> {
     }
     if part("shared") {
         bench_shared()?;
+    }
+    if part("idle") {
+        bench_idle()?;
     }
     Ok(())
 }

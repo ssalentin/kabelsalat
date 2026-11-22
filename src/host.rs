@@ -46,12 +46,14 @@ use clack_extensions::params::{
 };
 use clack_extensions::remote_controls::{PluginRemoteControls, RemoteControlsPageBuffer};
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
+use clack_extensions::tail::{HostTail, HostTailImpl, PluginTail, TailLength};
 use clack_host::events::event_types::{
     MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match};
 use clack_host::host::{HostError, HostExtensions};
 use clack_host::prelude::*;
+use clack_host::process::ProcessStatus;
 use clack_host::utils::{BeatTime, SecondsTime};
 
 use crate::main_controls::{self, Candidate, MainControls, RemotePage};
@@ -83,12 +85,16 @@ struct HostShared {
     gui: OnceLock<Option<PluginGui>>,
     timer: OnceLock<Option<PluginTimer>>,
     posix_fd: OnceLock<Option<PluginPosixFd>>,
+    tail: OnceLock<Option<PluginTail>>,
     // Plugin -> host requests. The plugin may raise them from any thread,
     // its audio thread included, so they are flags and nothing else;
     // `ClapVoiceMain::service` reads them on the main thread.
     callback_requested: AtomicBool,
     restart_requested: AtomicBool,
     flush_requested: AtomicBool,
+    /// Raised by `request_process`, `request_restart`, or `request_flush` so
+    /// a sleeping rig wakes immediately (#206).
+    wake_requested: AtomicBool,
     // Editor requests. clack dispatches every HostGuiImpl callback to the
     // shared handler (they may come from any thread).
     gui_resize: Mutex<Option<GuiSize>>,
@@ -105,13 +111,16 @@ impl<'a> SharedHandler<'a> for HostShared {
         let _ = self.gui.set(instance.get_extension());
         let _ = self.timer.set(instance.get_extension());
         let _ = self.posix_fd.set(instance.get_extension());
+        let _ = self.tail.set(instance.get_extension());
     }
     fn request_restart(&self) {
         self.restart_requested.store(true, Ordering::SeqCst);
+        self.wake_requested.store(true, Ordering::Release);
     }
-    /// Nothing to do: a voice a unit plays is processed in every block, and
-    /// a voice no unit plays is retired, never put to sleep.
-    fn request_process(&self) {}
+    /// Wake a sleeping rig so the audio thread resumes calling `process()` (#206).
+    fn request_process(&self) {
+        self.wake_requested.store(true, Ordering::Release);
+    }
     fn request_callback(&self) {
         self.callback_requested.store(true, Ordering::SeqCst);
     }
@@ -127,6 +136,7 @@ impl HostLogImpl for HostShared {
 impl HostParamsImplShared for HostShared {
     fn request_flush(&self) {
         self.flush_requested.store(true, Ordering::SeqCst);
+        self.wake_requested.store(true, Ordering::Release);
     }
 }
 
@@ -246,12 +256,25 @@ impl HostParamsImplMainThread for HostMainThread {
     fn clear(&self, _param_id: ClapId, _flags: ParamClearFlags) {}
 }
 
+#[derive(Default)]
+struct HostAudioProcessor {
+    tail_changed: bool,
+}
+
+impl AudioProcessorHandler<'_> for HostAudioProcessor {}
+
+impl HostTailImpl for HostAudioProcessor {
+    fn changed(&mut self) {
+        self.tail_changed = true;
+    }
+}
+
 struct TestHost;
 
 impl HostHandlers for TestHost {
     type Shared<'a> = HostShared;
     type MainThread<'a> = HostMainThread;
-    type AudioProcessor<'a> = ();
+    type AudioProcessor<'a> = HostAudioProcessor;
 
     fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
         builder
@@ -261,7 +284,8 @@ impl HostHandlers for TestHost {
             .register::<HostLatency>()
             .register::<HostGui>()
             .register::<HostTimer>()
-            .register::<HostPosixFd>();
+            .register::<HostPosixFd>()
+            .register::<HostTail>();
     }
 }
 
@@ -275,6 +299,7 @@ struct Exts {
     gui: Option<PluginGui>,
     timer: Option<PluginTimer>,
     posix_fd: Option<PluginPosixFd>,
+    tail: Option<PluginTail>,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,9 +381,19 @@ struct StateGate {
     processed: AtomicU64,
     /// The main side wants no `process()` call to run.
     held: AtomicBool,
+    /// Main thread changed state / opened editor / restarted: wake if sleeping (#206).
+    wake_requested: AtomicBool,
 }
 
 impl StateGate {
+    fn request_wake(&self) {
+        self.wake_requested.store(true, Ordering::Release);
+    }
+
+    fn take_wake(&self) -> bool {
+        self.wake_requested.swap(false, Ordering::AcqRel)
+    }
+
     /// Audio side, before `process()`: false while the main side holds the
     /// gate. After true, `leave` follows the call.
     fn enter(&self) -> bool {
@@ -433,7 +468,9 @@ impl Live {
             min_frames_count: 1,
             max_frames_count: BLOCK as u32,
         };
-        let stopped = plugin.activate(|_, _| (), audio_config).context("activating the plugin")?;
+        let stopped = plugin
+            .activate(|_, _| HostAudioProcessor::default(), audio_config)
+            .context("activating the plugin")?;
         let mut param_ranges = Vec::new();
         if let Some(params) = exts.params {
             let handle = plugin.plugin_handle();
@@ -541,6 +578,14 @@ pub struct ClapVoice {
     /// What the plugin reported when it was activated, or after a
     /// `host_latency.changed()` poll on the main thread, in frames.
     latency: Arc<std::sync::atomic::AtomicU32>,
+    /// Optional `clap.tail` extension, queried on the audio thread.
+    tail_ext: Option<PluginTail>,
+    /// Last status returned by `process()`, used for idle-rig sleep (#206).
+    last_status: ProcessStatus,
+    /// Most recently queried CLAP tail length.
+    tail_length: TailLength,
+    /// Whether `tail_ext.get()` has been queried for the active processor.
+    tail_queried: bool,
 }
 
 fn entry_is_effect(entry: &PluginEntry, id_str: &str) -> bool {
@@ -637,6 +682,7 @@ impl ClapVoice {
             gui: h.gui.get().copied().flatten(),
             timer: h.timer.get().copied().flatten(),
             posix_fd: h.posix_fd.get().copied().flatten(),
+            tail: h.tail.get().copied().flatten(),
         });
         println!(
             "extensions: params={} state={} latency={} audio-ports={} remote-controls={}",
@@ -696,6 +742,10 @@ impl ClapVoice {
             process_errors: 0,
             gate: gate.clone(),
             latency: shared_latency.clone(),
+            tail_ext: exts.tail,
+            last_status: ProcessStatus::Continue,
+            tail_length: TailLength::Finite(0),
+            tail_queried: false,
         };
         let main_id = id_str;
         let mut main = ClapVoiceMain {
@@ -800,6 +850,50 @@ impl ClapVoice {
         self.process_errors
     }
 
+    /// Last CLAP `ProcessStatus` returned by `process()`. Allocation- and lock-free.
+    pub fn last_process_status(&self) -> ProcessStatus {
+        self.last_status
+    }
+
+    /// Plugin-reported CLAP tail length (`None` if the plugin does not implement
+    /// `clap.tail`). Allocation- and lock-free.
+    pub fn tail_length(&self) -> Option<TailLength> {
+        self.tail_ext.map(|_| self.tail_length)
+    }
+
+    /// Check and clear any pending wake trigger for a sleeping voice: plugin
+    /// `request_process`/`request_restart`/`request_flush`, main-thread state
+    /// load/editor open/restart handoff, or queued events. Allocation- and lock-free.
+    pub fn take_wake_request(&mut self) -> bool {
+        let mut wake = self.gate.take_wake();
+        if let Some(live) = self.live.as_ref() {
+            wake |= live.processor.access_shared_handler(|h| h.wake_requested.swap(false, Ordering::AcqRel));
+        } else if !self.link.from_main.is_empty() {
+            wake = true;
+        }
+        if self.link.stop.load(Ordering::Acquire) {
+            wake = true;
+        }
+        wake || !self.rt_cmds.is_empty() || !self.cmds_rx.is_empty() || self.sched_idx < self.schedule.len()
+    }
+
+    /// True while a restart is in progress or queued events wait to be rendered.
+    /// Allocation- and lock-free; does not consume `wake_requested`.
+    pub fn has_pending_work(&self) -> bool {
+        self.live.is_none()
+            || self.link.stop.load(Ordering::Acquire)
+            || !self.rt_cmds.is_empty()
+            || !self.cmds_rx.is_empty()
+            || self.sched_idx < self.schedule.len()
+    }
+
+    /// Advance the sample clock across a sleeping block without calling
+    /// `process()`, keeping pending restart handoffs responsive. Allocation- and lock-free.
+    pub fn sleep_skip(&mut self, frames: usize) {
+        self.hand_over();
+        self.frame += frames as u64;
+    }
+
     /// Render `out.len() / 2` stereo-interleaved frames with the host
     /// `transport` as of the first frame. RT-safe: no allocation, no locks,
     /// no syscalls. Call from the audio thread only.
@@ -849,6 +943,10 @@ impl ClapVoice {
             out[..n * 2].fill(0.0);
             return;
         }
+        // Clear pending wake flags right before `process()`: any request raised
+        // prior to this block is served now, while one raised during/after stays.
+        self.gate.take_wake();
+        processor.access_shared_handler(|h| h.wake_requested.store(false, Ordering::Release));
         self.ev_in.clear();
         self.ev_out.clear();
 
@@ -921,14 +1019,28 @@ impl ClapVoice {
             Some(&transport_event(transport)),
         );
         self.gate.leave();
-        if status.is_err() {
-            self.process_errors += 1;
-        }
+        let failed = match status {
+            Ok(ps) => {
+                self.last_status = ps;
+                let tail_changed = processor.access_handler_mut(|h| std::mem::take(&mut h.tail_changed));
+                if tail_changed || !self.tail_queried {
+                    if let Some(ext) = self.tail_ext {
+                        self.tail_length = ext.get(&processor.plugin_handle());
+                    }
+                    self.tail_queried = true;
+                }
+                false
+            }
+            Err(_) => {
+                self.process_errors += 1;
+                self.last_status = ProcessStatus::Continue;
+                true
+            }
+        };
 
         // Copy the MAIN output port into `out` (stereo, or mono centered to
         // L and R); auxiliary output ports are rendered but unused. On
         // process failure output silence.
-        let failed = status.is_err();
         let main_chs = &out_bufs[*main_out];
         if failed || main_chs.is_empty() {
             out[..n * 2].fill(0.0);
@@ -952,7 +1064,11 @@ impl ClapVoice {
     /// Moves two boxes; allocates and frees nothing.
     fn hand_over(&mut self) {
         if self.live.is_none() {
-            self.live = self.link.from_main.pop().ok();
+            if let Ok(live) = self.link.from_main.pop() {
+                self.live = Some(live);
+                self.tail_queried = false;
+                self.last_status = ProcessStatus::Continue;
+            }
         }
         // The request stays up until there is a set to give: the main
         // thread may ask again before the last one it sent was adopted.
@@ -1284,6 +1400,61 @@ mod host_request_tests {
             println!("real CLAP effect {id}: test tone peak {peak:.3}");
             assert!(peak >= 1e-3, "{id} output was silent (peak {peak})");
         }
+    }
+
+    #[test]
+    fn clap_sleep_status_tail_extension_and_request_process_wake() {
+        use clap_sys::process::{CLAP_PROCESS_SLEEP, CLAP_PROCESS_TAIL};
+
+        let (mut voice, mut main, probe) = host_probe();
+        assert_eq!(voice.last_process_status(), ProcessStatus::Continue);
+        assert_eq!(voice.tail_length(), Some(TailLength::Finite(0)));
+
+        // CLAP_PROCESS_TAIL + clap.tail change notifies host and caches new finite tail length.
+        probe.set_tail_samples(12_345);
+        probe.notify_tail_changed();
+        probe.set_process_status(CLAP_PROCESS_TAIL);
+        render(&mut voice);
+        assert_eq!(voice.last_process_status(), ProcessStatus::Tail);
+        assert_eq!(voice.tail_length(), Some(TailLength::Finite(12_345)));
+
+        // CLAP_PROCESS_SLEEP status is observed, and sleep_skip advances steady_time without calling process().
+        probe.set_process_status(CLAP_PROCESS_SLEEP);
+        render(&mut voice);
+        assert_eq!(voice.last_process_status(), ProcessStatus::Sleep);
+        let t_before = probe.last_steady_time();
+        let blocks_before = probe.process_blocks();
+        voice.sleep_skip(256);
+        voice.sleep_skip(256);
+        assert_eq!(probe.process_blocks(), blocks_before, "sleep_skip must not invoke process()");
+        render(&mut voice);
+        assert!(
+            probe.last_steady_time() >= t_before + (BLOCK as i64) + 512,
+            "steady_time must advance across slept frames: before={t_before}, after={}",
+            probe.last_steady_time()
+        );
+
+        // request_process() sets the wake request once until consumed.
+        assert!(!voice.take_wake_request(), "no stale wake pending after render");
+        probe.request_process();
+        assert!(voice.take_wake_request(), "request_process() triggers immediate wake");
+        assert!(!voice.take_wake_request(), "wake flag resets when consumed");
+
+        // Main-thread wake triggers (`gate.request_wake`, `request_flush`, and `request_restart`) wake sleeping voices.
+        main.gate.request_wake();
+        assert!(voice.take_wake_request(), "gate.request_wake() requests wake");
+        assert!(!voice.take_wake_request(), "gate wake flag resets when consumed");
+
+        probe.request_flush();
+        assert!(voice.take_wake_request(), "request_flush() requests wake");
+
+        probe.request_restart();
+        main.service();
+        assert!(voice.has_pending_work());
+        assert!(voice.take_wake_request(), "restart requests wake");
+        render(&mut voice);
+        main.service();
+        main.retire(voice);
     }
 }
 
@@ -1696,6 +1867,7 @@ impl ClapVoiceMain {
         // is what `editor-test` checks, not this answer.
         let _ = gui.show(&handle);
         self.editor = Some(ClapEditor { gui, window, resizable });
+        self.gate.request_wake();
         Ok(())
     }
 
@@ -1782,6 +1954,7 @@ impl ClapVoiceMain {
             Restart::Idle => {
                 if self.restart_requested() {
                     self.link.stop.store(true, Ordering::SeqCst);
+                    self.gate.request_wake();
                     self.restart = Restart::Stopping;
                 }
             }
@@ -1811,6 +1984,7 @@ impl ClapVoiceMain {
                 // The ring is empty: the audio side adopted the last set
                 // before it could hand one back.
                 let _ = self.link.to_audio.push(live);
+                self.gate.request_wake();
                 self.restart = Restart::Idle;
                 self.served.restarts += 1;
                 // Parameters may be new ones.
@@ -1909,6 +2083,7 @@ impl ClapVoiceMain {
         let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
         state.load(&mut self.instance.plugin_handle(), &mut &data[..]).context("loading plugin state")?;
         self.load_mark = Some(self.gate.mark());
+        self.gate.request_wake();
         self.main_controls_rechecks = MAIN_CONTROLS_RECHECKS;
         Ok(())
     }

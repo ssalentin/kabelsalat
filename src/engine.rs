@@ -1718,6 +1718,15 @@ pub struct GraphEngine {
     rig_sustain_mask: u64,
     rig_busy_mask: u64,
     rig_held_mask: u64,
+    /// Idle-rig CPU sleep state (#206, allocation-free): consecutive quiet
+    /// frames per rig, which rigs are currently sleeping, rigs woken mid-block
+    /// (kept awake at least one block), cross-rig audio sources into each rig,
+    /// and pre-fader audio observed on non-live voices before `level` scaling.
+    rig_quiet_frames: [u64; MAX_RIGS],
+    rig_sleeping_mask: u64,
+    rig_wake_mask: u64,
+    rig_cross_in: [u64; MAX_RIGS],
+    rig_pre_audio_mask: u64,
     // Master recording tap (the final output). None = recording unavailable
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
@@ -1908,6 +1917,11 @@ impl GraphEngine {
             rig_sustain_mask: 0,
             rig_busy_mask: 0,
             rig_held_mask: 0,
+            rig_quiet_frames: [0; MAX_RIGS],
+            rig_sleeping_mask: 0,
+            rig_wake_mask: 0,
+            rig_cross_in: [0; MAX_RIGS],
+            rig_pre_audio_mask: 0,
             recorder: None,
             arm_master: true,
             arm_rigs: [false; MAX_RIGS],
@@ -1973,6 +1987,21 @@ impl GraphEngine {
                         }
                     }
                 }
+            }
+        }
+        self.rig_cross_in = [0; MAX_RIGS];
+        for e in &self.graph.edges {
+            if e.kind != PortKind::Audio || self.always_hosted_nodes.contains(&e.to.node) {
+                continue;
+            }
+            let Some(src) = self.graph.node(e.from.node) else { continue };
+            if matches!(src.kind, NodeKind::MasterOut | NodeKind::Dsp(DspKind::Bus)) {
+                continue;
+            }
+            let Some(dst) = self.graph.node(e.to.node) else { continue };
+            let (sr, dr) = (src.rig as usize, dst.rig as usize);
+            if sr != dr && sr < MAX_RIGS && dr < MAX_RIGS {
+                self.rig_cross_in[dr] |= 1u64 << sr;
             }
         }
     }
@@ -2080,6 +2109,7 @@ impl GraphEngine {
                 }
             }
         }
+        self.wake_node(node);
         if inst {
             // Units wired to this instrument route to it from now on.
             for k in 0..self.midi_fx.len() {
@@ -2117,6 +2147,7 @@ impl GraphEngine {
                 }
                 self.retire_lv2(old);
                 self.lv2_dirty = true;
+                self.wake_node(node);
             }
             None if live && self.lv2.len() < self.lv2.capacity() => {
                 self.lv2_restores += 1;
@@ -2201,6 +2232,7 @@ impl GraphEngine {
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                         s.plugin.apply_preset(&preset);
                     }
+                    self.wake_node(node);
                     if let Some(tx) = self.lv2_req.as_mut() {
                         let _ = tx.push(Lv2Request::RetirePreset(preset));
                     }
@@ -2250,6 +2282,7 @@ impl GraphEngine {
                 .min_by_key(|v| v.voice.voice_id());
             if let Some(v) = free {
                 v.bind(id);
+                self.wake_node(id);
             }
         }
         self.voices_dirty = true;
@@ -2315,6 +2348,7 @@ impl GraphEngine {
                     if ok {
                         slot.bind(node);
                         self.voices.push(slot);
+                        self.wake_node(node);
                         changed = true;
                     } else {
                         self.send_back(VoiceBack::Voice(slot));
@@ -2979,11 +3013,187 @@ impl GraphEngine {
         }
     }
 
-    /// Compute per-rig activity masks (pre-fader audio > -100 dBFS, held notes,
-    /// and sustain pedal) so outgoing rigs never retire while sounding or held
-    /// (#207, allocation-free).
-    fn update_rig_busy_masks(&mut self, n2: usize) {
-        const AUDIO_FLOOR: f32 = 1e-5;
+    /// Bitmask of rigs whose DSP/plugins are currently asleep (#206).
+    pub fn sleeping_rigs_mask(&self) -> u64 {
+        self.rig_sleeping_mask
+    }
+
+    #[inline]
+    fn rig_is_sleeping(&self, rig: usize) -> bool {
+        rig < MAX_RIGS && (self.rig_sleeping_mask & (1u64 << rig)) != 0
+    }
+
+    #[inline]
+    fn node_is_sleeping(&self, node: NodeId) -> bool {
+        if self.rig_sleeping_mask == 0 || self.always_hosted_nodes.contains(&node) {
+            return false;
+        }
+        self.graph.node(node).is_some_and(|n| self.rig_is_sleeping(n.rig as usize))
+    }
+
+    /// Wake `rig` (and any non-always-hosted downstream rig fed by its audio
+    /// cables) immediately for the current/next block. Allocation-free.
+    fn wake_rig(&mut self, rig: usize) {
+        if rig >= MAX_RIGS {
+            return;
+        }
+        let mut to_wake = 1u64 << rig;
+        while to_wake != 0 {
+            let mut next = 0u64;
+            for r in 0..MAX_RIGS {
+                let bit = 1u64 << r;
+                if (to_wake & bit) == 0 {
+                    continue;
+                }
+                self.rig_sleeping_mask &= !bit;
+                self.rig_quiet_frames[r] = 0;
+                self.rig_wake_mask |= bit;
+                for d in 0..MAX_RIGS {
+                    let dbit = 1u64 << d;
+                    if (self.rig_cross_in[d] & bit) != 0 && (self.rig_wake_mask & dbit) == 0 {
+                        next |= dbit;
+                    }
+                }
+            }
+            to_wake = next;
+        }
+    }
+
+    fn wake_node(&mut self, node: NodeId) {
+        if let Some(rig) = self.graph.node(node).map(|n| n.rig as usize) {
+            self.wake_rig(rig);
+        }
+    }
+
+    fn wake_all_rigs(&mut self) {
+        self.rig_sleeping_mask = 0;
+        self.rig_quiet_frames = [0; MAX_RIGS];
+        self.rig_wake_mask = u64::MAX;
+    }
+
+    /// Put `rig` to sleep after its audio and delay tails have completely
+    /// rung out below -100 dBFS (#206). Clears internal DSP/PDC ring state so
+    /// waking never replays stale tail energy, while keeping GainRamps at target.
+    fn enter_rig_sleep(&mut self, rig: usize) {
+        if rig >= MAX_RIGS {
+            return;
+        }
+        self.rig_sleeping_mask |= 1u64 << rig;
+        for s in &mut self.voices {
+            if s.node != NodeId::MAX
+                && !self.always_hosted_nodes.contains(&s.node)
+                && self.graph.node(s.node).is_some_and(|n| n.rig as usize == rig)
+            {
+                s.scratch.fill(0.0);
+            }
+        }
+        for d in &mut self.dsp {
+            if d.kind != DspKind::Bus
+                && !self.always_hosted_nodes.contains(&d.node)
+                && self.graph.node(d.node).is_some_and(|n| n.rig as usize == rig)
+            {
+                d.proc.reset();
+                d.buf.fill(0.0);
+                d.transport.click_remaining = 0;
+            }
+        }
+        for s in &mut self.lv2 {
+            if !self.always_hosted_nodes.contains(&s.node)
+                && self.graph.node(s.node).is_some_and(|n| n.rig as usize == rig)
+            {
+                s.buf.fill(0.0);
+            }
+        }
+        for a in &mut self.audio_in {
+            if !self.always_hosted_nodes.contains(&a.node)
+                && self.graph.node(a.node).is_some_and(|n| n.rig as usize == rig)
+            {
+                a.buf.fill(0.0);
+            }
+        }
+        let always = &self.always_hosted_nodes;
+        let graph = &self.graph;
+        self.pdc.clear_for(|id| {
+            !always.contains(&id) && graph.node(id).is_some_and(|n| n.rig as usize == rig)
+        });
+    }
+
+    /// Wake any sleeping rig that received a host/plugin wake request, live zone,
+    /// held key/sustain, demo, LV2 worker response, or upstream feed (#206).
+    fn poll_rig_wake_triggers(&mut self) {
+        if self.rig_sleeping_mask == 0 {
+            return;
+        }
+        for r in 0..MAX_RIGS {
+            if !self.rig_is_sleeping(r) {
+                continue;
+            }
+            let active = self.rig_zones[r].live
+                || self.rig_notes_down[r] != 0
+                || (self.rig_sustain_mask & (1u64 << r)) != 0
+                || (self.rig_wake_mask & (1u64 << r)) != 0
+                || self.demo.as_ref().is_some_and(|d| d.rig as usize == r)
+                || (self.rig_cross_in[r] & !self.rig_sleeping_mask) != 0;
+            if active {
+                self.wake_rig(r);
+            }
+        }
+        if self.rig_sleeping_mask == 0 {
+            return;
+        }
+        for i in 0..self.voices.len() {
+            let node = self.voices[i].node;
+            if node != NodeId::MAX && self.node_is_sleeping(node) && self.voices[i].voice.take_wake_request() {
+                self.wake_node(node);
+            }
+        }
+        for i in 0..self.lv2.len() {
+            let node = self.lv2[i].node;
+            if self.node_is_sleeping(node) && self.lv2[i].plugin.has_pending_worker_response() {
+                self.wake_node(node);
+            }
+        }
+        for i in 0..self.midi_fx.len() {
+            let node = self.midi_fx[i].node;
+            if self.node_is_sleeping(node) {
+                let pending = !self.midi_fx[i].in_q.is_empty()
+                    || matches!(&self.midi_fx[i].proc, Some(MidiFxProc::Lv2(s)) if s.plugin.has_pending_worker_response());
+                if pending {
+                    self.wake_node(node);
+                }
+            }
+        }
+        for i in 0..self.arp.len() {
+            let node = self.arp[i].node;
+            if self.node_is_sleeping(node) && self.arp[i].is_active() {
+                self.wake_node(node);
+            }
+        }
+        for i in 0..self.lv2_in_flight.len() {
+            let node = self.lv2_in_flight[i];
+            if self.node_is_sleeping(node) {
+                self.wake_node(node);
+            }
+        }
+        for i in 0..self.audio_in.len() {
+            let node = self.audio_in[i].node;
+            if self.audio_in[i].monitor && self.audio_in[i].consumer.is_some() && self.node_is_sleeping(node) {
+                self.wake_node(node);
+            }
+        }
+    }
+
+    /// Compute per-rig activity masks (#207) and transition idle rigs that have
+    /// completely rung out into CPU sleep (#206, allocation-free).
+    fn update_rig_sleep_and_busy(&mut self, frames: usize, n2: usize) {
+        use clack_extensions::tail::TailLength;
+        use clack_host::process::ProcessStatus;
+
+        const IDLE_SILENCE_FLOOR: f32 = 1e-5; // -100 dBFS
+        const IDLE_SETTLE_SECS: f64 = 1.0;
+        const IDLE_CLAP_SLEEP_SETTLE_SECS: f64 = 0.15;
+        const IDLE_CLAP_TAIL_MAX_SECS: f64 = 30.0;
+
         let mut held = self.rig_sustain_mask;
         for (r, &bits) in self.rig_notes_down.iter().enumerate() {
             if bits != 0 {
@@ -2996,19 +3206,25 @@ impl GraphEngine {
                 continue;
             }
             let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
-            if (audio & (1u64 << r)) != 0 || self.always_hosted_nodes.contains(&s.node) {
+            if (audio & (1u64 << r)) != 0
+                || (self.rig_sleeping_mask & (1u64 << r)) != 0
+                || self.always_hosted_nodes.contains(&s.node)
+            {
                 continue;
             }
-            if s.scratch[..n2.min(s.scratch.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+            if s.scratch[..n2.min(s.scratch.len())].iter().any(|x| x.abs() > IDLE_SILENCE_FLOOR) {
                 audio |= 1u64 << r;
             }
         }
         for s in &self.lv2 {
             let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
-            if (audio & (1u64 << r)) != 0 || self.always_hosted_nodes.contains(&s.node) {
+            if (audio & (1u64 << r)) != 0
+                || (self.rig_sleeping_mask & (1u64 << r)) != 0
+                || self.always_hosted_nodes.contains(&s.node)
+            {
                 continue;
             }
-            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > IDLE_SILENCE_FLOOR) {
                 audio |= 1u64 << r;
             }
         }
@@ -3017,15 +3233,169 @@ impl GraphEngine {
                 continue;
             }
             let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) else { continue };
-            if (audio & (1u64 << r)) != 0 {
+            if (audio & (1u64 << r)) != 0 || (self.rig_sleeping_mask & (1u64 << r)) != 0 {
                 continue;
             }
-            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > AUDIO_FLOOR) {
+            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > IDLE_SILENCE_FLOOR) {
                 audio |= 1u64 << r;
             }
         }
         self.rig_held_mask = held;
-        self.rig_busy_mask = held | audio;
+        self.rig_busy_mask = held | audio | self.rig_pre_audio_mask;
+
+        let mut present_rigs = 0u64;
+        for n in &self.graph.nodes {
+            let r = n.rig as usize;
+            if r < MAX_RIGS {
+                present_rigs |= 1u64 << r;
+            }
+        }
+
+        let mut active_rigs = held | audio | self.rig_pre_audio_mask | self.rig_wake_mask;
+        for r in 0..MAX_RIGS {
+            if self.rig_zones[r].live
+                || self.rig_gain[r].is_ramping()
+                || (self.rig_cross_in[r] & !self.rig_sleeping_mask) != 0
+            {
+                active_rigs |= 1u64 << r;
+            }
+        }
+        if let Some(d) = &self.demo {
+            let r = d.rig as usize;
+            if r < MAX_RIGS {
+                active_rigs |= 1u64 << r;
+            }
+        }
+        for a in &self.arp {
+            if a.is_active() && !self.always_hosted_nodes.contains(&a.node) {
+                if let Some(r) = self.graph.node(a.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                    active_rigs |= 1u64 << r;
+                }
+            }
+        }
+        for fx in &self.midi_fx {
+            if !self.always_hosted_nodes.contains(&fx.node)
+                && (!fx.in_q.is_empty()
+                    || matches!(&fx.proc, Some(MidiFxProc::Lv2(s)) if s.plugin.has_pending_worker_response()))
+            {
+                if let Some(r) = self.graph.node(fx.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                    active_rigs |= 1u64 << r;
+                }
+            }
+        }
+        for &node in &self.lv2_in_flight {
+            if !self.always_hosted_nodes.contains(&node) {
+                if let Some(r) = self.graph.node(node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                    active_rigs |= 1u64 << r;
+                }
+            }
+        }
+        for s in &self.voices {
+            if s.node != NodeId::MAX
+                && !self.always_hosted_nodes.contains(&s.node)
+                && (s.gain.is_ramping() || s.wet.is_ramping() || s.voice.has_pending_work())
+            {
+                if let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                    active_rigs |= 1u64 << r;
+                }
+            }
+        }
+        for s in &self.lv2 {
+            if !self.always_hosted_nodes.contains(&s.node)
+                && (s.wet.is_ramping() || s.plugin.has_pending_worker_response())
+            {
+                if let Some(r) = self.graph.node(s.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                    active_rigs |= 1u64 << r;
+                }
+            }
+        }
+        for d in &self.dsp {
+            if d.kind != DspKind::Bus && !self.always_hosted_nodes.contains(&d.node) && d.wet.is_ramping() {
+                if let Some(r) = self.graph.node(d.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                    active_rigs |= 1u64 << r;
+                }
+            }
+        }
+        for a in &self.audio_in {
+            if a.monitor && a.consumer.is_some() && !self.always_hosted_nodes.contains(&a.node) {
+                if let Some(r) = self.graph.node(a.node).map(|n| n.rig as usize).filter(|&r| r < MAX_RIGS) {
+                    active_rigs |= 1u64 << r;
+                }
+            }
+        }
+
+        let max_clap_tail = (IDLE_CLAP_TAIL_MAX_SECS * self.sample_rate).ceil() as u64;
+        for r in 0..MAX_RIGS {
+            let bit = 1u64 << r;
+            if (present_rigs & bit) == 0 {
+                self.rig_quiet_frames[r] = 0;
+                self.rig_sleeping_mask &= !bit;
+                continue;
+            }
+            if (self.rig_sleeping_mask & bit) != 0 {
+                continue;
+            }
+            if (active_rigs & bit) != 0 {
+                self.rig_quiet_frames[r] = 0;
+                continue;
+            }
+            self.rig_quiet_frames[r] = self.rig_quiet_frames[r].saturating_add(frames as u64);
+
+            let mut has_clap = false;
+            let mut all_clap_sleep = true;
+            let mut has_lv2 = false;
+            let mut clap_tail_frames = 0u64;
+            let mut dsp_tail_frames = 0u64;
+
+            for s in &self.voices {
+                if s.node == NodeId::MAX
+                    || self.always_hosted_nodes.contains(&s.node)
+                    || !self.graph.node(s.node).is_some_and(|n| n.rig as usize == r)
+                {
+                    continue;
+                }
+                has_clap = true;
+                if s.voice.last_process_status() != ProcessStatus::Sleep {
+                    all_clap_sleep = false;
+                    if let Some(TailLength::Finite(t)) = s.voice.tail_length() {
+                        clap_tail_frames = clap_tail_frames.max((t as u64).min(max_clap_tail));
+                    }
+                }
+            }
+            for s in &self.lv2 {
+                if !self.always_hosted_nodes.contains(&s.node)
+                    && self.graph.node(s.node).is_some_and(|n| n.rig as usize == r)
+                {
+                    has_lv2 = true;
+                    break;
+                }
+            }
+            for d in &self.dsp {
+                if d.kind != DspKind::Bus
+                    && !self.always_hosted_nodes.contains(&d.node)
+                    && self.graph.node(d.node).is_some_and(|n| n.rig as usize == r)
+                {
+                    dsp_tail_frames = dsp_tail_frames.saturating_add(d.proc.tail_hint_frames() as u64);
+                }
+            }
+            let pdc_frames = self.pdc.max_frames_for(|id| {
+                !self.always_hosted_nodes.contains(&id)
+                    && self.graph.node(id).is_some_and(|n| n.rig as usize == r)
+            }) as u64;
+            let base_settle = if has_clap && all_clap_sleep && !has_lv2 {
+                (IDLE_CLAP_SLEEP_SETTLE_SECS * self.sample_rate).ceil() as u64
+            } else {
+                (IDLE_SETTLE_SECS * self.sample_rate).ceil() as u64
+            };
+            let required = base_settle
+                .max(clap_tail_frames)
+                .saturating_add(dsp_tail_frames)
+                .saturating_add(pdc_frames);
+            if self.rig_quiet_frames[r] >= required {
+                self.enter_rig_sleep(r);
+            }
+        }
+        self.rig_wake_mask = 0;
     }
 
     /// The master's loudness target as the engine holds it (self-tests).
@@ -3121,6 +3491,10 @@ impl GraphEngine {
                 if let Some(p) = peak {
                     self.edge_levels.store(e.id, p);
                 }
+                continue;
+            }
+            if self.node_is_sleeping(src) {
+                self.edge_levels.store(e.id, 0.0);
                 continue;
             }
             let peak = if let Some(v) = self.voices.iter().find(|v| v.node == src) {
@@ -3537,17 +3911,25 @@ impl GraphEngine {
         self.matrix.route_into(source, msg, &mut self.route_out);
         for i in 0..self.route_out.len() {
             let (dest, m) = self.route_out[i];
-            // A rig that is not live takes only what returns to rest (#204).
-            if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) {
+            let live = zone_of(&self.rig_zones, &self.graph, dest).live;
+            let rest = at_rest(&m);
+            // A rig that is not live takes only what returns to rest (#204),
+            // and drops rest returns once already asleep (#206).
+            if !live && !rest {
+                continue;
+            }
+            if !live && rest && self.node_is_sleeping(dest) {
                 continue;
             }
             let has_midi = self.has_midi_cable(dest);
             let (wire, len) = m.wire();
+            let mut wake = false;
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                 if !has_midi || !source_accepted(s, source) {
                     continue;
                 }
                 s.voice.send_midi_rt(wire);
+                wake = !rest || live;
                 #[cfg(test)]
                 self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
             } else if self.graph.node(dest).map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. })) {
@@ -3563,9 +3945,13 @@ impl GraphEngine {
                     let mut wire = wire;
                     wire[0] &= 0xF0;
                     s.plugin.midi(&wire[..len]);
+                    wake = !rest || live;
                     #[cfg(test)]
                     self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
                 }
+            }
+            if wake {
+                self.wake_node(dest);
             }
         }
     }
@@ -3825,9 +4211,16 @@ impl GraphEngine {
             }
             let is_on = m.status == 0x90 && m.data[1] > 0;
             let is_off = m.status == 0x80 || (m.status == 0x90 && m.data[1] == 0);
+            let live = zone_of(&self.rig_zones, &self.graph, dest).live;
+            if is_off && !live && self.node_is_sleeping(dest) {
+                continue;
+            }
             if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
                 if dest != fx {
                     self.midi_fx[j].queue(m);
+                    if !is_off || live {
+                        self.wake_node(dest);
+                    }
                 }
                 continue;
             }
@@ -3838,12 +4231,14 @@ impl GraphEngine {
                 #[cfg(test)]
                 self.note_log.push((dest, m.data[0], is_on));
                 let note = m.data[0];
+                let mut wake = false;
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                     if is_on {
                         s.voice.note_on(note as u16, m.data[1] as f64 / 127.0);
                     } else {
                         s.voice.note_off(note as u16);
                     }
+                    wake = is_on || live;
                 }
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                     if s.plugin.is_instrument() {
@@ -3852,16 +4247,26 @@ impl GraphEngine {
                         } else {
                             s.plugin.note_off_ch(note, m.channel);
                         }
+                        wake = is_on || live;
                     }
                 }
+                if wake {
+                    self.wake_node(dest);
+                }
             } else if m.status == 0xB0 {
+                let mut wake = false;
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                     s.voice.send_cc_rt(m.channel, m.data[0], m.data[1]);
+                    wake = live || !at_rest(&m);
                 }
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                     if s.plugin.is_instrument() {
                         s.plugin.control_change(m.data[0], m.data[1]);
+                        wake = live || !at_rest(&m);
                     }
+                }
+                if wake {
+                    self.wake_node(dest);
                 }
             }
         }
@@ -3949,12 +4354,14 @@ impl GraphEngine {
     /// One rig bus's mix (SetRigMix, or a CC bound to it). Omitted fields
     /// keep their value. Allocation-free.
     fn set_rig_mix(&mut self, rig: u8, e: crate::matrix::MixEdit) {
-        let m = &mut self.rig_mix[(rig as usize).min(MAX_RIGS - 1)];
+        let r = (rig as usize).min(MAX_RIGS - 1);
+        let m = &mut self.rig_mix[r];
         if let Some(v) = e.vol { m.vol = v.clamp(0.0, 1.0); }
         if let Some(p) = e.pan { m.pan = p.clamp(-1.0, 1.0); }
         if let Some(b) = e.mute { m.mute = b; }
         if let Some(b) = e.solo { m.solo = b; }
-        if e.solo == Some(true) { RigMix::solo_only(&mut self.rig_mix, (rig as usize).min(MAX_RIGS - 1)); }
+        if e.solo == Some(true) { RigMix::solo_only(&mut self.rig_mix, r); }
+        self.wake_rig(r);
         self.mix_dirty = true;
     }
 
@@ -3983,6 +4390,7 @@ impl GraphEngine {
                 }
             }
             self.rig_zones[rig] = z;
+            self.wake_rig(rig);
         }
         if self.rig_zones != before {
             // A new part's floating edges start from home.
@@ -4011,6 +4419,7 @@ impl GraphEngine {
             }
         }
         self.strips.retain(|(_, m)| !m.is_default());
+        self.wake_node(node);
         self.mix_dirty = true;
     }
 
@@ -4042,6 +4451,10 @@ impl GraphEngine {
         if sounding(&self.sends) != was {
             self.replan_delays(false);
         }
+        match from {
+            SendSource::Rig(r) => self.wake_rig(r as usize),
+            SendSource::Node(n) => self.wake_node(n),
+        }
         self.mix_dirty = true;
         true
     }
@@ -4068,6 +4481,9 @@ impl GraphEngine {
             if let Some(o) = before { self.bus_outs.push(o); }
             self.assign_out_slots();
             return false;
+        }
+        if let SendSource::Rig(r) = bus {
+            self.wake_rig(r as usize);
         }
         self.mix_dirty = true;
         true
@@ -4152,6 +4568,7 @@ impl GraphEngine {
     /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
+        self.wake_node(node);
         let v = value as f32;
         if self.midi_fx.iter().any(|s| s.node == node) {
             self.apply_midi_fx_param(node, param, v)
@@ -4300,6 +4717,9 @@ impl GraphEngine {
         if on && !zone.starts(played, m.velocity(), &self.zone_hands) {
             return;
         }
+        if !on && !zone.live && self.node_is_sleeping(dest) {
+            return;
+        }
         let (m, vel) = if on {
             (MidiMsg { data: [m.data[0], zone.curve.shape7(m.data[1])], ..m }, zone.curve.shape(vel))
         } else {
@@ -4308,6 +4728,9 @@ impl GraphEngine {
         let Some(route) = self.keys_route_in_rig(rig, dest, played) else { return };
         let Some(out) = Self::routed_note(&m, &route).and_then(|n| shifted(n, zone.transpose.into())) else { return };
         if self.arp.iter().any(|a| a.node == dest) {
+            if on || zone.live {
+                self.wake_node(dest);
+            }
             if strip_bypassed(&self.strips, dest) {
                 self.deliver_arp_note(dest, out, on, vel as f32);
                 return;
@@ -4334,6 +4757,9 @@ impl GraphEngine {
             self.note_log.push((dest, out, on));
             if !on || source.is_none_or(|src| self.fx_accepts(dest, src)) {
                 self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
+                if on || zone.live {
+                    self.wake_node(dest);
+                }
             }
             return;
         }
@@ -4349,6 +4775,7 @@ impl GraphEngine {
                 self.vel_log.push((dest, m.data[1]));
             }
         }
+        let mut wake = false;
         if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
             if source.is_none_or(|src| source_accepted(s, src)) {
                 if on {
@@ -4356,6 +4783,7 @@ impl GraphEngine {
                 } else {
                     s.voice.note_off(out as u16);
                 }
+                wake = on || zone.live;
             }
         }
         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
@@ -4365,7 +4793,11 @@ impl GraphEngine {
                 } else {
                     s.plugin.note_off_ch(out, m.channel);
                 }
+                wake = on || zone.live;
             }
+        }
+        if wake {
+            self.wake_node(dest);
         }
     }
 
@@ -4375,6 +4807,7 @@ impl GraphEngine {
     /// breath sends both CC 2 and channel pressure to the rig's instruments.
     fn demo_event(&mut self, rig: u8, ev: crate::demo::DemoEvent) {
         use crate::demo::DemoEvent;
+        self.wake_rig(rig as usize);
         match ev {
             DemoEvent::On { note, vel } => {
                 let m = MidiMsg::note_on(0, note, vel);
@@ -4593,6 +5026,7 @@ impl GraphEngine {
                 _ => {}
             }
         }
+        self.wake_all_rigs();
     }
 
     /// Run `f` on the arp slot of `node` with the engine passable to its
@@ -4614,6 +5048,10 @@ impl GraphEngine {
             let e = &self.graph.edges[i];
             if e.kind != PortKind::Midi || e.from.node != arp_node { continue; }
             let dest = e.to.node;
+            let live = zone_of(&self.rig_zones, &self.graph, dest).live;
+            if !on && !live && self.node_is_sleeping(dest) {
+                continue;
+            }
             // An arp wired into a MIDI strip (arp → unit → synth): the unit
             // takes the note into its queue like one from the keys.
             if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
@@ -4621,6 +5059,9 @@ impl GraphEngine {
                 self.note_log.push((dest, note, on));
                 let v7 = (vel.clamp(0.0, 1.0) * 127.0) as u8;
                 self.midi_fx[j].queue(if on { MidiMsg::note_on(0, note, v7) } else { MidiMsg::note_off(0, note, 0) });
+                if on || live {
+                    self.wake_node(dest);
+                }
                 continue;
             }
             if on && strip_bypassed(&self.strips, dest) {
@@ -4628,12 +5069,14 @@ impl GraphEngine {
             }
             #[cfg(test)]
             self.note_log.push((dest, note, on));
+            let mut wake = false;
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                 if on {
                     s.voice.note_on(note as u16, vel as f64);
                 } else {
                     s.voice.note_off(note as u16);
                 }
+                wake = on || live;
             }
             if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                 if s.plugin.is_instrument() {
@@ -4642,7 +5085,11 @@ impl GraphEngine {
                     } else {
                         s.plugin.note_off(note);
                     }
+                    wake = on || live;
                 }
+            }
+            if wake {
+                self.wake_node(dest);
             }
         }
     }
@@ -4754,6 +5201,7 @@ impl GraphEngine {
                     }
                     _ => {}
                 }
+                self.wake_rig(rig as usize);
                 self.publish_graph();
             }
             Command::RemoveNode(id) => {
@@ -4802,6 +5250,7 @@ impl GraphEngine {
                     }
                 }
                 self.refresh_always_hosted();
+                self.wake_all_rigs();
                 self.publish_graph();
             }
             Command::Connect { id, from, to, kind } => {
@@ -4819,6 +5268,7 @@ impl GraphEngine {
                         self.route_midi_fx_outputs(from.node);
                     }
                     self.refresh_always_hosted();
+                    self.wake_all_rigs();
                     self.publish_graph();
                 }
             }
@@ -4840,6 +5290,7 @@ impl GraphEngine {
                 self.graph.disconnect(id);
                 if had {
                     self.refresh_always_hosted();
+                    self.wake_all_rigs();
                     self.publish_graph();
                 }
             }
@@ -4847,9 +5298,10 @@ impl GraphEngine {
                 self.apply_engine_param(node, param, value);
             }
             Command::LoadLv2Preset { node, preset_uri } => {
-                if let Some(NodeKind::Lv2 { uri }) = self.graph.nodes.iter().find(|n| n.id == node).map(|n| &n.kind) {
+                if let Some(&NodeKind::Lv2 { uri }) = self.graph.nodes.iter().find(|n| n.id == node).map(|n| &n.kind) {
+                    self.wake_node(node);
                     if let Some(tx) = self.lv2_req.as_mut() {
-                        let _ = tx.push(Lv2Request::Preset { node, uri: *uri, preset_uri });
+                        let _ = tx.push(Lv2Request::Preset { node, uri, preset_uri });
                         return;
                     }
                     let presets = crate::lv2::discover_presets(uri.as_str());
@@ -4865,6 +5317,7 @@ impl GraphEngine {
                 if !self.node_is_hosted(node) {
                     return;
                 }
+                self.wake_node(node);
                 let gen = self.lv2_gen;
                 if let Some(tx) = self.lv2_req.as_mut() {
                     if tx.push(Lv2Request::State { node, uri, gen, state }).is_err() {
@@ -4885,8 +5338,10 @@ impl GraphEngine {
                 let program = program.min(127);
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                     s.plugin.program_change(program);
+                    self.wake_node(node);
                 } else if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.voice.program_change_rt(program);
+                    self.wake_node(node);
                 }
             }
             Command::LoadGraph { graph } => {
@@ -4941,6 +5396,10 @@ impl GraphEngine {
                 self.hosted_lv2_dirty = false;
                 self.rig_notes_down = [0u128; MAX_RIGS];
                 self.rig_sustain_mask = 0;
+                self.rig_quiet_frames = [0; MAX_RIGS];
+                self.rig_sleeping_mask = 0;
+                self.rig_wake_mask = 0;
+                self.rig_pre_audio_mask = 0;
                 self.hosted_rigs = self.next_load_hosted_rigs.take().flatten();
                 self.refresh_always_hosted();
                 // The hosted voices move over to the new graph's Clap nodes;
@@ -5140,6 +5599,7 @@ impl GraphEngine {
                     s.src_keys = keyboard;
                     s.src_hw = hardware;
                 }
+                self.wake_node(node);
             }
             Command::RenameRig { rig, name } => {
                 // Structural metadata (block boundary; never the render path).
@@ -5157,6 +5617,7 @@ impl GraphEngine {
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.rig_device = device;
                 }
+                self.wake_node(node);
             }
             Command::SetRigMix { rig, vol, pan, mute, solo } => {
                 self.set_rig_mix(rig, crate::matrix::MixEdit { vol, pan, mute, solo, send: None });
@@ -5211,6 +5672,7 @@ impl GraphEngine {
                     m.bypass = false;
                     self.strips.retain(|(_, m)| !m.is_default());
                 }
+                self.wake_node(node);
                 self.mix_dirty = true;
             }
             Command::RenameNode { node, name } => {
@@ -5244,6 +5706,7 @@ impl GraphEngine {
                     }
                     // Unsplitting also drops the node's HIGH-port cables.
                     self.graph.set_split(node, point);
+                    self.wake_node(node);
                     self.publish_graph();
                 }
             }
@@ -5263,6 +5726,7 @@ impl GraphEngine {
                         }
                     }
                     self.graph.set_zone_octave(node, zone, octave);
+                    self.wake_node(node);
                     self.publish_graph();
                 }
             }
@@ -5284,6 +5748,7 @@ impl GraphEngine {
                         }
                     }
                     self.graph.set_scale(node, choice);
+                    self.wake_node(node);
                     self.publish_graph();
                 }
             }
@@ -5314,6 +5779,7 @@ impl GraphEngine {
                 // Stateless-matrix safety: release held notes on the destination
                 // so a range/transpose edit can't orphan a release (rare op).
                 self.release_all(dest);
+                self.wake_node(dest);
                 self.publish_graph();
             }
             Command::Cc { source, channel, cc, value } => {
@@ -5356,14 +5822,21 @@ impl GraphEngine {
                         .node(dest)
                         .map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. }));
                     let norm = mapping.map_or(m.data[1] as f64 / 127.0, |b| b.scale.norm(m.data[1]));
+                    let live = zone_of(&self.rig_zones, &self.graph, dest).live;
+                    let rest = at_rest(&m);
                     if let Some(CcMapping { target: CcTarget::ChannelPressure, scale, .. }) = mapping {
+                        if !live && rest && self.node_is_sleeping(dest) {
+                            continue;
+                        }
                         let pressure = (scale.norm(m.data[1]) * 127.0).round().clamp(0.0, 127.0) as u8;
                         let has_midi = self.has_midi_cable(dest);
+                        let mut wake = false;
                         if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                             if has_midi && source_accepted(s, source) {
                                 s.voice.send_cc_rt(m.channel, m.data[0], m.data[1]);
                                 let (wire, _) = MidiMsg::channel_aftertouch(m.channel, pressure).wire();
                                 s.voice.send_midi_rt(wire);
+                                wake = live || !rest;
                                 #[cfg(test)]
                                 {
                                     self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
@@ -5380,12 +5853,16 @@ impl GraphEngine {
                             if s.plugin.is_instrument() && has_midi {
                                 s.plugin.control_change(m.data[0], m.data[1]);
                                 s.plugin.channel_pressure(pressure);
+                                wake = live || !rest;
                                 #[cfg(test)]
                                 {
                                     self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
                                     self.cc_passthrough_log.push((dest, pressure, 0));
                                 }
                             }
+                        }
+                        if wake {
+                            self.wake_node(dest);
                         }
                         continue;
                     }
@@ -5401,7 +5878,16 @@ impl GraphEngine {
                     // or the show keeps the binding live. A master's or an aux
                     // bus's knob is a mix control no rig gates.
                     let mix_unit = self.graph.is_bus(dest) || self.graph.node(dest).is_some_and(|n| matches!(n.kind, NodeKind::MasterOut));
-                    if !zone_of(&self.rig_zones, &self.graph, dest).live && !at_rest(&m) && gate != Some(true) && !mix_unit {
+                    if !live && !rest && gate != Some(true) && !mix_unit {
+                        continue;
+                    }
+                    if !live
+                        && rest
+                        && gate != Some(true)
+                        && !mix_unit
+                        && !matches!(mapping, Some(CcMapping { target: CcTarget::Knob, .. }))
+                        && self.node_is_sleeping(dest)
+                    {
                         continue;
                     }
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
@@ -5426,6 +5912,9 @@ impl GraphEngine {
                         {
                             handled = true;
                         }
+                        if handled && (live || !rest || gate == Some(true)) {
+                            self.wake_node(dest);
+                        }
                         #[cfg(test)]
                         if handled {
                             self.cc_log.push((dest, out_cc as u32, norm));
@@ -5437,27 +5926,37 @@ impl GraphEngine {
                         match mapping {
                             // A learned knob (PluginParam target) moves the unit's control.
                             Some(b) => {
-                                self.apply_midi_fx_param(dest, b.param, norm as f32);
+                                if self.apply_midi_fx_param(dest, b.param, norm as f32) {
+                                    self.wake_node(dest);
+                                }
                                 #[cfg(test)]
                                 self.cc_log.push((dest, b.param, norm));
                             }
-                            None if self.has_midi_cable(dest) => self.midi_fx[j].queue(m),
+                            None if self.has_midi_cable(dest) => {
+                                self.midi_fx[j].queue(m);
+                                if live || !rest || gate == Some(true) {
+                                    self.wake_node(dest);
+                                }
+                            }
                             None => {}
                         }
                         continue;
                     }
                     let has_midi = self.has_midi_cable(dest);
                     let param = mapping.map(|m| m.param);
+                    let mut wake = false;
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if !has_midi || !source_accepted(s, source) {
                             continue;
                         }
                         if let Some(pid) = param {
                             s.voice.set_param_normalized_rt(pid, norm);
+                            wake = true;
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
                         } else {
                             s.voice.send_cc_rt(m.channel, m.data[0], m.data[1]);
+                            wake = live || !rest || gate == Some(true);
                             #[cfg(test)]
                             self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
                         }
@@ -5477,6 +5976,7 @@ impl GraphEngine {
                                 continue;
                             }
                             s.plugin.set_control_normalized(pid as usize, norm as f32);
+                            wake = true;
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
                         } else if self.apply_engine_param(dest, pid, norm) {
@@ -5489,9 +5989,13 @@ impl GraphEngine {
                         // the controller (mod wheel CC 1, sustain CC 64, …).
                         if s.plugin.is_instrument() && has_midi {
                             s.plugin.control_change(m.data[0], m.data[1]);
+                            wake = live || !rest || gate == Some(true);
                             #[cfg(test)]
                             self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
                         }
+                    }
+                    if wake {
+                        self.wake_node(dest);
                     }
                 }
             }
@@ -5558,9 +6062,14 @@ impl GraphEngine {
                 };
                 // Keep any already-opened ring; a fresh consumer arrives from
                 // the UI once it (re)opens the device. Old samples drain out.
+                let mut matched = false;
                 if let Some(slot) = self.audio_in.iter_mut().find(|s| s.node == node) {
                     slot.channels = next_channels;
                     slot.device = next_device;
+                    matched = true;
+                }
+                if matched {
+                    self.wake_node(node);
                 }
                 self.publish_graph();
             }
@@ -5630,6 +6139,7 @@ impl GraphEngine {
                         d.transport.set_playing(playing);
                     }
                     if changed {
+                        self.wake_node(node);
                         self.publish_graph();
                     }
                 }
@@ -5713,6 +6223,7 @@ impl GraphEngine {
             }
             Command::DemoPlay { rig, phrase } => {
                 self.stop_demo();
+                self.wake_rig(rig as usize);
                 self.demo = Some(crate::demo::DemoPlayer::new(rig, phrase));
                 self.demo_dirty = true;
             }
@@ -5947,8 +6458,13 @@ impl GraphEngine {
         // a (node, ring consumer) pair, swapped in place of any stale consumer.
         while let Some(rx) = self.audio_in_rx.as_mut() {
             let Ok((node, consumer)) = rx.pop() else { break };
+            let mut attached = false;
             if let Some(slot) = self.audio_in.iter_mut().find(|s| s.node == node) {
                 slot.consumer = Some(consumer);
+                attached = true;
+            }
+            if attached {
+                self.wake_node(node);
             }
         }
         // Mixer publication: a fixed-size copy under a NON-blocking lock
@@ -6003,15 +6519,35 @@ impl GraphEngine {
             taps.buf(b, n2).fill(0.0);
         }
 
+        self.poll_rig_wake_triggers();
+        self.rig_pre_audio_mask = 0;
+
         // 1. Every instrument renders and applies its level.
         self.node_timer.begin_block();
         let mut node_t0 = std::time::Instant::now();
+        let mut prev_skipped = false;
         for i in 0..self.voices.len() {
             // A free voice (no Clap node bound) or a CLAP audio effect (runs
             // in step 2b / bus chain / master insert): skip here.
             if self.voices[i].node == NodeId::MAX || self.voice_is_effect(i) {
                 continue;
             }
+            let node = self.voices[i].node;
+            if self.node_is_sleeping(node) {
+                self.voices[i].voice.sleep_skip(frames);
+                self.node_timer.record(node, std::time::Duration::ZERO);
+                prev_skipped = true;
+                continue;
+            }
+            if prev_skipped {
+                node_t0 = std::time::Instant::now();
+                prev_skipped = false;
+            }
+            let pre_check_rig = self
+                .graph
+                .node(node)
+                .map(|n| n.rig as usize)
+                .filter(|&r| r < MAX_RIGS && !self.rig_zones[r].live && !self.always_hosted_nodes.contains(&node));
             let s = &mut self.voices[i];
             let bypassed = strip_bypassed(&self.strips, s.node);
             if bypassed {
@@ -6022,6 +6558,11 @@ impl GraphEngine {
                 if latency != s.latency {
                     s.latency = latency;
                     self.latency_dirty = true;
+                }
+                if let Some(r) = pre_check_rig {
+                    if s.scratch[..n2].iter().any(|x| x.abs() > 1e-5) {
+                        self.rig_pre_audio_mask |= 1u64 << r;
+                    }
                 }
             }
             // Level and strip mix (mute/solo/pan) at the source's own output:
@@ -6041,10 +6582,15 @@ impl GraphEngine {
         self.fill_audio_in(frames);
         // A generator plays no notes, so a rig that is not live (#204) mutes
         // it here, at its own output: its effects ring out.
-        for a in &mut self.audio_in {
-            let muted = !zone_of(&self.rig_zones, &self.graph, a.node).live
-                || strip_bypassed(&self.strips, a.node);
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, a.node, None, muted, &mut a.buf[..n2]);
+        for i in 0..self.audio_in.len() {
+            let node = self.audio_in[i].node;
+            if self.node_is_sleeping(node) {
+                self.audio_in[i].buf[..n2].fill(0.0);
+                continue;
+            }
+            let muted = !zone_of(&self.rig_zones, &self.graph, node).live
+                || strip_bypassed(&self.strips, node);
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, node, None, muted, &mut self.audio_in[i].buf[..n2]);
         }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
@@ -6078,12 +6624,28 @@ impl GraphEngine {
             self.master_clock,
             MasterClock::CountingIn { remaining_beats, .. } if remaining_beats <= block_beats + 1e-9
         );
-        for d in &mut self.dsp {
-            if d.kind == DspKind::Metronome {
-                render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, sig, suppress_wrap_click);
-                let muted = !zone_of(&self.rig_zones, &self.graph, d.node).live
-                    || strip_bypassed(&self.strips, d.node);
-                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, None, muted, &mut d.buf[..n2]);
+        for i in 0..self.dsp.len() {
+            if self.dsp[i].kind == DspKind::Metronome {
+                let node = self.dsp[i].node;
+                if self.node_is_sleeping(node) {
+                    let t = &mut self.dsp[i].transport;
+                    if t.playing {
+                        let metro_inc = Transport::beats_per_frame(bpm, sr) / sig.beat_len();
+                        let total = t.phase + frames as f64 * metro_inc;
+                        let wraps = total.floor() as u64;
+                        t.phase = total - wraps as f64;
+                        t.beat = ((t.beat as u64 + wraps) % sig.num as u64) as u8;
+                        t.click_remaining = 0;
+                    }
+                    continue;
+                }
+                {
+                    let d = &mut self.dsp[i];
+                    render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, sig, suppress_wrap_click);
+                }
+                let muted = !zone_of(&self.rig_zones, &self.graph, node).live
+                    || strip_bypassed(&self.strips, node);
+                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, node, None, muted, &mut self.dsp[i].buf[..n2]);
             }
         }
         if counting_in_this_block {
@@ -6192,13 +6754,32 @@ impl GraphEngine {
         let (n_dsp, n_lv2) = (self.dsp.len(), self.lv2.len());
         let (inserts, n_ins) = self.master_inserts();
         self.fx_done.clear();
+        let mut sleeping_fx = [NodeId::MAX; crate::engine_info::NODE_TIME_SLOTS];
+        let mut n_sleeping_fx = 0usize;
         for f in 0..self.fx_count() {
             let later = self.fx_is_bus(f) || self.fx_after_bus[f] || inserts[..n_ins].contains(&f);
             let skip = (f < n_dsp && self.dsp[f].kind == DspKind::Metronome)
                 || (f >= n_dsp + n_lv2 && !self.voice_is_effect(f - n_dsp - n_lv2));
+            if !later && !skip {
+                let node = self.fx_node(f);
+                if self.node_is_sleeping(node) {
+                    if f >= n_dsp + n_lv2 {
+                        self.voices[f - n_dsp - n_lv2].voice.sleep_skip(frames);
+                    }
+                    if n_sleeping_fx < sleeping_fx.len() {
+                        sleeping_fx[n_sleeping_fx] = node;
+                        n_sleeping_fx += 1;
+                    }
+                    self.fx_done.push(true);
+                    continue;
+                }
+            }
             self.fx_done.push(later || skip);
         }
         self.run_effects(&mut bus, frames, &solo_rigs, Some(&mut taps));
+        for &node in &sleeping_fx[..n_sleeping_fx] {
+            self.node_timer.record(node, std::time::Duration::ZERO);
+        }
         self.lv2_in = bus;
 
         // 3. Master sums everything wired to it.
@@ -6266,12 +6847,25 @@ impl GraphEngine {
                 let rig = self.graph.node(master).map(|n| n.rig as usize).unwrap_or(0).min(MAX_RIGS - 1);
                 let (open, gl, gr) = gains[mi];
                 let from = SendSource::Rig(rig as u8);
+                let sends = self.sends.iter().any(|s| s.from == from);
+                let live = open && (gl != 0.0 || gr != 0.0 || sends);
+                if self.rig_is_sleeping(rig) {
+                    let target = if live { (gl, gr) } else { (0.0, 0.0) };
+                    self.rig_gain[rig] = gain_ramp::GainRamp::at_stereo(target.0, target.1);
+                    if let Some(rec) = &mut self.recorder {
+                        let rig_buf = &mut rig_v[..n2];
+                        rig_buf.fill(0.0);
+                        if rec.is_stem_active(rig as u8) {
+                            rec.push_rig_stereo(rig as u8, rig_buf);
+                        }
+                        rec.retro_rig(rig as u8, rig_buf);
+                    }
+                    continue;
+                }
                 let rig_buf = &mut rig_v[..n2];
                 for x in rig_buf.iter_mut() {
                     *x = 0.0;
                 }
-                let sends = self.sends.iter().any(|s| s.from == from);
-                let live = open && (gl != 0.0 || gr != 0.0 || sends);
                 // A rig that goes quiet (fader down, mute, another rig's solo)
                 // sums until its fader has faded out. Several masters of one
                 // rig each start from the same ramp.
@@ -6536,7 +7130,7 @@ impl GraphEngine {
         self.rig_buf = rig_v;
         self.bus_acc = bus_acc;
         self.out_mix = outs_v;
-        self.update_rig_busy_masks(n2);
+        self.update_rig_sleep_and_busy(frames, n2);
         self.publish_meter();
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
@@ -12822,5 +13416,577 @@ mod send_tests {
         });
         engine.render(&mut buf, 2);
         assert_eq!(pub_.lock().unwrap().rig_held_mask & 1, 0, "rig 0 cleared on NoteOff");
+    }
+}
+
+#[cfg(test)]
+mod idle_sleep_tests {
+    use super::*;
+    use crate::control::{
+        command_bus, name_bytes, ClapId, Command, DspKind, Graph, NodeId, NodeKind, PortKind, PortRef, RigZone,
+        SendSource,
+    };
+    use crate::dsp::tests::rt_alloc;
+    use crate::engine_info::{EngineCounters, EngineStats};
+    use crate::host::probe::{host_probe, PROBE_ID};
+    use crate::matrix::SourceId;
+    use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_SLEEP, CLAP_PROCESS_TAIL};
+
+    const SR: f64 = 48_000.0;
+    const FRAMES: usize = 256;
+
+    fn probe_clap_kind() -> NodeKind {
+        NodeKind::Clap { plugin_id: ClapId::new(PROBE_ID.to_str().unwrap()) }
+    }
+
+    fn only_rig_live(live_rig: usize) -> [RigZone; MAX_RIGS] {
+        let mut zones = [RigZone { live: false, ..RigZone::OPEN }; MAX_RIGS];
+        zones[live_rig] = RigZone::OPEN;
+        zones
+    }
+
+    fn all_live() -> [RigZone; MAX_RIGS] {
+        [RigZone::OPEN; MAX_RIGS]
+    }
+
+    fn no_live() -> [RigZone; MAX_RIGS] {
+        [RigZone { live: false, ..RigZone::OPEN }; MAX_RIGS]
+    }
+
+    fn max_second_diff(samples: &[f32]) -> f32 {
+        samples
+            .windows(3)
+            .map(|w| (w[2] - 2.0 * w[1] + w[0]).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn idle_non_live_rig_sleeps_after_ringout_and_skips_dsp_and_reports_zero_cpu() {
+        let mut g = Graph::default();
+        let mut keys = [0u32; 2];
+        let mut synths = [0u32; 2];
+        let mut verbs = [0u32; 2];
+        let mut masters = [0u32; 2];
+        let mut eid = 1u32;
+        for r in 0..2usize {
+            keys[r] = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            synths[r] = g.add_node(probe_clap_kind(), name_bytes("SYNTH"));
+            verbs[r] = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("VERB"));
+            masters[r] = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            for id in [keys[r], synths[r], verbs[r], masters[r]] {
+                g.set_rig(id, r as u8);
+            }
+            g.connect_with_id(eid, PortRef { node: keys[r], port: 0 }, PortRef { node: synths[r], port: 0 }, PortKind::Midi);
+            g.connect_with_id(eid + 1, PortRef { node: synths[r], port: 0 }, PortRef { node: verbs[r], port: 0 }, PortKind::Audio);
+            g.connect_with_id(eid + 2, PortRef { node: verbs[r], port: 0 }, PortRef { node: masters[r], port: 0 }, PortKind::Audio);
+            g.connect_with_id(eid + 3, PortRef { node: verbs[r], port: 0 }, PortRef { node: masters[r], port: 1 }, PortKind::Audio);
+            eid += 4;
+        }
+
+        let (v0, _m0, p0) = host_probe();
+        let (v1, _m1, p1) = host_probe();
+        p0.set_level(0.3);
+        p1.set_level(0.5);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(g, drain, SR, vec![(synths[0], v0), (synths[1], v1)]);
+        let times = engine.node_timer.handle();
+        let mut out = vec![0.0f32; FRAMES * 2];
+
+        // Warm up both rigs so Reverb 1 holds tail energy, then mute Probe 1 and switch rig 1 non-live.
+        for _ in 0..10 {
+            engine.render(&mut out, 2);
+        }
+        p1.set_level(0.0);
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+        engine.render(&mut out, 2);
+        assert_eq!(engine.sleeping_rigs_mask(), 0, "rig 1 must stay awake while Reverb tail rings out");
+
+        // Render through ring-out and settle while rig 0 actively plays notes/releases.
+        let max_settle_blocks = (5.0 * SR / FRAMES as f64).ceil() as usize;
+        for b in 0..max_settle_blocks {
+            if b % 40 == 0 {
+                let _ = bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+            } else if b % 40 == 20 {
+                let _ = bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
+            }
+            engine.render(&mut out, 2);
+            if engine.sleeping_rigs_mask() == 0b10 {
+                break;
+            }
+        }
+        assert_eq!(engine.sleeping_rigs_mask(), 0b10, "rig 1 should sleep after ringing out");
+
+        let p0_before = p0.process_blocks();
+        let p1_before = p1.process_blocks();
+        for b in 0..600 {
+            if b % 30 == 0 {
+                let _ = bus.send(Command::NoteOn { note: 64, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+            } else if b % 30 == 15 {
+                let _ = bus.send(Command::NoteOff { note: 64, source: SourceId::Keys, channel: 0 });
+            }
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask(), 0b10, "rig 1 must stay asleep during rig 0 note-ons/offs");
+        assert_eq!(p1.process_blocks(), p1_before, "sleeping rig 1 CLAP process() must not be called");
+        assert_eq!(p0.process_blocks(), p0_before + 600, "live rig 0 CLAP process() must run every block");
+
+        let stats = EngineStats::build(
+            EngineCounters { sample_rate: SR as u32, callback_frames: FRAMES as u32, ..Default::default() },
+            Some(&times),
+            0,
+            |_| None,
+        );
+        let us_of = |node: NodeId| stats.nodes.iter().find(|n| n.node == node).map(|n| n.avg_us);
+        assert_eq!(us_of(synths[1]), Some(0.0), "sleeping synth reports 0 us CPU: {:?}", stats.nodes);
+        assert_eq!(us_of(verbs[1]), Some(0.0), "sleeping reverb reports 0 us CPU: {:?}", stats.nodes);
+        assert!(us_of(synths[0]).unwrap_or(0.0) > 0.0, "live synth reports >0 us CPU");
+        assert!(us_of(verbs[0]).unwrap_or(0.0) > 0.0, "live reverb reports >0 us CPU");
+    }
+
+    #[test]
+    fn clap_sleep_protocol_and_tail_length_govern_idle_sleep() {
+        let mut g = Graph::default();
+        let mut masters = [0u32; 2];
+        let mut synths = [0u32; 2];
+        for r in 0..2usize {
+            let k = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            synths[r] = g.add_node(probe_clap_kind(), name_bytes("SYNTH"));
+            masters[r] = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            for id in [k, synths[r], masters[r]] {
+                g.set_rig(id, r as u8);
+            }
+            g.connect_with_id((r * 2 + 1) as u32, PortRef { node: k, port: 0 }, PortRef { node: synths[r], port: 0 }, PortKind::Midi);
+            g.connect_with_id((r * 2 + 2) as u32, PortRef { node: synths[r], port: 0 }, PortRef { node: masters[r], port: 0 }, PortKind::Audio);
+        }
+
+        let (v0, _m0, p0) = host_probe();
+        let (v1, _m1, p1) = host_probe();
+        p0.set_level(0.0);
+        p1.set_level(0.0);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(g, drain, SR, vec![(synths[0], v0), (synths[1], v1)]);
+        let mut out = vec![0.0f32; FRAMES * 2];
+
+        // Subcase A: CLAP_PROCESS_TAIL + 2.0 s finite tail keeps rig 1 awake beyond 1.2 s and sleeps by 2.3 s.
+        p1.set_tail_samples(96_000);
+        p1.notify_tail_changed();
+        p1.set_process_status(CLAP_PROCESS_TAIL);
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+        for _ in 0..240 {
+            // ~1.28 s
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask() & 0b10, 0, "finite 2.0 s CLAP tail must delay sleep past 1.28 s");
+        for _ in 0..200 {
+            // total ~2.35 s
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 sleeps once 2.0 s CLAP tail finishes");
+
+        // Subcase B: CLAP_PROCESS_SLEEP allows quick sleep (~0.25 s) and wakes in the exact block of request_process().
+        p1.set_tail_samples(0);
+        p1.notify_tail_changed();
+        p1.set_process_status(CLAP_PROCESS_SLEEP);
+        assert!(bus.send(Command::SetParam { node: synths[1], param: 0, value: 0.0 }));
+        engine.render(&mut out, 2);
+        assert_eq!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 wakes on param command");
+        for _ in 0..50 {
+            // ~0.27 s (< 1.0 s standard settle, >= 0.15 s CLAP sleep guard)
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "CLAP_PROCESS_SLEEP rig settles quickly");
+
+        p1.set_process_status(CLAP_PROCESS_CONTINUE);
+        let blocks_before = p1.process_blocks();
+        p1.request_process();
+        engine.render(&mut out, 2);
+        assert_eq!(p1.process_blocks(), blocks_before + 1, "request_process() wakes rig in exact next block");
+        assert_eq!(engine.sleeping_rigs_mask() & 0b10, 0);
+
+        p1.set_process_status(CLAP_PROCESS_SLEEP);
+        engine.render(&mut out, 2);
+        for _ in 0..45 {
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 returns to sleep again");
+    }
+
+    #[test]
+    fn waking_rig_plays_first_note_without_click_dropout_or_stale_delay_tail() {
+        let mut g = Graph::default();
+        let k0 = g.add_node(NodeKind::Keys, name_bytes("KEYS0"));
+        let s0 = g.add_node(probe_clap_kind(), name_bytes("SINE0"));
+        let m0 = g.add_node(NodeKind::MasterOut, name_bytes("M0"));
+        for id in [k0, s0, m0] {
+            g.set_rig(id, 0);
+        }
+        g.connect_with_id(1, PortRef { node: k0, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: m0, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: s0, port: 0 }, PortRef { node: m0, port: 1 }, PortKind::Audio);
+
+        let k1 = g.add_node(NodeKind::Keys, name_bytes("KEYS1"));
+        let s1 = g.add_node(probe_clap_kind(), name_bytes("SINE1"));
+        let delay1 = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY1"));
+        let m1 = g.add_node(NodeKind::MasterOut, name_bytes("M1"));
+        for id in [k1, s1, delay1, m1] {
+            g.set_rig(id, 1);
+        }
+        g.connect_with_id(4, PortRef { node: k1, port: 0 }, PortRef { node: s1, port: 0 }, PortKind::Midi);
+        g.connect_with_id(5, PortRef { node: s1, port: 0 }, PortRef { node: delay1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(6, PortRef { node: delay1, port: 0 }, PortRef { node: m1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(7, PortRef { node: delay1, port: 0 }, PortRef { node: m1, port: 1 }, PortKind::Audio);
+
+        let (v0, _m0, p0) = host_probe();
+        let (v1, _m1, p1) = host_probe();
+        p0.set_sine_on_note(true);
+        p1.set_sine_on_note(true);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(g, drain, SR, vec![(s0, v0), (s1, v1)]);
+        let mut out = vec![0.0f32; FRAMES * 2];
+
+        // Configure 1.5 s delay time, 50% mix, light feedback (0.05 -> decays cleanly within seconds) and let slew settle.
+        let delay_1_5s = ((1.5f64 / 0.05).ln() / (2.0f64 / 0.05).ln()) as f64;
+        assert!(bus.send(Command::SetParam { node: delay1, param: P_TIME, value: delay_1_5s }));
+        assert!(bus.send(Command::SetParam { node: delay1, param: P_MIX, value: 0.5 }));
+        assert!(bus.send(Command::SetParam { node: delay1, param: 0, value: 0.05 }));
+        for _ in 0..30 {
+            engine.render(&mut out, 2);
+        }
+
+        // Play a short note on rig 1 only, then release and make rig 1 non-live.
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(1) }));
+        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 }));
+        for _ in 0..8 {
+            engine.render(&mut out, 2);
+        }
+        assert!(bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 }));
+        for _ in 0..4 {
+            engine.render(&mut out, 2);
+        }
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+
+        // At 0.5 s (< 1.5 s delay), rig 1 must NOT be sleeping yet (tail_hint_frames protects delayed echo).
+        for _ in 0..94 {
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask() & 0b10, 0, "Delay tail hint prevents premature sleep at 0.5 s");
+
+        // Wait until Delay echo finishes and rig 1 enters sleep.
+        for _ in 0..3000 {
+            engine.render(&mut out, 2);
+            if (engine.sleeping_rigs_mask() & 0b10) != 0 {
+                break;
+            }
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 sleeps after Delay echo finishes");
+
+        // Wake rig 1 silently first (SetRigZones live without NoteOn): zero stale delay tail may replay.
+        assert!(bus.send(Command::SetRigZones { zones: all_live() }));
+        let mut stale_peak = 0.0f32;
+        for _ in 0..10 {
+            engine.render(&mut out, 2);
+            for &s in &out {
+                stale_peak = stale_peak.max(s.abs());
+            }
+        }
+        assert!(stale_peak < 1e-6, "waking must replay zero stale delay tail, got peak={stale_peak}");
+
+        // Put rig 1 back to sleep cleanly, then wake directly on NoteOn + SetRigZones in the SAME block.
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+        for _ in 0..3000 {
+            engine.render(&mut out, 2);
+            if (engine.sleeping_rigs_mask() & 0b10) != 0 {
+                break;
+            }
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0);
+
+        let p1_before = p1.process_blocks();
+        assert!(bus.send(Command::SetRigZones { zones: all_live() }));
+        assert!(bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Keys, channel: 0 }));
+        let mut captured_l = Vec::with_capacity(FRAMES * 8);
+        for b in 0..8 {
+            engine.render(&mut out, 2);
+            if b == 0 {
+                assert_eq!(p1.process_blocks(), p1_before + 1, "first note wakes and renders in block 0");
+                let b0_peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                assert!(b0_peak > 0.05, "no dropout on first wake block (peak={b0_peak})");
+            }
+            for f in 0..FRAMES {
+                captured_l.push(out[f * 2]);
+            }
+        }
+        let d2 = max_second_diff(&captured_l);
+        assert!(d2 < 0.02, "waking sine onset must be click-free (max_d2={d2})");
+
+        // Part 2: Hold a continuous sine on rig 0 while rig 1 sleeps and then wakes without click on master.
+        assert!(bus.send(Command::NoteOff { note: 64, source: SourceId::Keys, channel: 0 }));
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+        assert!(bus.send(Command::NoteOn { note: 69, velocity: 0.9, source: SourceId::Keys, channel: 0 }));
+        for _ in 0..3000 {
+            engine.render(&mut out, 2);
+            if (engine.sleeping_rigs_mask() & 0b10) != 0 {
+                break;
+            }
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0);
+
+        let mut held_sine = Vec::with_capacity(FRAMES * 12);
+        for b in 0..12 {
+            if b == 6 {
+                assert!(bus.send(Command::SetRigZones { zones: all_live() }));
+                assert!(bus.send(Command::SetParam { node: delay1, param: P_MIX, value: 0.4 }));
+            }
+            engine.render(&mut out, 2);
+            if b >= 2 {
+                for f in 0..FRAMES {
+                    held_sine.push(out[f * 2]);
+                }
+            }
+        }
+        let held_d2 = max_second_diff(&held_sine);
+        assert!(held_d2 < 0.02, "waking sleeping rig must not click held sine on rig 0 (max_d2={held_d2})");
+    }
+
+    #[test]
+    fn idle_rig_sleep_and_wake_allocate_nothing_on_audio_thread() {
+        let mut g = Graph::default();
+        let k1 = g.add_node(NodeKind::Keys, name_bytes("KEYS1"));
+        let s1 = g.add_node(probe_clap_kind(), name_bytes("SYNTH1"));
+        let delay1 = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY1"));
+        let verb1 = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("VERB1"));
+        let m1 = g.add_node(NodeKind::MasterOut, name_bytes("M1"));
+        for id in [k1, s1, delay1, verb1, m1] {
+            g.set_rig(id, 0);
+        }
+        g.connect_with_id(1, PortRef { node: k1, port: 0 }, PortRef { node: s1, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s1, port: 0 }, PortRef { node: delay1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: delay1, port: 0 }, PortRef { node: verb1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(4, PortRef { node: verb1, port: 0 }, PortRef { node: m1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(5, PortRef { node: verb1, port: 0 }, PortRef { node: m1, port: 1 }, PortKind::Audio);
+
+        let (v0, _m0, p0) = host_probe();
+        p0.set_level(0.0);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(g, drain, SR, vec![(s1, v0)]);
+        let mut out = vec![0.0f32; FRAMES * 2];
+
+        // Short delay (50 ms) + warm up one NoteOn/NoteOff/SetParam cycle so #[cfg(test)] logs reserve once.
+        assert!(bus.send(Command::SetParam { node: delay1, param: P_TIME, value: 0.0 }));
+        assert!(bus.send(Command::SetParam { node: delay1, param: 0, value: 0.0 }));
+        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 }));
+        engine.render(&mut out, 2);
+        assert!(bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 }));
+        for _ in 0..20 {
+            engine.render(&mut out, 2);
+        }
+
+        engine.note_log.clear();
+        engine.vel_log.clear();
+        let allocs0 = rt_alloc::count();
+        assert!(bus.send(Command::SetRigZones { zones: no_live() }));
+        for _ in 0..300 {
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask(), 0b1, "rig enters sleep");
+        for _ in 0..50 {
+            engine.render(&mut out, 2);
+        }
+        assert!(bus.send(Command::SetRigZones { zones: all_live() }));
+        assert!(bus.send(Command::NoteOn { note: 64, velocity: 0.8, source: SourceId::Keys, channel: 0 }));
+        assert!(bus.send(Command::SetParam { node: verb1, param: 0, value: 0.3 }));
+        for _ in 0..10 {
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask(), 0, "rig woke cleanly");
+        assert!(bus.send(Command::NoteOff { note: 64, source: SourceId::Keys, channel: 0 }));
+        assert!(bus.send(Command::SetRigZones { zones: no_live() }));
+        for _ in 0..300 {
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask(), 0b1, "rig re-enters sleep");
+        assert_eq!(
+            rt_alloc::count() - allocs0,
+            0,
+            "idle-rig sleep, skip, wake, play, and re-sleep must allocate 0 times on audio thread"
+        );
+    }
+
+    #[test]
+    fn held_notes_sustain_gain_ramp_pdc_and_prefader_sends_interact_safely_with_sleep() {
+        let mut g = Graph::default();
+        // Rig 0: Keys -> Probe0 -> Limiter (64f lookahead) -> Master0 -> MasterInsert Gain
+        let k0 = g.add_node(NodeKind::Keys, name_bytes("K0"));
+        let s0 = g.add_node(probe_clap_kind(), name_bytes("S0"));
+        let lim0 = g.add_node(NodeKind::Dsp(DspKind::Limiter), name_bytes("LIM0"));
+        let m0 = g.add_node(NodeKind::MasterOut, name_bytes("M0"));
+        let m_ins = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("MINS"));
+        for id in [k0, s0, lim0, m0, m_ins] {
+            g.set_rig(id, 0);
+        }
+        // Rig 1: parallel wet (64f lookahead Limiter) + dry paths into Master1 for PDC testing
+        let k1 = g.add_node(NodeKind::Keys, name_bytes("K1"));
+        let s1 = g.add_node(probe_clap_kind(), name_bytes("S1"));
+        let lim1 = g.add_node(NodeKind::Dsp(DspKind::Limiter), name_bytes("LIM1"));
+        let g_wet = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GWET"));
+        let g_dry = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GDRY"));
+        let m1 = g.add_node(NodeKind::MasterOut, name_bytes("M1"));
+        for id in [k1, s1, lim1, g_wet, g_dry, m1] {
+            g.set_rig(id, 1);
+        }
+        // Aux bus wired to Master0
+        let bus_node = g.add_node(NodeKind::Dsp(DspKind::Bus), name_bytes("AUX"));
+        g.set_rig(bus_node, 0);
+
+        g.connect_with_id(1, PortRef { node: k0, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: lim0, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: lim0, port: 0 }, PortRef { node: m0, port: 0 }, PortKind::Audio);
+        g.connect_with_id(4, PortRef { node: m0, port: 0 }, PortRef { node: m_ins, port: 0 }, PortKind::Audio);
+        g.connect_with_id(5, PortRef { node: k1, port: 0 }, PortRef { node: s1, port: 0 }, PortKind::Midi);
+        g.connect_with_id(6, PortRef { node: s1, port: 0 }, PortRef { node: lim1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(7, PortRef { node: lim1, port: 0 }, PortRef { node: g_wet, port: 0 }, PortKind::Audio);
+        g.connect_with_id(8, PortRef { node: g_wet, port: 0 }, PortRef { node: m1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(9, PortRef { node: s1, port: 0 }, PortRef { node: g_dry, port: 0 }, PortKind::Audio);
+        g.connect_with_id(10, PortRef { node: g_dry, port: 0 }, PortRef { node: m1, port: 0 }, PortKind::Audio);
+        g.connect_with_id(11, PortRef { node: bus_node, port: 0 }, PortRef { node: m0, port: 0 }, PortKind::Audio);
+
+        let (v0, _m0, p0) = host_probe();
+        let (v1, _m1, p1) = host_probe();
+        p0.set_level(0.0);
+        p1.set_level(0.0);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(g, drain, SR, vec![(s0, v0), (s1, v1)]);
+        let mut out = vec![0.0f32; FRAMES * 2];
+
+        // 1. Held note keeps non-live rig 1 awake until NoteOff.
+        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 }));
+        engine.render(&mut out, 2);
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask() & 0b10, 0, "held note blocks rig 1 sleep");
+        assert!(bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 }));
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 sleeps after NoteOff settles");
+        assert!(!engine.node_is_sleeping(m_ins), "master insert never sleeps");
+        assert!(!engine.node_is_sleeping(bus_node), "aux bus never sleeps");
+
+        // 2. Sustain pedal (CC 64 = 127) held before leaving live keeps rig 1 awake until CC 64 = 0.
+        assert!(bus.send(Command::SetRigZones { zones: all_live() }));
+        assert!(bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 127 }));
+        engine.render(&mut out, 2);
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_eq!(engine.sleeping_rigs_mask() & 0b10, 0, "held sustain pedal blocks rig 1 sleep");
+        assert!(bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 0 }));
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 sleeps once sustain pedal releases");
+
+        // 3. Unsettled GainRamp wakes rig 1, keeps it awake during the ramp, then re-sleeps smoothly.
+        assert!(bus.send(Command::SetRigMix { rig: 1, vol: Some(0.2), pan: None, mute: None, solo: None }));
+        let mut ramp_out = vec![0.0f32; 64 * 2];
+        engine.render(&mut ramp_out, 2);
+        assert_eq!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 wakes on mix edit");
+        assert!(engine.rig_gain[1].is_ramping(), "GainRamp is in flight over short block");
+        assert_eq!(engine.rig_quiet_frames[1], 0, "quiet countdown holds at 0 while GainRamp ramps");
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 sleeps after GainRamp settles");
+        assert!(bus.send(Command::SetRigMix { rig: 1, vol: Some(1.0), pan: None, mute: None, solo: None }));
+        engine.render(&mut out, 2);
+
+        // 4. Pre-fader send with P_LEVEL = 0 keeps rig 1 awake while synth1 produces audio > 1e-5.
+        assert!(bus.send(Command::SetSend { from: SendSource::Node(s1), bus: bus_node, level: Some(1.0), pre: Some(true) }));
+        assert!(bus.send(Command::SetParam { node: s1, param: P_LEVEL, value: 0.0 }));
+        p1.set_level(0.5);
+        let mut send_peak = 0.0f32;
+        for b in 0..250 {
+            engine.render(&mut out, 2);
+            if b < 10 {
+                send_peak = out.iter().fold(send_peak, |m, x| m.max(x.abs()));
+            }
+        }
+        assert_eq!(
+            engine.sleeping_rigs_mask() & 0b10,
+            0,
+            "pre-fader send with P_LEVEL=0 keeps non-live rig 1 awake while voice sounds"
+        );
+        assert!(send_peak > 0.1, "aux bus receives rig 1 pre-fader audio (peak={send_peak})");
+
+        p1.set_level(0.0);
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0, "rig 1 sleeps after pre-fader audio stops");
+
+        // 5. PDC alignment: parallel latent (lim1) vs dry leg inside rig 1 stays aligned after sleep and wake.
+        assert!(bus.send(Command::SetSend { from: SendSource::Node(s1), bus: bus_node, level: Some(0.0), pre: Some(true) }));
+        assert!(bus.send(Command::SetParam { node: s1, param: P_LEVEL, value: 0.25 }));
+        assert_eq!(engine.pdc.max_frames_for(|id| id == g_dry || id == lim1), 240, "240f PDC line planned on dry leg");
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0);
+
+        p1.set_sine_on_note(true);
+        assert!(bus.send(Command::SetRigMix { rig: 0, vol: Some(1.0), pan: None, mute: Some(true), solo: None }));
+        assert!(bus.send(Command::SetRigMix { rig: 1, vol: Some(1.0), pan: None, mute: Some(false), solo: None }));
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(1) }));
+        // Measure wet leg alone (dry muted)
+        assert!(bus.send(Command::SetStripMix { node: g_wet, pan: None, mute: Some(false), solo: None }));
+        assert!(bus.send(Command::SetStripMix { node: g_dry, pan: None, mute: Some(true), solo: None }));
+        for _ in 0..4 {
+            engine.render(&mut out, 2);
+        }
+        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 }));
+        let mut wet_buf = Vec::with_capacity(FRAMES * 8);
+        for _ in 0..8 {
+            engine.render(&mut out, 2);
+            for f in 0..FRAMES {
+                wet_buf.push(out[f * 2]);
+            }
+        }
+        assert!(bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 }));
+        for _ in 0..10 {
+            engine.render(&mut out, 2);
+        }
+
+        // Sleep rig 1, then wake rig 1 and measure dry leg alone (wet muted, compensated via PDC).
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(0) }));
+        for _ in 0..250 {
+            engine.render(&mut out, 2);
+        }
+        assert_ne!(engine.sleeping_rigs_mask() & 0b10, 0);
+
+        assert!(bus.send(Command::SetRigZones { zones: only_rig_live(1) }));
+        assert!(bus.send(Command::SetStripMix { node: g_wet, pan: None, mute: Some(true), solo: None }));
+        assert!(bus.send(Command::SetStripMix { node: g_dry, pan: None, mute: Some(false), solo: None }));
+        engine.render(&mut out, 2);
+        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 }));
+        let mut dry_buf = Vec::with_capacity(FRAMES * 8);
+        for _ in 0..8 {
+            engine.render(&mut out, 2);
+            for f in 0..FRAMES {
+                dry_buf.push(out[f * 2]);
+            }
+        }
+        let corr = crate::analysis::xcorr_peak(&wet_buf, &dry_buf, 300);
+        assert!(
+            corr.lag_frames == 0 && corr.r > 0.98,
+            "woken rig 1 dry PDC path must stay phase-aligned with latent wet path: {corr:?}"
+        );
     }
 }

@@ -360,28 +360,156 @@ pub fn scan_and_apply(target: Target) -> OutputState {
 /// `capture-test`).
 pub(crate) mod selftest {
     pub(crate) use super::pactl;
+    use serde_json::Value;
     use std::time::{Duration, Instant};
 
-    /// Unloads the test's null sinks and ends the tone, also on a failed check.
-    pub(crate) struct Cleanup { pub(crate) modules: Vec<String>, pub(crate) app: Option<ToneApp>, default: String }
-    impl Cleanup {
-        /// Remembers the default sink, to put it back at the end.
-        pub(crate) fn new() -> Self {
-            Self { modules: Vec::new(), app: None, default: pactl(&["get-default-sink"]).unwrap_or_default().trim().to_string() }
+    pub(crate) const CONFIGURED_SINK_KEY: &str = "default.configured.audio.sink";
+
+    type Runner = Box<dyn FnMut(&str, &[&str]) -> Option<String>>;
+
+    fn live_run(program: &str, args: &[&str]) -> Option<String> {
+        let o = std::process::Command::new(program).args(args).output().ok()?;
+        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    }
+
+    fn non_empty_sink(s: &str) -> Option<String> {
+        let t = s.trim();
+        (!t.is_empty() && t != "@DEFAULT_SINK@" && t != "@NONE@").then(|| t.to_string())
+    }
+
+    /// Parses the sink name from `pw-metadata -n default 0 <key>` output.
+    pub(crate) fn parse_pw_metadata_sink(output: &str, key: &str) -> Option<String> {
+        let needle = format!("key:'{key}'");
+        let line = output.lines().rev().find(|l| l.contains(&needle))?;
+        let rest = line.split_once("value:'")?.1.trim_end();
+        let json_str = rest
+            .rsplit_once("' type:")
+            .map(|(v, _)| v)
+            .or_else(|| rest.strip_suffix('\''))?;
+        let val: Value = serde_json::from_str(json_str).ok()?;
+        val.get("name").and_then(Value::as_str).and_then(non_empty_sink)
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum SavedDefault {
+        Configured { name: String, fallback: Option<String> },
+        Unset { fallback: Option<String> },
+        PactlOnly(Option<String>),
+    }
+
+    pub(crate) fn classify_saved_default(meta_output: Option<&str>, fallback: Option<String>) -> SavedDefault {
+        match meta_output {
+            Some(meta) if meta.contains("Found \"default\" metadata") => {
+                if let Some(name) = parse_pw_metadata_sink(meta, CONFIGURED_SINK_KEY) {
+                    SavedDefault::Configured { name, fallback }
+                } else {
+                    SavedDefault::Unset { fallback }
+                }
+            }
+            _ => SavedDefault::PactlOnly(fallback),
         }
-        pub(crate) fn null_sink(&mut self, name: &str, label: &str) -> anyhow::Result<()> {
-            let id = pactl(&["load-module", "module-null-sink", &format!("sink_name={name}"),
-                &format!("sink_properties=device.description={label}")])
-                .ok_or_else(|| anyhow::anyhow!("could not load a null sink"))?;
-            self.modules.push(id.trim().to_string());
+    }
+
+    /// Unloads the test's null sinks, restores the user's default sink, and
+    /// ends the tone, also on a failed check or panic.
+    pub(crate) struct Cleanup {
+        pub(crate) modules: Vec<String>,
+        pub(crate) app: Option<ToneApp>,
+        saved_default: SavedDefault,
+        default_changed: bool,
+        run: Runner,
+    }
+    impl Cleanup {
+        /// Remembers the configured and active default sink, to put it back at the end.
+        pub(crate) fn new() -> Self {
+            Self::with_runner(Box::new(live_run))
+        }
+        pub(crate) fn with_runner(mut run: Runner) -> Self {
+            let fallback = run("pactl", &["get-default-sink"]).as_deref().and_then(non_empty_sink);
+            let meta = run("pw-metadata", &["-n", "default", "0", CONFIGURED_SINK_KEY]);
+            let saved_default = classify_saved_default(meta.as_deref(), fallback);
+            Self { modules: Vec::new(), app: None, saved_default, default_changed: false, run }
+        }
+        pub(crate) fn null_sink(&mut self, name: &str, label: &str) -> anyhow::Result<String> {
+            let id = (self.run)(
+                "pactl",
+                &[
+                    "load-module",
+                    "module-null-sink",
+                    &format!("sink_name={name}"),
+                    &format!("sink_properties='device.description={label} state.restore-props=false'"),
+                ],
+            )
+            .ok_or_else(|| anyhow::anyhow!("could not load a null sink"))?;
+            let id = id.trim().to_string();
+            anyhow::ensure!(!id.is_empty(), "empty module id from load-module for {name}");
+            // Track before setting properties so Drop still unloads if volume/mute fails.
+            self.modules.push(id.clone());
+            anyhow::ensure!(
+                (self.run)("pactl", &["set-sink-volume", name, "100%"]).is_some(),
+                "set-sink-volume 100% failed for {name}"
+            );
+            anyhow::ensure!(
+                (self.run)("pactl", &["set-sink-mute", name, "0"]).is_some(),
+                "set-sink-mute 0 failed for {name}"
+            );
+            Ok(id)
+        }
+        pub(crate) fn unload_module(&mut self, module_id: &str) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                (self.run)("pactl", &["unload-module", module_id]).is_some(),
+                "unload-module failed for {module_id}"
+            );
+            self.modules.retain(|m| m != module_id);
             Ok(())
+        }
+        pub(crate) fn set_default_sink(&mut self, sink: &str) -> anyhow::Result<()> {
+            self.default_changed = true;
+            anyhow::ensure!(
+                (self.run)("pactl", &["set-default-sink", sink]).is_some(),
+                "set-default-sink failed"
+            );
+            Ok(())
+        }
+        fn restore_default(&mut self) {
+            match &self.saved_default {
+                SavedDefault::Configured { name, fallback } => {
+                    let json = serde_json::json!({ "name": name }).to_string();
+                    if (self.run)(
+                        "pw-metadata",
+                        &["-n", "default", "0", CONFIGURED_SINK_KEY, &json, "Spa:String:JSON"],
+                    )
+                    .is_none()
+                    {
+                        if let Some(fb) = fallback {
+                            let _ = (self.run)("pactl", &["set-default-sink", fb]);
+                        }
+                    }
+                }
+                SavedDefault::Unset { fallback } => {
+                    if (self.run)("pw-metadata", &["-n", "default", "-d", "0", CONFIGURED_SINK_KEY]).is_none() {
+                        if let Some(fb) = fallback {
+                            let _ = (self.run)("pactl", &["set-default-sink", fb]);
+                        }
+                    }
+                }
+                SavedDefault::PactlOnly(Some(name)) => {
+                    let _ = (self.run)("pactl", &["set-default-sink", name]);
+                }
+                SavedDefault::PactlOnly(None) => {}
+            }
         }
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
             self.app.take();
-            if !self.default.is_empty() { let _ = pactl(&["set-default-sink", &self.default]); }
-            for m in &self.modules { let _ = pactl(&["unload-module", m]); }
+            if self.default_changed {
+                self.restore_default();
+            }
+            let modules = std::mem::take(&mut self.modules);
+            for m in &modules {
+                let _ = (self.run)("pactl", &["unload-module", m]);
+            }
         }
     }
 
@@ -644,10 +772,14 @@ pub fn run_test() -> anyhow::Result<()> {
     let info = pactl(&["info"]).ok_or_else(|| anyhow::anyhow!("pactl info failed: no PipeWire/PulseAudio server"))?;
     println!("server: {}", info.lines().find(|l| l.starts_with("Server Name")).unwrap_or("?"));
     let mut cleanup = Cleanup::new();
-    let (home, other) = ("kabelsalat_test_home", "kabelsalat_test_other");
+    let pid = std::process::id();
+    let home_s = format!("kabelsalat_test_home_{pid}");
+    let other_s = format!("kabelsalat_test_other_{pid}");
+    let app_s = format!("Test Browser {pid}");
+    let (home, other, app) = (home_s.as_str(), other_s.as_str(), app_s.as_str());
     cleanup.null_sink(home, "Test-Home")?;
     cleanup.null_sink(other, "Test-Other")?;
-    anyhow::ensure!(pactl(&["set-default-sink", home]).is_some(), "set-default-sink failed");
+    cleanup.set_default_sink(home)?;
 
     // Our own output stream, the way the engine opens it (cpal, default device).
     let device = cpal::default_host().default_output_device()
@@ -662,7 +794,7 @@ pub fn run_test() -> anyhow::Result<()> {
     stream.play()?;
 
     // "Another app": a second process playing a 440 Hz tone.
-    cleanup.app = Some(tone_app(home, "Test Browser", "(2) Backing track - Video", 440.0)?);
+    cleanup.app = Some(tone_app(home, app, "(2) Backing track - Video", 440.0)?);
 
     // 1. No choice: our stream is found where PipeWire put it, both outputs are listed.
     let st = until("our stream in the scan", || Some(scan_and_apply(Target::Follow)).filter(|s| s.current.is_some()))?;
@@ -708,7 +840,7 @@ pub fn run_test() -> anyhow::Result<()> {
     println!("ok: back to the system default {home} after {passes} pass(es)");
 
     // 5. The other app: listed with app and title, never our own stream.
-    let theirs = until("the other app's stream", || scan_and_apply(Target::Follow).streams.into_iter().find(|s| s.app == "Test Browser"))?;
+    let theirs = until("the other app's stream", || scan_and_apply(Target::Follow).streams.into_iter().find(|s| s.app == app))?;
     println!("app stream: {theirs:?}");
     anyhow::ensure!(theirs.title == "(2) Backing track - Video", "title, got {:?}", theirs.title);
     anyhow::ensure!((theirs.volume - 1.0).abs() < 0.02 && !theirs.muted, "starts at 100 %, unmuted: {theirs:?}");
@@ -743,7 +875,7 @@ pub fn run_test() -> anyhow::Result<()> {
     println!("ok: the app stopped, its strip and meter are gone");
 
     drop(stream);
-    bus_output_check(home, other, &mut cleanup.modules)?;
+    bus_output_check(home, other, &mut cleanup)?;
     println!("audio-out-test: PASS");
     Ok(())
 }
@@ -788,19 +920,15 @@ fn capture_sink(sink: &str, secs: f32) -> anyhow::Result<Vec<f32>> {
 /// bus, and three null sinks read back through their monitors. A bus routed
 /// to its own output must arrive there and nowhere else, stay silent while
 /// its device is gone, come back with it, and return to the master.
-fn bus_output_check(home: &str, other: &str, modules: &mut Vec<String>) -> anyhow::Result<()> {
+fn bus_output_check(home: &str, other: &str, cleanup: &mut selftest::Cleanup) -> anyhow::Result<()> {
     use crate::control::{command_bus, name_bytes, AudioInChannel, Command, DspKind, Graph, NodeKind, PortKind, PortRef, SendSource, SinkName};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::time::{Duration, Instant};
     const A_HZ: f32 = 440.0;
     const B_HZ: f32 = 1130.0;
-    const PHONES: &str = "kabelsalat_test_phones";
+    let phones = format!("kabelsalat_test_phones_{}", std::process::id());
 
-    let load_phones = || pactl(&["load-module", "module-null-sink", &format!("sink_name={PHONES}"),
-        "sink_properties=device.description=Test-Phones"]).map(|id| id.trim().to_string())
-        .ok_or_else(|| anyhow::anyhow!("could not load a null sink"));
-    let mut phones_module = load_phones()?;
-    modules.push(phones_module.clone());
+    let phones_module = cleanup.null_sink(&phones, "Test-Phones")?;
 
     // Two rigs, each an Audio In fed its tone in the output callback, wired
     // to its own master; the aux bus comes in by command, as in the app.
@@ -872,7 +1000,7 @@ fn bus_output_check(home: &str, other: &str, modules: &mut Vec<String>) -> anyho
     // (440 Hz, 1130 Hz) amplitude on each of home, other, phones.
     let hear = || -> anyhow::Result<[(f32, f32); 3]> {
         let mut out = [(0.0, 0.0); 3];
-        for (i, sink) in [home, other, PHONES].into_iter().enumerate() {
+        for (i, sink) in [home, other, phones.as_str()].into_iter().enumerate() {
             let buf = capture_sink(sink, 1.0)?;
             out[i] = (tone_amp(&buf, A_HZ), tone_amp(&buf, B_HZ));
         }
@@ -905,17 +1033,16 @@ fn bus_output_check(home: &str, other: &str, modules: &mut Vec<String>) -> anyho
     let aux = poll("the aux bus in the engine", || Ok(graph_pub.lock().unwrap().graph.nodes.iter()
         .find(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).map(|n| n.id)))?;
     bus.send(Command::SetSend { from: SendSource::Rig(0), bus: aux, level: Some(0.5), pre: Some(true) });
-    bus.send(Command::SetBusOutput { bus: SendSource::Node(aux), sink: Some(SinkName::new(PHONES)) });
+    bus.send(Command::SetBusOutput { bus: SendSource::Node(aux), sink: Some(SinkName::new(&phones)) });
     let h = poll("the aux bus on the phones sink", || { let h = hear()?; Ok((h[2].0 > HEARD).then_some(h)) })?;
     anyhow::ensure!(h[2].1 < SILENT && h[1].0 < SILENT && h[1].1 > HEARD && h[0].0 > HEARD && h[0].1 < SILENT,
         "each bus plays on its own sink only: {}", show(&h));
     let dry = h[0].0;
     anyhow::ensure!(bus_streams() == 2, "one stream per routed sink, got {}", bus_streams());
-    println!("ok: aux bus routed to {PHONES}: {}", show(&h));
+    println!("ok: aux bus routed to {phones}: {}", show(&h));
 
     // 12. The phones go away: their bus is silent, and nobody else gets it.
-    anyhow::ensure!(pactl(&["unload-module", &phones_module]).is_some(), "unload the phones sink");
-    modules.retain(|m| *m != phones_module);
+    cleanup.unload_module(&phones_module)?;
     poll("the phones stream ending", || Ok((bus_streams() == 1).then_some(())))?;
     std::thread::sleep(Duration::from_millis(1200));
     anyhow::ensure!(bus_streams() == 1, "the stream of a missing output is not reopened elsewhere");
@@ -923,14 +1050,13 @@ fn bus_output_check(home: &str, other: &str, modules: &mut Vec<String>) -> anyho
     let (home_a, other_a) = (tone_amp(&h0, A_HZ), tone_amp(&h1, A_HZ));
     anyhow::ensure!((home_a - dry).abs() < dry * 0.1 && other_a < SILENT,
         "the bus of a missing output lands nowhere: home 440 Hz {home_a:.3} (dry {dry:.3}), other {other_a:.3}");
-    println!("ok: {PHONES} unplugged: its bus is silent (home 440 Hz {home_a:.3} = the dry rig, other {other_a:.3})");
+    println!("ok: {phones} unplugged: its bus is silent (home 440 Hz {home_a:.3} = the dry rig, other {other_a:.3})");
 
     // 13. They come back: the bus plays there again by itself.
-    phones_module = load_phones()?;
-    modules.push(phones_module.clone());
+    let _ = cleanup.null_sink(&phones, "Test-Phones")?;
     let t0 = Instant::now();
     let h = poll("the aux bus back on the phones sink", || { let h = hear()?; Ok((h[2].0 > HEARD).then_some(h)) })?;
-    println!("ok: {PHONES} re-plugged: heard again within {:.1} s: {}", t0.elapsed().as_secs_f32(), show(&h));
+    println!("ok: {phones} re-plugged: heard again within {:.1} s: {}", t0.elapsed().as_secs_f32(), show(&h));
 
     // 14. How far apart master and bus arrive. Both on one sink: rig 1 plays
     // noise bursts, dry through the master and through the bus into `home`,
@@ -1119,5 +1245,199 @@ mod tests {
         assert!(!is_own_process(1), "init is not ours");
         assert!(!is_own_process(std::os::unix::process::parent_id()), "nor is our parent");
         assert!(is_own_process(u32::MAX), "a process that cannot be read is not captured");
+    }
+
+    #[test]
+    fn parse_pw_metadata_sink_reads_configured_default_and_handles_unset() {
+        use selftest::{classify_saved_default, parse_pw_metadata_sink, SavedDefault, CONFIGURED_SINK_KEY};
+
+        let spaced = "Found \"default\" metadata 41\nupdate: id:0 key:'default.configured.audio.sink' value:'{ \"name\": \"alsa_output.usb-MOTU_M2_M2MA03B7IC-00.HiFi__Line__sink\" }' type:'Spa:String:JSON'\n";
+        assert_eq!(
+            parse_pw_metadata_sink(spaced, CONFIGURED_SINK_KEY).as_deref(),
+            Some("alsa_output.usb-MOTU_M2_M2MA03B7IC-00.HiFi__Line__sink")
+        );
+        assert_eq!(
+            classify_saved_default(Some(spaced), Some("audio_effect.j293-convolver".into())),
+            SavedDefault::Configured {
+                name: "alsa_output.usb-MOTU_M2_M2MA03B7IC-00.HiFi__Line__sink".into(),
+                fallback: Some("audio_effect.j293-convolver".into()),
+            }
+        );
+
+        let compact = "Found \"default\" metadata 41\nupdate: id:0 key:'default.configured.audio.sink' value:'{\"name\":\"speakers\"}'\n";
+        assert_eq!(parse_pw_metadata_sink(compact, CONFIGURED_SINK_KEY).as_deref(), Some("speakers"));
+
+        let multi = "Found \"default\" metadata 41\nupdate: id:0 key:'default.configured.audio.sink' value:'{\"name\":\"old\"}' type:'Spa:String:JSON'\nupdate: id:0 key:'default.configured.audio.sink' value:'{\"name\":\"latest\"}' type:'Spa:String:JSON'\n";
+        assert_eq!(parse_pw_metadata_sink(multi, CONFIGURED_SINK_KEY).as_deref(), Some("latest"));
+
+        let unset = "Found \"default\" metadata 41\n";
+        assert_eq!(parse_pw_metadata_sink(unset, CONFIGURED_SINK_KEY), None);
+        assert_eq!(
+            classify_saved_default(Some(unset), Some("speakers".into())),
+            SavedDefault::Unset { fallback: Some("speakers".into()) }
+        );
+
+        for placeholder in ["", "@DEFAULT_SINK@", "@NONE@"] {
+            let line = format!("Found \"default\" metadata 41\nupdate: id:0 key:'{CONFIGURED_SINK_KEY}' value:'{{\"name\":\"{placeholder}\"}}' type:'Spa:String:JSON'\n");
+            assert_eq!(parse_pw_metadata_sink(&line, CONFIGURED_SINK_KEY), None);
+            assert_eq!(
+                classify_saved_default(Some(&line), None),
+                SavedDefault::Unset { fallback: None }
+            );
+        }
+
+        assert_eq!(
+            classify_saved_default(None, Some("speakers".into())),
+            SavedDefault::PactlOnly(Some("speakers".into()))
+        );
+        assert_eq!(classify_saved_default(None, None), SavedDefault::PactlOnly(None));
+    }
+
+    #[test]
+    fn selftest_null_sink_sets_full_volume_unmuted_and_cleanup_restores_default_on_drop() {
+        use selftest::Cleanup;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        type Log = Rc<RefCell<Vec<(String, Vec<String>)>>>;
+
+        let make_runner = |log: Log,
+                           meta: Option<&'static str>,
+                           default_sink: Option<&'static str>,
+                           fail_vol: bool,
+                           fail_pw_restore: bool| {
+            let mut next_id = 10u32;
+            Box::new(move |prog: &str, args: &[&str]| -> Option<String> {
+                let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+                log.borrow_mut().push((prog.to_string(), owned));
+                match (prog, args.first().copied()) {
+                    ("pactl", Some("get-default-sink")) => default_sink.map(str::to_string),
+                    ("pw-metadata", Some("-n")) if args.contains(&"-d") => (!fail_pw_restore).then(String::new),
+                    ("pw-metadata", Some("-n")) if args.len() == 4 => meta.map(str::to_string),
+                    ("pw-metadata", Some("-n")) => (!fail_pw_restore).then(String::new),
+                    ("pactl", Some("load-module")) => {
+                        let id = next_id;
+                        next_id += 1;
+                        Some(format!("{id}\n"))
+                    }
+                    ("pactl", Some("set-sink-volume")) if fail_vol => None,
+                    ("pactl", _) => Some(String::new()),
+                    _ => Some(String::new()),
+                }
+            })
+        };
+
+        // 1. Normal path: null_sink sets state.restore-props=false, 100%, unmuted;
+        //    unload_module removes ID; Drop restores pw-metadata default BEFORE unloading.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        {
+            let mut c = Cleanup::with_runner(make_runner(
+                log.clone(),
+                Some("Found \"default\" metadata 41\nupdate: id:0 key:'default.configured.audio.sink' value:'{ \"name\": \"motu_m2\" }' type:'Spa:String:JSON'\n"),
+                Some("speakers"),
+                false,
+                false,
+            ));
+            let m1 = c.null_sink("home_1", "Test-Home").unwrap();
+            let m2 = c.null_sink("other_1", "Test-Other").unwrap();
+            assert_eq!(m1, "10");
+            assert_eq!(m2, "11");
+            c.set_default_sink("home_1").unwrap();
+            c.unload_module(&m2).unwrap();
+        }
+        let calls = log.borrow();
+        let load_call = calls.iter().find(|(p, a)| p == "pactl" && a[0] == "load-module").unwrap();
+        assert!(
+            load_call.1.iter().any(|a| a == "sink_properties='device.description=Test-Home state.restore-props=false'"),
+            "load-module must disable WirePlumber prop restore: {:?}", load_call
+        );
+        assert!(calls.iter().any(|(p, a)| p == "pactl" && a == &["set-sink-volume", "home_1", "100%"]));
+        assert!(calls.iter().any(|(p, a)| p == "pactl" && a == &["set-sink-mute", "home_1", "0"]));
+        let restore_pos = calls.iter().position(|(p, a)| {
+            p == "pw-metadata" && a == &["-n", "default", "0", "default.configured.audio.sink", "{\"name\":\"motu_m2\"}", "Spa:String:JSON"]
+        }).expect("configured default sink restored via pw-metadata");
+        let unload_10_pos = calls.iter().position(|(p, a)| p == "pactl" && a == &["unload-module", "10"])
+            .expect("remaining module 10 unloaded on drop");
+        assert!(restore_pos < unload_10_pos, "default sink restored before unloading modules");
+        assert_eq!(
+            calls.iter().filter(|(p, a)| p == "pactl" && a == &["unload-module", "11"]).count(),
+            1,
+            "explicitly unloaded module 11 is not unloaded a second time on drop"
+        );
+        drop(calls);
+
+        // 2. Error path when set-sink-volume fails: module is still unloaded on drop,
+        //    and default restore is skipped because set_default_sink was not called.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        {
+            let mut c = Cleanup::with_runner(make_runner(
+                log.clone(),
+                Some("Found \"default\" metadata 41\n"),
+                Some("speakers"),
+                true,
+                false,
+            ));
+            let err = c.null_sink("home_err", "Test-Home").unwrap_err();
+            assert!(err.to_string().contains("set-sink-volume 100% failed"));
+        }
+        let calls = log.borrow();
+        assert!(calls.iter().any(|(p, a)| p == "pactl" && a == &["unload-module", "10"]));
+        assert!(!calls.iter().any(|(p, a)| p == "pw-metadata" && a.contains(&"-d".to_string())));
+        drop(calls);
+
+        // 3. Panic path after set_default_sink: Drop still restores default & unloads.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut c = Cleanup::with_runner(make_runner(
+                log.clone(),
+                Some("Found \"default\" metadata 41\nupdate: id:0 key:'default.configured.audio.sink' value:'{\"name\":\"motu_m2\"}' type:'Spa:String:JSON'\n"),
+                Some("speakers"),
+                false,
+                false,
+            ));
+            c.null_sink("home_panic", "Test-Home").unwrap();
+            c.set_default_sink("home_panic").unwrap();
+            panic!("boom");
+        }));
+        assert!(res.is_err());
+        let calls = log.borrow();
+        assert!(calls.iter().any(|(p, a)| p == "pw-metadata" && a.contains(&"{\"name\":\"motu_m2\"}".to_string())));
+        assert!(calls.iter().any(|(p, a)| p == "pactl" && a == &["unload-module", "10"]));
+        drop(calls);
+
+        // 4. Unset configured default: deletes default.configured.audio.sink on drop.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        {
+            let mut c = Cleanup::with_runner(make_runner(
+                log.clone(),
+                Some("Found \"default\" metadata 41\n"),
+                Some("speakers"),
+                false,
+                false,
+            ));
+            c.set_default_sink("home_unset").unwrap();
+        }
+        assert!(log.borrow().iter().any(|(p, a)| {
+            p == "pw-metadata" && a == &["-n", "default", "-d", "0", "default.configured.audio.sink"]
+        }));
+
+        // 5. PactlOnly(Some(...)) vs PactlOnly(None): restores via pactl or skips gracefully.
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        {
+            let mut c = Cleanup::with_runner(make_runner(log.clone(), None, Some("speakers"), false, false));
+            c.set_default_sink("home_pa").unwrap();
+        }
+        assert!(log.borrow().iter().any(|(p, a)| p == "pactl" && a == &["set-default-sink", "speakers"]));
+
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        {
+            let mut c = Cleanup::with_runner(make_runner(log.clone(), None, Some("@DEFAULT_SINK@"), false, false));
+            c.set_default_sink("home_none").unwrap();
+        }
+        assert_eq!(
+            log.borrow().iter().filter(|(p, a)| p == "pactl" && a[0] == "set-default-sink").count(),
+            1,
+            "no meaningful prior default: only the test's own set-default-sink ran"
+        );
     }
 }

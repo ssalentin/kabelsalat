@@ -10777,10 +10777,17 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
     crate::sounds::load(sound, Target { node, clap: clap.as_mut().map(|(main, controller)| (main, &*controller)), bus: Some(&mut bus) })
         .map_err(|e| anyhow::anyhow!("loading '{label}': {e}"))?;
     // A plugin applies state and parameters on the audio thread; an LV2
-    // preset comes back from the loader thread.
-    for _ in 0..40 {
+    // preset comes back from the loader thread; Unsampled Piano rebuilds its
+    // modal instrument on a background thread (~1.4 s) and retires the old
+    // engine over 0.1 s of quiet output.
+    let (iters, sleep_ms) = if matches!(sound.load, Load::UnsampledPianoProfile(_)) {
+        (250, 10)
+    } else {
+        (40, 5)
+    };
+    for _ in 0..iters {
         engine.render(&mut buf, 2);
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
     }
     let readback = match &sound.load {
         Load::ParamValue { param, value } => {
@@ -10799,6 +10806,14 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
             let state = main.save_state()?;
             anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
             "plugin state changed".to_string()
+        }
+        Load::UnsampledPianoProfile(profile) => {
+            let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+            let state = main.save_state()?;
+            anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
+            let detected = crate::unsampled_piano::detect_profile(&state);
+            anyhow::ensure!(detected == Some(*profile), "detected profile {detected:?} after loading '{label}', expected {profile:?}");
+            format!("profile {} active", profile.name)
         }
         Load::VitalPatch(path) => vital_patch_readback(&mut engine, node, path)?,
         Load::Lv2Preset(uri) => {
@@ -10878,6 +10893,7 @@ pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
         "dexed" => Some("brass"),
         "vitalium" => Some("pad"),
         "aeolus" => Some("flute"),
+        "unsampled-piano" => Some("light dry"),
         "surge-xt" | "yanes" | "odin2" | "floe" | "guitarix" => Some("bass"),
         _ => None,
     };

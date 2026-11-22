@@ -1939,4 +1939,12 @@ Learned so far (2026-11-15, UI polish pass):
     Plugins tab can keep showing the log, so `list_instruments` must check
     `self.install.as_ref().filter(|i| i.running)` or `"installing": true` stays
     stuck forever (`instrument_catalog_parity_and_confirm_gate`).
+219. **`nice-plug` CLAP state uses an 8-byte LE length prefix and Unsampled Piano
+    rebuilds asynchronously (~1.5–2.0 s) on `load_state`:** `nice-plug` 0.4.2
+    prepends `u64::to_le_bytes(len)` before its JSON state payload
+    (`unsampled_piano::parse_state`), and `Unsampled Piano` polls `restored` every
+    50 ms, debounces 150 ms, rebuilds the modal instrument, then hot-swaps and
+    retires the previous engine after 0.1 s of quiet output. Tests that measure
+    sound/DSP changes after `load_state` (such as `sound-library-test`) must
+    pump ~2.5 s of `render` + wall time before sampling the new engine.
 

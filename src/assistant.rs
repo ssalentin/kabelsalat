@@ -836,7 +836,9 @@ fn system_prompt() -> String {
      'Say Again.' is an octave-bouncing echo FX patch — whenever you add a Dexed / DX7 \
      rig, ALWAYS load a playable DX7 voice with add_rig(sound=…) or load_sound, e.g. \
      'rhodes', 'e.piano', 'brass' or whatever character fits, never leave it on the \
-     default), setBfree its organ \
+     default), Aeolus its pipe organ registrations, Unsampled Piano its CPU/room profiles \
+     (Full, Balanced, Light, Dry, Light Dry — e.g. load 'light dry' or 'light' to cut DSP load), \
+     setBfree its organ \
      registrations (MIDI programmes), Vitalium its LV2 presets, YANES its chip presets. \
      When the user asks for a sound character (flute, warm pad, 808 bass, jazz \
      organ…) on the rig's current instrument, call load_sound(query, rig) (or add_rig with \
@@ -1394,12 +1396,12 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_sounds",
-            "description":"Search the sound library of ONE instrument by words in its sounds' names, e.g. 'flute', 'pad warm', 'bass', 'jazz'. Each instrument has its own library: Surge patches (~3000, 'Category/Name'), Dexed DX7 cartridge voices, an LV2 instrument's presets and MIDI programmes (setBfree's organ registrations, Vitalium's presets), or a plugin's own preset list (YANES). rig: index of the rig whose instrument is searched (default: the rig in view); node: the instrument's node id, needed when a rig holds several different instruments. Returns up to 25 sounds with the instrument, the library and its size, or says what the instrument offers instead when it has no sounds to browse.",
+            "description":"Search the sound library of ONE instrument by words in its sounds' names, e.g. 'flute', 'pad warm', 'bass', 'jazz', 'light dry'. Each instrument has its own library: Surge patches (~3000, 'Category/Name'), Dexed DX7 cartridge voices, Aeolus organ registrations, Unsampled Piano CPU/room profiles (Full, Balanced, Light, Dry, Light Dry), an LV2 instrument's presets and MIDI programmes (setBfree's organ registrations, Vitalium's presets), or a plugin's own preset list (YANES). rig: index of the rig whose instrument is searched (default: the rig in view); node: the instrument's node id, needed when a rig holds several different instruments. Returns up to 25 sounds with the instrument, the library and its size, or says what the instrument offers instead when it has no sounds to browse.",
             "parameters":{"type":"object","properties":{"query":{"type":"string"},"rig":{"type":"integer"},"node":{"type":"integer"}},"required":["query"]}
         }},
         {"type":"function","function":{
             "name":"load_sound",
-            "description":"Load a sound into a rig's instrument from that instrument's own library (see list_sounds): a Surge patch, a Dexed voice, an LV2 preset or MIDI programme, a plugin preset. query: words or an entry of list_sounds; rig: index from get_rigs (default: the rig in view); node: the instrument's node id, needed when a rig holds several different instruments. Returns the sound that was loaded and the unit it went into.",
+            "description":"Load a sound into a rig's instrument from that instrument's own library (see list_sounds): a Surge patch, a Dexed voice, an Aeolus registration, an Unsampled Piano CPU/room profile (e.g. 'light dry' or 'light' to reduce DSP load), an LV2 preset or MIDI programme, a plugin preset. query: words or an entry of list_sounds; rig: index from get_rigs (default: the rig in view); node: the instrument's node id, needed when a rig holds several different instruments. Returns the sound that was loaded and the unit it went into.",
             "parameters":{"type":"object","properties":{"query":{"type":"string"},"rig":{"type":"integer"},"node":{"type":"integer"}},"required":["query"]}
         }},
         {"type":"function","function":{

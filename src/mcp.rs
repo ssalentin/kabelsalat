@@ -4456,7 +4456,7 @@ impl McpServer {
     }
 
     /// Search the sound library of a rig's instrument.
-    #[tool(name = "list_sounds", description = "Search the sound library of ONE instrument: Surge patches, Dexed DX7 cartridge voices, an LV2 instrument's presets and MIDI programmes (setBfree's organ registrations, Vitalium's presets), or a plugin's own preset list (YANES). rig: whose instrument (default: the rig in view); node: the instrument's node id when a rig holds several different ones. Returns up to 25 sounds plus the instrument and the library they are from. A CLAP plugin's own preset list needs the running app (kabelsalat mcp --attach).")]
+    #[tool(name = "list_sounds", description = "Search the sound library of ONE instrument: Surge patches, Dexed DX7 cartridge voices, Aeolus organ registrations, Unsampled Piano CPU/room profiles (Full, Balanced, Light, Dry, Light Dry), an LV2 instrument's presets and MIDI programmes (setBfree's organ registrations, Vitalium's presets), or a plugin's own preset list (YANES). rig: whose instrument (default: the rig in view); node: the instrument's node id when a rig holds several different ones. Returns up to 25 sounds plus the instrument and the library they are from. A CLAP plugin's own preset list needs the running app (kabelsalat mcp --attach).")]
     fn list_sounds(&self, Parameters(args): Parameters<ListSoundsArgs>) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -4472,7 +4472,7 @@ impl McpServer {
     }
 
     /// Load a sound into a rig's instrument.
-    #[tool(name = "load_sound", description = "Load a sound into a rig's instrument from that instrument's own library (see list_sounds): a Surge patch, a Dexed voice, an LV2 preset or MIDI programme, a plugin preset. query: words or an entry of list_sounds; rig: index (default: the rig in view); node: the instrument's node id when a rig holds several different ones. CLAP instruments (Surge, Dexed, YANES) need the running app (kabelsalat mcp --attach): their plugins live on its UI thread.")]
+    #[tool(name = "load_sound", description = "Load a sound into a rig's instrument from that instrument's own library (see list_sounds): a Surge patch, a Dexed voice, an Aeolus registration, an Unsampled Piano CPU/room profile (e.g. 'light dry', 'light', 'balanced', 'dry', 'full'), an LV2 preset or MIDI programme, a plugin preset. query: words or an entry of list_sounds; rig: index (default: the rig in view); node: the instrument's node id when a rig holds several different ones. CLAP instruments (Surge, Dexed, Unsampled Piano, YANES) need the running app (kabelsalat mcp --attach): their plugins live on its UI thread.")]
     fn load_sound(&self, Parameters(args): Parameters<LoadSoundArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {

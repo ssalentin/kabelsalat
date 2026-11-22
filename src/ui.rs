@@ -11495,15 +11495,17 @@ impl DemoApp {
             .unwrap_or_default();
         // Current sound = the patch named IN the synth's own state (correct
         // across rig edits and session loads, unlike a slot-keyed memo).
-        let is_surge = pool_idx
+        let plugin_id = pool_idx
             .and_then(|i| self.clap_plugin_ids.get(i))
-            .map(|id| id == SURGE_ID)
-            .unwrap_or(false);
-        if is_surge {
+            .map(|id| id.as_str());
+        if plugin_id == Some(SURGE_ID) || plugin_id == Some(crate::unsampled_piano::PLUGIN_ID) {
             if let Some(name) = pool_idx
                 .and_then(|i| self._surge_main.get_mut(i))
                 .and_then(|m| m.save_state().ok())
-                .and_then(|st| crate::host::patch_name_from_state(&st))
+                .and_then(|st| match plugin_id {
+                    Some(SURGE_ID) => crate::host::patch_name_from_state(&st),
+                    _ => crate::unsampled_piano::detect_profile(&st).map(|p| p.name.to_string()),
+                })
             {
                 if let Some(n) = self.patch_names.get_mut(rig) { *n = Some(name); }
             }
@@ -11733,11 +11735,25 @@ impl DemoApp {
                         ui.add_space(6.0);
                     }
                 }
-                let plugin_id = pool_idx.and_then(|i| self.clap_plugin_ids.get(i)).map(|s| s.as_str());
+                let plugin_id: Option<String> = pool_idx
+                    .and_then(|i| self.clap_plugin_ids.get(i))
+                    .cloned()
+                    .or_else(|| {
+                        let node_id = self.clap_rigs().into_iter().find(|(s, _)| *s == rig).map(|(_, n)| n)?;
+                        match &self.base_graph.node(node_id)?.kind {
+                            NodeKind::Clap { plugin_id } => Some(plugin_id.as_str().to_string()),
+                            _ => None,
+                        }
+                    });
                 // Sound: exchange the instrument (patch) of THIS synth.
-                let browser = match plugin_id {
+                let browser = match plugin_id.as_deref() {
                     Some(SURGE_ID) => Some(("Init (Surge default)", "search sounds… e.g. flute, warm pad, bass", "sound_list")),
                     Some(DEXED_ID) => Some(("Say Again. (Dexed default)", "search DX7 sounds… e.g. piano, bass, brass", "dexed_sound_list")),
+                    Some(id) if id == crate::unsampled_piano::PLUGIN_ID => Some((
+                        "Full (default)",
+                        "search CPU profiles… e.g. light, balanced, dry, full",
+                        "unsampled_piano_sound_list",
+                    )),
                     _ => None,
                 };
                 if let (Some((init, hint, list_id)), Some(id)) = (browser, plugin_id) {
@@ -11747,7 +11763,7 @@ impl DemoApp {
                     ui.add_sized([ui.available_width(), 20.0],
                         egui::TextEdit::singleline(&mut self.sound_filter).hint_text(hint));
                     let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
-                    let library = match self.sounds.get(&crate::sounds::Instrument::Clap(id.to_string())) {
+                    let library = match self.sounds.get(&crate::sounds::Instrument::Clap(id)) {
                         crate::sounds::Lookup::Ready(library) => Some(library),
                         _ => None,
                     };
@@ -11769,7 +11785,10 @@ impl DemoApp {
                                 crate::sounds::Load::DexedVoice { program, .. } => format!("{} · {:02} {}", s.category, program + 1, s.name),
                                 _ => format!("{} · {}", s.category, s.name),
                             };
-                            let resp = ui.selectable_label(false, egui::RichText::new(text).size(12.5).color(theme::CREAM));
+                            let mut resp = ui.selectable_label(false, egui::RichText::new(text).size(12.5).color(theme::CREAM));
+                            if let crate::sounds::Load::UnsampledPianoProfile(profile) = &s.load {
+                                resp = resp.on_hover_text(profile.summary);
+                            }
                             if resp.clicked() { chosen = Some(s.clone()); }
                         }
                         if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
@@ -37774,6 +37793,83 @@ mod rig_switch_tests {
         if let Ok(dir) = std::env::var("KABELSALAT_SHOTS_DIR") {
             let _ = std::fs::create_dir_all(&dir);
             super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &std::path::Path::new(&dir).join("param-editor-pin.png"));
+        }
+    }
+
+    #[test]
+    fn unsampled_piano_sound_browser_lists_cpu_profiles() {
+        let setup = || {
+            let mut app = DemoApp::new_with_sink(None);
+            app.sounds = crate::sounds::Libraries::blocking(crate::sounds::scan);
+            let mut g = crate::control::Graph::default();
+            let keys = g.add_node(NodeKind::Keys, crate::control::name_bytes("KEYS"));
+            let inst = g.add_node(
+                NodeKind::Clap {
+                    plugin_id: crate::control::ClapId::new(crate::unsampled_piano::PLUGIN_ID),
+                },
+                crate::control::name_bytes("UNSAMPLED PIANO"),
+            );
+            let master = g.add_node(NodeKind::MasterOut, crate::control::name_bytes("MASTER"));
+            g.connect_with_id(
+                1,
+                crate::control::PortRef { node: keys, port: 0 },
+                crate::control::PortRef { node: inst, port: 0 },
+                crate::control::PortKind::Midi,
+            );
+            g.connect_with_id(
+                2,
+                crate::control::PortRef { node: inst, port: 0 },
+                crate::control::PortRef { node: master, port: 0 },
+                crate::control::PortKind::Audio,
+            );
+            app.build_rack(&g, &[]);
+            app.editor_open = true;
+            app.editor_rig = 0;
+            app.lv2_editor_node = None;
+            app
+        };
+        let mut app = setup();
+        let ctx = egui::Context::default();
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            texts.clear();
+            fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                    egui::Shape::Vec(v) => for s in v { walk(s, out); },
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut texts);
+            }
+            out.textures_delta.clear(); // rule 11
+        }
+        assert!(texts.iter().any(|t| t == "Full (default)"), "expected default profile label, got: {texts:?}");
+        for label in [
+            "CPU · Full",
+            "CPU · Balanced",
+            "CPU · Light",
+            "CPU · Dry",
+            "CPU · Light Dry",
+        ] {
+            assert!(
+                texts.iter().any(|t| t == label),
+                "expected {label:?} in Unsampled Piano Sound browser, got: {texts:?}"
+            );
+        }
+        if let Ok(dir) = std::env::var("KABELSALAT_SHOTS_DIR") {
+            let _ = std::fs::create_dir_all(&dir);
+            let mut shot_app = setup();
+            super::offline_shots::shot(
+                &mut shot_app,
+                Vec2::new(1280.0, 800.0),
+                &std::path::Path::new(&dir).join("unsampled-piano-cpu-profiles.png"),
+            );
         }
     }
 

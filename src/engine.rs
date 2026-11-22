@@ -3447,6 +3447,19 @@ impl GraphEngine {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
     }
 
+    /// Whether any async LV2 plugin load is still in flight (verification).
+    pub fn has_lv2_in_flight(&self) -> bool {
+        !self.lv2_in_flight.is_empty()
+    }
+
+    /// Clear the recorded last MIDI event on every attached LV2 node so a
+    /// verification check sees only events sent afterwards (not load-time sync).
+    pub fn clear_lv2_last_events(&mut self) {
+        for s in &mut self.lv2 {
+            s.plugin.clear_last_midi_event();
+        }
+    }
+
     /// Current plain value of an LV2 node's nth control input (verification).
     pub fn lv2_control_value(&self, node: NodeId, nth: usize) -> Option<f32> {
         let slot = self.lv2.iter().find(|s| s.node == node)?;

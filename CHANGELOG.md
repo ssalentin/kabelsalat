@@ -7,6 +7,136 @@ releases may still change behaviour and session files.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-22
+
+### Added
+- **Assistant plugin & parameter intelligence:** the built-in assistant and MCP server can now inspect any built-in DSP, CLAP, LV2, or catalog plugin (`inspect_plugin`), browse parameters with current values, musical display text, ranges, units, stepped options, module summaries, and modified-only diffs (`list_params`), directly shape parameters using musical text or normalized/native values (`set_param`), and reset all or filtered parameters back to defaults (`reset_params`).
+- **Full built-in DSP, setBfree organ & LV2 metadata:** every native parameter of built-in DSP units (including Delay feedback/ping-pong/damping, Reverb size/damping/width, EQ3 shelf/mid frequencies & Q, Filter resonance/mode, Limiter ceiling/drive/release, Saturation drive/mix/output), all 13 setBfree organ controls, and LV2 port units/flags/scale points are now inspectable, editable by name or musical text, and preserved across sessions and undo.
+- **Native PipeWire, JACK (`pipewire-jack`), and ALSA backend selection (#349):** kabelsalat now opens a native PipeWire audio node (`kabelsalat`) by default via `libpipewire-0.3.so.0` (no `pipewire-alsa` bridge required) and lets you switch live between **Auto**, **PipeWire**, **JACK (`pipewire-jack`)**, and **ALSA** (with direct ALSA PCM device selection) in **Settings → Audio**, via `KABELSALAT_AUDIO_BACKEND`, or through the `set_audio_backend` agent/MCP tool.
+- **Audio Doctor in Settings → Audio (#211):** checks PipeWire quantum and sample rate against kabelsalat's configured buffer, realtime audio priority (`rtkit` / `RLIMIT_RTPRIO` / live render thread), CPU governor / power profile, USB audio autosuspend, and buffer xrun headroom — each with a plain explanation and a non-blocking **Fix** action (no terminal needed). Includes a guided **Round-trip latency** measurement in milliseconds, a cancellable 60-second **Live xrun check** that diagnoses likely causes, a direct **Open Audio Doctor** link from Pre-show check audio/buffer warnings, a read-only `audio_doctor` agent / MCP tool, and `kabelsalat audio-doctor [--json]`.
+- **Back-panel cable ergonomics (#303):** Hovering a jack on the back of the rack now traces all cables connected to it while dimming unrelated routes, and shows a live port tooltip with connected source/destination labels and signal readouts (dBFS for audio, active/recent notes for MIDI). Added persistent **Cable opacity** (30–100%) and **Cable tension** controls in **Settings → Display** and on the back panel, plus a right-click menu on cables and occupied jacks to cycle family-safe jacket colors or unplug all cables on a jack.
+- **CI performance budgets (#280):** headless benchmarks for audio block render time, UI frame time and vertex counts, built-in 4-rig session load time, start-up to first frame, and default-rack memory now emit JSON and are enforced in CI on both `x86_64` and `aarch64` against versioned budgets and release baselines (`docs/perf-budgets.json`, `docs/ARCHITECTURE.md`).
+- **Idle-rig CPU sleep (#206):** non-live rigs that are no longer held and have completely rung out below −100 dBFS (honouring CLAP `sleep` / `tail` extensions and built-in delay and compensation tails) now sleep allocation-free without rendering DSP or plugins, waking in the exact audio block a note, control, or part switch targets them.
+- **Precision knob controls (#304):** hold **Shift** while dragging a rack or
+  mixer knob for 10× fine-tune adjustment without mid-drag jumps (keeping
+  **Ctrl+drag** for unit rearranging), **double-click** any rack knob to reset
+  it to its default, see formatted physical units (`Hz`, `ms`, `dB`, `%`,
+  semitones, and CLAP plugin readouts) on hover and while dragging, and type an
+  exact value inside the knob context menu without disturbing quick MIDI learn.
+- **Per-unit live CPU meter overlay on the rack (#302):** press **F3** (or toggle **Rack CPU · F3** in Engine info) to show a compact live CPU micro-bar and `%` / `µs` badge on every visible rack unit, front and back, reading lock-free per-node render times with cream/amber (> 15 %)/red (> 30 %) load thresholds.
+- **Rack unit context menu and visible bypass state (#305):** Right-clicking any unit plate on the front or back of the rack opens a context menu to **Bypass / Enable** (`Ctrl+E`), **Duplicate unit** (`Ctrl+D`, copying parameters and plugin state), **Initialize parameters**, **Randomize parameters** (`Ctrl+R`, bounded musically as one undo step), **Copy / Paste settings** between compatible units, **Unplug all cables**, **Open plugin GUI / Parameters**, or **Remove unit**. Bypassed units dim on both front and back faces with a crisp `BYPASSED` chip (clickable to re-enable), stay synced with the mixer and agents, release held notes safely, and preserve delay compensation. The assistant and MCP server expose matching `duplicate_node`, `reset_node_params`, and `randomize_node_params` tools.
+- **MIDI learn and hardware sync on instrument interfaces (#241):** right-click
+  any control on the expanded instrument console, keyboard dock, or organ rack
+  face — including the swell pedal (CC 11), drawbars, rotary speed, percussion,
+  drive, reverb, sustain/damper (CC 64), soft pedal (CC 67), mod wheel (CC 1),
+  arp, and macro knobs — to arm MIDI learn, open its binding/range menu, or
+  clear its mapping. Both learned bindings (`target="cc"` / `"knob"` / `"plugin"`)
+  and transparent passthrough hardware CCs now sync directly to the on-screen
+  pedals, buttons, wheels, drawbars, and knobs.
+- **Setlist (#204):** organize your gig into songs and parts (Verse, Chorus, Solo) over the loaded rigs and switch without cutting held notes or reverb tails. Each song carries a name and optional tempo and time signature; each part picks which rigs take new notes, with per-rig key range, transpose, level and stored knob values. Outgoing rigs keep sounding whatever keys or sustain pedal are held until released, while new notes reach only the new part's rigs from the same audio block on. Build and edit songs in the new **Setlist** view (**F12**), step parts from the top bar, with **PageUp / PageDown** (**Shift+PageUp / Shift+PageDown** for songs, compatible with page-turner pedals), or from a learned pedal or button (#277). **Add song from session** imports a saved session's rigs into the current gig as a new song. The setlist saves with the session, follows rig edits and undo, and is available to the assistant and MCP agents (`get_setlist`, `set_setlist_song`, `select_setlist_part`, `add_song_from_session`).
+- **Every show action on a pedal or button (#277):** Setlist → Show controls lists next and previous song, next and previous part, Panic, tap tempo, tuner on/off, master mute, backing track start/stop and record start/stop. Click Learn and press a foot switch, pad, key or preset button: its CC, note or program change does that action from then on, in every song and in Show mode, and never reaches an instrument. The devices whose program change picks the song are rows of the same list. A tuner shows the note the first Audio In plays. Agents use `get_show_controls` and `set_show_control`.
+- **Crash report and restart (#279):** when kabelsalat crashes it writes a report to `~/.local/state/kabelsalat/crashes/` (version, cause, plugins loaded, last engine commands, stack frames; no folder or file names of yours, nothing sent) and starts again by itself on the session and setlist part it was on. The restarted app offers to open the report folder or a prefilled GitHub issue. `KABELSALAT_WATCHDOG=0` runs without the restart.
+- **Four more instruments on the keyboard (#198):** E-Piano, Bass, Wind and
+  Drums each get their own keyboard surface and full-window console: tines
+  that ring on the e-piano, a bass neck that shows and plays the notes, a
+  breath control (CC 2, CC 11 or aftertouch) for winds, and drum pads and a
+  kit seen from above that sound the moment you hit them.
+- **Every rig has an instrument type (#198):** piano, e-piano, jazz organ,
+  pipe organ, synth, bass, wind or drums, from its plugin or the sound it
+  plays, or marked by hand. The mark is saved with the session and kept when
+  you add, delete, clone or undo rigs. The left rail shows each rig's type.
+- **Long setlists — keep only the next songs loaded (#207):** per-setlist **Load ahead** option (`Setlist::load_ahead`, `set_setlist_window` tool) that hosts only the active song and the next 1–8 playable songs (plus show-level rigs, active set-level rigs, shared instruments, aux-bus chains, and master inserts) so memory follows the window instead of the length of the gig. Upcoming CLAP and LV2 plugins load and warm up on background loader threads (`kabelsalat-clap-loader` and `kabelsalat-lv2-loader`), outgoing rigs stay hosted until held notes and effect tails finish ringing out before retiring, the song list shows each song's **Ready / Loading / Unloaded** state, and jumping directly to an unloaded song announces that it is loading and loads it in the background without blocking the audio thread. Added `kabelsalat setlist-window-test` to measure real Surge XT memory scaling and gapless in-order switching.
+- **Up to 32 rigs (#205):** a session now holds up to 32 rigs instead of 8, so
+  a setlist can keep every sound of a gig loaded. Each rig has its own mixer
+  bus, record arm and stem, the Left Rail and the top bar scroll to every rig,
+  and rigs past Z are named AA, AB, … Sessions saved with up to 8 rigs load as
+  before.
+- **Pre-show check (#278):** **Setlist → Check show** finds what could go wrong before the first song, and changes nothing: a MIDI device the show binds that is not plugged in, a chosen output or Audio In device that is not connected, a plugin that is missing or does not load, a rig that makes no sound (each rig plays its demo phrase in an offline engine of its own), a missing backing-track file, little disk space for recording, a buffer without headroom, and running on battery. Every check says ok, warning or problem, and what to do. Agents use the `preshow_check` tool; `kabelsalat preshow-check <session.ksalat>` prints the same list and exits with status 1 on a problem.
+- **A backing track per song (#278):** a setlist song can name a WAV backing track (`set_setlist_song` with `backing`); selecting the song starts it in the file player, and a song without one stops it.
+- **Program change picks the song (#208):** in the Setlist view, turn a MIDI
+  device on under "Program change picks the song" and its preset buttons pick
+  songs: program change N jumps to the first part of song N+1 in the next
+  audio block. That device's program changes no longer reach its instruments;
+  other devices' program changes now reach theirs (they were dropped before).
+  The choice is saved by the device's name, so it survives another plug order.
+- **Rack edit lock (#363):** lock the rack against accidental edits from the top-bar padlock button or **Ctrl+L** (agents/MCP: `set_rack_locked`, reported in `get_status`, and saved with the session). While locked, playing, transport, rig switching, setlist stepping, and flipping front/back to inspect wiring keep working, while patching, unplugging, reordering, adding/deleting units or rigs, rack knob edits, and mutating agent calls are blocked.
+- **Save the last minutes after the fact (#215):** kabelsalat keeps the last
+  two minutes of the master and of every armed rig's stem in memory. Right-click
+  REC and choose "Save the last 2:00" to write them as a take folder, exactly as
+  you heard them. Settings → Audio → Keep the last sets the length (1 to 10
+  minutes, or off; off by default on machines with under 3 GB of memory). The
+  assistant and MCP agents save it with `record_save_last`, and
+  `record_status` reports what is kept.
+- **Share one instrument between songs (#275):** songs and parts can share a single hosted instrument instance with per-part level, pan, split, velocity layer, effect-chain bypasses, and stored rack/plugin knobs — all applied smoothly on switch without cutting held notes (including a 5 ms dry/wet ramp for zero-latency effect bypasses). **Add song from session** automatically reuses matching hosted instruments (same plugin and saved preset) while keeping different presets as separate instances, and the Setlist view shows the exact count of hosted instrument instances, whether differences apply at the switch or use a separate instance, **Own instance** to fork a rig for a different preset, and **Vary per song** to share a show-level rig across songs.
+- **Show, set and song levels (#273):** a vocal mic, a master reverb or a volume pedal can now stay through the whole show. Every rig, aux bus and MIDI controller binding lives at show level (no song switch touches it: it keeps the whole keyboard, its fader and its knobs), at the level of a set, or at song level (only where the setlist's parts use it). Songs can be grouped into named sets, which move or are skipped as a whole. Choose levels and build sets under **Setlist → Sets & levels**, or on the mixer's bus strips; a part can now also name the buses it uses. Older sessions load with everything at show level, except the rigs their setlist's parts already use, which keep playing only in those parts. Agents use `get_setlist`, `set_level` and `set_setlist_set`; `kabelsalat levels-test` renders ten song switches under a show-level vocal and reverb.
+- **Show mode (#210):** a locked full-window stage screen with the current song and part in large type, the next song, tempo, the master meter, one meter per live rig, a clock and a Panic button. No click or key edits the patch, the mix or the setlist while it is open; PageUp / PageDown and foot switches still step parts, and holding Esc for a second, then letting go, leaves. Agents open and leave it with `set_show_mode`.
+- **Panic (#210):** all notes off on every rig, on every MIDI channel, with pedals up and arps and demo phrases stopped (`panic` for agents).
+- **`kabelsalat setlist-switch-test` (#274):** renders part and song switches
+  under a held chord with real Surge XT voices and measures them: no gap or
+  click in the held chord, the delay and reverb tails ring on, and the first
+  note of the next song starts in the block that switched (at most one 5.3 ms
+  buffer plus Surge's own onset of up to 1 ms, against a 50 ms budget), by the
+  app and by the foot switch.
+- **Show mode status pills, next part & F2 shortcut:** Show mode (`F2`) now previews the upcoming part in teal, surfaces top `REC`, `TRACK`, `CLICK`, and crash-recovery pills, scales cleanly down to `760×520`, and restores Show mode after crash recovery.
+- **Setlist backing-track picker & part controls:** songs can attach `.wav` tracks via **Pick WAV…** (scanning Sessions/Audio) or drag-and-drop; parts now support **↑**, **↓**, **Dup**, and **Clear knobs**; pre-show failing rows link directly (`Matrix →`, `Mixer →`, `Install →`, `Rack →`, `Settings →`, `Fix track →`); **Ctrl+T** and clickable `TUNE` on Audio In toggle the tuner.
+- **Retrospective chip & Plugins clarity:** a dedicated **Retro** save chip sits next to `REC`, **MIDI FX** is a top-level Plugins catalog category alongside clearer **Layer in rig** / **Install** prompts, and Mixer pins `Kabelsalat` + `Master out` when 4+ rigs overflow.
+- **Velocity layers and a floating split (#276):** each rig of a setlist part now has a velocity range beside its key range, so a soft pad can sit under a hard-struck piano, and a velocity curve (linear, soft for a lighter touch, hard for a firmer one). Its **Float** setting makes the key range's edges follow your hands: a bass run that climbs a few keys past the split stays on the bass, and the right hand coming down stays on its own sound, up to the set number of keys. Releases always reach whatever a key started, whatever the part, layer or split did while it was held. Edit them in the Setlist view next to each rig's keys; they save with the session and the assistant and MCP agents set them through `set_setlist_song` (`vel_lo`, `vel_hi`, `vel_curve`, `float`).
+
+### Changed
+- **Refreshed front-of-rack README hero screenshot (#385):** updated `docs/shots/front.png` from the current UI and restored it as the README hero image.
+- **One tool for show controls:** `set_show_control` replaces `set_setlist_footswitch`, and `get_setlist` lists `show_controls` in place of `foot_switch`. Sessions with the old foot-switch CCs or `program_devices` load them into the unified controls list.
+- **One instrument type everywhere (#198):** the Plugins browser groups and
+  labels instruments by the same type the keyboard uses (Pianos, Organs,
+  Basses, Winds, Drums), the catalog names each card's type, the demo phrase
+  follows a rig's type and its mark, and the agent reads and sets the type of
+  any rig (`get_keyboard_state`, `set_keyboard_mode` with `rig`, `get_rigs`,
+  `list_plugins`).
+- **Rack units name their plugin (#198):** an LV2 instrument's subtitle is
+  the plugin's name instead of "lv2 synth".
+- **A shorter README with a quick start:** the README now gets a new player
+  from download to first notes in four steps, lists what kabelsalat can do in
+  one line per feature, and adds install options at a glance and a
+  troubleshooting list. Every feature's full description moved to the new
+  user guide, `docs/GUIDE.md`.
+- **Safer live shortcuts, undo & delete confirmations:** moved knob reset to **Shift+R** (selected unit or active rig, synced to engine with undo), assigned **C** to Assistant and **F12** cleanly to Setlist, extended **Ctrl+Z** undo to manual cable, template, setlist, rig, and bus edits, and added two-step confirms before deleting songs, parts, aux buses, or rig presets.
+- **On-stage UX & contrast polish:** upgraded dark-surface warnings/learn prompts to legible high-contrast amber (`ACCENT_BRIGHT`), showed patch feedback notices inline in non-Rack stage headers, added Enter-to-save and clickable `openrouter.ai/keys` link in the Assistant onboarding bar, and showed hardware device names in **Sets & levels**.
+
+### Fixed
+- **Assistant picks named instrument plugins instead of Surge:** asking the assistant for a specific instrument plugin (such as Unsampled Piano, Dexed, or Odin 2) now loads that plugin instead of falling back to a Surge XT preset.
+- **Rig solo is exclusive (#256):** soloing a rig now un-solos every other
+  rig, from the mixer's S button, a MIDI controller, the assistant, MCP or the
+  CLI alike. Solo of a source within a rig still stacks.
+- **Audio output self-test (#345):** `kabelsalat audio-out-test` now uses run-unique null sinks with `state.restore-props=false`, explicitly sets each test sink to 100 % and unmuted so saved WirePlumber volumes cannot attenuate measurements, and restores the user's configured PipeWire default sink (including unplugged devices) on exit, error, or panic.
+- **Release tagging and PR conflict handling (#271, #341):** `tag-release.yml` now also triggers via `workflow_run` when CI passes on a `release-*` PR so bot auto-merges tag `vX.Y.Z` and start `release.yml`, `resolve-conflicts.yml` labels conflicting PRs `merge-conflict` without pushing bot commits that strand required checks, and `scripts/sync-branch.sh` fixes `LC_ALL=C` overlap sorting and preserves exit-3 overlap warnings across separate rebase and `--push` runs.
+- **Help overlay on small windows (#111):** The keyboard shortcut card (`?` / `F1`) now fits inside narrow and short windows (such as 760×520, with or without the Navigator open) by stacking into a single scrollable column inside the stage while keeping its two-column layout on wider windows.
+- **LV2 parameter units (#348):** inline blank-node `units:unit` definitions (such as LSP Compressor gain ports) now show their real unit symbol (e.g. `G`) instead of raw lilv blank-node IDs like `133b11`.
+- **Per-synth MIDI device in rig presets and song import (#322):** saving and loading a rig preset or importing a song via "Add song from session" now preserves each CLAP synth's per-synth MIDI device binding and input switches instead of falling back to all hardware.
+- **Monospace digit spacing without JetBrains Mono (#327):** probe JetBrains Mono across Arch, Debian/Ubuntu, Fedora, `/usr/local`, Flatpak, and user font directories, and keep egui's built-in `Hack` monospace face ahead of symbol/math fallbacks so monospace labels (such as `CC 64` in Setlist) always render digits with monospace spacing even when JetBrains Mono is not installed.
+- **Agent eval `organ_no_pad` false failure (#346):** `EvalRig::load` now waits for async LV2 loads to settle and clears load-time organ face CC sync (`CC 91 = 25`) from the LV2 MIDI baseline before each eval turn, so read-only `organ_no_pad` runs pass while unintended agent program changes, notes, or parameter CCs still fail.
+- **Unsampled Piano / `baseview` plugin GUIs on Wayland (#391):** set `EGL_PLATFORM=x11` at startup when `WAYLAND_DISPLAY` is set so Mesa EGL does not mistake an X11 plugin editor's display pointer for a Wayland display and crash on open.
+- **Catalog install status after completion (#392):** `list_instruments` now reports `"installing": false` as soon as an instrument install finishes instead of staying stuck on `true` while the Plugins log stays visible.
+- **Settings → Audio**: stop repeating `Active:` under Audio backend and Audio output when the dropdown already shows that value, show the JACK server's buffer size read-only, and replace the cryptic `Active: N frames` line under Buffer size with an explicit override notice only when the audio server forces a different quantum.
+- **Top-bar collapsed rig pills:** inactive numbered rig pills now show live audio output as a bottom horizontal teal meter bar instead of a middle teal dot, so they never show two identical green dots when a setlist is active (the single top-right dot belongs exclusively to setlist live/out-of-song status, and out-of-song inactive pills also dim). Collapsed pill widths no longer jump while a rig sounds.
+- **System-audio capture can no longer feed back into itself (#27):** capture now records each other playing app's stream directly (`parec --monitor-stream`, excluding kabelsalat and any process it started) instead of the output sink's monitor. kabelsalat's own output is never captured, whichever sound card is selected and after switching outputs or reopening the audio stream, and no capture reader runs while muted.
+- **Dexed default patch guidance:** the assistant now knows Dexed's factory default (`Say Again.`) is an octave-bouncing echo FX patch and loads a playable DX7 cartridge voice when adding a Dexed rig (`add_rig` also warns if Dexed is added without a `sound`), and the sound browser labels Dexed's unloaded default accurately as `Say Again. (Dexed default)`.
+- **Plugin windows open centred on the active monitor:** opening a plugin's own GUI on Omarchy/Hyprland (especially with multiple monitors or scaled displays under XWayland) now centres the window on the focused RandR monitor instead of the combined X11 root screen, so it no longer lands at the side of the display.
+- **Ignore chattering hardware MIDI CCs during learn and per port:** continuously oscillating or stuck hardware CCs (such as a scratchy potentiometer) no longer hijack knob, switch, or show-control MIDI learn. In the MIDI Matrix, any chattering CC offers a one-click `Ignore CC N` chip on its hardware port row that drops that CC at hardware MIDI intake (saved per port in `config.json` as `ignored_ccs`) so it never reaches plugins, knobs, or MIDI learn.
+- **Aligned Install catalog plugin cards:** cards in each row of the Plugins → Install grid now share a uniform height, aligned metadata and action button rows, and wrapped action lines that never stretch a card past its column width.
+- **Device bindings survive another scan order (#227):** an LV2 instrument bound to one MIDI device, routes and MIDI-learned CC bindings from a hardware controller, and a rig bound to one device now come back on the same keyboard when a session or rig preset is reopened, even when the devices are found in another order or one is not plugged in. A rig's device binding is now saved with the session, and loading a rig preset no longer sends the other rigs' synths back to all hardware.
+- **A setlist foot switch no longer plays the instruments (#261):** the CC
+  learned for Next or Previous part steps the setlist and reaches no
+  instrument, so a foot switch on CC 64 no longer holds the sustain pedal.
+  The new part's zones take effect in the audio block the pedal press
+  arrives in, without waiting for the screen.
+- **Setlist header at narrow windows:** the subtitle no longer runs under the step buttons and the live song; it is shortened instead.
+- **A part that changes a rig's level no longer clicks a held chord (#274):**
+  a rig fader or an instrument's LEVEL that a part recalls (or the mixer, a
+  MIDI controller or an agent moves) now takes 5 ms to arrive instead of
+  jumping in one sample. Muting a rig, soloing another or pulling a fader to
+  zero fades it out the same way, and unmuting fades it back in.
+- **Rack-lock & modal Escape gaps:** blocked `F4`–`F8`, Left Rail, Matrix, and Mixer mutations while the rack is locked, closed param/dialog leaks on lock, fixed drums laptop keys mapping to GM C2 (MIDI 36), and kept `Escape` closing open rig modals cleanly while clearing two-step confirmations first.
+- **Unsampled Piano presets installed with the plugin:** Installing Unsampled Piano from the Plugins browser now also copies its shipped `presets/` folder into `~/.local/share/unsampled-piano/presets` so the plugin editor finds them.
+
 ## [0.2.0] — 2026-11-20
 
 ### Added
@@ -761,6 +891,7 @@ The first tagged release: a working live rack for Linux.
 - Sessions and starter templates; system-audio capture and WAV backing tracks.
 - Arch/Omarchy packaging (`packaging/PKGBUILD`).
 
-[Unreleased]: https://github.com/ssalentin/kabelsalat/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ssalentin/kabelsalat/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ssalentin/kabelsalat/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ssalentin/kabelsalat/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ssalentin/kabelsalat/releases/tag/v0.1.0

@@ -1,2 +1,0 @@
-### Added
-- **Crash report and restart (#279):** when kabelsalat crashes it writes a report to `~/.local/state/kabelsalat/crashes/` (version, cause, plugins loaded, last engine commands, stack frames; no folder or file names of yours, nothing sent) and starts again by itself on the session and setlist part it was on. The restarted app offers to open the report folder or a prefilled GitHub issue. `KABELSALAT_WATCHDOG=0` runs without the restart.

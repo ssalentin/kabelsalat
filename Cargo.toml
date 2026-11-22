@@ -1,6 +1,6 @@
 [package]
 name = "kabelsalat"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Live audio/MIDI wiring, alive — an AUM-style plugin host with animated cables"
 license = "MIT"

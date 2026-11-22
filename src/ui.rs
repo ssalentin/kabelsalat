@@ -45776,6 +45776,28 @@ mod settings_and_dropdown_tests {
         assert!(app.assistant_chip_rect.is_positive(), "the button is back");
     }
 
+    /// Issue #382: plain F12 opens and closes the Setlist even when the
+    /// assistant is enabled; C opens the assistant dock.
+    #[test]
+    fn f12_opens_setlist_while_assistant_is_enabled() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        assert!(app.assistant_enabled);
+        assert_eq!(app.stage_view, StageView::Rack);
+        assert_eq!(app.dock, DockView::None);
+
+        run_frame(&mut app, &ctx, size, key(Key::F12));
+        assert_eq!(app.stage_view, StageView::Setlist, "F12 must open Setlist, not the assistant dock");
+        assert_eq!(app.dock, DockView::None, "F12 must not open the assistant dock");
+
+        run_frame(&mut app, &ctx, size, key(Key::F12));
+        assert_eq!(app.stage_view, StageView::Rack, "second F12 closes Setlist back to Rack");
+
+        run_frame(&mut app, &ctx, size, key(Key::C));
+        assert_eq!(app.dock, DockView::Assistant, "C opens the assistant dock");
+    }
+
     #[test]
     #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat agent_mode_shots -- --ignored"]
     fn agent_mode_shots() {

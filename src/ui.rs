@@ -20695,13 +20695,20 @@ impl DemoApp {
         self.add_clap_rig(SURGE_ID, "Surge");
     }
 
+    const BROWSER_CARD_PAD_X: i8 = 14;
+    const BROWSER_CARD_PAD_Y: i8 = 12;
+
+    fn browser_card_inner_w(width: f32) -> f32 {
+        (width - 2.0 * f32::from(Self::BROWSER_CARD_PAD_X)).max(160.0)
+    }
+
     fn plugin_card(ui: &mut egui::Ui, width: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
-        let inner_w = (width - 30.0).max(160.0);
+        let inner_w = Self::browser_card_inner_w(width);
         egui::Frame::new()
             .fill(theme::DARK_PANEL_HI)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
             .corner_radius(4.0)
-            .inner_margin(egui::Margin::symmetric(14, 12))
+            .inner_margin(egui::Margin::symmetric(Self::BROWSER_CARD_PAD_X, Self::BROWSER_CARD_PAD_Y))
             .show(ui, |ui| {
                 ui.allocate_ui_with_layout(
                     egui::vec2(inner_w, 92.0),
@@ -20744,22 +20751,23 @@ impl DemoApp {
         }
     }
 
-    /// A taller [`plugin_card`] for catalog entries: name, one-line
-    /// description, repo link and an Install button / Installed badge.
-    fn catalog_card(ui: &mut egui::Ui, width: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
-        let inner_w = (width - 30.0).max(160.0);
+    /// A [`plugin_card`] for catalog entries, sized to the tallest card in its
+    /// row (`min_inner_h`) so every card and band in a row lines up.
+    fn catalog_card(ui: &mut egui::Ui, width: f32, min_inner_h: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
+        let inner_w = Self::browser_card_inner_w(width);
         egui::Frame::new()
             .fill(theme::DARK_PANEL_HI)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
             .corner_radius(4.0)
-            .inner_margin(egui::Margin::symmetric(14, 12))
+            .inner_margin(egui::Margin::symmetric(Self::BROWSER_CARD_PAD_X, Self::BROWSER_CARD_PAD_Y))
             .show(ui, |ui| {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(inner_w, 118.0),
+                    egui::vec2(inner_w, min_inner_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         ui.set_width(inner_w);
-                        ui.set_min_height(118.0);
+                        ui.set_min_height(min_inner_h);
                         body(ui, inner_w);
                     },
                 );
@@ -21011,10 +21019,63 @@ impl DemoApp {
                                 return;
                             }
 
-                            for row in matches.chunks(cols) {
-                                ui.horizontal_top(|ui| {
-                                    ui.spacing_mut().item_spacing.x = gap;
-                                    for e in row {
+                            enum CatalogAction<'a> {
+                                Status { text: &'static str, color: Color32, hover: Option<&'a str> },
+                                Install { id: &'static str, hover: String },
+                                ShowType { ty: PluginType },
+                                OpenUrl { label: &'static str, url: String },
+                            }
+                            struct PreparedCatalogCard<'a> {
+                                entry: &'static crate::catalog::CatalogEntry,
+                                badge: String,
+                                badge_col: Color32,
+                                desc_galley: std::sync::Arc<egui::Galley>,
+                                desc_elided: bool,
+                                about_galley: std::sync::Arc<egui::Galley>,
+                                meta_galley: std::sync::Arc<egui::Galley>,
+                                action_lines: Vec<Vec<CatalogAction<'a>>>,
+                                actions_h: f32,
+                            }
+
+                            let inner_w = Self::browser_card_inner_w(card_w);
+                            let header_h = ui
+                                .fonts_mut(|f| {
+                                    f.row_height(&theme::medium_font(14.0))
+                                        .max(f.row_height(&FontId::proportional(9.5)))
+                                })
+                                .max(ui.spacing().interact_size.y)
+                                .ceil();
+                            let primary_btn_h = (egui::WidgetText::from(egui::RichText::new("Install"))
+                                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button)
+                                .size()
+                                .y
+                                + 10.0)
+                                .max(26.0);
+                            let chip_btn_h = (egui::WidgetText::from(egui::RichText::new("Source code").size(12.5))
+                                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button)
+                                .size()
+                                .y
+                                + 10.0)
+                                .max(26.0);
+                            let action_line_h = primary_btn_h.max(chip_btn_h).ceil();
+                            const ACTION_GAP_X: f32 = 6.0;
+                            const ACTION_GAP_Y: f32 = 6.0;
+                            let row_gap_y = (gap - ui.spacing().item_spacing.y).max(0.0);
+
+                            let status_width = |ui: &egui::Ui, text: &str| -> f32 {
+                                egui::WidgetText::from(egui::RichText::new(text).size(12.0))
+                                    .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+                                    .size()
+                                    .x
+                            };
+
+                            for (row_idx, row) in matches.chunks(cols).enumerate() {
+                                if row_idx > 0 {
+                                    ui.add_space(row_gap_y);
+                                }
+                                let prepared: Vec<PreparedCatalogCard<'_>> = row
+                                    .iter()
+                                    .map(|&e| {
                                         let is_inst = crate::catalog::installed(e, &scan, &roots);
                                         let active = self.install.as_ref().filter(|i| i.id == e.id);
                                         let running = active.is_some_and(|i| i.running);
@@ -21033,11 +21094,135 @@ impl DemoApp {
                                         } else {
                                             theme::LIVE_TEAL
                                         };
-                                        Self::catalog_card(ui, card_w, |ui, iw| {
-                                            ui.horizontal(|ui| {
-                                                ui.set_width(iw);
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    theme::tracked_label(ui, &badge, 9.5, 0.12, badge_col);
+                                        let desc_galley = egui::WidgetText::from(
+                                            egui::RichText::new(e.description).size(12.5).color(theme::INK),
+                                        )
+                                        .into_galley(ui, Some(egui::TextWrapMode::Truncate), inner_w, egui::TextStyle::Body);
+                                        let desc_elided = desc_galley.elided;
+                                        let about_galley = egui::WidgetText::from(
+                                            egui::RichText::new(e.about).size(12.0).color(theme::INK_2),
+                                        )
+                                        .into_galley(ui, Some(egui::TextWrapMode::Wrap), inner_w, egui::TextStyle::Body);
+                                        let route = crate::catalog::local_route(e);
+                                        let how = route.map_or_else(
+                                            || format!("No Linux build for {}", std::env::consts::ARCH),
+                                            |r| r.summary(),
+                                        );
+                                        let stars = e
+                                            .source
+                                            .github()
+                                            .and_then(|repo| self.catalog_stars.get(repo))
+                                            .map(|&n| format!("★ {} · ", crate::catalog::stars_label(n)))
+                                            .unwrap_or_default();
+                                        let meta_galley = egui::WidgetText::from(
+                                            egui::RichText::new(format!("{stars}License {} · {how}", e.license))
+                                                .size(11.5)
+                                                .color(theme::CREAM_DIM),
+                                        )
+                                        .into_galley(ui, Some(egui::TextWrapMode::Wrap), inner_w, egui::TextStyle::Body);
+
+                                        let mut raw_actions: Vec<(f32, CatalogAction<'_>)> = Vec::new();
+                                        if is_inst {
+                                            raw_actions.push((
+                                                status_width(ui, "Installed"),
+                                                CatalogAction::Status { text: "Installed", color: theme::LIVE_TEAL, hover: None },
+                                            ));
+                                            raw_actions.push((
+                                                theme::chip_button_width(ui, "Plugins →"),
+                                                CatalogAction::ShowType { ty: e.plugin_type },
+                                            ));
+                                        } else if running {
+                                            raw_actions.push((
+                                                status_width(ui, "Installing…"),
+                                                CatalogAction::Status { text: "Installing…", color: theme::AGENT_COLOR, hover: None },
+                                            ));
+                                        } else if let Some(err) = failed {
+                                            raw_actions.push((
+                                                status_width(ui, "Install failed"),
+                                                CatalogAction::Status {
+                                                    text: "Install failed",
+                                                    color: theme::CLIP_BRIGHT,
+                                                    hover: Some(err),
+                                                },
+                                            ));
+                                        } else if route.is_some() {
+                                            raw_actions.push((
+                                                theme::primary_button_width(ui, "Install"),
+                                                CatalogAction::Install { id: e.id, hover: how },
+                                            ));
+                                        }
+                                        if let Some(source) = e.source.url() {
+                                            raw_actions.push((
+                                                theme::chip_button_width(ui, "Source code"),
+                                                CatalogAction::OpenUrl { label: "Source code", url: source },
+                                            ));
+                                        }
+                                        if let Some(site) = e.homepage {
+                                            raw_actions.push((
+                                                theme::chip_button_width(ui, "Website"),
+                                                CatalogAction::OpenUrl { label: "Website", url: site.to_string() },
+                                            ));
+                                        }
+
+                                        let mut action_lines: Vec<Vec<CatalogAction<'_>>> = Vec::new();
+                                        let mut cur_line: Vec<CatalogAction<'_>> = Vec::new();
+                                        let mut cur_w = 0.0f32;
+                                        for (w, act) in raw_actions {
+                                            let item_w = w + 1.0;
+                                            if !cur_line.is_empty() && cur_w + ACTION_GAP_X + item_w > inner_w {
+                                                action_lines.push(cur_line);
+                                                cur_line = vec![act];
+                                                cur_w = item_w;
+                                            } else {
+                                                if !cur_line.is_empty() {
+                                                    cur_w += ACTION_GAP_X;
+                                                }
+                                                cur_line.push(act);
+                                                cur_w += item_w;
+                                            }
+                                        }
+                                        if !cur_line.is_empty() {
+                                            action_lines.push(cur_line);
+                                        }
+                                        let n_lines = action_lines.len().max(1);
+                                        let actions_h = n_lines as f32 * action_line_h + (n_lines - 1) as f32 * ACTION_GAP_Y;
+
+                                        PreparedCatalogCard {
+                                            entry: e,
+                                            badge,
+                                            badge_col,
+                                            desc_galley,
+                                            desc_elided,
+                                            about_galley,
+                                            meta_galley,
+                                            action_lines,
+                                            actions_h,
+                                        }
+                                    })
+                                    .collect();
+
+                                let row_desc_h = prepared.iter().map(|c| c.desc_galley.size().y).fold(0.0f32, f32::max);
+                                let row_meta_h = prepared.iter().map(|c| c.meta_galley.size().y).fold(0.0f32, f32::max);
+                                let row_actions_h = prepared.iter().map(|c| c.actions_h).fold(action_line_h, f32::max);
+                                let fixed_h = header_h + 4.0 + row_desc_h + 4.0 + 8.0 + row_meta_h + 10.0 + row_actions_h;
+                                let row_about_h = prepared
+                                    .iter()
+                                    .map(|c| c.about_galley.size().y)
+                                    .fold(0.0f32, f32::max)
+                                    .max((118.0 - fixed_h).max(0.0));
+                                let row_inner_h = fixed_h + row_about_h;
+
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = gap;
+                                    for card in prepared {
+                                        let e = card.entry;
+                                        Self::catalog_card(ui, card_w, row_inner_h, |ui, iw| {
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(iw, header_h),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.set_min_size(egui::vec2(iw, header_h));
+                                                    theme::tracked_label(ui, &card.badge, 9.5, 0.12, card.badge_col);
                                                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                                         ui.add(
                                                             egui::Label::new(
@@ -21048,74 +21233,91 @@ impl DemoApp {
                                                             .truncate(),
                                                         );
                                                     });
-                                                });
-                                            });
-                                            ui.add_space(4.0);
-                                            ui.add(
-                                                egui::Label::new(egui::RichText::new(e.description).size(12.5).color(theme::INK))
-                                                    .truncate(),
+                                                },
                                             );
                                             ui.add_space(4.0);
-                                            ui.add(egui::Label::new(egui::RichText::new(e.about).size(12.0).color(theme::INK_2)).wrap());
-                                            ui.add_space(6.0);
-                                            let route = crate::catalog::local_route(e);
-                                            let how = route.map_or_else(
-                                                || format!("No Linux build for {}", std::env::consts::ARCH),
-                                                |r| r.summary(),
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(iw, row_desc_h),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                                    ui.set_min_size(egui::vec2(iw, row_desc_h));
+                                                    let resp = ui.add(egui::Label::new(card.desc_galley));
+                                                    if card.desc_elided {
+                                                        resp.on_hover_text(e.description);
+                                                    }
+                                                },
                                             );
-                                            let stars = e
-                                                .source
-                                                .github()
-                                                .and_then(|repo| self.catalog_stars.get(repo))
-                                                .map(|&n| format!("★ {} · ", crate::catalog::stars_label(n)))
-                                                .unwrap_or_default();
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(format!("{stars}License {} · {how}", e.license))
-                                                        .size(11.5)
-                                                        .color(theme::CREAM_DIM),
-                                                )
-                                                .wrap(),
+                                            ui.add_space(4.0);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(iw, row_about_h),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                                    ui.set_min_size(egui::vec2(iw, row_about_h));
+                                                    ui.add(egui::Label::new(card.about_galley));
+                                                },
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(iw, row_meta_h),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                                    ui.set_min_size(egui::vec2(iw, row_meta_h));
+                                                    ui.add(egui::Label::new(card.meta_galley));
+                                                },
                                             );
                                             ui.add_space(10.0);
-                                            ui.horizontal(|ui| {
-                                                // The status label comes first: give the row the buttons'
-                                                // height before it is placed, or it centres on a shorter row.
-                                                ui.set_min_height(26.0);
-                                                ui.spacing_mut().item_spacing.x = 8.0;
-                                                if is_inst {
-                                                    ui.label(egui::RichText::new("Installed").size(12.0).color(theme::LIVE_TEAL));
-                                                    if theme::chip_button(ui, "Show in Plugins →", false)
-                                                        .on_hover_text("switch to the installed plugins tab filtered to this plugin")
-                                                        .clicked()
-                                                    {
-                                                        action = Some(BrowserAction::ShowType(e.plugin_type));
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(iw, row_actions_h),
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                                    ui.set_min_size(egui::vec2(iw, row_actions_h));
+                                                    for (li, line) in card.action_lines.into_iter().enumerate() {
+                                                        if li > 0 {
+                                                            ui.add_space(ACTION_GAP_Y);
+                                                        }
+                                                        ui.horizontal(|ui| {
+                                                            // Set row height before placing a label (rule 117).
+                                                            ui.set_min_height(action_line_h);
+                                                            ui.spacing_mut().item_spacing.x = ACTION_GAP_X;
+                                                            for act in line {
+                                                                match act {
+                                                                    CatalogAction::Status { text, color, hover } => {
+                                                                        let resp = ui.label(egui::RichText::new(text).size(12.0).color(color));
+                                                                        if let Some(h) = hover {
+                                                                            resp.on_hover_text(h);
+                                                                        }
+                                                                    }
+                                                                    CatalogAction::Install { id, hover } => {
+                                                                        if theme::primary_button(ui, "Install").on_hover_text(&hover).clicked() {
+                                                                            action = Some(BrowserAction::Install(id.to_string()));
+                                                                        }
+                                                                    }
+                                                                    CatalogAction::ShowType { ty } => {
+                                                                        if theme::chip_button(ui, "Plugins →", false)
+                                                                            .on_hover_text("switch to the installed plugins tab filtered to this plugin")
+                                                                            .clicked()
+                                                                        {
+                                                                            action = Some(BrowserAction::ShowType(ty));
+                                                                        }
+                                                                    }
+                                                                    CatalogAction::OpenUrl { label, url } => {
+                                                                        if theme::chip_button(ui, label, false).on_hover_text(&url).clicked() {
+                                                                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
                                                     }
-                                                } else if running {
-                                                    ui.label(egui::RichText::new("Installing…").size(12.0).color(theme::AGENT_COLOR));
-                                                } else if let Some(err) = failed {
-                                                    ui.label(egui::RichText::new("Install failed").size(12.0).color(theme::CLIP_BRIGHT))
-                                                        .on_hover_text(err);
-                                                } else if route.is_some() {
-                                                    if theme::primary_button(ui, "Install").on_hover_text(&how).clicked() {
-                                                        action = Some(BrowserAction::Install(e.id.to_string()));
-                                                    }
-                                                }
-                                                if let Some(source) = e.source.url() {
-                                                    if theme::chip_button(ui, "Source code", false).on_hover_text(&source).clicked() {
-                                                        ui.ctx().open_url(egui::OpenUrl::new_tab(source));
-                                                    }
-                                                }
-                                                if let Some(site) = e.homepage {
-                                                    if theme::chip_button(ui, "Website", false).on_hover_text(site).clicked() {
-                                                        ui.ctx().open_url(egui::OpenUrl::new_tab(site));
-                                                    }
-                                                }
-                                            });
+                                                },
+                                            );
                                         });
                                     }
                                 });
-                                ui.add_space(gap);
                             }
                             return;
                         }
@@ -39050,22 +39252,342 @@ mod split_bpm_tests {
     }
 
     /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat catalog_shots -- --ignored`:
-    /// the Install tab, whole and searched, one fresh app per image (rule 148).
+    /// the Install tab, whole, scrolled and searched, one fresh app per image (rule 148).
     #[test]
     #[ignore]
     fn catalog_shots() {
         let Ok(dir) = std::env::var("KABELSALAT_SHOTS") else { return };
-        for (name, filter) in [("catalog", ""), ("catalog-onetrick", "OneTrick"), ("catalog-starbreath", "Starbreath"), ("catalog-drums", "drum")] {
+        let seed_app = |filter: &str| {
             let mut app = DemoApp::new_with_sink(None);
             app.plugins_loaded = true;
+            app.plugins_clap = vec![
+                ClapPluginInfo {
+                    id: SURGE_ID.into(),
+                    name: "Surge XT".into(),
+                    vendor: "Surge Synth Team".into(),
+                    features: vec!["instrument".into()],
+                },
+                ClapPluginInfo {
+                    id: crate::sounds::ODIN_ID.into(),
+                    name: "Odin2".into(),
+                    vendor: "TheWaveWarden".into(),
+                    features: vec!["instrument".into()],
+                },
+                ClapPluginInfo {
+                    id: "fr.mgth.unsampled-piano".into(),
+                    name: "Unsampled Piano".into(),
+                    vendor: "mgth".into(),
+                    features: vec!["instrument".into()],
+                },
+            ];
+            app.plugins_lv2 = vec![Lv2PluginInfo {
+                uri: "http://gareus.org/oss/lv2/b_synth".into(),
+                name: "setBfree DSP Tonewheel Organ".into(),
+                author: "Robin Gareus".into(),
+                lv2_class: "InstrumentPlugin".into(),
+                num_ports: 4,
+                is_instrument: true,
+                is_midi_fx: false,
+            }];
             app.catalog_roots = Some(vec![]);
             app.stage_view = StageView::Plugins;
             app.plugin_category = PluginCategory::Install;
             app.plugin_filter = filter.to_string();
-            app.catalog_stars.insert("surge-synthesizer/surge", 4147);
             app.catalog_stars.insert("pantherb/setBfree", 235);
-            super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &std::path::Path::new(&dir).join(format!("{name}.png")));
+            app.catalog_stars.insert("surge-synthesizer/surge", 4147);
+            app.catalog_stars.insert("kayrockscreenprinting/ultramaster_kr106", 205);
+            app.catalog_stars.insert("baconpaul/six-sines", 317);
+            app.catalog_stars.insert("DISTRHO/Cardinal", 3300);
+            app.catalog_stars.insert("mgth/unsampled-piano", 6);
+            app
+        };
+        for (name, filter, size) in [
+            ("catalog", "", Vec2::new(1280.0, 800.0)),
+            ("catalog-1600x1000", "", Vec2::new(1600.0, 1000.0)),
+            ("catalog-781x950", "", Vec2::new(781.0, 950.0)),
+            ("catalog-onetrick", "OneTrick", Vec2::new(1280.0, 800.0)),
+            ("catalog-starbreath", "Starbreath", Vec2::new(1280.0, 800.0)),
+            ("catalog-drums", "drum", Vec2::new(1280.0, 800.0)),
+        ] {
+            let mut app = seed_app(filter);
+            super::offline_shots::shot(&mut app, size, &std::path::Path::new(&dir).join(format!("{name}.png")));
         }
+        let mut app = seed_app("");
+        super::offline_shots::shot_with(
+            &mut app,
+            Vec2::new(1600.0, 1000.0),
+            &std::path::Path::new(&dir).join("catalog-1600x1000-scrolled.png"),
+            |_, i| match i {
+                2 => vec![egui::Event::PointerMoved(Pos2::new(800.0, 500.0))],
+                3 => vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -420.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                    modifiers: Modifiers::NONE,
+                }],
+                _ => Vec::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn catalog_cards_align_per_row_and_stay_within_columns() {
+        let make_app = |nav_open: bool| {
+            let mut app = DemoApp::new_with_sink(None);
+            app.plugins_loaded = true;
+            app.plugins_clap = vec![
+                ClapPluginInfo {
+                    id: SURGE_ID.into(),
+                    name: "Surge XT".into(),
+                    vendor: "Surge Synth Team".into(),
+                    features: vec!["instrument".into()],
+                },
+                ClapPluginInfo {
+                    id: crate::sounds::ODIN_ID.into(),
+                    name: "Odin2".into(),
+                    vendor: "TheWaveWarden".into(),
+                    features: vec!["instrument".into()],
+                },
+                ClapPluginInfo {
+                    id: "fr.mgth.unsampled-piano".into(),
+                    name: "Unsampled Piano".into(),
+                    vendor: "mgth".into(),
+                    features: vec!["instrument".into()],
+                },
+            ];
+            app.plugins_lv2 = vec![Lv2PluginInfo {
+                uri: "http://gareus.org/oss/lv2/b_synth".into(),
+                name: "setBfree DSP Tonewheel Organ".into(),
+                author: "Robin Gareus".into(),
+                lv2_class: "InstrumentPlugin".into(),
+                num_ports: 4,
+                is_instrument: true,
+                is_midi_fx: false,
+            }];
+            app.catalog_roots = Some(vec![]);
+            app.stage_view = StageView::Plugins;
+            app.plugin_category = PluginCategory::Install;
+            app.nav_open = nav_open;
+            app.catalog_stars.insert("pantherb/setBfree", 235);
+            app.catalog_stars.insert("surge-synthesizer/surge", 4147);
+            app.catalog_stars.insert("kayrockscreenprinting/ultramaster_kr106", 205);
+            app.catalog_stars.insert("baconpaul/six-sines", 317);
+            app.catalog_stars.insert("DISTRHO/Cardinal", 3300);
+            app.catalog_stars.insert("mgth/unsampled-piano", 6);
+            app
+        };
+
+        let walk_shapes = |app: &DemoApp, shapes: &[egui::epaint::ClippedShape]| {
+            fn walk(
+                app: &DemoApp,
+                shape: &Shape,
+                clip: Rect,
+                cards: &mut Vec<(Rect, Rect)>,
+                texts: &mut Vec<(String, Rect, Rect)>,
+            ) {
+                match shape {
+                    Shape::Rect(r)
+                        if r.fill == theme::DARK_PANEL_HI
+                            && (r.stroke.width - 1.0).abs() < 0.1
+                            && r.rect.width() >= 180.0
+                            && r.rect.height() >= 100.0
+                            && (!app.nav_open || !app.nav_panel_rect.intersects(r.rect.shrink(1.0))) =>
+                    {
+                        cards.push((r.rect, clip));
+                    }
+                    Shape::Text(t) if !t.galley.text().trim().is_empty() => {
+                        texts.push((
+                            t.galley.text().to_owned(),
+                            t.visual_bounding_rect(),
+                            t.galley.rect.translate(t.pos.to_vec2()),
+                        ));
+                    }
+                    Shape::Vec(v) => {
+                        for s in v {
+                            walk(app, s, clip, cards, texts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut cards = Vec::new();
+            let mut texts = Vec::new();
+            for cs in shapes {
+                walk(app, &cs.shape, cs.clip_rect, &mut cards, &mut texts);
+            }
+            (cards, texts)
+        };
+
+        let assert_aligned = |tag: &str, size: Vec2, nav_open: bool, scroll_dy: f32| {
+            let mut app = make_app(nav_open);
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            let mut last_shapes = Vec::new();
+            for i in 0..6 {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+                raw.time = Some(i as f64 * 0.1);
+                raw.focused = true;
+                if scroll_dy != 0.0 && i == 3 {
+                    raw.events = vec![
+                        egui::Event::PointerMoved(Pos2::new(size.x * 0.5, size.y * 0.5)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, scroll_dy),
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Unknown,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ];
+                }
+                eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+                let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+                out.textures_delta.clear(); // rule 11
+                last_shapes = out.shapes;
+            }
+            let (cards, texts) = walk_shapes(&app, &last_shapes);
+            assert!(!cards.is_empty(), "{tag}: expected catalog cards");
+
+            // Group cards into visual rows by top coordinate.
+            let mut sorted = cards;
+            sorted.sort_by(|a, b| a.0.top().total_cmp(&b.0.top()).then(a.0.left().total_cmp(&b.0.left())));
+            let mut rows: Vec<Vec<(Rect, Rect)>> = Vec::new();
+            for item in sorted {
+                if let Some(last) = rows.last_mut() {
+                    if (last[0].0.top() - item.0.top()).abs() <= 1.0 {
+                        last.push(item);
+                        continue;
+                    }
+                }
+                rows.push(vec![item]);
+            }
+            for row in &mut rows {
+                row.sort_by(|a, b| a.0.left().total_cmp(&b.0.left()));
+            }
+            let cols = rows[0].len();
+            assert!(cols >= 1, "{tag}: expected at least 1 column");
+
+            for (r_idx, row) in rows.iter().enumerate() {
+                assert!(row.len() <= cols, "{tag}: row {r_idx} has {} cards > cols {cols}", row.len());
+                let row_top = row[0].0.top();
+                let row_bottom = row[0].0.bottom();
+                let col_w = row[0].0.width();
+                for (c_idx, &(card, clip)) in row.iter().enumerate() {
+                    assert!(
+                        (card.top() - row_top).abs() < 0.5,
+                        "{tag} row {r_idx} col {c_idx}: top {} != {}",
+                        card.top(),
+                        row_top
+                    );
+                    assert!(
+                        (card.bottom() - row_bottom).abs() < 0.5,
+                        "{tag} row {r_idx} col {c_idx}: bottom {} != {} (height {} vs {})",
+                        card.bottom(),
+                        row_bottom,
+                        card.height(),
+                        row[0].0.height()
+                    );
+                    assert!(
+                        (card.width() - col_w).abs() < 0.5,
+                        "{tag} row {r_idx} col {c_idx}: width {} != {}",
+                        card.width(),
+                        col_w
+                    );
+                    assert!(
+                        (card.left() - rows[0][c_idx].0.left()).abs() < 0.5
+                            && (card.right() - rows[0][c_idx].0.right()).abs() < 0.5,
+                        "{tag} row {r_idx} col {c_idx}: {:?} misaligned with col 0 {:?}",
+                        card,
+                        rows[0][c_idx].0
+                    );
+                    if c_idx > 0 {
+                        let gap_x = card.left() - row[c_idx - 1].0.right();
+                        assert!((gap_x - 12.0).abs() < 1.0, "{tag} row {r_idx}: horizontal gap {gap_x}");
+                    }
+                    assert!(
+                        card.left() >= -0.5 && card.right() <= size.x + 0.5,
+                        "{tag} row {r_idx} col {c_idx}: card {card:?} escapes window {size:?}"
+                    );
+
+                    // Inside any fully unclipped card, text must stay inside card bounds.
+                    if clip.expand(0.5).contains_rect(card) {
+                        for (txt, tr, _) in &texts {
+                            if card.expand(0.5).contains(tr.center()) {
+                                assert!(
+                                    tr.left() >= card.left() - 0.5 && tr.right() <= card.right() + 0.5,
+                                    "{tag} row {r_idx} col {c_idx}: text {txt:?} {tr:?} overflows card {card:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+                if r_idx > 0 {
+                    let gap_y = row_top - rows[r_idx - 1][0].0.bottom();
+                    assert!((gap_y - 12.0).abs() < 1.0, "{tag} row {r_idx}: vertical gap {gap_y}");
+                }
+
+                // If every card in this row is completely inside the scroll clip rect,
+                // verify metadata top Y and first-line action galley center Y match across the row.
+                let row_visible = row.iter().all(|&(card, clip)| clip.expand(0.5).contains_rect(card));
+                if row_visible && row.len() > 1 {
+                    let mut meta_tops = Vec::new();
+                    let mut action_line0_centers = Vec::new();
+                    for &(card, _) in row {
+                        let card_texts: Vec<(&str, Rect)> = texts
+                            .iter()
+                            .filter(|(_, ink, _)| card.expand(0.5).contains(ink.center()))
+                            .map(|(s, _, box_rect)| (s.as_str(), *box_rect))
+                            .collect();
+                        let meta = card_texts
+                            .iter()
+                            .find(|(s, _)| s.starts_with("★ ") || s.starts_with("License "))
+                            .unwrap_or_else(|| panic!("{tag} row {r_idx}: missing metadata line in {card_texts:?}"));
+                        meta_tops.push(meta.1.top());
+
+                        let mut actions: Vec<(&str, Rect)> = card_texts
+                            .iter()
+                            .copied()
+                            .filter(|(s, _)| matches!(*s, "Install" | "Installed" | "Installing…" | "Install failed" | "Plugins →" | "Source code" | "Website"))
+                            .collect();
+                        actions.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+                        assert!(!actions.is_empty(), "{tag} row {r_idx}: missing action items");
+                        let line0_top = actions[0].1.top();
+                        let line0_cy = actions[0].1.center().y;
+                        for (lbl, ar) in &actions {
+                            if (ar.top() - line0_top).abs() <= 8.0 {
+                                assert!(
+                                    (ar.center().y - line0_cy).abs() < 1.5,
+                                    "{tag} row {r_idx}: {lbl:?} center.y {} != {} on same action line",
+                                    ar.center().y,
+                                    line0_cy
+                                );
+                            }
+                        }
+                        action_line0_centers.push(line0_cy);
+                    }
+                    for w in meta_tops.windows(2) {
+                        assert!(
+                            (w[0] - w[1]).abs() < 1.0,
+                            "{tag} row {r_idx}: metadata tops misaligned across row: {meta_tops:?}"
+                        );
+                    }
+                    for w in action_line0_centers.windows(2) {
+                        assert!(
+                            (w[0] - w[1]).abs() < 1.5,
+                            "{tag} row {r_idx}: action row center Y misaligned across row: {action_line0_centers:?}"
+                        );
+                    }
+                }
+            }
+        };
+
+        assert_aligned("1600x1000", Vec2::new(1600.0, 1000.0), false, 0.0);
+        assert_aligned("1600x1000-scrolled", Vec2::new(1600.0, 1000.0), false, -420.0);
+        assert_aligned("1280x800", Vec2::new(1280.0, 800.0), false, 0.0);
+        assert_aligned("1280x800-nav", Vec2::new(1280.0, 800.0), true, 0.0);
+        assert_aligned("781x950", Vec2::new(781.0, 950.0), false, 0.0);
+        assert_aligned("760x520", Vec2::new(760.0, 520.0), false, 0.0);
     }
 
     #[test]
@@ -49188,7 +49710,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 46] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 47] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -49254,6 +49776,28 @@ mod window_size_layout_tests {
                 a.clock.set_wired("MIDIMATE eX:MIDIMATE eX MIDI 1", true);
             }),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("plugins-install", &|a| {
+                a.stage_view = StageView::Plugins;
+                a.plugin_category = PluginCategory::Install;
+                a.plugins_loaded = true;
+                a.catalog_roots = Some(vec![]);
+                a.plugins_clap = vec![
+                    ClapPluginInfo {
+                        id: SURGE_ID.into(),
+                        name: "Surge XT".into(),
+                        vendor: "Surge Synth Team".into(),
+                        features: vec!["instrument".into()],
+                    },
+                    ClapPluginInfo {
+                        id: crate::sounds::ODIN_ID.into(),
+                        name: "Odin2".into(),
+                        vendor: "TheWaveWarden".into(),
+                        features: vec!["instrument".into()],
+                    },
+                ];
+                a.catalog_stars.insert("surge-synthesizer/surge", 4147);
+                a.catalog_stars.insert("pantherb/setBfree", 235);
+            }),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("sessions-installed", &|a| { a.stage_view = StageView::Sessions; template_plugins_installed(a) }),
             ("settings", &|a| a.stage_view = StageView::Settings),
@@ -50029,7 +50573,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 23] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 24] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -50052,6 +50596,28 @@ mod offline_shots {
                 a.clock.set_wired("MIDIMATE eX:MIDIMATE eX MIDI 1", true);
             }),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("plugins-install", &|a| {
+                a.stage_view = StageView::Plugins;
+                a.plugin_category = PluginCategory::Install;
+                a.plugins_loaded = true;
+                a.catalog_roots = Some(vec![]);
+                a.plugins_clap = vec![
+                    ClapPluginInfo {
+                        id: SURGE_ID.into(),
+                        name: "Surge XT".into(),
+                        vendor: "Surge Synth Team".into(),
+                        features: vec!["instrument".into()],
+                    },
+                    ClapPluginInfo {
+                        id: crate::sounds::ODIN_ID.into(),
+                        name: "Odin2".into(),
+                        vendor: "TheWaveWarden".into(),
+                        features: vec!["instrument".into()],
+                    },
+                ];
+                a.catalog_stars.insert("surge-synthesizer/surge", 4147);
+                a.catalog_stars.insert("pantherb/setBfree", 235);
+            }),
             ("plugins-foreign", &|a| {
                 a.stage_view = StageView::Plugins;
                 a.plugins_unloadable = ["Vital.clap", "Aeolus.clap", "floe.so"]

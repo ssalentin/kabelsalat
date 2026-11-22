@@ -1,0 +1,2 @@
+### Fixed
+- **Release tagging and PR conflict handling (#271, #341):** `tag-release.yml` now also triggers via `workflow_run` when CI passes on a `release-*` PR so bot auto-merges tag `vX.Y.Z` and start `release.yml`, `resolve-conflicts.yml` labels conflicting PRs `merge-conflict` without pushing bot commits that strand required checks, and `scripts/sync-branch.sh` fixes `LC_ALL=C` overlap sorting and preserves exit-3 overlap warnings across separate rebase and `--push` runs.

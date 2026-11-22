@@ -1,26 +1,93 @@
 name: Tag release
 
-# When a merge to main sets a Cargo.toml version that has no tag yet (the
-# release PR from prepare-release.yml, or one made by hand), tag that commit
-# vX.Y.Z and start release.yml on it. A tag pushed with GITHUB_TOKEN starts
-# no workflow by itself, hence the dispatch.
+# When a release PR merges to main (including when auto-merged by
+# github-actions[bot] via GITHUB_TOKEN, which suppresses the push event),
+# tag that merge commit vX.Y.Z and start release.yml on it. A tag pushed
+# with GITHUB_TOKEN starts no workflow by itself, hence the dispatch.
 on:
   push:
     branches: [main]
     paths: [Cargo.toml]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: ['release-*']
+  workflow_dispatch:
 
 permissions:
   contents: write
   actions: write
+  pull-requests: read
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
 
 jobs:
   tag:
+    if: >-
+      ${{ github.event_name != 'workflow_run'
+      || (github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success') }}
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
+      - id: target
+        name: Resolve the release commit to tag
+        env:
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ "$EVENT_NAME" != workflow_run ]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          merged_sha=
+          for _ in $(seq 1 36); do
+            info=$(gh pr list --head "$RELEASE_BRANCH" --base main --state all \
+              --json number,state,headRefOid,mergeCommit,autoMergeRequest --limit 5)
+            pr=$(jq -c --arg sha "$RUN_HEAD_SHA" \
+              '[.[] | select(.headRefOid == $sha)][0] // empty' <<<"$info")
+            if [ -z "$pr" ]; then
+              echo "No PR on $RELEASE_BRANCH at $RUN_HEAD_SHA (missing or superseded); nothing to tag"
+              exit 0
+            fi
+            state=$(jq -r '.state' <<<"$pr")
+            pr_num=$(jq -r '.number' <<<"$pr")
+            auto_merge=$(jq -r '.autoMergeRequest // empty' <<<"$pr")
+            merge_sha=$(jq -r '.mergeCommit.oid // ""' <<<"$pr")
+            if [ "$state" = MERGED ] && [ -n "$merge_sha" ]; then
+              merged_sha=$merge_sha
+              break
+            fi
+            if [ "$state" = CLOSED ]; then
+              echo "Release PR #$pr_num was closed without merging; nothing to tag"
+              exit 0
+            fi
+            if [ -z "$auto_merge" ]; then
+              echo "Release PR #$pr_num is not queued for auto-merge; a manual merge will trigger push"
+              exit 0
+            fi
+            sleep 5
+          done
+          if [ -z "$merged_sha" ]; then
+            echo "::warning::Release PR on $RELEASE_BRANCH did not finish auto-merging within 3 minutes; run gh workflow run tag-release.yml once merged"
+            exit 0
+          fi
+          echo "sha=$merged_sha" >> "$GITHUB_OUTPUT"
+      - name: Check out the release merge commit
+        if: ${{ steps.target.outputs.sha != '' && steps.target.outputs.sha != github.sha }}
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          (git fetch --depth=1 origin "$TARGET_SHA" || git fetch origin main) && git checkout --detach "$TARGET_SHA"
       - name: Tag a new version and start the release
+        if: ${{ steps.target.outputs.sha != '' }}
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
           tag=v$version
@@ -29,6 +96,6 @@ jobs:
             exit 0
           fi
           scripts/ci/release-notes.sh "$version" > /dev/null
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$TARGET_SHA"
           gh workflow run release.yml --ref "$tag"
-          echo "tagged $GITHUB_SHA as $tag and started release.yml"
+          echo "tagged $TARGET_SHA as $tag and started release.yml"

@@ -23,7 +23,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write
   issues: read
 
 concurrency:
@@ -66,6 +65,7 @@ jobs:
           git push -u origin "$branch"
           {
             echo "Release **v$VERSION**, prepared by \`prepare-release.yml\` (bump: \`$BUMP\`)."
+            echo "Approve the pending \`pull_request\` workflow runs on this PR to run CI and let auto-merge land it."
             echo "Merging tags it and publishes every package (\`tag-release.yml\` → \`release.yml\`)."
             echo
             echo "## Notes"
@@ -75,6 +75,7 @@ jobs:
           gh pr create --base main --head "$branch" --title "Release v$VERSION" \
             --body-file "$RUNNER_TEMP/body.md"
           gh pr merge "$branch" --auto --squash
-          # A PR opened with GITHUB_TOKEN starts no pull_request workflows;
-          # dispatching CI on the branch produces the required checks.
-          gh workflow run ci.yml --ref "$branch"
+          # A PR opened with GITHUB_TOKEN puts pull_request runs into
+          # action_required until a maintainer approves them (workflow_dispatch
+          # check runs are ignored by branch protection). Once approved CI passes,
+          # auto-merge lands the PR and tag-release.yml tags it via workflow_run.

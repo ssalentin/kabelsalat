@@ -12,10 +12,11 @@
 # files: resolve them, `git add` them, `git rebase --continue`, run the gate
 # tests again, then run this script again.
 #
-# With --push, when the rebase brought in changes from main to files this
-# branch changes too (Markdown aside), it does not push but exits 3 and names them: run their
-# test modules (rule 155), then run it again (the branch is up to date now,
-# so the second run pushes).
+# Non-Markdown overlaps introduced by a rebase are recorded in
+# `$(git rev-parse --git-path sync-branch-overlap)` so that even when you
+# rebase first with plain `scripts/sync-branch.sh` and push later with
+# `--push`, `--push` still stops once with exit 3 naming those files. Run
+# their test modules (rule 155), then run `--push` again to push cleanly.
 #
 # A merge commit the resolve-conflicts bot pushed to the branch is dropped by
 # the rebase (its content is already in main), so --force-with-lease after a
@@ -51,6 +52,8 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
+overlap_file=$(git rev-parse --git-path sync-branch-overlap)
+
 git fetch -q origin main
 git fetch -q origin "$branch" 2>/dev/null || true # the branch may not be pushed yet
 
@@ -82,16 +85,36 @@ else
   echo "sync-branch: rebased $(git rev-list --count origin/main..HEAD) commit(s) onto origin/main"
 fi
 
-if [ "$push" -eq 1 ]; then
-  if [ "$(git rev-parse HEAD)" != "$before" ]; then
-    both=$(comm -12 <(git diff --name-only "$oldbase" origin/main | sort) \
-                    <(git diff --name-only origin/main HEAD | sort) | grep -v '\.md$' || true)
-    if [ -n "$both" ]; then
-      echo "sync-branch: main changed files this branch changes too; run their test modules again" >&2
-      echo "  before you push (rule 155), then run this script again:" >&2
+if [ "$(git rev-parse HEAD)" != "$before" ]; then
+  both=$(LC_ALL=C comm -12 \
+    <(git diff --name-only "$oldbase" origin/main | LC_ALL=C sort -u) \
+    <(git diff --name-only origin/main HEAD | LC_ALL=C sort -u) \
+    | grep -v '\.md$' || true)
+  if [ -n "$both" ]; then
+    tmp_overlap=$(mktemp "${overlap_file}.XXXXXX")
+    if [ -f "$overlap_file" ]; then
+      { cat "$overlap_file"; printf '%s\n' "$both"; } | LC_ALL=C sort -u > "$tmp_overlap"
+    else
+      printf '%s\n' "$both" | LC_ALL=C sort -u > "$tmp_overlap"
+    fi
+    mv "$tmp_overlap" "$overlap_file"
+    if [ "$push" -eq 0 ]; then
+      echo "sync-branch: note: main also changed non-Markdown file(s) touched by this branch:" >&2
       echo "$both" | sed 's/^/    /' >&2
-      exit 3
+      echo "  Run their test modules (rule 155); the next --push will require acknowledgement (exit 3)." >&2
     fi
   fi
+fi
+
+if [ "$push" -eq 1 ]; then
+  if [ -s "$overlap_file" ]; then
+    overlapped=$(cat "$overlap_file")
+    rm -f "$overlap_file"
+    echo "sync-branch: main changed files this branch changes too; run their test modules again" >&2
+    echo "  before you push (rule 155), then run this script again:" >&2
+    echo "$overlapped" | sed 's/^/    /' >&2
+    exit 3
+  fi
+  rm -f "$overlap_file"
   git push --force-with-lease -u origin "HEAD:$branch"
 fi

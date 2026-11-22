@@ -59,6 +59,7 @@ mod sounds;
 mod theme;
 mod transport;
 mod ui;
+mod unsampled_piano;
 mod vital;
 mod watchdog;
 

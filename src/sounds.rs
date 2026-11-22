@@ -65,6 +65,8 @@ pub enum Load {
     ParamValue { param: u32, value: f64 },
     /// An Aeolus registration, written as the plugin's CLAP state.
     AeolusRegistration(&'static crate::aeolus::Registration),
+    /// An Unsampled Piano CPU/room profile, applied to its CLAP state.
+    UnsampledPianoProfile(&'static crate::unsampled_piano::Profile),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,6 +108,9 @@ pub enum Source {
     /// Registrations of Aeolus's built-in organ, kabelsalat's own table
     /// (`aeolus::REGISTRATIONS`): the plugin has no presets.
     AeolusRegistrations,
+    /// CPU / room profiles for Unsampled Piano (`unsampled_piano::PROFILES`),
+    /// applied to its CLAP state.
+    UnsampledPianoProfiles,
     /// `pset:Preset` files in the LV2 bundles, plus the programmes the
     /// plugin names in its MIDNAM document.
     Lv2Bundles,
@@ -129,6 +134,7 @@ impl Instrument {
             Instrument::Clap(id) if id == DEXED_ID => Source::DexedCartridges,
             Instrument::Clap(id) if id == ODIN_ID => Source::OdinSoundbanks,
             Instrument::Clap(id) if id == crate::aeolus::AEOLUS_ID => Source::AeolusRegistrations,
+            Instrument::Clap(id) if id == crate::unsampled_piano::PLUGIN_ID => Source::UnsampledPianoProfiles,
             Instrument::Clap(_) => Source::PresetParameter,
             Instrument::Lv2(uri) if uri == crate::vital::URI => Source::VitalPatches,
             Instrument::Lv2(_) => Source::Lv2Bundles,
@@ -144,6 +150,7 @@ pub fn scan(instrument: &Instrument) -> Library {
         Source::DexedCartridges => dexed_library(),
         Source::OdinSoundbanks => odin_library(&odin_soundbanks_dir()),
         Source::AeolusRegistrations => aeolus_library(),
+        Source::UnsampledPianoProfiles => unsampled_piano_library(),
         Source::Lv2Bundles => lv2_library(instrument.id()),
         Source::VitalPatches => vital_library(&crate::vital::data_dir()),
         // Nothing on disk: the plugin is asked.
@@ -261,6 +268,16 @@ fn aeolus_library() -> Library {
         load: Load::AeolusRegistration(r),
     }).collect();
     Library { kind: "Aeolus organ registrations".into(), sounds, params: Vec::new() }
+}
+
+fn unsampled_piano_library() -> Library {
+    let sounds = crate::unsampled_piano::PROFILES.iter().map(|p| Sound {
+        category: p.category.into(),
+        name: p.name.into(),
+        preferred: p.preferred,
+        load: Load::UnsampledPianoProfile(p),
+    }).collect();
+    Library { kind: "Unsampled Piano CPU profiles".into(), sounds, params: Vec::new() }
 }
 
 /// An LV2 instrument's installed presets plus the MIDI programmes it names.
@@ -422,6 +439,12 @@ pub fn load(sound: &Sound, to: Target) -> Result<(), String> {
             plugin()?.0.load_state(&state).map_err(|e| e.to_string())
         }
         Load::AeolusRegistration(reg) => plugin()?.0.load_state(&crate::aeolus::state(reg)).map_err(|e| e.to_string()),
+        Load::UnsampledPianoProfile(profile) => {
+            let main = plugin()?.0;
+            let cur = main.save_state().map_err(|e| e.to_string())?;
+            let next = crate::unsampled_piano::apply_profile(&cur, profile)?;
+            main.load_state(&next).map_err(|e| e.to_string())
+        }
         Load::ParamValue { param, value } => {
             plugin()?.1.set_param(clack_host::prelude::ClapId::new(*param), *value);
             Ok(())
@@ -450,6 +473,7 @@ fn word_alternatives(w: &str) -> &'static [&'static str] {
         "clavinet" | "clav" => &["clavinet", "clav"],
         "percussion" | "perc" => &["percussion", "perc"],
         "reverb" | "verb" => &["reverb", "verb"],
+        "low" => &["low", "light"],
         "atmospheric" | "atmosphere" | "atmos" => &["atmospheric", "atmosphere", "atmos", "ambient", "pad"],
         "spooky" | "creepy" | "eerie" => &["spooky", "creepy", "eerie", "dark", "haunt"],
         _ => &[],
@@ -608,7 +632,7 @@ impl Libraries {
         if instrument.source() == Source::PresetParameter {
             return Lookup::AskPlugin;
         }
-        if !self.threaded {
+        if !self.threaded || instrument.source() == Source::UnsampledPianoProfiles {
             let library = Arc::new((self.scan)(instrument));
             found.insert(instrument.clone(), Slot::Ready(library.clone(), now));
             return Lookup::Ready(library);
@@ -891,5 +915,45 @@ mod tests {
         assert_eq!(Instrument::of(&NodeKind::Clap { plugin_id: crate::control::ClapId::new("Surge XT") }), Some(Instrument::Clap(SURGE_ID.into())));
         assert_eq!(Instrument::of(&NodeKind::Lv2 { uri: Lv2Uri::new("urn:distrho:vitalium") }), Some(Instrument::Lv2("urn:distrho:vitalium".into())));
         assert_eq!(Instrument::of(&NodeKind::Keys), None);
+    }
+
+    #[test]
+    fn unsampled_piano_profiles_are_listed_searchable_and_need_live_plugin_to_load() {
+        let inst = Instrument::of(&NodeKind::Clap {
+            plugin_id: crate::control::ClapId::new(crate::unsampled_piano::PLUGIN_ID),
+        })
+        .expect("Unsampled Piano node resolves to an instrument");
+        assert_eq!(inst.source(), Source::UnsampledPianoProfiles);
+        let lib = match Libraries::installed().get(&inst) {
+            Lookup::Ready(lib) => lib,
+            _ => panic!("Unsampled Piano profiles should be ready without background scanning"),
+        };
+        let labels: Vec<String> = lib.sounds.iter().map(Sound::label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "CPU/Full",
+                "CPU/Balanced",
+                "CPU/Light",
+                "CPU/Dry",
+                "CPU/Light Dry",
+            ]
+        );
+        for (q, want) in [
+            ("full", "Full"),
+            ("balanced", "Balanced"),
+            ("light", "Light"),
+            ("dry", "Dry"),
+            ("light dry", "Light Dry"),
+            ("low cpu", "Light"),
+        ] {
+            let hit = find(&lib.sounds, q).unwrap_or_else(|| panic!("query {q:?} missed"));
+            assert_eq!(hit.name, want, "query {q:?}");
+        }
+        let light = find(&lib.sounds, "light dry").unwrap();
+        assert_eq!(
+            load(light, Target { node: 1, clap: None, bus: None }),
+            Err("no live plugin (headless)".into())
+        );
     }
 }

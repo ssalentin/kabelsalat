@@ -298,7 +298,7 @@ pub fn run_test() -> anyhow::Result<()> {
     let (home, other, app) = (&format!("kabelsalat_capture_home_{pid}"), &format!("kabelsalat_capture_other_{pid}"), &format!("Test Browser {pid}"));
     cleanup.null_sink(home, "Capture-Home")?;
     cleanup.null_sink(other, "Capture-Other")?;
-    anyhow::ensure!(pactl(&["set-default-sink", home]).is_some(), "set-default-sink failed");
+    cleanup.set_default_sink(home)?;
 
     // Our own output, the way the engine opens it, playing a 1 kHz tone.
     let device = cpal::default_host().default_output_device()
@@ -437,7 +437,7 @@ pub fn run_test() -> anyhow::Result<()> {
 
     // 4. The other app follows us there, and the default output changes too.
     move_to(theirs.index, other)?;
-    anyhow::ensure!(pactl(&["set-default-sink", other]).is_some(), "set-default-sink failed");
+    cleanup.set_default_sink(other)?;
     check("both on the other sink, now the default", &mut capture, &mut feed)?;
 
     // 5. Our output stream is reopened (a buffer-size change does that): the

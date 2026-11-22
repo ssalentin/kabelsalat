@@ -1811,3 +1811,14 @@ Learned so far (2026-11-15, UI polish pass):
     the model to `list_plugins(type="instrument")` + `add_node`/`add_rig`
     instead of substituting Surge (`a_sound_is_searched_in_the_library_of_the_rigs_own_instrument`,
     `agent-eval --task unsampled_piano`).
+208. **A test loading a named PipeWire node sets every property it measures
+    through and restores the default sink on exit/error:** WirePlumber saves and
+    restores sink/stream volumes (`stream-properties`) and `default.configured.audio.sink`
+    (`default-nodes`) by node name, so a lowered saved volume permanently broke
+    `audio-out-test` and `pactl set-default-sink` left the test sink configured.
+    Load test null sinks with PID-unique names and `state.restore-props=false`,
+    explicitly run `pactl set-sink-volume <sink> 100%` and `set-sink-mute <sink> 0`,
+    and change/restore the default sink through `audio_out::selftest::Cleanup::set_default_sink`
+    so `Drop` restores `default.configured.audio.sink` (via `pw-metadata`, falling back
+    to `pactl`) and unloads modules on exit, error, and panic
+    (`selftest_null_sink_sets_full_volume_unmuted_and_cleanup_restores_default_on_drop`).

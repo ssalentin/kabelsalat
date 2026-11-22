@@ -1970,4 +1970,14 @@ Learned so far (2026-11-15, UI polish pass):
     culling/wrapping tight views). Any test waiting on a background thread before
     reading layout/text must run at least 2 warmup frames (`frames < 2`) so the
     checked frame runs on Frame 3+ at full logical dimensions.
+223. **CLAP plugin editors: set `DISPLAY` before `gui.create`, sync X11 before
+    `set_parent`, and never starve `m.pump()` in the sandbox worker:**
+    `plugin_window::ensure_display()` must run before `gui.create()` (probing
+    `/tmp/.X11-unix/X*` for the first reachable socket so a greeter's `:0` does
+    not block a user's `:1`), `PluginWindow::open` must round-trip sync with the
+    X server before handing its XID to the plugin's separate connection,
+    `choose_gui_config` falls back from embedded X11 to floating X11/Wayland,
+    and `host::sandbox::run_plugin_worker` must run `m.pump()` after `Ok(req)`
+    RPCs too (and give `OpenEditor` a 15 s timeout) — otherwise frame-rate
+    `EditorOpen` polls prevent `recv_msg` timeouts and freeze the editor.
 

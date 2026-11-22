@@ -1822,3 +1822,12 @@ Learned so far (2026-11-15, UI polish pass):
     so `Drop` restores `default.configured.audio.sink` (via `pw-metadata`, falling back
     to `pactl`) and unloads modules on exit, error, and panic
     (`selftest_null_sink_sets_full_volume_unmuted_and_cleanup_restores_default_on_drop`).
+209. **Clear load-time LV2 MIDI sync before an eval turn measures what the
+    agent sent:** setBfree's face knobs publish default CCs at rack load
+    (ending with reverb CC 91 = 25 via `organ_pending` and
+    `reapply_attached_lv2_node`), which sat in `Lv2Plugin::last_event` and
+    made `agent-eval --task organ_no_pad` fail on read-only turns (#346).
+    `EvalRig::load` waits for `engine.has_lv2_in_flight()` to drain, settles
+    post-attach re-sync, and calls `engine.clear_lv2_last_events()` so
+    `lv2_last_note` records only events sent during the turn
+    (`organ_no_pad_ignores_load_time_face_sync_and_catches_agent_events`).

@@ -2230,6 +2230,11 @@ impl Lv2Plugin {
         self.last_event
     }
 
+    /// Clear the recorded last MIDI event (verification baseline before a turn).
+    pub fn clear_last_midi_event(&mut self) {
+        self.last_event = None;
+    }
+
     /// Bytes the plugin wrote to its first atom output in the last run()
     /// (the sequence body; 8 = an empty sequence). None without atom outputs.
     pub fn atom_output_size(&self) -> Option<u32> {
@@ -3401,6 +3406,33 @@ mod tests {
         retire(plugin);
         eprintln!("setbfree note peak: {peak:.4}");
         assert!(peak > 1e-3, "setBfree produced no audio while a key was held: peak={peak}");
+    }
+
+    #[test]
+    fn setbfree_clear_last_midi_event_resets_baseline_and_records_subsequent_events() {
+        let uri = "http://gareus.org/oss/lv2/b_synth";
+        if !discover().iter().any(|p| p.uri == uri) {
+            return;
+        }
+        let mut plugin = Lv2Plugin::load(uri, 48000.0, 256).expect("setBfree is installed but failed to load");
+        plugin.control_change(91, 25);
+        assert_eq!(plugin.last_midi_event(), Some([0xB0, 91, 25]));
+        plugin.clear_last_midi_event();
+        assert_eq!(plugin.last_midi_event(), None);
+
+        plugin.program_change(0);
+        assert_eq!(plugin.last_midi_event(), Some([0xC0, 0, 0]));
+        plugin.clear_last_midi_event();
+        assert_eq!(plugin.last_midi_event(), None);
+
+        plugin.note_on(60, 100);
+        assert_eq!(plugin.last_midi_event(), Some([0x90, 60, 100]));
+        plugin.clear_last_midi_event();
+        assert_eq!(plugin.last_midi_event(), None);
+
+        plugin.control_change(91, 25);
+        assert_eq!(plugin.last_midi_event(), Some([0xB0, 91, 25]));
+        retire(plugin);
     }
 
     #[test]

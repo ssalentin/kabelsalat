@@ -34150,6 +34150,9 @@ impl EvalRig {
             }
         }
         self.settle();
+        // Load-time face sync (e.g. setBfree's default drawbars and reverb CC 91)
+        // belongs to rack setup, not to the agent turn that follows (#346).
+        self.engine.clear_lv2_last_events();
         Ok(())
     }
 
@@ -34166,6 +34169,11 @@ impl EvalRig {
         }
         self.app.build_rack(&merged, &[]);
         for _ in 0..100 {
+            self.frame();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.engine.has_lv2_in_flight() && std::time::Instant::now() < deadline {
             self.frame();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -40950,6 +40958,109 @@ mod ui_polish_agent_tests {
             }
             assert!(resent.is_empty(), "the organ has the programme's values already: {resent:?}");
         }
+    }
+
+    #[test]
+    fn organ_no_pad_ignores_load_time_face_sync_and_catches_agent_events() {
+        let lv2_plugins = crate::lv2::discover();
+        if !lv2_plugins.iter().any(|p| p.uri == EVAL_ORGAN) {
+            return;
+        }
+        let (assistant, _tx, _rx) = Assistant::with_test_worker();
+        let mut app = DemoApp::new_app(None, false, assistant);
+        app.sounds = crate::sounds::Libraries::blocking(|instrument| match instrument {
+            crate::sounds::Instrument::Lv2(uri) if uri == EVAL_ORGAN => crate::sounds::Library {
+                kind: "LV2 presets and MIDI programmes".into(),
+                sounds: vec![
+                    crate::sounds::Sound { category: "".into(), name: "Jazz 1 all".into(), preferred: true, load: crate::sounds::Load::MidiProgram(0) },
+                    crate::sounds::Sound { category: "".into(), name: "Jimmy Smith".into(), preferred: true, load: crate::sounds::Load::MidiProgram(103) },
+                ],
+                params: vec![],
+            },
+            other => test_sounds(other),
+        });
+        let (bus, drain) = crate::control::command_bus();
+        let bus = Arc::new(Mutex::new(bus));
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, 48000.0, vec![]);
+        let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+        engine.set_graph_pub(graph_pub.clone());
+        engine.spawn_lv2_loader();
+        app.graph_pub = Some(graph_pub);
+        app.bus = Some(bus.clone());
+        app.plugins_lv2 = lv2_plugins;
+        app.plugins_loaded = true;
+
+        let ctx = egui::Context::default();
+        let mut buf = vec![0.0f32; 256 * 2];
+        let started = std::time::Instant::now();
+        let mut step = |app: &mut DemoApp, engine: &mut GraphEngine| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+            raw.time = Some(started.elapsed().as_secs_f64());
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear(); // rule 11
+            engine.render(&mut buf, 2);
+        };
+
+        let rigs = vec![
+            crate::control::Rig::new("Rig A", crate::control::standard_rig_graph(true), None),
+            crate::control::Rig::new("Organ", crate::control::instrument_rig_graph(NodeKind::Lv2 { uri: Lv2Uri::new(EVAL_ORGAN) }, "setBfree"), None),
+        ];
+        let merged = crate::control::merge_rigs(&rigs);
+        assert!(bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 }));
+        app.build_rack(&merged, &[]);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for _ in 0..8 {
+            step(&mut app, &mut engine);
+        }
+        while engine.has_lv2_in_flight() && std::time::Instant::now() < deadline {
+            step(&mut app, &mut engine);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!engine.has_lv2_in_flight(), "setBfree load did not finish within 10 s");
+        for _ in 0..8 {
+            step(&mut app, &mut engine);
+        }
+
+        let organ = eval_node(&eval_graph(&app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. })).unwrap();
+        assert_eq!(engine.lv2_last_note(organ), Some([0xB0, 91, 25]), "load-time face sync sends setBfree's default reverb CC 91 = 25");
+
+        engine.clear_lv2_last_events();
+        for _ in 0..4 {
+            step(&mut app, &mut engine);
+        }
+        let search = app.exec_tool("list_sounds", &serde_json::json!({"query": "pad", "rig": 1}));
+        assert!(search.contains("no LV2 presets and MIDI programmes"), "unexpected list_sounds output: {search}");
+        for _ in 0..4 {
+            step(&mut app, &mut engine);
+        }
+
+        let task = EVAL_TASKS.iter().find(|t| t.name == "organ_no_pad").expect("organ_no_pad eval task");
+        assert_eq!((task.check)(&mut app, &engine, "setBfree has no pad sound in its library."), Ok(()));
+
+        assert!(bus.lock().unwrap().send(Command::ProgramChange { node: organ, program: 0 }));
+        for _ in 0..4 {
+            step(&mut app, &mut engine);
+        }
+        let err = (task.check)(&mut app, &engine, "Loaded.").unwrap_err();
+        assert!(err.contains("192"), "expected ProgramChange [192, ..] failure, got: {err}");
+
+        engine.clear_lv2_last_events();
+        assert!(bus.lock().unwrap().send(Command::SetParam { node: organ, param: crate::organ::P_REVERB, value: 0.2 }));
+        for _ in 0..4 {
+            step(&mut app, &mut engine);
+        }
+        let err = (task.check)(&mut app, &engine, "Adjusted reverb.").unwrap_err();
+        assert!(err.contains("[176, 91, 25]"), "expected CC 91 = 25 failure, got: {err}");
+
+        engine.clear_lv2_last_events();
+        assert!(bus.lock().unwrap().send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 }));
+        for _ in 0..4 {
+            step(&mut app, &mut engine);
+        }
+        let err = (task.check)(&mut app, &engine, "Played a note.").unwrap_err();
+        assert!(err.contains("144"), "expected NoteOn [144, ..] failure, got: {err}");
     }
 
     #[test]

@@ -1927,4 +1927,16 @@ Learned so far (2026-11-15, UI polish pass):
     against `inner_w` per row chunk before painting each card with shared band
     heights and `ui.set_min_height(action_line_h)` before labels (Rule 117;
     `catalog_cards_align_per_row_and_stay_within_columns`).
+217. **Set `EGL_PLATFORM=x11` at startup under Wayland for X11 plugin GUIs (#391):**
+    `baseview` plugins (like Unsampled Piano) pass an X11 display handle to
+    legacy `eglGetDisplay`, which Mesa EGL misidentifies as Wayland when
+    `WAYLAND_DISPLAY` is set and `EGL_PLATFORM` is unset, crashing in
+    `wl_proxy_create_wrapper`. Call `plugin_window::ensure_x11_egl_platform()`
+    single-threaded in `main()` (and before opening `PluginWindow`; `eframe`/
+    `wgpu` uses Vulkan or explicit `eglGetPlatformDisplay`).
+218. **Filter `self.install` by `.running` in `list_instruments` (#392):**
+    `poll_install` retains finished `InstallState` (`running: false`) so the
+    Plugins tab can keep showing the log, so `list_instruments` must check
+    `self.install.as_ref().filter(|i| i.running)` or `"installing": true` stays
+    stuck forever (`instrument_catalog_parity_and_confirm_gate`).
 

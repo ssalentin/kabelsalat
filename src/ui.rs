@@ -10774,7 +10774,7 @@ impl DemoApp {
                 }
             }
             "list_instruments" => {
-                let installing_id = self.install.as_ref().map(|i| i.id.clone());
+                let installing_id = self.install.as_ref().filter(|i| i.running).map(|i| i.id.clone());
                 let entries: Vec<serde_json::Value> = crate::catalog::CATALOG
                     .iter()
                     .map(|e| crate::catalog::entry_json(e, self.catalog_installed(e), installing_id.as_deref() == Some(e.id)))
@@ -39212,6 +39212,16 @@ mod split_bpm_tests {
         // A second install is refused while one runs; an unknown id errors.
         assert!(app.exec_tool("install_instrument", &serde_json::json!({"id": "yanes", "confirm": true})).contains("already installing"));
         assert!(app.exec_tool("install_instrument", &serde_json::json!({"id": "nope", "confirm": true})).contains("no catalog instrument"));
+
+        // #392: once poll_install finishes, self.install remains populated for the
+        // Plugins log view, but list_instruments must report installing: false.
+        app.poll_install();
+        assert!(app.install.is_some() && !app.install.as_ref().unwrap().running);
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("list_instruments", &serde_json::json!({}))).unwrap();
+        assert_eq!(
+            v["instruments"].as_array().unwrap().iter().find(|e| e["id"] == "setbfree").unwrap()["installing"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]

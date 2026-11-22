@@ -49,6 +49,7 @@ impl PluginWindow {
     /// size, so tiling window managers float it at the plugin's own size.
     pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Result<Self> {
         ensure_display();
+        ensure_x11_egl_platform();
         let (conn, screen_num) =
             x11rb::connect(None).context("no X server for plugin windows (is XWayland running?)")?;
         let screen = &conn.setup().roots[screen_num];
@@ -310,6 +311,30 @@ fn ensure_display() {
     }
 }
 
+fn should_set_x11_egl_platform(
+    wayland_display: Option<&std::ffi::OsStr>,
+    egl_platform: Option<&std::ffi::OsStr>,
+) -> bool {
+    wayland_display.is_some_and(|v| !v.is_empty()) && !egl_platform.is_some_and(|v| !v.is_empty())
+}
+
+/// Set `EGL_PLATFORM=x11` under Wayland when unset (#391).
+///
+/// Plugins built on `baseview` (e.g. Unsampled Piano) call legacy
+/// `eglGetDisplay(x11_display)`; when `WAYLAND_DISPLAY` is set and
+/// `EGL_PLATFORM` is unset, Mesa EGL guesses the Wayland platform and
+/// dereferences the X11 display pointer as a `wl_display`, crashing with
+/// `SIGSEGV`. `eframe`/`wgpu` uses Vulkan or explicit `eglGetPlatformDisplay`,
+/// so keeping the main window on native Wayland is unaffected.
+pub fn ensure_x11_egl_platform() {
+    if should_set_x11_egl_platform(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("EGL_PLATFORM").as_deref(),
+    ) {
+        std::env::set_var("EGL_PLATFORM", "x11");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +379,16 @@ mod tests {
         assert_eq!(center_in_rect(0, 0, 2560, 1600, 866, 674), (847, 463));
         // Oversized plugin clamps to the monitor's top-left rather than negative offset
         assert_eq!(center_in_rect(2560, 100, 1920, 1080, 2400, 1200), (2560, 100));
+    }
+
+    #[test]
+    fn x11_egl_platform_only_sets_under_wayland_when_unset() {
+        let s = std::ffi::OsStr::new;
+        assert!(should_set_x11_egl_platform(Some(s("wayland-1")), None));
+        assert!(should_set_x11_egl_platform(Some(s("wayland-1")), Some(s(""))));
+        assert!(!should_set_x11_egl_platform(Some(s("wayland-1")), Some(s("wayland"))));
+        assert!(!should_set_x11_egl_platform(Some(s("wayland-1")), Some(s("x11"))));
+        assert!(!should_set_x11_egl_platform(None, None));
+        assert!(!should_set_x11_egl_platform(Some(s("")), None));
     }
 }

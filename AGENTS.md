@@ -1858,3 +1858,12 @@ Learned so far (2026-11-15, UI polish pass):
     redundant post-`apply_session` `adopt_rig_devices()` that would clobber
     per-synth overrides), and use `clap_meta` switches only as a legacy
     fallback for nodes absent from `midi_sources` (`ui::hw_ports_tests`).
+210. **Idle non-live rigs sleep allocation-free only after full ring-out and wake
+    in-block without false wakes on rest messages (#206):** reset internal DSP
+    buffers/filters and rig PDC delay lines on sleep entry (`enter_rig_sleep`)
+    while preserving `GainRamp` targets and `always_hosted_nodes` so waking
+    replays no stale delay tail and clicks nothing, advance the CLAP sample
+    clock with `sleep_skip` while recording `Duration::ZERO` in `NodeTimer`
+    (updating `node_t0` before the next awake unit), and gate away stray
+    `NoteOff` / `at_rest` messages when a non-live rig is already asleep
+    (`idle_sleep_tests`).

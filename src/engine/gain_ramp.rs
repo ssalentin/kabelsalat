@@ -23,6 +23,16 @@ impl GainRamp {
         GainRamp { now: (g, g), to: (g, g), step: (0.0, 0.0), left: 0 }
     }
 
+    /// A stereo gain at `(l, r)` that is not moving.
+    pub const fn at_stereo(l: f32, r: f32) -> Self {
+        GainRamp { now: (l, r), to: (l, r), step: (0.0, 0.0), left: 0 }
+    }
+
+    /// True while a transition is still in progress.
+    pub const fn is_ramping(&self) -> bool {
+        self.left > 0
+    }
+
     /// Head for `to` over `frames` frames, from wherever the gain is now.
     pub fn set(&mut self, to: (f32, f32), frames: u32) {
         if to == self.to {

@@ -25,6 +25,14 @@ pub trait Processor: Send {
     fn latency_frames(&self) -> usize {
         0
     }
+    /// Frames of silent delay-line travel this processor can produce after
+    /// input falls silent before its tail is gone (e.g. a delay line's length).
+    fn tail_hint_frames(&self) -> usize {
+        self.latency_frames()
+    }
+    /// Clear internal audio ring/filter state before sleeping so waking never
+    /// replays stale energy; preserves smoothed parameter values and targets.
+    fn reset(&mut self) {}
 }
 
 /// Instantiate a built-in node for the control plane's `DspKind`.
@@ -422,6 +430,10 @@ impl Processor for Eq3 {
             _ => "unknown",
         }
     }
+
+    fn reset(&mut self) {
+        self.state = [[BiquadState::default(); 3]; 2];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +565,10 @@ impl Processor for Filter {
             _ => "unknown",
         }
     }
+
+    fn reset(&mut self) {
+        self.ic = [[0.0; 2]; 2];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +682,13 @@ impl Processor for Limiter {
 
     fn latency_frames(&self) -> usize {
         self.lookahead
+    }
+
+    fn reset(&mut self) {
+        self.ring.fill(0.0);
+        self.write = 0;
+        self.env = 0.0;
+        self.gain = 1.0;
     }
 }
 
@@ -864,6 +887,16 @@ impl Processor for Delay {
             _ => "unknown",
         }
     }
+
+    fn tail_hint_frames(&self) -> usize {
+        self.delay.value.max(self.delay.target).ceil().max(0.0) as usize + 64
+    }
+
+    fn reset(&mut self) {
+        self.buf.fill(0.0);
+        self.write = 0;
+        self.damp_state = [0.0; 2];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,6 +1076,18 @@ impl Processor for Reverb {
             2 => "mix",
             3 => "width",
             _ => "unknown",
+        }
+    }
+
+    fn reset(&mut self) {
+        for c in self.combs_l.iter_mut().chain(self.combs_r.iter_mut()) {
+            c.buf.fill(0.0);
+            c.idx = 0;
+            c.store = 0.0;
+        }
+        for ap in self.aps_l.iter_mut().chain(self.aps_r.iter_mut()) {
+            ap.buf.fill(0.0);
+            ap.idx = 0;
         }
     }
 }

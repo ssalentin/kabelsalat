@@ -2241,6 +2241,12 @@ impl Lv2Plugin {
         self.atom_out.first().map(|(_, b)| (b[0] & 0xffff_ffff) as u32)
     }
 
+    /// True while a worker-thread response waits to be delivered in `process()`.
+    /// Allocation- and lock-free.
+    pub fn has_pending_worker_response(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| !w.resp_rx.is_empty())
+    }
+
     /// Process a stereo-interleaved block (allocation-free).
     pub fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
         let frames = frames.min(self.block);

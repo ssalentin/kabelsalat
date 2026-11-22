@@ -9,14 +9,15 @@
 //! is what a restart is for.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
 use clap_sys::entry::clap_plugin_entry;
-use clap_sys::events::{clap_event_param_value, clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE};
+use clap_sys::events::{clap_event_param_value, clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE};
 use clap_sys::ext::audio_ports::{clap_audio_port_info, clap_plugin_audio_ports, CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO};
 use clap_sys::ext::params::{clap_host_params, clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE};
+use clap_sys::ext::tail::{clap_host_tail, clap_plugin_tail, CLAP_EXT_TAIL};
 use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
 use clap_sys::host::clap_host;
 use clap_sys::id::CLAP_INVALID_ID;
@@ -54,6 +55,16 @@ pub struct Probe {
     sidechain_peak: AtomicU32,
     /// The next `activate()` answers false.
     pub refuse_activation: AtomicBool,
+    /// `clap_process_status` returned by `plugin_process`.
+    process_status: AtomicI32,
+    /// `clap_plugin_tail.get()` return value in samples (`i32::MAX as u32` = infinite).
+    tail_samples: AtomicU32,
+    /// Last `clap_process.steady_time` seen by `plugin_process`.
+    last_steady_time: AtomicI64,
+    /// When true, note-on starts a 440 Hz phase-continuous sine wave until note-off.
+    sine_on_note: AtomicBool,
+    note_held: AtomicBool,
+    sine_phase: AtomicU64,
     host: AtomicPtr<clap_host>,
 }
 
@@ -72,8 +83,54 @@ impl Probe {
             out_channels,
             sidechain_peak: AtomicU32::new(0.0f32.to_bits()),
             refuse_activation: AtomicBool::new(false),
+            process_status: AtomicI32::new(CLAP_PROCESS_CONTINUE),
+            tail_samples: AtomicU32::new(0),
+            last_steady_time: AtomicI64::new(-1),
+            sine_on_note: AtomicBool::new(false),
+            note_held: AtomicBool::new(false),
+            sine_phase: AtomicU64::new(0.0f64.to_bits()),
             host: AtomicPtr::new(std::ptr::null_mut()),
         })
+    }
+
+    pub fn set_sine_on_note(&self, on: bool) {
+        self.sine_on_note.store(on, Ordering::SeqCst);
+        self.note_held.store(false, Ordering::SeqCst);
+        self.sine_phase.store(0.0f64.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn process_blocks(&self) -> usize {
+        self.blocks.load(Ordering::SeqCst) as usize
+    }
+
+    pub fn set_process_status(&self, status: clap_process_status) {
+        self.process_status.store(status, Ordering::SeqCst);
+    }
+
+    pub fn set_tail_samples(&self, samples: u32) {
+        self.tail_samples.store(samples, Ordering::SeqCst);
+    }
+
+    pub fn set_level(&self, level: f32) {
+        self.level.store(level.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn last_steady_time(&self) -> i64 {
+        self.last_steady_time.load(Ordering::SeqCst)
+    }
+
+    pub fn request_process(&self) {
+        let host = self.host();
+        unsafe { host.request_process.unwrap()(host) }
+    }
+
+    pub fn notify_tail_changed(&self) {
+        let host = self.host();
+        unsafe {
+            let ext = host.get_extension.unwrap()(host, CLAP_EXT_TAIL.as_ptr()) as *const clap_host_tail;
+            assert!(!ext.is_null(), "the host offers no tail extension");
+            (*ext).changed.unwrap()(host)
+        }
     }
 
     pub fn sidechain_peak(&self) -> f32 {
@@ -294,13 +351,28 @@ unsafe fn apply_events(probe: &Probe, events: *const clap_input_events) {
         return;
     }
     let (Some(size), Some(get)) = ((*events).size, (*events).get) else { return };
+    let sine_on_note = probe.sine_on_note.load(Ordering::SeqCst);
     for i in 0..size(events) {
         let header = get(events, i);
-        if (*header).space_id == CLAP_CORE_EVENT_SPACE_ID && (*header).type_ == CLAP_EVENT_PARAM_VALUE {
-            let ev = &*(header as *const clap_event_param_value);
-            if ev.param_id == 0 {
-                probe.level.store((ev.value as f32).to_bits(), Ordering::SeqCst);
+        if (*header).space_id != CLAP_CORE_EVENT_SPACE_ID {
+            continue;
+        }
+        match (*header).type_ {
+            CLAP_EVENT_PARAM_VALUE => {
+                let ev = &*(header as *const clap_event_param_value);
+                if ev.param_id == 0 {
+                    probe.level.store((ev.value as f32).to_bits(), Ordering::SeqCst);
+                }
             }
+            CLAP_EVENT_NOTE_ON if sine_on_note => {
+                if !probe.note_held.swap(true, Ordering::SeqCst) {
+                    probe.sine_phase.store(0.0f64.to_bits(), Ordering::SeqCst);
+                }
+            }
+            CLAP_EVENT_NOTE_OFF if sine_on_note => {
+                probe.note_held.store(false, Ordering::SeqCst);
+            }
+            _ => {}
         }
     }
 }
@@ -311,15 +383,45 @@ unsafe extern "C" fn plugin_process(p: *const clap_plugin, process: *const clap_
         probe.record("first process");
     }
     let process = &*process;
+    probe.last_steady_time.store(process.steady_time, Ordering::SeqCst);
     apply_events(probe, process.in_events);
     let level = f32::from_bits(probe.level.load(Ordering::SeqCst));
     let n = process.frames_count as usize;
     if probe.in_ports.is_empty() || process.audio_inputs_count == 0 {
-        for port in 0..process.audio_outputs_count as usize {
-            let buffer = &*process.audio_outputs.add(port);
-            for ch in 0..buffer.channel_count as usize {
-                let data = *buffer.data32.add(ch);
-                std::slice::from_raw_parts_mut(data, n).fill(level);
+        if probe.sine_on_note.load(Ordering::SeqCst) {
+            let held = probe.note_held.load(Ordering::SeqCst);
+            let mut phase = f64::from_bits(probe.sine_phase.load(Ordering::SeqCst));
+            let step = 440.0 / 48_000.0;
+            for port in 0..process.audio_outputs_count as usize {
+                let buffer = &*process.audio_outputs.add(port);
+                let mut port_phase = phase;
+                for i in 0..n {
+                    let s = if held {
+                        let v = (2.0 * std::f64::consts::PI * port_phase).sin() as f32 * 0.5;
+                        port_phase += step;
+                        if port_phase >= 1.0 {
+                            port_phase -= 1.0;
+                        }
+                        v
+                    } else {
+                        0.0
+                    };
+                    for ch in 0..buffer.channel_count as usize {
+                        *(*buffer.data32.add(ch)).add(i) = s;
+                    }
+                }
+                if port == 0 {
+                    phase = port_phase;
+                }
+            }
+            probe.sine_phase.store(phase.to_bits(), Ordering::SeqCst);
+        } else {
+            for port in 0..process.audio_outputs_count as usize {
+                let buffer = &*process.audio_outputs.add(port);
+                for ch in 0..buffer.channel_count as usize {
+                    let data = *buffer.data32.add(ch);
+                    std::slice::from_raw_parts_mut(data, n).fill(level);
+                }
             }
         }
     } else {
@@ -351,7 +453,7 @@ unsafe extern "C" fn plugin_process(p: *const clap_plugin, process: *const clap_
             }
         }
     }
-    CLAP_PROCESS_CONTINUE
+    probe.process_status.load(Ordering::SeqCst)
 }
 
 unsafe extern "C" fn plugin_get_extension(_p: *const clap_plugin, id: *const c_char) -> *const c_void {
@@ -360,9 +462,17 @@ unsafe extern "C" fn plugin_get_extension(_p: *const clap_plugin, id: *const c_c
         &PARAMS as *const clap_plugin_params as *const c_void
     } else if id == CLAP_EXT_AUDIO_PORTS {
         &AUDIO_PORTS as *const clap_plugin_audio_ports as *const c_void
+    } else if id == CLAP_EXT_TAIL {
+        &TAIL as *const clap_plugin_tail as *const c_void
     } else {
         std::ptr::null()
     }
+}
+
+static TAIL: clap_plugin_tail = clap_plugin_tail { get: Some(tail_get) };
+
+unsafe extern "C" fn tail_get(p: *const clap_plugin) -> u32 {
+    probe_of(p).tail_samples.load(Ordering::SeqCst)
 }
 
 fn write_name(dst: &mut [c_char], name: &str) {

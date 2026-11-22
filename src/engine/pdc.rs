@@ -517,6 +517,30 @@ impl Pdc {
         self.lines.iter().any(|l| l.src == src && l.frames > 0)
     }
 
+    /// Longest active compensation delay (in frames) touching any node in
+    /// `pred` (lines or bypass lines). Allocation-free.
+    pub fn max_frames_for(&self, mut pred: impl FnMut(NodeId) -> bool) -> usize {
+        let mut max_f = 0usize;
+        for l in self.lines.iter().chain(self.bypass.iter()) {
+            if l.frames > 0 && (pred(l.src) || pred(l.dest)) {
+                max_f = max_f.max(l.frames);
+            }
+        }
+        max_f
+    }
+
+    /// Zero all active compensation and bypass delay rings sourced from nodes
+    /// matched by `pred` (used when entering rig sleep after full ring-out).
+    /// Allocation-free.
+    pub fn clear_for(&mut self, mut pred: impl FnMut(NodeId) -> bool) {
+        for l in self.lines.iter_mut().chain(self.bypass.iter_mut()) {
+            if l.frames > 0 && pred(l.src) {
+                l.ring[..l.frames * 2].fill(0.0);
+                l.pos = 0;
+            }
+        }
+    }
+
     /// A latent unit delays by its latency also while bypassed, so the
     /// paths it sums with stay aligned and a bypass toggle moves nothing in
     /// time. Bypassed: `out` becomes `input` that many frames late. Running:

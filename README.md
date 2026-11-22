@@ -167,9 +167,13 @@ hard-struck piano, and a floating split: its key range's edges follow the hand
 that plays across them, by up to the set number of keys.
 Switching parts never cuts held notes or reverb tails — outgoing rigs keep
 sounding until you release the keys or sustain pedal, while new notes play the
-next part from the same audio block on. A part that moves a rig's fader, pan,
-an instrument's level or an effect's bypass ramps it over 5 ms, so a
-chord held through the switch does not click.
+next part from the same audio block on. Once an inactive non-live rig has rung
+out below -100 dBFS (honouring CLAP `sleep` / `tail` hints and built-in
+delay/compensation tails), it automatically enters allocation-free CPU sleep so
+large multi-song shows only pay DSP cost for live rigs, waking in the exact
+audio block a note, control, or part switch targets it. A part that moves a
+rig's fader, pan, an instrument's level or an effect's bypass ramps it over
+5 ms, so a chord held through the switch does not click.
 `kabelsalat setlist-switch-test` measures a switch under a held chord with real
 Surge XT voices (including switching between two songs that share one instance):
 no gap, no click, the reverb and delay tails ring on, and the

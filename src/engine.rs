@@ -13649,7 +13649,9 @@ mod send_tests {
         // now (over the 5 ms ramp, #415), and is gone one block later.
         r.send(SendSource::Rig(0), 0.0, false);
         r.render(1);
-        assert!(r.peak(gain) < 0.5 * 0.25 * pa, "no block of delay between send and insert: {}", r.peak(gain));
+        let d = r.engine.dsp.iter().find(|d| d.node == gain).expect("a dsp slot");
+        let tail = block_peak(&d.buf[(N - 8) * 2..N * 2]);
+        assert!(r.peak(gain) > 0.0 && tail == 0.0, "no block of delay between send and insert: it fades inside the block ({tail} at its end)");
         r.render(1);
         assert_eq!(r.peak(gain), 0.0, "the closed send is gone");
         // A node of the chain cannot send (feedback), nor can a bus.

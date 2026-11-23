@@ -747,7 +747,9 @@ fn system_prompt() -> String {
      singer or guitarist wants a dry verse and a wet chorus or solo; \
      select_setlist_part jumps to a song/part or steps next_part/prev_part/next_song/prev_song/clear; \
      add_song_from_session imports a saved session's rigs into the current gig and makes a song \
-     of them; get_show_controls lists and set_show_control binds or clears the pedal, key or button \
+     of them; save_setlist/load_setlist/list_setlists/set_setlist_folder save, load and manage \
+     standalone setlists (.ksalat-setlist) in the user's configured setlists folder (default \
+     ~/kabelsalat-setlists); get_show_controls lists and set_show_control binds or clears the pedal, key or button \
      (a CC, a note or a program change from a device) for each show action: next/previous song or part, \
      panic, tap tempo, tuner, master mute, backing track and record; it also chooses the devices whose \
      program change N picks song N+1; \
@@ -1393,6 +1395,26 @@ pub(crate) fn tools() -> Value {
             "name":"add_song_from_session",
             "description":"Import a saved session as a new song in the setlist. By default (share=true), any rig whose instrument plugin(s) and saved preset/state match an already-hosted rig shares that one instance (merging extra effects with per-part bypasses) instead of loading a duplicate; a different preset or share=false hosts a separate instance. session = saved session name from list_sessions; optional name overrides the song title.",
             "parameters":{"type":"object","properties":{"session":{"type":"string"},"name":{"type":"string"},"share":{"type":"boolean"}},"required":["session"]}
+        }},
+        {"type":"function","function":{
+            "name":"save_setlist",
+            "description":"Save the current setlist (songs, parts, sets, levels, show controls) together with its loaded rigs, plugin state blobs, knobs, mix and MIDI routes as a named setlist package (.ksalat-setlist) in the configured setlists folder (default ~/kabelsalat-setlists).",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Setlist name (no slashes)"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"load_setlist",
+            "description":"Load a saved setlist package by name from the configured setlists folder, restoring all rigs, sounds, mix, MIDI routes, songs, parts, sets, levels and show controls.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Saved setlist name (see list_setlists)"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_setlists",
+            "description":"List saved setlist names (.ksalat-setlist) in the configured setlists folder and return the folder path.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_setlist_folder",
+            "description":"Set the folder where saved setlists (.ksalat-setlist) are stored and listed, or pass path=null to reset to the default ~/kabelsalat-setlists.",
+            "parameters":{"type":"object","properties":{"path":{"type":["string","null"],"description":"Full folder path (starting with / or ~), or null to reset to default"}}}
         }},
         {"type":"function","function":{
             "name":"get_show_controls",

@@ -154,7 +154,8 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 
 **Play live**
 - **A setlist of songs and parts** that switches without cutting held notes
-  or reverb tails. → [Setlist](docs/GUIDE.md#play-a-setlist-without-a-gap),
+  or reverb tails, and saves as a standalone setlist file in your chosen
+  folder. → [Setlist](docs/GUIDE.md#play-a-setlist-without-a-gap),
   [show, set and song levels](docs/GUIDE.md#keep-what-stays-through-the-whole-show)
 - **Send scenes for singers and guitarists:** each part recalls its own send levels
   and send-effect settings (dry verse, hall on the chorus, echo on the solo) with

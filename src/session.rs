@@ -63,6 +63,16 @@ pub const RIG_PRESET_FILE: &str = "rig.json";
 pub const RIG_PRESET_EXT: &str = "ksalat-rig";
 /// On-disk format version for single-rig preset manifests.
 pub const RIG_PRESET_FORMAT_VERSION: u32 = 1;
+/// The manifest inside a saved setlist package.
+pub const SETLIST_FILE: &str = "setlist.json";
+/// Package directory extension for saved setlists.
+pub const SETLIST_EXT: &str = "ksalat-setlist";
+/// On-disk format version for saved setlist manifests.
+pub const SETLIST_FORMAT_VERSION: u32 = 1;
+/// Field in `~/.config/kabelsalat/config.json` storing the user's setlist folder.
+pub const SETLISTS_DIR_CONFIG_FIELD: &str = "setlists_dir";
+/// Optional environment override for the saved setlist folder.
+pub const SETLISTS_DIR_ENV: &str = "KABELSALAT_SETLISTS_DIR";
 
 /// The Surge XT CLAP id — the reference plugin (docs/ARCHITECTURE.md §1), native on ARM.
 const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
@@ -721,16 +731,18 @@ impl Session {
     /// wholesale and is never modified in place; on any error it stays intact.
     pub fn save(&self, package: &Path) -> Result<()> {
         self.validate()?;
-        stage_package(package, "session", |staging| self.write_package(staging))
+        stage_package(package, "session", |staging| {
+            self.write_to_dir(staging, SESSION_FILE, FORMAT_VERSION)
+        })
     }
 
     /// Write manifest + blobs into a fresh staging directory. Files are
     /// written temp-then-renamed and fsynced; the manifest goes last so a
     /// half-written staging dir is never a valid package.
-    fn write_package(&self, dir: &Path) -> Result<()> {
+    fn write_to_dir(&self, dir: &Path, manifest_file: &str, format: u32) -> Result<()> {
         let refs = write_state_files(dir, &self.states)?;
         let manifest = SessionFile {
-            format: FORMAT_VERSION,
+            format,
             name: self.name.clone(),
             graph: self.graph.clone(),
             params: self.params.clone(),
@@ -756,7 +768,7 @@ impl Session {
             macros: self.macros.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
-        write_atomic(&dir.join(SESSION_FILE), &json)?;
+        write_atomic(&dir.join(manifest_file), &json)?;
         Ok(())
     }
 
@@ -764,24 +776,33 @@ impl Session {
     /// exactly as saved; the caller restores blobs via `ClapVoiceMain::load_state`
     /// and re-issues knob values as `SetParam` commands.
     pub fn load(package: &Path) -> Result<Session> {
-        let manifest_path = package.join(SESSION_FILE);
+        Self::load_from_dir(package, SESSION_FILE, FORMAT_VERSION, "session")
+    }
+
+    fn load_from_dir(
+        package: &Path,
+        manifest_file: &str,
+        expected_format: u32,
+        kind: &str,
+    ) -> Result<Session> {
+        let manifest_path = package.join(manifest_file);
         let text = fs::read_to_string(&manifest_path).with_context(|| {
             format!(
-                "Could not read {} — is this a kabelsalat session package?",
+                "Could not read {} — is this a kabelsalat {kind} package?",
                 manifest_path.display()
             )
         })?;
         let manifest: SessionFile = serde_json::from_str(&text)
-            .with_context(|| format!("{} is not valid session JSON.", manifest_path.display()))?;
-        if manifest.format != FORMAT_VERSION {
+            .with_context(|| format!("{} is not valid {kind} JSON.", manifest_path.display()))?;
+        if manifest.format != expected_format {
             bail!(
-                "This session uses format version {} but this build understands version {}. \
+                "This {kind} uses format version {} but this build understands version {}. \
                  It may have been written by a newer kabelsalat.",
                 manifest.format,
-                FORMAT_VERSION
+                expected_format
             );
         }
-        let states = read_state_files(package, &manifest.states, "session")?;
+        let states = read_state_files(package, &manifest.states, kind)?;
         let rig_types = rig_types_of(&manifest);
         let mut setlist = manifest.setlist;
         setlist.normalize();
@@ -1432,6 +1453,179 @@ pub fn delete_rig_preset(dir: &Path, name: &str) -> Result<()> {
     let path = RigPreset::package_path(dir, name)?;
     if !path.exists() {
         bail!("rig preset '{name}' does not exist");
+    }
+    fs::remove_dir_all(&path)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Standalone saved setlists (<name>.ksalat-setlist) in a configurable folder
+// ---------------------------------------------------------------------------
+
+/// A saved setlist package: the complete setlist (songs, parts, sets, levels,
+/// show controls, load-ahead window) together with the rigs, plugin state
+/// blobs, knobs, mixer strips, sends, and MIDI routes it plays.
+#[derive(Clone, Debug)]
+pub struct SavedSetlist {
+    pub name: String,
+    pub session: Session,
+}
+
+impl SavedSetlist {
+    /// Wrap `session` as a named saved setlist, normalizing `name` on both.
+    pub fn new(name: impl Into<String>, mut session: Session) -> Self {
+        let trimmed = name.into().trim().to_string();
+        session.name = trimmed.clone();
+        Self { name: trimmed, session }
+    }
+
+    /// `parent/name.ksalat-setlist` with a plain-language check on the name.
+    pub fn package_path(parent: &Path, name: &str) -> Result<PathBuf> {
+        validate_package_path(parent, name, SETLIST_EXT, "setlist")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            bail!("The setlist needs a name before it can be saved.");
+        }
+        self.session.validate()
+    }
+
+    /// Atomically save this setlist package (staged in a hidden sibling, then
+    /// swapped into place; an existing package stays untouched on error).
+    pub fn save(&self, package: &Path) -> Result<()> {
+        self.validate()?;
+        let mut normalized = self.session.clone();
+        normalized.name = self.name.trim().to_string();
+        stage_package(package, "setlist", |staging| {
+            normalized.write_to_dir(staging, SETLIST_FILE, SETLIST_FORMAT_VERSION)
+        })
+    }
+
+    /// Load a saved setlist package.
+    pub fn load(package: &Path) -> Result<SavedSetlist> {
+        let session = Session::load_from_dir(package, SETLIST_FILE, SETLIST_FORMAT_VERSION, "setlist")?;
+        Ok(SavedSetlist { name: session.name.clone(), session })
+    }
+}
+
+/// Default folder where saved setlists are stored (`~/kabelsalat-setlists`).
+pub fn default_setlists_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join("kabelsalat-setlists")
+}
+
+/// Clean and validate a user-entered folder path (`~` expansion, quotes
+/// stripped, absolute path required, existing non-directory files refused).
+pub fn normalize_folder_path(raw: &str) -> std::result::Result<PathBuf, String> {
+    let mut s = raw.trim();
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            s = s[1..s.len() - 1].trim();
+        }
+    }
+    if s.is_empty() {
+        return Err("enter a folder path".into());
+    }
+    if s.contains('\0') || s.contains('\n') {
+        return Err("that is not a folder path".into());
+    }
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let expanded = if s == "~" {
+        home.ok_or("no home folder to expand ~")?
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home.ok_or("no home folder to expand ~")?.join(rest)
+    } else {
+        PathBuf::from(s)
+    };
+    if !expanded.is_absolute() {
+        return Err("use a full path that starts with / or ~".into());
+    }
+    let clean: PathBuf = expanded.components().collect();
+    if clean.exists() && !clean.is_dir() {
+        return Err("that path is a file, not a folder".into());
+    }
+    Ok(clean)
+}
+
+/// Read the configured setlists folder from `config_path`, if any.
+pub fn load_setlists_dir_from(config_path: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get(SETLISTS_DIR_CONFIG_FIELD).and_then(Value::as_str).map(str::to_string))?;
+    normalize_folder_path(&raw).ok()
+}
+
+/// Persist or clear the configured setlists folder in `config_path`.
+pub fn save_setlists_dir_to(config_path: &Path, dir: Option<&Path>) -> std::io::Result<()> {
+    match dir {
+        Some(path) => crate::assistant::save_config_values_to(
+            config_path,
+            &[(SETLISTS_DIR_CONFIG_FIELD, serde_json::json!(path.to_string_lossy()))],
+        ),
+        None => crate::assistant::remove_config_field_from(config_path, SETLISTS_DIR_CONFIG_FIELD),
+    }
+}
+
+/// Configured setlist folder override (`KABELSALAT_SETLISTS_DIR`, else
+/// `config.json` `setlists_dir`). Always `None` under `cfg(test)` (rule 37).
+pub fn setlists_dir_configured() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    if let Ok(env_val) = std::env::var(SETLISTS_DIR_ENV) {
+        if let Ok(path) = normalize_folder_path(&env_val) {
+            return Some(path);
+        }
+    }
+    load_setlists_dir_from(&crate::assistant::config_path())
+}
+
+/// Active directory for saved setlists (isolated under `cfg(test)`).
+pub fn setlists_dir() -> PathBuf {
+    #[cfg(test)]
+    let dir = std::env::temp_dir().join(format!("kabelsalat-test-setlists-{}", std::process::id()));
+    #[cfg(not(test))]
+    let dir = setlists_dir_configured().unwrap_or_else(default_setlists_dir);
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+/// Persist (or reset with `None`) the user's setlists folder in `config.json`
+/// (no-op under `cfg(test)`, rule 37).
+pub fn save_setlists_dir(dir: Option<&Path>) -> std::io::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    save_setlists_dir_to(&crate::assistant::config_path(), dir)
+}
+
+/// Sorted list of saved setlist names in `dir`.
+pub fn list_setlists(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == SETLIST_EXT) && p.is_dir() {
+                        p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Delete a saved setlist package by name from `dir`.
+pub fn delete_setlist(dir: &Path, name: &str) -> Result<()> {
+    let path = SavedSetlist::package_path(dir, name)?;
+    if !path.exists() {
+        bail!("setlist '{name}' does not exist");
     }
     fs::remove_dir_all(&path)?;
     Ok(())
@@ -3126,6 +3320,135 @@ mod tests {
         assert_eq!(state_of(v2), b"KSV3-SONG2-STRINGS");
         assert_eq!(state_of(l1), b"LV2-SONG1-PLUCK");
         assert_eq!(state_of(l2), b"LV2-SONG2-BASS");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_setlist_round_trips_all_gig_state_and_survives_failed_overwrite() {
+        use crate::control::{merge_rigs, ClapId, Rig};
+        use crate::setlist::{Part, PartRig, Setlist, SetlistPos, Song};
+        use crate::show::{ShowAction, ShowMsg};
+        use crate::transport::TimeSig;
+
+        let dir = test_dir("saved-setlist");
+        let make_rig = |label: &str| -> Rig {
+            let mut g = Graph::default();
+            g.reserve(8, 8);
+            let k = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            let inst = g.add_node(NodeKind::Clap { plugin_id: ClapId::new(SURGE_ID) }, name_bytes(label));
+            let fx = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+            let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: k, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
+            g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+            g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+            Rig::new(label, g, Some(0))
+        };
+        let rigs = vec![make_rig("PIANO"), make_rig("PAD")];
+        let g = merge_rigs(&rigs);
+        let inst_0 = g.nodes.iter().find(|n| n.rig == 0 && n.kind.is_hosted_voice()).unwrap().id;
+        let fx_0 = g.nodes.iter().find(|n| n.rig == 0 && matches!(n.kind, NodeKind::Dsp(DspKind::Delay))).unwrap().id;
+        let inst_1 = g.nodes.iter().find(|n| n.rig == 1 && n.kind.is_hosted_voice()).unwrap().id;
+
+        let mut s = Session::new("Scratch", g);
+        s.rig_names = vec!["Piano".into(), "Warm Pad".into()];
+        s.rig_devices = vec![Some(0), None];
+        s.hw_ports.insert(0, "Nord Stage:Nord Stage MIDI 1".into());
+        s.set_midi_sources(MidiSources {
+            node: inst_0,
+            keyboard: true,
+            hardware: true,
+            device: Some("Nord Stage:Nord Stage MIDI 1".into()),
+        });
+        s.set_param(fx_0, P_MIX, 0.42);
+        s.set_plugin_state(inst_0, SURGE_ID, b"PIANO-BLOB".to_vec());
+        s.set_plugin_state(inst_1, SURGE_ID, b"PAD-BLOB".to_vec());
+
+        let mut sl = Setlist::default();
+        let mut p1 = Part::new("Verse", vec![PartRig::new(0)]);
+        p1.set_param(fx_0, P_MIX, 0.25);
+        p1.set_fx(fx_0, true);
+        let mut p2 = Part::new("Chorus", vec![PartRig::new(0), PartRig { rig: 1, key_lo: 48, key_hi: 96, transpose: 12, level: 0.8, ..Default::default() }]);
+        p2.set_fx(fx_0, false);
+        let mut song1 = Song::new("Opener", vec![p1, p2]);
+        song1.bpm = Some(124.0);
+        song1.time_sig = Some(TimeSig::normalized(6, 8));
+        song1.notes = "{c: Verse}\n[Am]Hold on [G]tight".into();
+        song1.backing = Some("/tracks/opener.wav".into());
+        sl.songs = vec![song1, Song::new("Encore", vec![Part::new("Main", vec![PartRig::new(1)])])];
+        let set_id = sl.add_set("Set 1");
+        sl.assign_set(0, Some(set_id));
+        sl.learn(ShowAction::NextPart, Some(0), ShowMsg::Cc(64));
+        sl.active = Some(SetlistPos { song: 0, part: 1 });
+        sl.load_ahead = Some(2);
+        s.setlist = sl;
+
+        let pkg = SavedSetlist::package_path(&dir, "Tour 2026").unwrap();
+        let saved = SavedSetlist::new("  Tour 2026  ", s);
+        saved.save(&pkg).unwrap();
+        assert!(pkg.join(SETLIST_FILE).is_file());
+        assert_eq!(list_setlists(&dir), vec!["Tour 2026".to_string()]);
+
+        let loaded = SavedSetlist::load(&pkg).unwrap();
+        assert_eq!(loaded.name, "Tour 2026");
+        assert_eq!(loaded.session.name, "Tour 2026");
+        assert!(loaded.session.same_content(&saved.session));
+        assert_eq!(loaded.session.setlist.songs.len(), 2);
+        assert_eq!(loaded.session.setlist.sets.len(), 1);
+        assert_eq!(loaded.session.setlist.load_ahead, Some(2));
+        assert_eq!(loaded.session.setlist.songs[0].notes, "{c: Verse}\n[Am]Hold on [G]tight");
+        assert_eq!(loaded.session.setlist.songs[0].backing.as_deref(), Some("/tracks/opener.wav"));
+        assert_eq!(loaded.session.hw_ports().get(&0).map(String::as_str), Some("Nord Stage:Nord Stage MIDI 1"));
+
+        // Failed overwrite leaves the previous saved setlist intact.
+        let mut broken = saved.clone();
+        broken.session.states[0].plugin_id = "wrong.plugin".into();
+        assert!(broken.save(&pkg).is_err());
+        assert!(SavedSetlist::load(&pkg).unwrap().session.same_content(&saved.session));
+
+        // Corrupt manifest or bad name is refused cleanly.
+        assert!(SavedSetlist::package_path(&dir, "../escape").is_err());
+        assert!(SavedSetlist::new("   ", saved.session.clone()).validate().is_err());
+
+        delete_setlist(&dir, "Tour 2026").unwrap();
+        assert!(list_setlists(&dir).is_empty());
+        assert!(delete_setlist(&dir, "Tour 2026").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setlists_dir_normalization_and_config_round_trip() {
+        let dir = test_dir("setlists-cfg");
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, r#"{"audio_buffer_frames": 256}"#).unwrap();
+
+        // Normalization accepts absolute paths, ~, quotes, and rejects relative or regular files.
+        let file = dir.join("not-a-folder");
+        fs::write(&file, b"hi").unwrap();
+        assert!(normalize_folder_path("").is_err());
+        assert!(normalize_folder_path("relative/path").is_err());
+        assert!(normalize_folder_path(file.to_str().unwrap()).is_err());
+        let target = dir.join("my setlists");
+        let quoted = format!("  \"{}/\"  ", target.display());
+        assert_eq!(normalize_folder_path(&quoted).unwrap(), target);
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(
+                normalize_folder_path("~/gig-setlists/").unwrap(),
+                PathBuf::from(home).join("gig-setlists")
+            );
+        }
+
+        // Config persistence saves, loads, preserves unrelated fields, and clears cleanly.
+        assert_eq!(load_setlists_dir_from(&cfg), None);
+        save_setlists_dir_to(&cfg, Some(&target)).unwrap();
+        assert_eq!(load_setlists_dir_from(&cfg), Some(target.clone()));
+        let raw: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(raw["audio_buffer_frames"], json!(256));
+
+        save_setlists_dir_to(&cfg, None).unwrap();
+        assert_eq!(load_setlists_dir_from(&cfg), None);
+        let raw: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(raw["audio_buffer_frames"], json!(256));
 
         let _ = fs::remove_dir_all(&dir);
     }

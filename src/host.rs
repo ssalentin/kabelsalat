@@ -66,6 +66,7 @@ pub use loader::{ClapLoader, ClapLoaderResp, HostedClapMain};
 pub(crate) use loader::trim_heap;
 pub use sandbox::{
     run_plugin_worker, run_sandbox_test, sandbox_enabled, spawn_sandboxed_clap,
+    spawn_sandboxed_lv2, HostedLv2, SandboxLv2Main,
 };
 
 static NEXT_VOICE_ID: AtomicU64 = AtomicU64::new(1);
@@ -586,6 +587,7 @@ pub struct ClapVoice {
     /// Lock-free ring carrying plugin-initiated `ParamValueEvent`s from
     /// `ev_out` on the audio thread back to `ClapVoiceMain` (GigChain #60).
     out_param_tx: rtrb::Producer<(u32, f64)>,
+    out_param_dirty: bool,
     process_errors: u64,
     gate: Arc<StateGate>,
     /// What the plugin reported when it was activated, or after a
@@ -628,6 +630,13 @@ impl ClapVoice {
     /// an instrument. Allocation- and lock-free.
     pub fn is_effect(&self) -> bool {
         self.is_effect
+    }
+
+    pub(crate) fn take_out_param_dirty(&mut self) -> bool {
+        if let Some(v) = &mut self.vst3 {
+            return v.take_out_param_dirty();
+        }
+        std::mem::take(&mut self.out_param_dirty)
     }
 
     /// Load Surge XT from the CLAP search paths, instantiate, activate and start
@@ -763,6 +772,7 @@ impl ClapVoice {
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             out_param_tx,
+            out_param_dirty: false,
             process_errors: 0,
             gate: gate.clone(),
             latency: shared_latency.clone(),
@@ -823,6 +833,7 @@ impl ClapVoice {
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             out_param_tx,
+            out_param_dirty: false,
             process_errors: 0,
             gate: Arc::new(StateGate::default()),
             latency,
@@ -862,6 +873,7 @@ impl ClapVoice {
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             out_param_tx,
+            out_param_dirty: false,
             process_errors: 0,
             gate: Arc::new(StateGate::default()),
             latency,
@@ -1216,6 +1228,7 @@ impl ClapVoice {
                     let val = pv.value();
                     if val.is_finite() {
                         let _ = self.out_param_tx.push((id.get(), val));
+                        self.out_param_dirty = true;
                     }
                 }
             }

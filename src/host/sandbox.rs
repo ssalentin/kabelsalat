@@ -18,7 +18,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ use clack_host::utils::ClapId;
 use serde::{Deserialize, Serialize};
 
 use super::{ClapVoice, ClapVoiceMain, ParamDesc, VoiceCmd};
+use crate::lv2::{FxOutEvent, Lv2ControlDesc, Lv2Plugin, Lv2Preset};
 use crate::main_controls::{MainControl, MainControls, MainSource};
 use crate::transport::{TimeSig, Transport};
 
@@ -123,6 +124,7 @@ struct ShmBlock {
     last_status: AtomicU32,
     tail_frames: AtomicU32,
     wake_requested: AtomicU32,
+    param_edits_pending: AtomicU32,
     sample_rate: f64,
     frames: u32,
     has_input: u32,
@@ -214,24 +216,23 @@ fn futex_wait_timeout(atom: &AtomicU32, expected: u32, timeout_ns: u64) {
     }
 }
 
-/// Owned mapping of a [`ShmBlock`]. Safe to move across threads (`Send`),
-/// must only be dropped on a non-RT thread because `Drop` calls `munmap` and
-/// `close`.
-pub(crate) struct ShmRegion {
+/// Owned mapping of a `#[repr(C)]` shared-memory struct backed by `memfd_create`.
+/// Safe to move across threads (`Send`); must only be dropped on a non-RT thread
+/// because `Drop` calls `munmap` and `close`.
+pub(crate) struct ShmRegion<T = ShmBlock> {
     fd: RawFd,
-    ptr: *mut ShmBlock,
+    ptr: *mut T,
     len: usize,
 }
 
-// SAFETY: `ShmRegion` owns a process-mapped shared memory region whose fields
-// follow the strict host/worker sequence protocol.
-unsafe impl Send for ShmRegion {}
+// SAFETY: `ShmRegion<T>` exclusively owns a process-mapped shared memory region
+// whose fields follow the strict host/worker sequence protocol.
+unsafe impl<T> Send for ShmRegion<T> {}
 
-impl ShmRegion {
-    fn create(sample_rate: f64) -> Result<Self> {
-        let len = std::mem::size_of::<ShmBlock>();
+impl<T> ShmRegion<T> {
+    fn create_raw(name: &[u8]) -> Result<Self> {
+        let len = std::mem::size_of::<T>();
         let fd = unsafe {
-            let name = b"kabelsalat-plugin-shm\0";
             let fd = libc::syscall(
                 libc::SYS_memfd_create,
                 name.as_ptr() as *const libc::c_char,
@@ -247,30 +248,7 @@ impl ShmRegion {
             }
             fd
         };
-        let region = Self::map_fd(fd, len)?;
-        let blk = region.block_mut();
-        blk.magic = SHM_MAGIC;
-        blk.version = SHM_VERSION;
-        blk.host_seq.store(0, Ordering::Relaxed);
-        blk.worker_seq.store(0, Ordering::Relaxed);
-        blk.worker_alive.store(1, Ordering::Relaxed);
-        blk.worker_pid.store(0, Ordering::Relaxed);
-        blk.latency_frames.store(0, Ordering::Relaxed);
-        blk.last_status.store(1, Ordering::Relaxed);
-        blk.tail_frames.store(u32::MAX, Ordering::Relaxed);
-        blk.wake_requested.store(0, Ordering::Relaxed);
-        blk.sample_rate = sample_rate;
-        Ok(region)
-    }
-
-    fn from_inherited_fd(fd: RawFd) -> Result<Self> {
-        let len = std::mem::size_of::<ShmBlock>();
-        let region = Self::map_fd(fd, len)?;
-        let blk = region.block();
-        if blk.magic != SHM_MAGIC || blk.version != SHM_VERSION {
-            bail!("invalid plugin shm header: magic={:#x} ver={}", blk.magic, blk.version);
-        }
-        Ok(region)
+        Self::map_fd(fd, len)
     }
 
     fn map_fd(fd: RawFd, len: usize) -> Result<Self> {
@@ -289,7 +267,7 @@ impl ShmRegion {
             unsafe { libc::close(fd); }
             return Err(err).context("mmap plugin shm");
         }
-        Ok(Self { fd, ptr: ptr as *mut ShmBlock, len })
+        Ok(Self { fd, ptr: ptr as *mut T, len })
     }
 
     fn raw_fd(&self) -> RawFd {
@@ -297,23 +275,165 @@ impl ShmRegion {
     }
 
     #[inline]
-    fn block(&self) -> &ShmBlock {
+    fn block(&self) -> &T {
         unsafe { &*self.ptr }
     }
 
     #[inline]
-    fn block_mut(&self) -> &mut ShmBlock {
+    fn block_mut(&self) -> &mut T {
         unsafe { &mut *self.ptr }
     }
 }
 
-impl Drop for ShmRegion {
+impl<T> Drop for ShmRegion<T> {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
             libc::close(self.fd);
         }
     }
+}
+
+impl ShmRegion<ShmBlock> {
+    fn create(sample_rate: f64) -> Result<Self> {
+        let region = Self::create_raw(b"kabelsalat-plugin-shm\0")?;
+        let blk = region.block_mut();
+        blk.magic = SHM_MAGIC;
+        blk.version = SHM_VERSION;
+        blk.host_seq.store(0, Ordering::Relaxed);
+        blk.worker_seq.store(0, Ordering::Relaxed);
+        blk.worker_alive.store(1, Ordering::Relaxed);
+        blk.worker_pid.store(0, Ordering::Relaxed);
+        blk.latency_frames.store(0, Ordering::Relaxed);
+        blk.last_status.store(1, Ordering::Relaxed);
+        blk.tail_frames.store(u32::MAX, Ordering::Relaxed);
+        blk.wake_requested.store(0, Ordering::Relaxed);
+        blk.param_edits_pending.store(0, Ordering::Relaxed);
+        blk.sample_rate = sample_rate;
+        Ok(region)
+    }
+
+    fn from_inherited_fd(fd: RawFd) -> Result<Self> {
+        let len = std::mem::size_of::<ShmBlock>();
+        let region = Self::map_fd(fd, len)?;
+        let blk = region.block();
+        if blk.magic != SHM_MAGIC || blk.version != SHM_VERSION {
+            bail!("invalid plugin shm header: magic={:#x} ver={}", blk.magic, blk.version);
+        }
+        Ok(region)
+    }
+}
+
+const LV2_SHM_MAGIC: u32 = 0x4B53_4C32; // "KSL2"
+const LV2_SHM_VERSION: u32 = 1;
+pub const MAX_LV2_SHM_FRAMES: usize = 512;
+const MAX_LV2_CONTROLS: usize = 512;
+const MAX_LV2_MIDI_EVENTS: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Lv2ShmMidiEvent {
+    len: u8,
+    bytes: [u8; 3],
+}
+
+#[repr(C, align(64))]
+struct Lv2ShmBlock {
+    magic: u32,
+    version: u32,
+    host_seq: AtomicU32,
+    worker_seq: AtomicU32,
+    worker_alive: AtomicU32,
+    worker_pid: AtomicU32,
+    latency_frames: AtomicU32,
+    pending_worker_resp: AtomicU32,
+    sample_rate: f64,
+    frames: u32,
+    is_midi_fx: u32,
+    control_count: u32,
+    controls_dirty: u32,
+    controls: [f32; MAX_LV2_CONTROLS],
+    midi_in_count: u32,
+    midi_in: [Lv2ShmMidiEvent; MAX_LV2_MIDI_EVENTS],
+    midi_out_count: u32,
+    midi_out: [Lv2ShmMidiEvent; MAX_LV2_MIDI_EVENTS],
+    in_buf: [f32; MAX_LV2_SHM_FRAMES * 2],
+    out_buf: [f32; MAX_LV2_SHM_FRAMES * 2],
+}
+
+type Lv2ShmRegion = ShmRegion<Lv2ShmBlock>;
+
+impl Lv2ShmRegion {
+    fn create(sample_rate: f64, is_midi_fx: bool) -> Result<Self> {
+        let region = Self::create_raw(b"kabelsalat-lv2-shm\0")?;
+        let blk = region.block_mut();
+        blk.magic = LV2_SHM_MAGIC;
+        blk.version = LV2_SHM_VERSION;
+        blk.host_seq.store(0, Ordering::Relaxed);
+        blk.worker_seq.store(0, Ordering::Relaxed);
+        blk.worker_alive.store(1, Ordering::Relaxed);
+        blk.worker_pid.store(0, Ordering::Relaxed);
+        blk.latency_frames.store(0, Ordering::Relaxed);
+        blk.pending_worker_resp.store(0, Ordering::Relaxed);
+        blk.sample_rate = sample_rate;
+        blk.is_midi_fx = u32::from(is_midi_fx);
+        blk.controls_dirty = 0;
+        blk.midi_in_count = 0;
+        blk.midi_out_count = 0;
+        Ok(region)
+    }
+
+    fn from_inherited_fd(fd: RawFd) -> Result<Self> {
+        let len = std::mem::size_of::<Lv2ShmBlock>();
+        let region = Self::map_fd(fd, len)?;
+        let blk = region.block();
+        if blk.magic != LV2_SHM_MAGIC || blk.version != LV2_SHM_VERSION {
+            bail!("invalid lv2 shm header: magic={:#x} ver={}", blk.magic, blk.version);
+        }
+        Ok(region)
+    }
+}
+
+#[inline]
+fn wait_for_worker_seq(
+    worker_seq: &AtomicU32,
+    worker_alive: &AtomicU32,
+    prev_seq: u32,
+    expected_seq: u32,
+    first_block: &mut bool,
+    deadline_ns: u64,
+) -> bool {
+    let mut ready = worker_seq.load(Ordering::Acquire) == expected_seq;
+    if !ready {
+        for _ in 0..64 {
+            std::hint::spin_loop();
+            if worker_seq.load(Ordering::Acquire) == expected_seq {
+                ready = true;
+                break;
+            }
+        }
+    }
+    let wait_ns = if *first_block {
+        *first_block = false;
+        FIRST_BLOCK_DEADLINE_US * 1_000
+    } else {
+        deadline_ns
+    };
+    if !ready {
+        let start = Instant::now();
+        while worker_seq.load(Ordering::Acquire) != expected_seq {
+            if worker_alive.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            let elapsed_ns = start.elapsed().as_nanos() as u64;
+            if elapsed_ns >= wait_ns {
+                break;
+            }
+            futex_wait_timeout(worker_seq, prev_seq, wait_ns - elapsed_ns);
+        }
+        ready = worker_seq.load(Ordering::Acquire) == expected_seq;
+    }
+    ready
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +446,16 @@ enum CtrlReq {
         plugin_id: String,
         sample_rate: f64,
         state: Option<Vec<u8>>,
+    },
+    InitLv2 {
+        uri: String,
+        sample_rate: f64,
+        block: usize,
+        state: Option<(String, String, Vec<u8>)>,
+        controls: Vec<(usize, f32)>,
+    },
+    Lv2SaveState {
+        key: String,
     },
     SaveState,
     LoadState { data: Vec<u8> },
@@ -343,6 +473,7 @@ enum CtrlReq {
     CloseEditor,
     EditorOpen,
     Pump,
+    DrainParamEdits,
     Shutdown,
 }
 
@@ -354,6 +485,15 @@ enum CtrlResp {
         main_controls: MainControls,
         has_editor: bool,
         param_ranges: Vec<(u32, f64, f64)>,
+    },
+    InitLv2Ok {
+        uri: String,
+        is_instrument: bool,
+        is_midi_fx: bool,
+        reports_latency: bool,
+        has_midi_in: bool,
+        latency: u32,
+        controls: Vec<Lv2ControlDesc>,
     },
     Ok,
     Err(String),
@@ -370,6 +510,7 @@ enum CtrlResp {
     },
     Latency(u32),
     Bool(bool),
+    ParamEdits(Vec<(u32, f64)>),
 }
 
 fn send_msg<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
@@ -405,6 +546,7 @@ struct TestSynthState {
     held_note: Option<u16>,
     /// Incremented on every rendered block.
     blocks: u64,
+    pending_edits: Vec<(u32, f64)>,
 }
 
 impl TestSynthState {
@@ -416,6 +558,7 @@ impl TestSynthState {
             gain: 0.4,
             held_note: None,
             blocks: 0,
+            pending_edits: Vec::new(),
         }
     }
 
@@ -569,17 +712,27 @@ pub fn run_plugin_worker(shm_fd: RawFd, ctrl_fd: RawFd) -> Result<()> {
         libc::signal(libc::SIGBUS, libc::SIG_DFL);
         let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        #[cfg(target_os = "linux")]
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
-    let shm = ShmRegion::from_inherited_fd(shm_fd)?;
     let mut ctrl = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
-    shm.block().worker_pid.store(std::process::id(), Ordering::Release);
-    shm.block().worker_alive.store(1, Ordering::Release);
 
-    // Wait for Init.
+    // Read the first control message BEFORE mapping `shm_fd` because CLAP/VST3
+    // and LV2 use distinct shared-memory layouts (`ShmBlock` vs `Lv2ShmBlock`).
     let (plugin_id, sample_rate, init_state) = match recv_msg::<CtrlReq>(&mut ctrl)? {
         CtrlReq::Init { plugin_id, sample_rate, state } => (plugin_id, sample_rate, state),
-        _ => bail!("expected Init as first plugin-worker request"),
+        CtrlReq::InitLv2 { uri, sample_rate, block, state, controls } => {
+            return run_lv2_worker(shm_fd, ctrl, uri, sample_rate, block, state, controls);
+        }
+        _ => {
+            unsafe { libc::close(shm_fd); }
+            bail!("expected Init or InitLv2 as first plugin-worker request");
+        }
     };
+
+    let shm = ShmRegion::<ShmBlock>::from_inherited_fd(shm_fd)?;
+    shm.block().worker_pid.store(std::process::id(), Ordering::Release);
+    shm.block().worker_alive.store(1, Ordering::Release);
 
     let (worker_audio, mut worker_main, init_resp) = if plugin_id == SANDBOX_TEST_PLUGIN_ID {
         let mut st = TestSynthState::new(sample_rate);
@@ -678,13 +831,18 @@ pub fn run_plugin_worker(shm_fd: RawFd, ctrl_fd: RawFd) -> Result<()> {
     // the plugin's X11/timer/posix_fd event loop.
     ctrl.set_read_timeout(Some(Duration::from_millis(16)))?;
     let mut last_pump = Instant::now();
-    let pump_due = |worker_main: &mut WorkerMain, shm: &ShmRegion, last_pump: &mut Instant| {
+    let mut pending_edits: Vec<(u32, f64)> = Vec::new();
+    let pump_due = |worker_main: &mut WorkerMain,
+                    pending_edits: &mut Vec<(u32, f64)>,
+                    shm: &ShmRegion,
+                    last_pump: &mut Instant| {
         if last_pump.elapsed() >= Duration::from_millis(16) {
             if let WorkerMain::Clap(m) = worker_main {
                 m.pump();
                 let lat = m.poll_latency();
                 shm.block().latency_frames.store(lat, Ordering::Release);
             }
+            collect_worker_edits(worker_main, pending_edits, shm);
             *last_pump = Instant::now();
         }
     };
@@ -695,16 +853,16 @@ pub fn run_plugin_worker(shm_fd: RawFd, ctrl_fd: RawFd) -> Result<()> {
                 break;
             }
             Ok(req) => {
-                let resp = handle_worker_req(&mut worker_main, req);
+                let resp = handle_worker_req(&mut worker_main, req, &mut pending_edits, &shm);
                 if send_msg(&mut ctrl, &resp).is_err() {
                     break;
                 }
-                pump_due(&mut worker_main, &shm, &mut last_pump);
+                pump_due(&mut worker_main, &mut pending_edits, &shm, &mut last_pump);
             }
             Err(e) => {
                 if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
                     if matches!(ioe.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
-                        pump_due(&mut worker_main, &shm, &mut last_pump);
+                        pump_due(&mut worker_main, &mut pending_edits, &shm, &mut last_pump);
                         continue;
                     }
                 }
@@ -784,6 +942,9 @@ fn worker_audio_loop(mut audio: WorkerAudio, blk: &mut ShmBlock, stop: &AtomicBo
                 if voice.take_wake_request() {
                     blk.wake_requested.store(1, Ordering::Release);
                 }
+                if voice.take_out_param_dirty() {
+                    blk.param_edits_pending.store(1, Ordering::Release);
+                }
             }
             WorkerAudio::TestSynth(shared) => {
                 if let Ok(mut st) = shared.lock() {
@@ -806,7 +967,40 @@ fn worker_audio_loop(mut audio: WorkerAudio, blk: &mut ShmBlock, stop: &AtomicBo
     }
 }
 
-fn handle_worker_req(main: &mut WorkerMain, req: CtrlReq) -> CtrlResp {
+fn collect_worker_edits(
+    worker_main: &mut WorkerMain,
+    pending: &mut Vec<(u32, f64)>,
+    shm: &ShmRegion,
+) {
+    let edits = match worker_main {
+        WorkerMain::Clap(m) => m.drain_param_edits(),
+        WorkerMain::TestSynth(shared) => {
+            let mut st = shared.lock().unwrap();
+            std::mem::take(&mut st.pending_edits)
+        }
+    };
+    if !edits.is_empty() {
+        for (id, val) in edits {
+            if pending.len() >= 512 {
+                pending.remove(0);
+            }
+            pending.push((id, val));
+        }
+        shm.block().param_edits_pending.store(1, Ordering::Release);
+    }
+}
+
+fn handle_worker_req(
+    main: &mut WorkerMain,
+    req: CtrlReq,
+    pending_edits: &mut Vec<(u32, f64)>,
+    shm: &ShmRegion,
+) -> CtrlResp {
+    if let CtrlReq::DrainParamEdits = req {
+        collect_worker_edits(main, pending_edits, shm);
+        shm.block().param_edits_pending.store(0, Ordering::Release);
+        return CtrlResp::ParamEdits(std::mem::take(pending_edits));
+    }
     match main {
         WorkerMain::Clap(m) => match req {
             CtrlReq::SaveState => match m.save_state() {
@@ -849,7 +1043,9 @@ fn handle_worker_req(main: &mut WorkerMain, req: CtrlReq) -> CtrlResp {
                 m.pump();
                 CtrlResp::Ok
             }
-            CtrlReq::Init { .. } | CtrlReq::Shutdown => CtrlResp::Ok,
+            CtrlReq::DrainParamEdits => CtrlResp::ParamEdits(Vec::new()),
+            CtrlReq::Init { .. } | CtrlReq::InitLv2 { .. } | CtrlReq::Shutdown => CtrlResp::Ok,
+            CtrlReq::Lv2SaveState { .. } => CtrlResp::Err("unexpected Lv2SaveState on CLAP worker".into()),
         },
         WorkerMain::TestSynth(shared) => {
             let mut st = shared.lock().unwrap();
@@ -874,10 +1070,224 @@ fn handle_worker_req(main: &mut WorkerMain, req: CtrlReq) -> CtrlResp {
                 CtrlReq::PollMainControls => CtrlResp::MainControlsPoll { changed: false, controls: None },
                 CtrlReq::PollLatency => CtrlResp::Latency(0),
                 CtrlReq::OpenEditor { .. } => CtrlResp::Err("test synth has no editor".into()),
-                CtrlReq::CloseEditor | CtrlReq::Pump | CtrlReq::Init { .. } | CtrlReq::Shutdown => CtrlResp::Ok,
+                CtrlReq::CloseEditor
+                | CtrlReq::Pump
+                | CtrlReq::Init { .. }
+                | CtrlReq::InitLv2 { .. }
+                | CtrlReq::Shutdown => CtrlResp::Ok,
+                CtrlReq::Lv2SaveState { .. } => CtrlResp::Err("unexpected Lv2SaveState on test worker".into()),
+                CtrlReq::DrainParamEdits => CtrlResp::ParamEdits(Vec::new()),
                 CtrlReq::EditorOpen => CtrlResp::Bool(false),
             }
         }
+    }
+}
+
+fn run_lv2_worker(
+    shm_fd: RawFd,
+    mut ctrl: UnixStream,
+    uri: String,
+    sample_rate: f64,
+    block: usize,
+    init_state: Option<(String, String, Vec<u8>)>,
+    init_controls: Vec<(usize, f32)>,
+) -> Result<()> {
+    crate::lv2::load_extra_bundles_from_env();
+    let shm = Lv2ShmRegion::from_inherited_fd(shm_fd)?;
+    shm.block().worker_pid.store(std::process::id(), Ordering::Release);
+    shm.block().worker_alive.store(1, Ordering::Release);
+
+    let mut plugin = match Lv2Plugin::load(&uri, sample_rate, block.max(MAX_LV2_SHM_FRAMES)) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = send_msg(&mut ctrl, &CtrlResp::Err(format!("{e:#}")));
+            shm.block().worker_alive.store(0, Ordering::Release);
+            return Err(e);
+        }
+    };
+
+    if let Some((key, kind, data)) = &init_state {
+        if let Err(e) = plugin.restore_state(&[(key.as_str(), kind.as_str(), data.as_slice())]) {
+            let _ = send_msg(&mut ctrl, &CtrlResp::Err(format!("{e:#}")));
+            shm.block().worker_alive.store(0, Ordering::Release);
+            std::mem::forget(plugin);
+            return Err(e);
+        }
+    }
+    for (nth, val) in init_controls {
+        plugin.set_control_native(nth, val);
+    }
+    if !plugin.is_midi_fx() {
+        let warm_in = [0.0f32; 256 * 2];
+        let mut warm_out = [0.0f32; 256 * 2];
+        plugin.process(&warm_in, &mut warm_out, 256);
+        plugin.process(&warm_in, &mut warm_out, 256);
+    }
+
+    let resolved_uri = plugin.uri().to_string();
+    let is_instrument = plugin.is_instrument();
+    let is_midi_fx = plugin.is_midi_fx();
+    let reports_latency = plugin.reports_latency();
+    let has_midi_in = plugin.has_midi_in();
+    let latency = plugin.latency_frames();
+    let controls = plugin.control_descs();
+
+    {
+        let blk = shm.block_mut();
+        blk.is_midi_fx = u32::from(is_midi_fx);
+        blk.latency_frames.store(latency, Ordering::Release);
+        blk.pending_worker_resp
+            .store(u32::from(plugin.has_pending_worker_response()), Ordering::Release);
+        let cc = controls.len().min(MAX_LV2_CONTROLS);
+        blk.control_count = cc as u32;
+        for (i, d) in controls.iter().take(cc).enumerate() {
+            blk.controls[i] = d.value;
+        }
+    }
+
+    let plugin = Arc::new(std::sync::Mutex::new(plugin));
+    let stop_audio = Arc::new(AtomicBool::new(false));
+    let audio_ready = Arc::new(AtomicBool::new(false));
+    let stop_bg = stop_audio.clone();
+    let ready_bg = audio_ready.clone();
+    let plugin_bg = plugin.clone();
+    let shm_ptr = shm.ptr as usize;
+    let audio_handle = std::thread::Builder::new()
+        .name("kabelsalat-worker-audio".into())
+        .spawn(move || {
+            let blk = unsafe { &mut *(shm_ptr as *mut Lv2ShmBlock) };
+            ready_bg.store(true, Ordering::Release);
+            lv2_worker_audio_loop(plugin_bg, blk, &stop_bg);
+        })
+        .context("spawn lv2 worker audio thread")?;
+    while !audio_ready.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+
+    send_msg(
+        &mut ctrl,
+        &CtrlResp::InitLv2Ok {
+            uri: resolved_uri,
+            is_instrument,
+            is_midi_fx,
+            reports_latency,
+            has_midi_in,
+            latency,
+            controls,
+        },
+    )?;
+
+    loop {
+        match recv_msg::<CtrlReq>(&mut ctrl) {
+            Ok(CtrlReq::Shutdown) => {
+                let _ = send_msg(&mut ctrl, &CtrlResp::Ok);
+                break;
+            }
+            Ok(CtrlReq::Lv2SaveState { key }) => {
+                let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
+                let resp = match guard.saved_state(&key) {
+                    Ok(bytes) => CtrlResp::State(bytes),
+                    Err(e) => CtrlResp::Err(format!("{e:#}")),
+                };
+                drop(guard);
+                if send_msg(&mut ctrl, &resp).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {
+                if send_msg(&mut ctrl, &CtrlResp::Ok).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    stop_audio.store(true, Ordering::Release);
+    shm.block().worker_alive.store(0, Ordering::Release);
+    futex_wake(&shm.block().host_seq);
+    let _ = audio_handle.join();
+    // Never run C++ plugin destructors on worker exit (`NEVER_FREE`, rule 56).
+    std::mem::forget(plugin);
+    Ok(())
+}
+
+fn lv2_worker_audio_loop(
+    plugin: Arc<std::sync::Mutex<Lv2Plugin>>,
+    blk: &mut Lv2ShmBlock,
+    stop: &AtomicBool,
+) {
+    let mut last_seq = 0u32;
+    let mut out_tmp = [0.0f32; MAX_LV2_SHM_FRAMES * 2];
+    let mut in_tmp = [0.0f32; MAX_LV2_SHM_FRAMES * 2];
+    let mut fx_out = Vec::with_capacity(MAX_LV2_MIDI_EVENTS);
+
+    while !stop.load(Ordering::Acquire) && blk.worker_alive.load(Ordering::Acquire) != 0 {
+        let mut seq = blk.host_seq.load(Ordering::Acquire);
+        if seq == last_seq {
+            for _ in 0..64 {
+                std::hint::spin_loop();
+                seq = blk.host_seq.load(Ordering::Acquire);
+                if seq != last_seq {
+                    break;
+                }
+            }
+        }
+        if seq == last_seq {
+            futex_wait_timeout(&blk.host_seq, last_seq, 25_000_000);
+            continue;
+        }
+        last_seq = seq;
+
+        let frames = (blk.frames as usize).min(MAX_LV2_SHM_FRAMES);
+        let n2 = frames * 2;
+        let is_midi_fx = blk.is_midi_fx != 0;
+        if !is_midi_fx && n2 > 0 {
+            in_tmp[..n2].copy_from_slice(&blk.in_buf[..n2]);
+        }
+
+        let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
+        if blk.controls_dirty != 0 {
+            let cc = (blk.control_count as usize).min(MAX_LV2_CONTROLS);
+            for i in 0..cc {
+                guard.set_control_native(i, blk.controls[i]);
+            }
+            blk.controls_dirty = 0;
+        }
+        let mc = (blk.midi_in_count as usize).min(MAX_LV2_MIDI_EVENTS);
+        for i in 0..mc {
+            let ev = blk.midi_in[i];
+            let len = (ev.len as usize).min(3);
+            if len > 0 {
+                guard.midi(&ev.bytes[..len]);
+            }
+        }
+        if is_midi_fx {
+            fx_out.clear();
+            guard.process(&[], &mut [], frames);
+            guard.read_midi_out(&mut fx_out);
+            let out_n = fx_out.len().min(MAX_LV2_MIDI_EVENTS);
+            blk.midi_out_count = out_n as u32;
+            for (i, ev) in fx_out.iter().take(out_n).enumerate() {
+                let bytes = match *ev {
+                    FxOutEvent::NoteOn { channel, note, velocity } => [0x90 | (channel & 0x0F), note, velocity],
+                    FxOutEvent::NoteOff { channel, note } => [0x80 | (channel & 0x0F), note, 0],
+                    FxOutEvent::Midi(d) => d,
+                };
+                blk.midi_out[i] = Lv2ShmMidiEvent { len: 3, bytes };
+            }
+        } else {
+            guard.process(&in_tmp[..n2], &mut out_tmp[..n2], frames);
+            blk.out_buf[..n2].copy_from_slice(&out_tmp[..n2]);
+            blk.midi_out_count = 0;
+        }
+        blk.latency_frames.store(guard.latency_frames(), Ordering::Release);
+        blk.pending_worker_resp
+            .store(u32::from(guard.has_pending_worker_response()), Ordering::Release);
+        drop(guard);
+
+        blk.worker_seq.store(seq, Ordering::Release);
+        futex_wake(&blk.worker_seq);
     }
 }
 
@@ -897,6 +1307,7 @@ pub(crate) struct SandboxVoice {
     consecutive_misses: u32,
     crashed: Arc<AtomicBool>,
     latency: Arc<AtomicU32>,
+    param_edits_pending: Arc<AtomicBool>,
     last_status: ProcessStatus,
     tail_length: Option<TailLength>,
 }
@@ -930,6 +1341,7 @@ impl SandboxVoice {
             self.consecutive_misses = 0;
             self.first_block = true;
             self.crashed.store(false, Ordering::Release);
+            self.param_edits_pending.store(false, Ordering::Release);
             self.last_status = ProcessStatus::Continue;
         }
     }
@@ -975,37 +1387,14 @@ impl SandboxVoice {
         let seq = blk.host_seq.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         futex_wake(&blk.host_seq);
 
-        // Brief spin before sleeping in futex.
-        let mut ready = blk.worker_seq.load(Ordering::Acquire) == seq;
-        if !ready {
-            for _ in 0..64 {
-                std::hint::spin_loop();
-                if blk.worker_seq.load(Ordering::Acquire) == seq {
-                    ready = true;
-                    break;
-                }
-            }
-        }
-        let wait_ns = if self.first_block {
-            self.first_block = false;
-            FIRST_BLOCK_DEADLINE_US * 1_000
-        } else {
-            self.deadline_ns
-        };
-        if !ready {
-            let start = Instant::now();
-            while blk.worker_seq.load(Ordering::Acquire) != seq {
-                if blk.worker_alive.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-                let elapsed_ns = start.elapsed().as_nanos() as u64;
-                if elapsed_ns >= wait_ns {
-                    break;
-                }
-                futex_wait_timeout(&blk.worker_seq, prev_seq, wait_ns - elapsed_ns);
-            }
-            ready = blk.worker_seq.load(Ordering::Acquire) == seq;
-        }
+        let ready = wait_for_worker_seq(
+            &blk.worker_seq,
+            &blk.worker_alive,
+            prev_seq,
+            seq,
+            &mut self.first_block,
+            self.deadline_ns,
+        );
 
         if ready {
             out[..n2].copy_from_slice(&blk.out_buf[..n2]);
@@ -1013,6 +1402,9 @@ impl SandboxVoice {
             self.latency.store(lat, Ordering::Relaxed);
             self.last_status = decode_status(blk.last_status.load(Ordering::Acquire));
             self.tail_length = decode_tail(blk.tail_frames.load(Ordering::Acquire));
+            if blk.param_edits_pending.swap(0, Ordering::AcqRel) != 0 {
+                self.param_edits_pending.store(true, Ordering::Release);
+            }
             self.consecutive_misses = 0;
         } else {
             out[..n2].fill(0.0);
@@ -1035,6 +1427,7 @@ pub struct SandboxMain {
     swap_tx: rtrb::Producer<ShmRegion>,
     retire_rx: rtrb::Consumer<ShmRegion>,
     crashed: Arc<AtomicBool>,
+    param_edits_pending: Arc<AtomicBool>,
     last_state: Option<Vec<u8>>,
     main_controls: MainControls,
     has_editor: bool,
@@ -1059,16 +1452,14 @@ struct SpawnedWorker {
     pid: u32,
 }
 
-fn spawn_worker(plugin_id: &str, sample_rate: f64, state: Option<Vec<u8>>) -> Result<SpawnedWorker> {
-    let shm = ShmRegion::create(sample_rate)?;
-    let (mut parent_sock, child_sock) = UnixStream::pair().context("UnixStream::pair")?;
-    let shm_fd = shm.raw_fd();
-    let child_fd = child_sock.as_raw_fd();
-
+fn spawn_worker_process(shm_fd: RawFd, child_fd: RawFd, label: &str) -> Result<Child> {
     let exe = std::env::current_exe().context("current_exe")?;
     let mut cmd = Command::new(&exe);
     if let Some(extra_vst3) = crate::vst3::scan::extra_bundles_env() {
         cmd.env("KABELSALAT_EXTRA_VST3_BUNDLES", extra_vst3);
+    }
+    if let Some(extra_lv2) = crate::lv2::extra_bundles_env() {
+        cmd.env("KABELSALAT_EXTRA_LV2_BUNDLES", extra_lv2);
     }
     #[cfg(test)]
     {
@@ -1103,7 +1494,13 @@ fn spawn_worker(plugin_id: &str, sample_rate: f64, state: Option<Vec<u8>>) -> Re
         });
     }
 
-    let mut child = cmd.spawn().with_context(|| format!("spawn plugin-worker for {plugin_id}"))?;
+    cmd.spawn().with_context(|| format!("spawn plugin-worker for {label}"))
+}
+
+fn spawn_worker(plugin_id: &str, sample_rate: f64, state: Option<Vec<u8>>) -> Result<SpawnedWorker> {
+    let shm = ShmRegion::<ShmBlock>::create(sample_rate)?;
+    let (mut parent_sock, child_sock) = UnixStream::pair().context("UnixStream::pair")?;
+    let mut child = spawn_worker_process(shm.raw_fd(), child_sock.as_raw_fd(), plugin_id)?;
     let pid = child.id();
     drop(child_sock);
 
@@ -1170,6 +1567,7 @@ pub fn spawn_sandboxed_clap(
     let (retire_tx, retire_rx) = rtrb::RingBuffer::<ShmRegion>::new(4);
     let crashed = Arc::new(AtomicBool::new(false));
     let latency_atom = Arc::new(AtomicU32::new(w.latency));
+    let param_edits_pending = Arc::new(AtomicBool::new(false));
 
     let sv = SandboxVoice {
         shm: w.shm,
@@ -1181,6 +1579,7 @@ pub fn spawn_sandboxed_clap(
         consecutive_misses: 0,
         crashed: crashed.clone(),
         latency: latency_atom.clone(),
+        param_edits_pending: param_edits_pending.clone(),
         last_status: ProcessStatus::Continue,
         tail_length: None,
     };
@@ -1194,6 +1593,7 @@ pub fn spawn_sandboxed_clap(
         swap_tx,
         retire_rx,
         crashed,
+        param_edits_pending,
         last_state: initial_state,
         main_controls: w.main_controls,
         has_editor: w.has_editor,
@@ -1269,52 +1669,14 @@ impl SandboxMain {
         // Always drain retired shared memory regions on the main thread.
         while self.retire_rx.pop().is_ok() {}
 
-        let mut died_reason: Option<String> = None;
-        if let Some(child) = self.child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let why = if let Some(sig) = status.signal() {
-                        match sig {
-                            libc::SIGSEGV => "SIGSEGV".to_string(),
-                            libc::SIGABRT => "SIGABRT".to_string(),
-                            libc::SIGKILL => "SIGKILL".to_string(),
-                            libc::SIGBUS => "SIGBUS".to_string(),
-                            libc::SIGFPE => "SIGFPE".to_string(),
-                            other => format!("signal {other}"),
-                        }
-                    } else if let Some(code) = status.code() {
-                        format!("exit {code}")
-                    } else {
-                        "terminated".to_string()
-                    };
-                    died_reason = Some(why);
-                    self.child = None;
-                    self.ctrl = None;
-                    self.editor_open = false;
-                    self.crashed.store(true, Ordering::Release);
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    died_reason = Some("wait failed".into());
-                    self.child = None;
-                    self.ctrl = None;
-                }
-            }
-        } else if self.crashed.load(Ordering::Acquire) {
-            died_reason = self.last_crash_reason.take().or_else(|| Some("worker lost".into()));
-        }
-
-        // Hung worker (missed consecutive audio deadlines while still alive).
-        if died_reason.is_none() && self.crashed.load(Ordering::Acquire) {
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            self.ctrl = None;
-            self.editor_open = false;
-            died_reason = Some("hung (deadline exceeded)".into());
-        }
-
+        let died_reason = detect_worker_death(
+            &mut self.child,
+            &mut self.ctrl,
+            &self.crashed,
+            &mut self.last_crash_reason,
+            Some(&mut self.editor_open),
+            self.swap_tx.slots() == 4,
+        );
         let reason = died_reason?;
         self.crash_count += 1;
         self.last_crash_reason = Some(reason.clone());
@@ -1346,6 +1708,18 @@ impl SandboxMain {
 
     pub fn editor_open(&self) -> bool {
         self.editor_open
+    }
+
+    pub fn has_pending_param_edits(&self) -> bool {
+        self.param_edits_pending.load(Ordering::Acquire)
+    }
+
+    pub fn drain_param_edits(&mut self) -> Vec<(u32, f64)> {
+        self.param_edits_pending.store(false, Ordering::Release);
+        match self.rpc(CtrlReq::DrainParamEdits) {
+            Some(CtrlResp::ParamEdits(edits)) => edits,
+            _ => Vec::new(),
+        }
     }
 
     pub fn open_editor(&mut self, title: &str) -> Result<()> {
@@ -1498,6 +1872,1009 @@ impl Drop for SandboxMain {
     }
 }
 
+fn exit_reason(status: std::process::ExitStatus) -> String {
+    if let Some(sig) = status.signal() {
+        match sig {
+            libc::SIGSEGV => "SIGSEGV".to_string(),
+            libc::SIGABRT => "SIGABRT".to_string(),
+            libc::SIGKILL => "SIGKILL".to_string(),
+            libc::SIGBUS => "SIGBUS".to_string(),
+            libc::SIGFPE => "SIGFPE".to_string(),
+            other => format!("signal {other}"),
+        }
+    } else if let Some(code) = status.code() {
+        format!("exit {code}")
+    } else {
+        "terminated".to_string()
+    }
+}
+
+/// Detect whether `child` has died or `crashed` indicates a hung worker,
+/// killing a hung child so a replacement can be spawned cleanly.
+fn detect_worker_death(
+    child_slot: &mut Option<Child>,
+    ctrl_slot: &mut Option<UnixStream>,
+    crashed: &AtomicBool,
+    last_crash_reason: &mut Option<String>,
+    clear_editor: Option<&mut bool>,
+    hung_check_allowed: bool,
+) -> Option<String> {
+    let mut died_reason: Option<String> = None;
+    let mut editor_open = clear_editor;
+    if let Some(child) = child_slot.as_mut() {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                died_reason = Some(exit_reason(status));
+                *child_slot = None;
+                *ctrl_slot = None;
+                if let Some(ed) = editor_open.as_deref_mut() {
+                    *ed = false;
+                }
+                crashed.store(true, Ordering::Release);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                died_reason = Some("wait failed".into());
+                *child_slot = None;
+                *ctrl_slot = None;
+            }
+        }
+    } else if crashed.load(Ordering::Acquire) {
+        died_reason = last_crash_reason.take().or_else(|| Some("worker lost".into()));
+    }
+
+    if died_reason.is_none() && hung_check_allowed && crashed.load(Ordering::Acquire) {
+        if let Some(mut child) = child_slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        *ctrl_slot = None;
+        if let Some(ed) = editor_open {
+            *ed = false;
+        }
+        died_reason = Some("hung (deadline exceeded)".into());
+    }
+    died_reason
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-process LV2 hosting (#413)
+// ---------------------------------------------------------------------------
+
+static NEXT_LV2_SLOT_ID: AtomicU64 = AtomicU64::new(1);
+
+struct SpawnedLv2Worker {
+    child: Child,
+    ctrl: UnixStream,
+    shm: Lv2ShmRegion,
+    uri: String,
+    is_instrument: bool,
+    is_midi_fx: bool,
+    reports_latency: bool,
+    has_midi_in: bool,
+    latency: u32,
+    controls: Vec<Lv2ControlDesc>,
+    pid: u32,
+}
+
+fn spawn_lv2_worker(
+    uri: &str,
+    sample_rate: f64,
+    block: usize,
+    state: Option<(String, String, Vec<u8>)>,
+    controls: Vec<(usize, f32)>,
+) -> Result<SpawnedLv2Worker> {
+    let shm = Lv2ShmRegion::create(sample_rate, false)?;
+    let (mut parent_sock, child_sock) = UnixStream::pair().context("UnixStream::pair")?;
+    let mut child = spawn_worker_process(shm.raw_fd(), child_sock.as_raw_fd(), uri)?;
+    let pid = child.id();
+    drop(child_sock);
+
+    parent_sock.set_read_timeout(Some(Duration::from_secs(15)))?;
+    parent_sock.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    send_msg(
+        &mut parent_sock,
+        &CtrlReq::InitLv2 {
+            uri: uri.to_string(),
+            sample_rate,
+            block,
+            state,
+            controls,
+        },
+    )?;
+
+    match recv_msg::<CtrlResp>(&mut parent_sock) {
+        Ok(CtrlResp::InitLv2Ok {
+            uri: resolved_uri,
+            is_instrument,
+            is_midi_fx,
+            reports_latency,
+            has_midi_in,
+            latency,
+            controls,
+        }) => {
+            parent_sock.set_read_timeout(Some(Duration::from_secs(3)))?;
+            Ok(SpawnedLv2Worker {
+                child,
+                ctrl: parent_sock,
+                shm,
+                uri: resolved_uri,
+                is_instrument,
+                is_midi_fx,
+                reports_latency,
+                has_midi_in,
+                latency,
+                controls,
+                pid,
+            })
+        }
+        Ok(CtrlResp::Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("lv2 worker init failed for {uri}: {e}");
+        }
+        Ok(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("unexpected lv2 worker init reply for {uri}");
+        }
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(e).with_context(|| format!("lv2 worker handshake failed for {uri}"))
+        }
+    }
+}
+
+/// Audio-thread side of a sandboxed LV2 plugin (#413). Allocation-free and
+/// lock-free; old shared-memory regions return to `SandboxLv2Main` over
+/// `retire_tx` so the audio thread never calls `munmap`.
+pub struct SandboxLv2Audio {
+    slot_id: u64,
+    uri: String,
+    is_instrument: bool,
+    is_midi_fx: bool,
+    reports_latency: bool,
+    has_midi_in: bool,
+    shm: Lv2ShmRegion,
+    current_gen: u64,
+    swap_rx: rtrb::Consumer<(u64, Lv2ShmRegion)>,
+    retire_tx: rtrb::Producer<Lv2ShmRegion>,
+    controls_meta: Vec<Lv2ControlDesc>,
+    controls_by_symbol: HashMap<String, usize>,
+    controls_shadow: Arc<Vec<AtomicU32>>,
+    controls_dirty: bool,
+    midi_in_q: Vec<Lv2ShmMidiEvent>,
+    midi_out_q: Vec<Lv2ShmMidiEvent>,
+    last_event: Option<[u8; 3]>,
+    latency: u32,
+    pending_worker_resp: bool,
+    deadline_ns: u64,
+    first_block: bool,
+    consecutive_misses: u32,
+    crashed_gen: Arc<AtomicU64>,
+}
+
+impl SandboxLv2Audio {
+    pub fn slot_id(&self) -> u64 {
+        self.slot_id
+    }
+
+    pub fn worker_pid(&self) -> u32 {
+        self.shm.block().worker_pid.load(Ordering::Relaxed)
+    }
+
+    fn adopt_swap(&mut self) {
+        while let Ok((new_gen, new_shm)) = self.swap_rx.pop() {
+            let old = std::mem::replace(&mut self.shm, new_shm);
+            if let Err(rtrb::PushError::Full(old)) = self.retire_tx.push(old) {
+                std::mem::forget(old);
+            }
+            self.current_gen = new_gen;
+            self.consecutive_misses = 0;
+            self.first_block = true;
+            self.pending_worker_resp = false;
+            self.controls_dirty = true;
+        }
+    }
+
+    fn is_crashed_now(&self) -> bool {
+        self.crashed_gen.load(Ordering::Acquire) == self.current_gen
+            || self.shm.block().worker_alive.load(Ordering::Acquire) == 0
+    }
+
+    fn mark_crashed_now(&self) {
+        self.crashed_gen.store(self.current_gen, Ordering::Release);
+    }
+
+    fn queue_midi_bytes(&mut self, msg: &[u8]) {
+        if !self.has_midi_in || msg.is_empty() || msg.len() > 3 {
+            return;
+        }
+        let mut bytes = [0u8; 3];
+        bytes[..msg.len()].copy_from_slice(msg);
+        self.last_event = Some(bytes);
+        if self.midi_in_q.len() < self.midi_in_q.capacity() {
+            self.midi_in_q.push(Lv2ShmMidiEvent { len: msg.len() as u8, bytes });
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn is_instrument(&self) -> bool {
+        self.is_instrument
+    }
+
+    pub fn is_midi_fx(&self) -> bool {
+        self.is_midi_fx
+    }
+
+    pub fn reports_latency(&self) -> bool {
+        self.reports_latency
+    }
+
+    pub fn latency_frames(&self) -> u32 {
+        self.latency
+    }
+
+    pub fn control_count(&self) -> usize {
+        self.controls_meta.len()
+    }
+
+    pub fn set_control_normalized(&mut self, nth: usize, value: f32) {
+        let Some(meta) = self.controls_meta.get(nth) else { return };
+        let Some(atom) = self.controls_shadow.get(nth) else { return };
+        let v = meta.min + (meta.max - meta.min) * value.clamp(0.0, 1.0);
+        atom.store(v.to_bits(), Ordering::Release);
+        self.controls_dirty = true;
+    }
+
+    pub fn control_normalized(&self, nth: usize) -> Option<f32> {
+        let meta = self.controls_meta.get(nth)?;
+        let atom = self.controls_shadow.get(nth)?;
+        let v = f32::from_bits(atom.load(Ordering::Relaxed));
+        Some(if meta.max > meta.min {
+            ((v - meta.min) / (meta.max - meta.min)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        })
+    }
+
+    pub fn control_descs(&self) -> Vec<Lv2ControlDesc> {
+        self.controls_meta
+            .iter()
+            .enumerate()
+            .map(|(i, meta)| {
+                let mut d = meta.clone();
+                if let Some(atom) = self.controls_shadow.get(i) {
+                    d.value = f32::from_bits(atom.load(Ordering::Relaxed));
+                }
+                d
+            })
+            .collect()
+    }
+
+    pub fn apply_preset(&mut self, preset: &Lv2Preset) {
+        for (sym, val) in &preset.values {
+            if let Some(&nth) = self.controls_by_symbol.get(sym) {
+                if let Some(atom) = self.controls_shadow.get(nth) {
+                    atom.store(val.to_bits(), Ordering::Release);
+                    self.controls_dirty = true;
+                }
+            }
+        }
+    }
+
+    pub fn send_midi(&mut self, ev: [u8; 3]) {
+        self.queue_midi_bytes(&ev);
+    }
+
+    pub fn read_midi_out(&self, out: &mut Vec<FxOutEvent>) {
+        for ev in &self.midi_out_q {
+            if out.len() >= out.capacity() {
+                break;
+            }
+            let d = ev.bytes;
+            let (status, ch) = (d[0] & 0xF0, d[0] & 0x0F);
+            match status {
+                0x90 if d[2] > 0 => out.push(FxOutEvent::NoteOn { channel: ch, note: d[1], velocity: d[2] }),
+                0x80 | 0x90 => out.push(FxOutEvent::NoteOff { channel: ch, note: d[1] }),
+                0xB0 | 0xE0 | 0xA0 => out.push(FxOutEvent::Midi(d)),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn note_on(&mut self, note: u8, velocity: u8) {
+        self.note_on_ch(note, velocity, 0);
+    }
+
+    pub fn note_off(&mut self, note: u8) {
+        self.note_off_ch(note, 0);
+    }
+
+    pub fn note_on_ch(&mut self, note: u8, velocity: u8, channel: u8) {
+        self.queue_midi_bytes(&[0x90 | (channel & 0x0F), note, velocity]);
+    }
+
+    pub fn note_off_ch(&mut self, note: u8, channel: u8) {
+        self.queue_midi_bytes(&[0x80 | (channel & 0x0F), note, 0]);
+    }
+
+    pub fn control_change(&mut self, cc: u8, value: u8) {
+        self.control_change_ch(cc, value, 0);
+    }
+
+    pub fn control_change_ch(&mut self, cc: u8, value: u8, channel: u8) {
+        self.queue_midi_bytes(&[0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F]);
+    }
+
+    pub fn channel_pressure(&mut self, value: u8) {
+        self.queue_midi_bytes(&[0xD0, value & 0x7F]);
+    }
+
+    pub fn midi(&mut self, msg: &[u8]) {
+        self.queue_midi_bytes(msg);
+    }
+
+    pub fn program_change(&mut self, program: u8) {
+        self.queue_midi_bytes(&[0xC0, program.min(127)]);
+    }
+
+    pub fn last_midi_event(&self) -> Option<[u8; 3]> {
+        self.last_event
+    }
+
+    pub fn clear_last_midi_event(&mut self) {
+        self.last_event = None;
+    }
+
+    pub fn has_pending_worker_response(&self) -> bool {
+        self.pending_worker_resp
+    }
+
+    pub fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
+        self.adopt_swap();
+        self.midi_out_q.clear();
+        let out_total = (frames * 2).min(output.len());
+        if self.is_crashed_now() {
+            if out_total > 0 {
+                output[..out_total].fill(0.0);
+            }
+            self.midi_in_q.clear();
+            self.pending_worker_resp = false;
+            return;
+        }
+        if frames == 0 && !self.is_midi_fx {
+            return;
+        }
+
+        let mut offset = 0usize;
+        let mut chunk_idx = 0usize;
+        while offset < frames || (frames == 0 && chunk_idx == 0) {
+            let chunk = if frames == 0 {
+                0
+            } else {
+                (frames - offset).min(MAX_LV2_SHM_FRAMES)
+            };
+            let n2 = chunk * 2;
+            let sent_controls = chunk_idx == 0 && self.controls_dirty;
+            let sent_midi = chunk_idx == 0;
+
+            {
+                let blk = self.shm.block_mut();
+                blk.frames = chunk as u32;
+                blk.is_midi_fx = u32::from(self.is_midi_fx);
+                if sent_controls {
+                    let cc = self.controls_shadow.len().min(MAX_LV2_CONTROLS);
+                    blk.control_count = cc as u32;
+                    for (i, atom) in self.controls_shadow.iter().take(cc).enumerate() {
+                        blk.controls[i] = f32::from_bits(atom.load(Ordering::Relaxed));
+                    }
+                    blk.controls_dirty = 1;
+                } else {
+                    blk.controls_dirty = 0;
+                }
+                if sent_midi {
+                    let mc = self.midi_in_q.len().min(MAX_LV2_MIDI_EVENTS);
+                    blk.midi_in_count = mc as u32;
+                    if mc > 0 {
+                        blk.midi_in[..mc].copy_from_slice(&self.midi_in_q[..mc]);
+                    }
+                } else {
+                    blk.midi_in_count = 0;
+                }
+                if !self.is_midi_fx && n2 > 0 {
+                    let src_start = offset * 2;
+                    let avail = input.len().saturating_sub(src_start).min(n2);
+                    if avail > 0 {
+                        blk.in_buf[..avail].copy_from_slice(&input[src_start..src_start + avail]);
+                    }
+                    if avail < n2 {
+                        blk.in_buf[avail..n2].fill(0.0);
+                    }
+                }
+            }
+
+            let prev_seq = self.shm.block().worker_seq.load(Ordering::Acquire);
+            let seq = self.shm.block().host_seq.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+            futex_wake(&self.shm.block().host_seq);
+
+            let ready = {
+                let blk = self.shm.block();
+                wait_for_worker_seq(
+                    &blk.worker_seq,
+                    &blk.worker_alive,
+                    prev_seq,
+                    seq,
+                    &mut self.first_block,
+                    self.deadline_ns,
+                )
+            };
+
+            if ready {
+                let blk = self.shm.block();
+                if sent_controls {
+                    self.controls_dirty = false;
+                }
+                if sent_midi {
+                    self.midi_in_q.clear();
+                }
+                if !self.is_midi_fx && n2 > 0 {
+                    let dst_start = offset * 2;
+                    let avail = output.len().saturating_sub(dst_start).min(n2);
+                    if avail > 0 {
+                        output[dst_start..dst_start + avail].copy_from_slice(&blk.out_buf[..avail]);
+                    }
+                }
+                let moc = (blk.midi_out_count as usize).min(MAX_LV2_MIDI_EVENTS);
+                for ev in &blk.midi_out[..moc] {
+                    if self.midi_out_q.len() < self.midi_out_q.capacity() {
+                        self.midi_out_q.push(*ev);
+                    }
+                }
+                self.latency = blk.latency_frames.load(Ordering::Acquire);
+                self.pending_worker_resp = blk.pending_worker_resp.load(Ordering::Acquire) != 0;
+                self.consecutive_misses = 0;
+            } else {
+                self.midi_in_q.clear();
+                if !self.is_midi_fx {
+                    let dst_start = offset * 2;
+                    if dst_start < output.len() {
+                        let rem = (frames * 2).saturating_sub(dst_start).min(output.len() - dst_start);
+                        output[dst_start..dst_start + rem].fill(0.0);
+                    }
+                }
+                self.pending_worker_resp = false;
+                self.consecutive_misses += 1;
+                if self.shm.block().worker_alive.load(Ordering::Acquire) == 0
+                    || self.consecutive_misses >= DEAD_MISS_THRESHOLD
+                {
+                    self.mark_crashed_now();
+                }
+                break;
+            }
+
+            if frames == 0 {
+                break;
+            }
+            offset += chunk;
+            chunk_idx += 1;
+        }
+    }
+}
+
+/// Off-RT supervisor for a sandboxed LV2 worker (#413).
+pub struct SandboxLv2Main {
+    slot_id: u64,
+    uri: String,
+    sample_rate: f64,
+    block: usize,
+    child: Option<Child>,
+    ctrl: Option<UnixStream>,
+    swap_tx: rtrb::Producer<(u64, Lv2ShmRegion)>,
+    retire_rx: rtrb::Consumer<Lv2ShmRegion>,
+    spawn_gen: u64,
+    crashed_gen: Arc<AtomicU64>,
+    controls_shadow: Arc<Vec<AtomicU32>>,
+    last_state: Option<(String, String, Vec<u8>)>,
+    worker_pid: u32,
+    crash_count: u32,
+    last_crash_reason: Option<String>,
+    strip_notice: Option<String>,
+}
+
+impl SandboxLv2Main {
+    pub fn slot_id(&self) -> u64 {
+        self.slot_id
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn worker_pid(&self) -> u32 {
+        self.worker_pid
+    }
+
+    pub fn crash_count(&self) -> u32 {
+        self.crash_count
+    }
+
+    pub fn strip_notice(&self) -> Option<&str> {
+        self.strip_notice.as_deref()
+    }
+
+    pub fn is_crashed(&self) -> bool {
+        self.crashed_gen.load(Ordering::Acquire) == self.spawn_gen
+    }
+
+    pub fn save_state(&mut self, key: &str) -> Result<Vec<u8>> {
+        let ctrl = match self.ctrl.as_mut() {
+            Some(c) => c,
+            None => {
+                if let Some((k, _, blob)) = &self.last_state {
+                    if k == key {
+                        return Ok(blob.clone());
+                    }
+                }
+                bail!("lv2 worker unavailable");
+            }
+        };
+        if send_msg(ctrl, &CtrlReq::Lv2SaveState { key: key.to_string() }).is_err() {
+            self.ctrl = None;
+            self.crashed_gen.store(self.spawn_gen, Ordering::Release);
+            if self.last_crash_reason.is_none() {
+                self.last_crash_reason = Some("control socket closed".into());
+            }
+            bail!("lv2 control socket closed");
+        }
+        match recv_msg::<CtrlResp>(ctrl) {
+            Ok(CtrlResp::State(bytes)) => {
+                let kind = crate::lv2::state_format(&self.uri)
+                    .map_or("http://lv2plug.in/ns/ext/atom#Chunk", |f| f.kind)
+                    .to_string();
+                self.last_state = Some((key.to_string(), kind, bytes.clone()));
+                Ok(bytes)
+            }
+            Ok(CtrlResp::Err(e)) => bail!("{e}"),
+            Ok(_) => bail!("unexpected reply to Lv2SaveState"),
+            Err(_) => {
+                self.ctrl = None;
+                self.crashed_gen.store(self.spawn_gen, Ordering::Release);
+                if self.last_crash_reason.is_none() {
+                    self.last_crash_reason = Some("control socket error".into());
+                }
+                bail!("lv2 control socket error");
+            }
+        }
+    }
+
+    /// Check if the LV2 worker crashed or hung; if so, restart it with its
+    /// last saved state and live control values and hot-swap into the audio
+    /// thread. Returns `(strip_badge, banner_msg)`.
+    pub fn poll_recovery(&mut self) -> Option<(String, String)> {
+        while self.retire_rx.pop().is_ok() {}
+
+        let mut died_reason: Option<String> = None;
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    died_reason = Some(exit_reason(status));
+                    self.child = None;
+                    self.ctrl = None;
+                    self.crashed_gen.store(self.spawn_gen, Ordering::Release);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    died_reason = Some("wait failed".into());
+                    self.child = None;
+                    self.ctrl = None;
+                }
+            }
+        } else if self.is_crashed() {
+            died_reason = self.last_crash_reason.take().or_else(|| Some("worker lost".into()));
+        }
+
+        if died_reason.is_none() && self.is_crashed() {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.ctrl = None;
+            died_reason = Some("hung (deadline exceeded)".into());
+        }
+
+        let reason = died_reason?;
+        self.crash_count += 1;
+        self.last_crash_reason = Some(reason.clone());
+
+        let controls: Vec<(usize, f32)> = self
+            .controls_shadow
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, f32::from_bits(a.load(Ordering::Acquire))))
+            .collect();
+
+        match spawn_lv2_worker(&self.uri, self.sample_rate, self.block, self.last_state.clone(), controls) {
+            Ok(w) => {
+                self.child = Some(w.child);
+                self.ctrl = Some(w.ctrl);
+                self.worker_pid = w.pid;
+                self.spawn_gen = self.spawn_gen.wrapping_add(1).max(1);
+                let _ = self.swap_tx.push((self.spawn_gen, w.shm));
+                let badge = format!("RESTARTED ({reason})");
+                let msg = format!("LV2 plugin {} crashed ({reason}) — restarted with saved state", self.uri);
+                self.strip_notice = Some(badge.clone());
+                Some((badge, msg))
+            }
+            Err(e) => {
+                let badge = format!("CRASHED ({reason})");
+                let msg = format!("LV2 plugin {} crashed ({reason}) and failed to restart: {e}", self.uri);
+                self.strip_notice = Some(badge.clone());
+                Some((badge, msg))
+            }
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        if let Some(mut ctrl) = self.ctrl.take() {
+            let _ = send_msg(&mut ctrl, &CtrlReq::Shutdown);
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        while self.retire_rx.pop().is_ok() {}
+    }
+}
+
+impl Drop for SandboxLv2Main {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Spawn a new out-of-process LV2 worker and return its RT-safe audio handle
+/// (`SandboxLv2Audio`) and off-RT supervisor (`SandboxLv2Main`).
+pub fn spawn_sandboxed_lv2(
+    uri: &str,
+    sample_rate: f64,
+    block: usize,
+    initial_state: Option<(String, String, Vec<u8>)>,
+) -> Result<(SandboxLv2Audio, SandboxLv2Main)> {
+    let w = spawn_lv2_worker(uri, sample_rate, block, initial_state.clone(), Vec::new())?;
+    let slot_id = NEXT_LV2_SLOT_ID.fetch_add(1, Ordering::Relaxed);
+    let (swap_tx, swap_rx) = rtrb::RingBuffer::<(u64, Lv2ShmRegion)>::new(4);
+    let (retire_tx, retire_rx) = rtrb::RingBuffer::<Lv2ShmRegion>::new(4);
+    let crashed_gen = Arc::new(AtomicU64::new(0));
+    let spawn_gen = 1u64;
+
+    let mut controls_by_symbol = HashMap::new();
+    let mut shadow_vec = Vec::with_capacity(w.controls.len());
+    for (i, d) in w.controls.iter().enumerate() {
+        controls_by_symbol.insert(d.symbol.clone(), i);
+        shadow_vec.push(AtomicU32::new(d.value.to_bits()));
+    }
+    let controls_shadow = Arc::new(shadow_vec);
+
+    let audio = SandboxLv2Audio {
+        slot_id,
+        uri: w.uri.clone(),
+        is_instrument: w.is_instrument,
+        is_midi_fx: w.is_midi_fx,
+        reports_latency: w.reports_latency,
+        has_midi_in: w.has_midi_in,
+        shm: w.shm,
+        current_gen: spawn_gen,
+        swap_rx,
+        retire_tx,
+        controls_meta: w.controls,
+        controls_by_symbol,
+        controls_shadow: controls_shadow.clone(),
+        controls_dirty: false,
+        midi_in_q: Vec::with_capacity(MAX_LV2_MIDI_EVENTS),
+        midi_out_q: Vec::with_capacity(MAX_LV2_MIDI_EVENTS),
+        last_event: None,
+        latency: w.latency,
+        pending_worker_resp: false,
+        deadline_ns: DEFAULT_DEADLINE_US * 1_000,
+        first_block: true,
+        consecutive_misses: 0,
+        crashed_gen: crashed_gen.clone(),
+    };
+
+    let main = SandboxLv2Main {
+        slot_id,
+        uri: w.uri,
+        sample_rate,
+        block,
+        child: Some(w.child),
+        ctrl: Some(w.ctrl),
+        swap_tx,
+        retire_rx,
+        spawn_gen,
+        crashed_gen,
+        controls_shadow,
+        last_state: initial_state,
+        worker_pid: w.pid,
+        crash_count: 0,
+        last_crash_reason: None,
+        strip_notice: None,
+    };
+    Ok((audio, main))
+}
+
+/// Either an in-process [`Lv2Plugin`] (`KABELSALAT_SANDBOX=0`) or an isolated
+/// worker-backed [`SandboxLv2Audio`].
+pub enum HostedLv2 {
+    InProcess(Lv2Plugin),
+    Sandbox(SandboxLv2Audio),
+}
+
+impl HostedLv2 {
+    pub fn slot_id(&self) -> Option<u64> {
+        match self {
+            Self::InProcess(_) => None,
+            Self::Sandbox(s) => Some(s.slot_id()),
+        }
+    }
+
+    pub fn is_sandboxed(&self) -> bool {
+        matches!(self, Self::Sandbox(_))
+    }
+
+    pub fn worker_pid(&self) -> Option<u32> {
+        match self {
+            Self::InProcess(_) => None,
+            Self::Sandbox(s) => Some(s.worker_pid()),
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::InProcess(p) => p.uri(),
+            Self::Sandbox(s) => s.uri(),
+        }
+    }
+
+    pub fn is_instrument(&self) -> bool {
+        match self {
+            Self::InProcess(p) => p.is_instrument(),
+            Self::Sandbox(s) => s.is_instrument(),
+        }
+    }
+
+    pub fn is_midi_fx(&self) -> bool {
+        match self {
+            Self::InProcess(p) => p.is_midi_fx(),
+            Self::Sandbox(s) => s.is_midi_fx(),
+        }
+    }
+
+    pub fn reports_latency(&self) -> bool {
+        match self {
+            Self::InProcess(p) => p.reports_latency(),
+            Self::Sandbox(s) => s.reports_latency(),
+        }
+    }
+
+    pub fn latency_frames(&self) -> u32 {
+        match self {
+            Self::InProcess(p) => p.latency_frames(),
+            Self::Sandbox(s) => s.latency_frames(),
+        }
+    }
+
+    pub fn control_count(&self) -> usize {
+        match self {
+            Self::InProcess(p) => p.control_count(),
+            Self::Sandbox(s) => s.control_count(),
+        }
+    }
+
+    pub fn set_control_normalized(&mut self, nth: usize, value: f32) {
+        match self {
+            Self::InProcess(p) => p.set_control_normalized(nth, value),
+            Self::Sandbox(s) => s.set_control_normalized(nth, value),
+        }
+    }
+
+    pub fn control_normalized(&self, nth: usize) -> Option<f32> {
+        match self {
+            Self::InProcess(p) => p.control_normalized(nth),
+            Self::Sandbox(s) => s.control_normalized(nth),
+        }
+    }
+
+    pub fn control_descs(&self) -> Vec<Lv2ControlDesc> {
+        match self {
+            Self::InProcess(p) => p.control_descs(),
+            Self::Sandbox(s) => s.control_descs(),
+        }
+    }
+
+    pub fn apply_preset(&mut self, preset: &Lv2Preset) {
+        match self {
+            Self::InProcess(p) => p.apply_preset(preset),
+            Self::Sandbox(s) => s.apply_preset(preset),
+        }
+    }
+
+    pub fn send_midi(&mut self, ev: [u8; 3]) {
+        match self {
+            Self::InProcess(p) => p.send_midi(ev),
+            Self::Sandbox(s) => s.send_midi(ev),
+        }
+    }
+
+    pub fn read_midi_out(&self, out: &mut Vec<FxOutEvent>) {
+        match self {
+            Self::InProcess(p) => p.read_midi_out(out),
+            Self::Sandbox(s) => s.read_midi_out(out),
+        }
+    }
+
+    pub fn note_on(&mut self, note: u8, velocity: u8) {
+        match self {
+            Self::InProcess(p) => p.note_on(note, velocity),
+            Self::Sandbox(s) => s.note_on(note, velocity),
+        }
+    }
+
+    pub fn note_off(&mut self, note: u8) {
+        match self {
+            Self::InProcess(p) => p.note_off(note),
+            Self::Sandbox(s) => s.note_off(note),
+        }
+    }
+
+    pub fn note_on_ch(&mut self, note: u8, velocity: u8, channel: u8) {
+        match self {
+            Self::InProcess(p) => p.note_on_ch(note, velocity, channel),
+            Self::Sandbox(s) => s.note_on_ch(note, velocity, channel),
+        }
+    }
+
+    pub fn note_off_ch(&mut self, note: u8, channel: u8) {
+        match self {
+            Self::InProcess(p) => p.note_off_ch(note, channel),
+            Self::Sandbox(s) => s.note_off_ch(note, channel),
+        }
+    }
+
+    pub fn control_change(&mut self, cc: u8, value: u8) {
+        match self {
+            Self::InProcess(p) => p.control_change(cc, value),
+            Self::Sandbox(s) => s.control_change(cc, value),
+        }
+    }
+
+    pub fn control_change_ch(&mut self, cc: u8, value: u8, channel: u8) {
+        match self {
+            Self::InProcess(p) => p.control_change_ch(cc, value, channel),
+            Self::Sandbox(s) => s.control_change_ch(cc, value, channel),
+        }
+    }
+
+    pub fn channel_pressure(&mut self, value: u8) {
+        match self {
+            Self::InProcess(p) => p.channel_pressure(value),
+            Self::Sandbox(s) => s.channel_pressure(value),
+        }
+    }
+
+    pub fn midi(&mut self, msg: &[u8]) {
+        match self {
+            Self::InProcess(p) => p.midi(msg),
+            Self::Sandbox(s) => s.midi(msg),
+        }
+    }
+
+    pub fn program_change(&mut self, program: u8) {
+        match self {
+            Self::InProcess(p) => p.program_change(program),
+            Self::Sandbox(s) => s.program_change(program),
+        }
+    }
+
+    pub fn last_midi_event(&self) -> Option<[u8; 3]> {
+        match self {
+            Self::InProcess(p) => p.last_midi_event(),
+            Self::Sandbox(s) => s.last_midi_event(),
+        }
+    }
+
+    pub fn clear_last_midi_event(&mut self) {
+        match self {
+            Self::InProcess(p) => p.clear_last_midi_event(),
+            Self::Sandbox(s) => s.clear_last_midi_event(),
+        }
+    }
+
+    pub fn has_pending_worker_response(&self) -> bool {
+        match self {
+            Self::InProcess(p) => p.has_pending_worker_response(),
+            Self::Sandbox(s) => s.has_pending_worker_response(),
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
+        match self {
+            Self::InProcess(p) => p.process(input, output, frames),
+            Self::Sandbox(s) => s.process(input, output, frames),
+        }
+    }
+}
+
+fn run_lv2_sandbox_phase() -> Result<()> {
+    let (dir, uri) = crate::lv2::ui::build_fixture_bundle("sandbox-lv2")?;
+    let res = (|| -> Result<()> {
+        let bias: f32 = 0.5;
+        let init_state = (
+            "urn:kabelsalat:fixture:state_bias".to_string(),
+            "http://lv2plug.in/ns/ext/atom#Chunk".to_string(),
+            bias.to_le_bytes().to_vec(),
+        );
+        let (mut lv2, mut main) = spawn_sandboxed_lv2(&uri, 48000.0, 8192, Some(init_state))?;
+        anyhow::ensure!(!lv2.is_instrument(), "gain fixture should be an effect");
+        anyhow::ensure!(lv2.control_count() == 1, "expected 1 control port");
+        // Gain port range is 0.0..=2.0 -> normalized 0.6 = native 1.2; times bias 0.5 = 0.6.
+        lv2.set_control_normalized(0, 0.6);
+
+        let inp = vec![1.0f32; 256 * 2];
+        let mut out = vec![0.0f32; 256 * 2];
+        lv2.process(&inp, &mut out, 256);
+        let peak = |buf: &[f32]| buf.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let p_before = peak(&out);
+        anyhow::ensure!(
+            (p_before - 0.6).abs() < 1e-3,
+            "sandboxed LV2 expected peak 0.6 before crash (got {p_before})"
+        );
+
+        let pid_before = main.worker_pid();
+        println!("sandbox-test: killing LV2 fixture worker pid={pid_before} with SIGSEGV...");
+        unsafe { libc::kill(pid_before as libc::pid_t, libc::SIGSEGV); }
+
+        let mut recovered = None;
+        for _ in 0..40 {
+            lv2.process(&inp, &mut out, 256);
+            if let Some(pair) = main.poll_recovery() {
+                recovered = Some(pair);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (badge, msg) = recovered.ok_or_else(|| anyhow!("LV2 worker did not detect SIGSEGV and restart"))?;
+        anyhow::ensure!(badge == "RESTARTED (SIGSEGV)", "unexpected badge {badge:?}");
+        println!("sandbox-test: {msg}");
+        anyhow::ensure!(main.worker_pid() != pid_before, "new LV2 worker must have a new PID");
+        anyhow::ensure!(main.crash_count() == 1, "LV2 crash_count should be 1");
+        anyhow::ensure!(main.strip_notice() == Some("RESTARTED (SIGSEGV)"));
+
+        // Verify silence before adoption is safe AND post-adoption preserves state + control.
+        lv2.process(&inp, &mut out, 256);
+        let p_after = peak(&out);
+        anyhow::ensure!(
+            (p_after - 0.6).abs() < 1e-3,
+            "recovered LV2 lost state or control value: expected 0.6, got {p_after}"
+        );
+        let saved = main.save_state("urn:kabelsalat:fixture:state_bias")?;
+        anyhow::ensure!(saved.len() == 4, "expected 4-byte float state, got {}", saved.len());
+        let saved_bias = f32::from_le_bytes(saved.try_into().unwrap());
+        anyhow::ensure!((saved_bias - 0.5).abs() < 1e-5, "saved state bias mismatch: {saved_bias}");
+
+        main.shutdown();
+        Ok(())
+    })();
+    crate::lv2::remove_bundle(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    res
+}
+
 // ---------------------------------------------------------------------------
 // CLI self-test & IPC latency benchmark (`kabelsalat sandbox-test`)
 // ---------------------------------------------------------------------------
@@ -1589,6 +2966,8 @@ pub fn run_sandbox_test() -> Result<()> {
     m1.shutdown();
     m2.shutdown();
 
+    run_lv2_sandbox_phase()?;
+
     let (med64, p95_64, max64) = measure_ipc_roundtrip(64, 500)?;
     let (med256, p95_256, max256) = measure_ipc_roundtrip(256, 500)?;
     println!(
@@ -1657,7 +3036,7 @@ mod tests {
         let (mut voice, mut main) = spawn_sandboxed_clap(48000.0, &key, None).unwrap();
 
         let params = main.param_list();
-        assert_eq!(params.len(), 2);
+        assert_eq!(params.len(), 3);
         assert_eq!(params[0].name, "Gain");
         assert!((main.param_value(0).unwrap() - 1.0).abs() < 1e-4);
 
@@ -1680,5 +3059,56 @@ mod tests {
 
         main.shutdown();
         let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
+    }
+
+    #[test]
+    fn sandbox_drain_param_edits_rpc_delivers_edits() {
+        let (bundle, synth_cid, _) = crate::vst3::build_fixture_bundle("sandbox-edits").unwrap();
+        let key = crate::vst3::voice_key(&synth_cid);
+        let (mut voice, mut main) = spawn_sandboxed_clap(48000.0, &key, None).unwrap();
+
+        let mut buf = [0.0f32; 128 * 2];
+        voice.push_rt(VoiceCmd::Param(ClapId::new(0), 0.421875));
+        voice.render(&mut buf, Transport::default());
+
+        assert!(
+            main.has_pending_param_edits(),
+            "worker audio outputParameterChanges must raise SandboxMain pending flag"
+        );
+        let edits = main.drain_param_edits();
+        assert!(
+            edits.iter().any(|&(id, val)| id == 0 && (val - 0.625).abs() < 1e-4),
+            "expected (0, 0.625) across sandbox DrainParamEdits RPC, got {edits:?}"
+        );
+        assert!(!main.has_pending_param_edits(), "drain_param_edits clears pending flag");
+        assert!(main.drain_param_edits().is_empty(), "subsequent drain is empty");
+
+        main.shutdown();
+        let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
+    }
+
+    #[test]
+    fn lv2_sandbox_segv_recovery_preserves_controls_and_state() {
+        run_lv2_sandbox_phase().expect("LV2 sandbox recovery phase must pass");
+    }
+
+    #[test]
+    fn lv2_sandbox_in_process_fallback_works() {
+        let (dir, uri) = crate::lv2::ui::build_fixture_bundle("inproc-lv2").unwrap();
+        let plugin = Lv2Plugin::load(&uri, 48000.0, 8192).unwrap();
+        let mut hosted = HostedLv2::InProcess(plugin);
+        assert!(!hosted.is_sandboxed());
+        assert_eq!(hosted.slot_id(), None);
+        assert_eq!(hosted.worker_pid(), None);
+        hosted.set_control_normalized(0, 0.25); // range 0..2 -> 0.5
+        let inp = vec![1.0f32; 64 * 2];
+        let mut out = vec![0.0f32; 64 * 2];
+        hosted.process(&inp, &mut out, 64);
+        assert!((out[0] - 0.5).abs() < 1e-4, "expected 0.5, got {}", out[0]);
+        if let HostedLv2::InProcess(p) = hosted {
+            crate::lv2::retire(p);
+        }
+        crate::lv2::remove_bundle(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

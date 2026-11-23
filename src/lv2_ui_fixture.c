@@ -66,16 +66,68 @@ typedef struct {
     uint32_t (*port_index)(void *handle, const char *symbol);
 } LV2UI_Port_Map;
 
+typedef uint32_t LV2_URID;
+
+typedef struct {
+    void *handle;
+    LV2_URID (*map)(void *handle, const char *uri);
+} LV2_URID_Map;
+
+typedef int (*LV2_State_Store_Function)(
+    void *handle,
+    uint32_t key,
+    const void *value,
+    size_t size,
+    uint32_t type,
+    uint32_t flags);
+
+typedef const void *(*LV2_State_Retrieve_Function)(
+    void *handle,
+    uint32_t key,
+    size_t *size,
+    uint32_t *type,
+    uint32_t *flags);
+
+typedef struct {
+    int (*save)(
+        LV2_Handle instance,
+        LV2_State_Store_Function store,
+        void *handle,
+        uint32_t flags,
+        const LV2_Feature *const *features);
+    int (*restore)(
+        LV2_Handle instance,
+        LV2_State_Retrieve_Function retrieve,
+        void *handle,
+        uint32_t flags,
+        const LV2_Feature *const *features);
+} LV2_State_Interface;
+
 /* --- DSP plugin --- */
 typedef struct {
     const float *in[2];
     float *out[2];
     const float *gain;
+    float state_bias;
+    uint32_t state_key;
+    uint32_t chunk_type;
 } GainPlugin;
 
 static LV2_Handle dsp_inst(const void *d, double sr, const char *p, const LV2_Feature *const *f) {
-    (void)d; (void)sr; (void)p; (void)f;
-    return calloc(1, sizeof(GainPlugin));
+    (void)d; (void)sr; (void)p;
+    GainPlugin *gp = (GainPlugin *)calloc(1, sizeof(GainPlugin));
+    if (!gp) return 0;
+    gp->state_bias = 1.0f;
+    for (int i = 0; f && f[i]; i++) {
+        if (strcmp(f[i]->URI, "http://lv2plug.in/ns/ext/urid#map") == 0 && f[i]->data) {
+            const LV2_URID_Map *m = (const LV2_URID_Map *)f[i]->data;
+            if (m->map) {
+                gp->state_key = m->map(m->handle, "urn:kabelsalat:fixture:state_bias");
+                gp->chunk_type = m->map(m->handle, "http://lv2plug.in/ns/ext/atom#Chunk");
+            }
+        }
+    }
+    return gp;
 }
 static void dsp_conn(LV2_Handle h, uint32_t port, void *data) {
     GainPlugin *p = (GainPlugin *)h;
@@ -85,13 +137,54 @@ static void dsp_conn(LV2_Handle h, uint32_t port, void *data) {
 }
 static void dsp_run(LV2_Handle h, uint32_t frames) {
     GainPlugin *p = (GainPlugin *)h;
-    float g = p->gain ? *p->gain : 1.0f;
+    float g = (p->gain ? *p->gain : 1.0f) * p->state_bias;
     for (uint32_t i = 0; i < frames; i++) {
         p->out[0][i] = p->in[0] ? p->in[0][i] * g : 0.0f;
         p->out[1][i] = p->in[1] ? p->in[1][i] * g : 0.0f;
     }
 }
 static void dsp_cleanup(LV2_Handle h) { free(h); }
+
+static int dsp_state_save(
+    LV2_Handle h,
+    LV2_State_Store_Function store,
+    void *handle,
+    uint32_t flags,
+    const LV2_Feature *const *features) {
+    (void)flags; (void)features;
+    GainPlugin *p = (GainPlugin *)h;
+    if (!p || !store || p->state_key == 0) return 1;
+    return store(handle, p->state_key, &p->state_bias, sizeof(float), p->chunk_type, 1 | 2);
+}
+
+static int dsp_state_restore(
+    LV2_Handle h,
+    LV2_State_Retrieve_Function retrieve,
+    void *handle,
+    uint32_t flags,
+    const LV2_Feature *const *features) {
+    (void)flags; (void)features;
+    GainPlugin *p = (GainPlugin *)h;
+    if (!p || !retrieve || p->state_key == 0) return 1;
+    size_t size = 0;
+    uint32_t type = 0;
+    uint32_t rflags = 0;
+    const void *val = retrieve(handle, p->state_key, &size, &type, &rflags);
+    if (val && size == sizeof(float)) {
+        memcpy(&p->state_bias, val, sizeof(float));
+        return 0;
+    }
+    return 1;
+}
+
+static const LV2_State_Interface dsp_state_iface = { dsp_state_save, dsp_state_restore };
+
+static const void *dsp_ext(const char *uri) {
+    if (uri && strcmp(uri, "http://lv2plug.in/ns/ext/state#interface") == 0) {
+        return &dsp_state_iface;
+    }
+    return 0;
+}
 
 static const LV2_Descriptor dsp_desc = {
     "urn:kabelsalat:fixture:ui_gain",
@@ -101,7 +194,7 @@ static const LV2_Descriptor dsp_desc = {
     dsp_run,
     0,
     dsp_cleanup,
-    0,
+    dsp_ext,
 };
 
 __attribute__((visibility("default")))

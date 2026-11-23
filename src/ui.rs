@@ -4414,6 +4414,11 @@ struct DemoApp {
     editor_params: Vec<ParamDesc>,
     /// `ui_time` of the last plugin poll for main-control knobs.
     main_poll_at: f32,
+    /// `ui_time` of the last periodic poll for plugin-initiated parameter edits (#418).
+    param_edit_poll_at: f32,
+    /// Latest outbound 7-bit CC feedback value per `(source, channel, cc)` for
+    /// learned `PluginParam` bindings (#418; consumed by #218 hardware feedback).
+    plugin_param_feedback: HashMap<(SourceId, u8, u8), u8>,
     /// Aeolus faces by node id: the stops its plugin has drawn and the
     /// division the face shows (aeolus.rs).
     aeolus_faces: HashMap<u32, AeolusFace>,
@@ -4434,6 +4439,11 @@ struct DemoApp {
     lv2_editor_controls: Vec<crate::lv2::Lv2ControlDesc>,
     lv2_editor_presets: Vec<crate::lv2::Lv2Preset>,
     lv2_preset_name: Option<String>,
+    /// Per-node LV2 sandbox strip badges (e.g. `RESTARTED (SIGSEGV)`),
+    /// keyed by node id (#413).
+    lv2_strip_notices: HashMap<u32, String>,
+    last_lv2_notice_rev: u64,
+    last_lv2_crash_rev: u64,
     /// Plugin state the app restored into an LV2 node (a Vital patch), by
     /// node id. The engine builds new LV2 instances on every graph load, so
     /// sessions, rig edits and undo carry it and restore it.
@@ -4894,6 +4904,8 @@ impl DemoApp {
             editor_rig: 0,
             editor_params: Vec::new(),
             main_poll_at: 0.0,
+            param_edit_poll_at: 0.0,
+            plugin_param_feedback: HashMap::new(),
             aeolus_faces: HashMap::new(),
             aeolus_poll_at: f32::NEG_INFINITY,
             lv2_main_restore: Vec::new(),
@@ -4904,6 +4916,9 @@ impl DemoApp {
             lv2_editor_controls: Vec::new(),
             lv2_editor_presets: Vec::new(),
             lv2_preset_name: None,
+            lv2_strip_notices: HashMap::new(),
+            last_lv2_notice_rev: 0,
+            last_lv2_crash_rev: 0,
             lv2_states: HashMap::new(),
             setlist_window: window_load::SetlistWindowState::default(),
             lv2_editor_request: None,
@@ -6413,6 +6428,21 @@ impl DemoApp {
             }
             self.setlist_window.lv2_loaded.clone_from(&g.lv2_loaded);
             self.setlist_window.lv2_loading.clone_from(&g.lv2_loading);
+        }
+        if g.lv2_notice_rev != self.last_lv2_notice_rev {
+            self.last_lv2_notice_rev = g.lv2_notice_rev;
+            self.lv2_strip_notices.clear();
+            for entry in &g.lv2_notices {
+                if entry.node != u32::MAX && !entry.as_str().is_empty() {
+                    self.lv2_strip_notices.insert(entry.node, entry.as_str().to_string());
+                }
+            }
+        }
+        if g.lv2_crash_rev != self.last_lv2_crash_rev {
+            self.last_lv2_crash_rev = g.lv2_crash_rev;
+            if !g.lv2_crash_msg.as_str().is_empty() {
+                self.plugin_msg = g.lv2_crash_msg.as_str().to_string();
+            }
         }
         let graph_rev_changed = g.rev != self.last_graph_rev;
         // The engine's voice binding. While it has not published the load
@@ -25898,6 +25928,162 @@ impl DemoApp {
         }
     }
 
+    fn cc_value_for_norm(scale: &crate::matrix::CcScale, norm: f32) -> u8 {
+        let lo = scale.lo.min(127) as f32;
+        let hi = scale.hi.min(127) as f32;
+        let in_lo = scale.in_lo.min(127) as f32;
+        let in_hi = scale.in_hi.min(127) as f32;
+        let p127 = norm.clamp(0.0, 1.0) * 127.0;
+        let t = if (hi - lo).abs() > 1e-6 {
+            ((p127 - lo) / (hi - lo)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if in_hi > in_lo {
+            (in_lo + (in_hi - in_lo) * t).round().clamp(0.0, 127.0) as u8
+        } else {
+            (t * 127.0).round().clamp(0.0, 127.0) as u8
+        }
+    }
+
+    fn record_plugin_param_feedback(&mut self, node_id: u32, param_id: u32, norm: f32) {
+        let mut updates: Vec<((SourceId, u8, u8), u8)> = Vec::new();
+        for (&(src, dest), edit) in &self.rule_edits {
+            if dest != node_id {
+                continue;
+            }
+            let ch = edit.channel.unwrap_or(0) & 0x0F;
+            for m in &edit.cc_map {
+                if m.target == crate::matrix::CcTarget::PluginParam && m.param == param_id {
+                    let cc_val = Self::cc_value_for_norm(&m.scale, norm);
+                    updates.push(((src, ch, m.cc & 0x7F), cc_val));
+                }
+            }
+        }
+        for (k, v) in updates {
+            self.plugin_param_feedback.insert(k, v);
+        }
+    }
+
+    /// Poll plugin-initiated parameter edits (from CLAP `out_events` / `flush`
+    /// or VST3 `performEdit` / `outputParameterChanges`, #418) and mirror them
+    /// onto the parameter editor, face/strip quick knobs, active setlist part,
+    /// and learned CC feedback without echoing back to the engine.
+    fn pump_plugin_param_edits(&mut self) {
+        let periodic = self.ui_time - self.param_edit_poll_at >= MAIN_POLL_SECS;
+        if periodic {
+            self.param_edit_poll_at = self.ui_time;
+        }
+        let slots = self.clap_rigs();
+        let rm = self.reduce_motion;
+        let hold_until = self.ui_time + READBACK_HOLD_SECS;
+        for (slot, node_id) in slots {
+            let Some(pool_idx) = self.clap_pool_idx(slot) else { continue };
+            let should_drain = {
+                let Some(main) = self._surge_main.get(pool_idx) else { continue };
+                main.has_pending_param_edits() || periodic
+            };
+            if !should_drain {
+                continue;
+            }
+            let edits = self._surge_main[pool_idx].drain_param_edits();
+            if edits.is_empty() {
+                continue;
+            }
+            let mut coalesced: Vec<(u32, f64)> = Vec::new();
+            for (pid, val) in edits {
+                if !val.is_finite() {
+                    continue;
+                }
+                if let Some(existing) = coalesced.iter_mut().find(|(id, _)| *id == pid) {
+                    existing.1 = val;
+                } else {
+                    coalesced.push((pid, val));
+                }
+            }
+            let ui_idx = self.units.iter().position(|u| u.node_id == node_id);
+            let dragging = ui_idx.is_some_and(|idx| matches!(self.drag, Drag::Knob { unit, .. } if unit == idx))
+                || self.mixer_knob_drag.is_some_and(|(n, _, _)| n == node_id);
+            for (param_id, plain_val) in coalesced {
+                if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == slot {
+                    for ep in &mut self.editor_params {
+                        if ep.id == param_id {
+                            ep.value = plain_val.clamp(ep.min, ep.max);
+                        }
+                    }
+                }
+                let mut norm_opt: Option<f32> = None;
+                if let Some(ui) = ui_idx {
+                    for k in &mut self.units[ui].knobs {
+                        if let Some(mut pin) = k.clap {
+                            if pin.id == param_id {
+                                let span = (pin.max - pin.min).abs();
+                                let norm = if span > 1e-9 {
+                                    ((plain_val - pin.min) / (pin.max - pin.min)).clamp(0.0, 1.0) as f32
+                                } else {
+                                    0.0
+                                };
+                                norm_opt = Some(norm);
+                                if !dragging && (k.value - pin.sent).abs() <= 1e-4 {
+                                    k.glide_to(norm, rm);
+                                    pin.sent = norm;
+                                    pin.hold_until = hold_until;
+                                    k.clap = Some(pin);
+                                    k.cached_text = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((part, _)) = self.setlist.current_part_mut() {
+                    for p in &mut part.plugin_params {
+                        if p.node == node_id && p.param == param_id {
+                            p.value = plain_val;
+                        }
+                    }
+                }
+                let norm = norm_opt
+                    .or_else(|| {
+                        if self.editor_rig == slot {
+                            self.editor_params.iter().find(|ep| ep.id == param_id).map(|ep| {
+                                let span = (ep.max - ep.min).abs();
+                                if span > 1e-9 {
+                                    ((plain_val - ep.min) / (ep.max - ep.min)).clamp(0.0, 1.0) as f32
+                                } else {
+                                    0.0
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        let has_cc = self.rule_edits.iter().any(|(&(_, dest), edit)| {
+                            dest == node_id
+                                && edit
+                                    .cc_map
+                                    .iter()
+                                    .any(|m| m.target == crate::matrix::CcTarget::PluginParam && m.param == param_id)
+                        });
+                        if !has_cc {
+                            return None;
+                        }
+                        self._surge_main.get_mut(pool_idx).and_then(|m| m.param_desc(param_id)).map(|p| {
+                            let span = (p.max - p.min).abs();
+                            if span > 1e-9 {
+                                ((plain_val - p.min) / (p.max - p.min)).clamp(0.0, 1.0) as f32
+                            } else {
+                                0.0
+                            }
+                        })
+                    });
+                if let Some(n) = norm {
+                    self.record_plugin_param_feedback(node_id, param_id, n);
+                }
+            }
+        }
+    }
+
     /// Plugin parameters currently controlled by MIDI CC on `node_id`, in a
     /// deterministic order (`source_sort_key`, `cc`, `param`). Mixer controls
     /// and CLAP built-in knobs (`LEVEL`) are excluded.
@@ -30516,24 +30702,28 @@ impl DemoApp {
 
             if let Some(badge) = self.bypass_badge_rect(ui) {
                 self.draw_bypass_badge(painter, badge);
-            } else if matches!(u.node_kind, UnitKind::Clap) {
-                if let Some(rig) = self.rig_of_unit(ui) {
-                    if let Some(idx) = self.clap_pool_idx(rig) {
-                        if let Some(notice) = self._surge_main.get(idx).and_then(|m| m.strip_notice()) {
-                            if r.width() >= 120.0 && r.height() >= 64.0 && self.text_alpha > 0.01 {
-                                let is_crashed = notice.starts_with("CRASHED");
-                                let col = if is_crashed { theme::CLIP_RED } else { theme::CABLE_AMBER };
-                                let bw = (notice.len() as f32 * 5.8 + 14.0).min(r.width() - 24.0);
-                                let badge = Rect::from_min_size(
-                                    Pos2::new(r.right() - 12.0 - bw, r.top() + 8.0),
-                                    Vec2::new(bw, BYPASS_BADGE_H),
-                                );
-                                let sr = self.xf.rect(badge);
-                                painter.rect_filled(sr, 2.0, alpha(theme::DARK_PANEL_HI, self.text_alpha));
-                                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(col, self.text_alpha)), egui::StrokeKind::Inside);
-                                self.face_text(painter, badge.center(), notice, theme::medium_font(9.0), col);
-                            }
-                        }
+            } else {
+                let strip_notice: Option<&str> = if matches!(u.node_kind, UnitKind::Clap) {
+                    self.rig_of_unit(ui)
+                        .and_then(|rig| self.clap_pool_idx(rig))
+                        .and_then(|idx| self._surge_main.get(idx))
+                        .and_then(|m| m.strip_notice())
+                } else {
+                    self.lv2_strip_notices.get(&u.node_id).map(String::as_str)
+                };
+                if let Some(notice) = strip_notice {
+                    if r.width() >= 120.0 && r.height() >= 64.0 && self.text_alpha > 0.01 {
+                        let is_crashed = notice.starts_with("CRASHED");
+                        let col = if is_crashed { theme::CLIP_RED } else { theme::CABLE_AMBER };
+                        let bw = (notice.len() as f32 * 5.8 + 14.0).min(r.width() - 24.0);
+                        let badge = Rect::from_min_size(
+                            Pos2::new(r.right() - 12.0 - bw, r.top() + 8.0),
+                            Vec2::new(bw, BYPASS_BADGE_H),
+                        );
+                        let sr = self.xf.rect(badge);
+                        painter.rect_filled(sr, 2.0, alpha(theme::DARK_PANEL_HI, self.text_alpha));
+                        painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(col, self.text_alpha)), egui::StrokeKind::Inside);
+                        self.face_text(painter, badge.center(), notice, theme::medium_font(9.0), col);
                     }
                 }
             }
@@ -35105,6 +35295,7 @@ impl DemoApp {
             }
             main.pump();
         }
+        self.pump_plugin_param_edits();
         self.pump_lv2_guis();
         self.adopt_hw_devices();
         self.sync_instrument_maps();
@@ -45740,6 +45931,146 @@ mod main_control_tests {
         follow_plugin_values(&mut app.units[surge], &mut main, sent_at + 0.1, true);
         assert!((app.units[surge].knobs[0].value - start).abs() < 1e-6, "held while the change travels");
         main.retire(voice);
+    }
+
+    #[test]
+    fn clap_probe_editor_param_edit_updates_editor_quick_knob_part_and_feedback() {
+        let (mut voice, main, probe) = crate::host::probe::host_probe();
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = true;
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let node = app.units[surge].node_id;
+        let ctl = voice.controller();
+        let vid = voice.voice_id();
+
+        app._surge_main = vec![HostedClapMain::Local(main)];
+        app.surge_controllers = vec![ctl];
+        app.clap_plugin_ids = vec!["org.kabelsalat.test-probe".into()];
+        app.clap_voice_ids = vec![vid];
+        app.clap_slot_map = vec![Some(0)];
+
+        let p0 = crate::host::ParamDesc {
+            id: 0,
+            name: "Level".into(),
+            module: "Main".into(),
+            min: 0.0,
+            max: 1.0,
+            value: 0.25,
+            default: 0.25,
+            automatable: true,
+            stepped: false,
+            hidden: false,
+            readonly: false,
+        };
+        assert!(app.toggle_pin(0, &p0).starts_with("pinned"));
+        app.strip_knobs.insert(node, "LEVEL".into());
+        assert_eq!(app.quick_knob(surge), Some(0));
+
+        app.editor_open = true;
+        app.editor_rig = 0;
+        app.lv2_editor_node = None;
+        app.editor_params = vec![p0];
+
+        let mut part = crate::setlist::Part::new("Main", vec![crate::setlist::PartRig::new(0)]);
+        part.plugin_params.push(crate::session::ParamValue { node, param: 0, value: 0.25 });
+        let song = crate::setlist::Song::new("Song 1", vec![part]);
+        app.setlist.songs.push(song);
+        app.setlist.active = Some(crate::setlist::SetlistPos { song: 0, part: 0 });
+
+        app.set_cc_binding(SourceId::Hardware(0), node, 74, Some(0), crate::matrix::CcTarget::PluginParam);
+
+        probe.emit_param_value(0, 0.75);
+        let mut buf = [0.0f32; 64 * 2];
+        voice.render(&mut buf, crate::transport::Transport::default());
+
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        assert!((app.editor_params[0].value - 0.75).abs() < 1e-4, "editor_params updated");
+        let qk = app.quick_knob(surge).unwrap();
+        let k = &app.units[surge].knobs[qk];
+        assert!((k.value - 0.75).abs() < 1e-4, "quick knob value updated: {}", k.value);
+        assert!((k.clap.unwrap().sent - 0.75).abs() < 1e-4, "pin.sent updated to prevent echo");
+        assert!(
+            (app.setlist.current().unwrap().1.plugin_params[0].value - 0.75).abs() < 1e-4,
+            "active setlist part cached plugin_params updated"
+        );
+        assert_eq!(
+            app.plugin_param_feedback.get(&(SourceId::Hardware(0), 0, 74)),
+            Some(&95),
+            "learned CC feedback recorded"
+        );
+
+        let main = app._surge_main.remove(0);
+        main.retire(voice);
+    }
+
+    #[test]
+    fn vst3_probe_editor_param_edit_updates_editor_and_quick_knob() {
+        let (bundle, synth_cid, _) = crate::vst3::build_fixture_bundle("ui-sync").unwrap();
+        let key = crate::vst3::voice_key(&synth_cid);
+        let (mut voice, main) = crate::host::spawn_sandboxed_clap(48000.0, &key, None).unwrap();
+
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = true;
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let node = app.units[surge].node_id;
+        let ctl = voice.controller();
+        let vid = voice.voice_id();
+
+        app._surge_main = vec![HostedClapMain::from(main)];
+        app.surge_controllers = vec![ctl];
+        app.clap_plugin_ids = vec![key];
+        app.clap_voice_ids = vec![vid];
+        app.clap_slot_map = vec![Some(0)];
+
+        let p0 = crate::host::ParamDesc {
+            id: 0,
+            name: "Gain".into(),
+            module: String::new(),
+            min: 0.0,
+            max: 1.0,
+            value: 1.0,
+            default: 1.0,
+            automatable: true,
+            stepped: false,
+            hidden: false,
+            readonly: false,
+        };
+        assert!(app.toggle_pin(0, &p0).starts_with("pinned"));
+        app.strip_knobs.insert(node, "GAIN".into());
+
+        app.editor_open = true;
+        app.editor_rig = 0;
+        app.lv2_editor_node = None;
+        app.editor_params = vec![p0];
+
+        voice.push_rt(crate::host::VoiceCmd::Param(ClapId::new(0), 0.421875));
+        let mut buf = [0.0f32; 128 * 2];
+        voice.render(&mut buf, crate::transport::Transport::default());
+
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        assert!(
+            (app.editor_params[0].value - 0.625).abs() < 1e-4,
+            "VST3 editor_params must update to 0.625, got {}",
+            app.editor_params[0].value
+        );
+        let qk = app.quick_knob(surge).unwrap();
+        let k = &app.units[surge].knobs[qk];
+        assert!((k.value - 0.625).abs() < 1e-4, "VST3 quick knob must update to 0.625, got {}", k.value);
+        assert!((k.clap.unwrap().sent - 0.625).abs() < 1e-4, "pin.sent updated");
+
+        let main = app._surge_main.remove(0);
+        main.retire(voice);
+        let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
     }
 
     #[test]

@@ -2003,4 +2003,14 @@ Learned so far (2026-11-15, UI polish pass):
 228. **Drain CLAP `out_events` on the audio thread:** forward plugin-initiated
     `ParamValueEvent`s from `ev_out` via a lock-free ring to `ClapVoiceMain`
     instead of discarding `ev_out` between blocks (GigChain #60).
+229. **Isolated plugin workers must call `prctl(PR_SET_DUMPABLE, 0)` on Linux:**
+    `RLIMIT_CORE = 0` alone does not stop piped `core_pattern` handlers
+    (`apport`/`systemd-coredump`) from stalling `waitpid` for ~2 s on `SIGSEGV`
+    and making `poll_recovery` misclassify crashes as `hung (deadline exceeded)`.
+230. **LV2 test fixtures must mint unique URIs and directories per call and
+    unregister on cleanup:** sharing one URI across concurrent
+    `build_fixture_bundle` calls injects duplicate `ui:binary` triples into
+    `LilvWorld` and crashes `liblilv` in `lilv_world_get_unique`; suffix both
+    path and URI with a monotonic counter, call `lv2::remove_bundle(&dir)` before
+    deletion, and skip non-existent dirs in `EXTRA_BUNDLES`.
 

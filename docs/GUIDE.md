@@ -242,18 +242,20 @@ kabelsalat discovers Linux-native and yabridge-bridged Windows `.vst3` plugins
 in `~/.vst3`, `/usr/lib/vst3`, `/usr/local/lib/vst3`, `/usr/lib64/vst3`, and
 `$VST3_PATH` (out of process via `kabelsalat scan-vst3`). Bridged Windows
 plugins show a `VST3 · YABRIDGE` badge in the plugin browser. VST3 instruments
-and effects run inside the same per-plugin shared-memory sandbox as CLAP plugins,
-save state into sessions, map MIDI CCs (`IMidiMapping`), and open their native
-`IPlugView` X11 editor window.
+and effects run inside the same per-plugin shared-memory sandbox as CLAP and
+LV2 plugins, save state into sessions, map MIDI CCs (`IMidiMapping`), and open
+their native `IPlugView` X11 editor window.
 
+Controls moved inside a native CLAP, VST3, or LV2 plugin GUI stay synchronized
+live with Kabelsalat's parameter editor, pinned face/strip quick knobs, active
+setlist part parameter cache, and learned MIDI CC feedback (and vice versa).
 LV2 instruments, audio effects, and MIDI strips that ship a native
 `ui:X11UI` or `ui:showInterface` editor also expose **Open plugin window** in
-both the rack unit's right-click menu and the LV2 preset/parameter window.
-Controls moved inside the native LV2 GUI stay synchronized with the rack knobs
-and engine parameters (and vice versa). Note that yabridge and native X11
-plugin UIs run in XWayland windows on Linux; while verified against C probe
-fixtures (`vst3-test`, `lv2-ui-test`), specific third-party Windows/desktop
-bundles can be checked against your installed plugins.
+both the rack unit's right-click menu and the LV2 preset/parameter window. Note
+that yabridge and native X11 plugin UIs run in XWayland windows on Linux; while
+verified against C probe fixtures (`vst3-test`, `lv2-ui-test`), specific
+third-party Windows/desktop bundles can be checked against your installed
+plugins.
 
 ### Install instruments from the catalog
 
@@ -276,19 +278,20 @@ which plugins have been tested, what works, and what is still untested.
 
 ### Plugin crash isolation
 
-Every hosted CLAP and VST3 plugin runs in its own isolated
+Every hosted CLAP, VST3, and LV2 plugin runs in its own isolated
 `kabelsalat plugin-worker` helper process, communicating with the audio engine
 over an anonymous Linux shared-memory block (`memfd_create` + cross-process
-futex) and a control socket for parameters, state and the plugin's X11 editor
-window. If a plugin crashes (`SIGSEGV`, `SIGABRT`) or hangs past its per-block
+futex) and a control socket for parameters, state, and X11 plugin editor
+windows. If a plugin crashes (`SIGSEGV`, `SIGABRT`) or hangs past its per-block
 deadline, the engine plays silence for that strip while every other rig keeps
 sounding without an xrun. kabelsalat automatically restarts the dead helper
-with the unit's last saved state and shows a `RESTARTED` badge on the strip so
-you know what happened.
+with the unit's last saved state (and live control port values for LV2) and
+shows a `RESTARTED` badge on the strip so you know what happened.
 
-Set `KABELSALAT_SANDBOX=0` to host CLAP and VST3 plugins in-process instead. Run
-`kabelsalat sandbox-test` to verify `SIGSEGV` recovery across two live rigs and
-measure the shared-memory IPC round-trip time at 64 and 256 frames.
+Set `KABELSALAT_SANDBOX=0` to host CLAP, VST3, and LV2 plugins in-process
+instead. Run `kabelsalat sandbox-test` to verify `SIGSEGV` recovery across
+live rigs (CLAP and LV2) and measure the shared-memory IPC round-trip time at
+64 and 256 frames.
 
 ## Mix
 

@@ -1,2 +1,0 @@
-### Added
-- **Unsampled Piano CPU & room profiles in Sounds:** added five selectable profiles (`Full`, `Balanced`, `Light`, `Dry`, `Light Dry`) under Unsampled Piano's Sound library and assistant `load_sound` so players on laptops or low-buffer setups can trade built-in room/sympathetic physics for lower single-threaded DSP load (~25% vs ~76% under dense pedalled chords, ~0.4% vs ~7.2% idle on Apple M1).

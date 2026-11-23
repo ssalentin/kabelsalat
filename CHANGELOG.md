@@ -7,6 +7,30 @@ releases may still change behaviour and session files.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-23
+
+### Added
+- **Song notes and ChordPro charts in Show mode:** attach lyrics, cues, or ChordPro (`[Chord]`, `{comment:...}`) charts per song in the Setlist editor and read them on stage in Show mode with highlighted chords and keyboard scrolling.
+- **VST3 Program Change support:** MIDI Program Change messages (`0xC0`) now translate to the plugin's `kIsProgramChange` unit parameter so hardware pedals and keyboards switch VST3 presets cleanly.
+- **Startup realtime-priority warning:** logs a clear warning at startup if the audio thread is running without realtime priority (across PipeWire, JACK, and ALSA), pointing to Audio Doctor.
+- **Raspberry Pi / ARM64 and backing-track band guides:** added dedicated sections in `docs/GUIDE.md` for headless ARM64 rigs and live backing-track band workflows.
+- **Out-of-process plugin sandboxing (#209):** CLAP plugins now run in isolated `kabelsalat plugin-worker` helper processes communicating over anonymous shared memory (`memfd_create` + cross-process futex) and a control socketpair. If a plugin crashes or hangs past its block deadline, only that strip goes silent while every other rig keeps playing without an xrun, and the strip automatically restarts with its last saved state and displays a recovery badge. Set `KABELSALAT_SANDBOX=0` to disable sandboxing; run `kabelsalat sandbox-test` to test `SIGSEGV` recovery and measure IPC round-trip latency at 64 and 256 frames.
+- **Unsampled Piano CPU & room profiles in Sounds:** added five selectable profiles (`Full`, `Balanced`, `Light`, `Dry`, `Light Dry`) under Unsampled Piano's Sound library and assistant `load_sound` so players on laptops or low-buffer setups can trade built-in room/sympathetic physics for lower single-threaded DSP load (~25% vs ~76% under dense pedalled chords, ~0.4% vs ~7.2% idle on Apple M1).
+- **Live parameter sync from native CLAP and VST3 editors (#418):** parameter edits initiated inside a plugin's native editor (`performEdit`, `outputParameterChanges`, or CLAP `out_events`) now propagate across `plugin-worker` shared memory into Kabelsalat's parameter editor, pinned rack/strip quick knobs, active setlist part parameter cache, and learned MIDI CC feedback without echo loops.
+- **LV2 out-of-process plugin sandboxing (#413):** hosted LV2 instruments, audio effects, and MIDI FX now run inside isolated `kabelsalat plugin-worker` processes over `memfd_create` shared memory and futex wakeups, automatically restarting with saved state (`LV2_State_Interface`) and live control port values after a worker crash or hang and displaying a `RESTARTED` / `CRASHED` badge on the rack strip (disable with `KABELSALAT_SANDBOX=0`).
+- **VST3 plugin hosting & yabridge support (#285):** Scan and host Linux-native and yabridge-bridged Windows `.vst3` instruments and audio effects out-of-process inside the per-plugin `plugin-worker` sandbox with shared-memory audio, state save/restore (`KSV3`), MIDI CC mapping (`IMidiMapping`), parameter automation, and native `IPlugView` X11 editor windows (`kabelsalat vst3-test`).
+- **LV2 native GUI windows (#70):** Host LV2 `ui:X11UI` views inside a dedicated host `PluginWindow` (with `ui:showInterface` and `ui:idleInterface` support) toggled from the unit context menu or LV2 parameter editor, keeping parameter controls and MIDI events synchronized bidirectionally with the rack and engine (`kabelsalat lv2-ui-test`).
+
+### Fixed
+- **On-screen Stop demo button (#398):** while any rig demo phrase is playing (including one started by the Assistant), a `■ Stop demo` button now appears in the top bar (always visible even with the Left Rail closed) and in the Assistant panel header so you can stop playback with one click.
+- **CLAP plugin GUI opening reliability:** set `DISPLAY` (probing for the first reachable X11/XWayland socket) and `EGL_PLATFORM=x11` before `gui.create`, sync the host X11 window with the X server before `set_parent`, resize to post-attach plugin dimensions, fall back to floating X11/Wayland CLAP GUIs when embedded X11 is unsupported, allow double-clicking parameter-less CLAP plugins with native GUIs, and prevent sandboxed plugin workers from starving editor `pump()` callbacks or timing out slow GUI initialization.
+- **Repeated Note On on a held note:** retriggering an already-held note now emits Note Off before Note On per voice/LV2 slot so a single Note Off never leaves an orphan voice sounding.
+- **CLAP plugin editor parameter feedback:** plugin-initiated `ParamValueEvent`s from CLAP `out_events` are now drained lock-free to the host instead of being discarded between audio blocks.
+- **Plugin scanner crash vs kill handling:** killing the app or scanner with `SIGKILL`/`SIGTERM` during plugin loading no longer negatively caches (blocklists) healthy CLAP/VST3 plugins.
+- **Backing track stop-at-end:** starting a setlist song's backing track now always resets loop mode to off so a song stops cleanly at the end instead of looping unexpectedly.
+- **MIDI device name readability:** long hardware MIDI device names in Settings, Show Controls, Levels, and the MIDI Matrix now truncate cleanly with full-name hover tooltips.
+- **Setlist F12 shortcut documentation and test (#382):** documented `F12` for opening the Setlist in `docs/GUIDE.md` so the guide, tooltips, and help card all agree, and added a regression test confirming `F12` opens Setlist while `C` toggles the assistant dock.
+
 ## [0.3.0] — 2026-11-22
 
 ### Added
@@ -891,7 +915,8 @@ The first tagged release: a working live rack for Linux.
 - Sessions and starter templates; system-audio capture and WAV backing tracks.
 - Arch/Omarchy packaging (`packaging/PKGBUILD`).
 
-[Unreleased]: https://github.com/ssalentin/kabelsalat/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ssalentin/kabelsalat/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ssalentin/kabelsalat/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ssalentin/kabelsalat/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ssalentin/kabelsalat/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ssalentin/kabelsalat/releases/tag/v0.1.0

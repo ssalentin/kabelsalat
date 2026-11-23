@@ -22306,7 +22306,7 @@ impl DemoApp {
             std::thread::Builder::new()
                 .name("catalog-stars".into())
                 .spawn(move || {
-                    let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(8)).build() else {
+                    let Ok(client) = crate::llm::client_builder().timeout(std::time::Duration::from_secs(8)).build() else {
                         return;
                     };
                     for repo in crate::catalog::CATALOG.iter().filter_map(|e| e.source.github()) {

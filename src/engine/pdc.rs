@@ -501,6 +501,23 @@ impl Pdc {
         }
     }
 
+    /// [`Pdc::mix`] in stereo with a gain that is moving (a send level on
+    /// its way to a new value, #415): one `ramp` step per frame, times
+    /// `scale`. Allocation-free.
+    pub fn mix_ramped(&mut self, src: NodeId, dest: NodeId, buf: &[f32], ramp: &mut super::gain_ramp::GainRamp, scale: f32, out: &mut [f32]) {
+        let frames = out.len() / 2;
+        let mut line = self.lines.iter_mut().find(|l| l.src == src && l.dest == dest && l.frames > 0);
+        for i in 0..frames {
+            let (gl, gr) = ramp.tick();
+            let (l, r) = match line.as_mut() {
+                Some(line) => line.push(buf[i * 2], buf[i * 2 + 1]),
+                None => (buf[i * 2], buf[i * 2 + 1]),
+            };
+            out[i * 2] += l * gl * scale;
+            out[i * 2 + 1] += r * gr * scale;
+        }
+    }
+
     /// A rig's sum on its way into the mix, after its sends are tapped:
     /// delayed in place when a bus return is later than the sum.
     /// Allocation-free.

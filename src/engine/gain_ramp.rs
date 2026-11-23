@@ -44,6 +44,27 @@ impl GainRamp {
         self.step = ((to.0 - self.now.0) / n, (to.1 - self.now.1) / n);
     }
 
+    /// The gain right now.
+    pub const fn now(&self) -> (f32, f32) {
+        self.now
+    }
+
+    /// Land on the target at once: a ramp nothing was scaled with.
+    pub fn settle(&mut self) {
+        self.now = self.to;
+        self.left = 0;
+    }
+
+    /// Move one frame on and give that frame's gain (what `apply` scales a
+    /// frame by).
+    pub fn tick(&mut self) -> (f32, f32) {
+        if self.left > 0 {
+            self.left -= 1;
+            self.now = if self.left == 0 { self.to } else { (self.now.0 + self.step.0, self.now.1 + self.step.1) };
+        }
+        self.now
+    }
+
     /// At zero and staying there.
     pub fn is_silent(&self) -> bool {
         self.now == (0.0, 0.0) && self.to == (0.0, 0.0)

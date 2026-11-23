@@ -1289,20 +1289,46 @@ impl BusTaps<'_> {
 
     /// Add every send of `from` tapped at this point (`pre` or post fader)
     /// into its bus, scaled by `gain`, through its compensation delay when
-    /// the plan has one. Allocation-free; no work at all without sends.
-    fn tap(&mut self, pdc: &mut pdc::Pdc, sends: &[AuxSend], from: SendSource, pre: bool, gain: f32, src: &[f32]) {
+    /// the plan has one. A send whose level is moving ramps (#415), so a
+    /// part switch never steps what a bus hears. Allocation-free; no work at
+    /// all without sends.
+    fn tap(&mut self, pdc: &mut pdc::Pdc, sends: &mut [SendFade], from: SendSource, pre: bool, gain: f32, src: &[f32]) {
         // Only a source's send can have a delay; a rig's has no key.
         let key = match from {
             SendSource::Node(n) => n,
             SendSource::Rig(_) => NodeId::MAX,
         };
         for s in sends {
-            if s.from != from || s.pre != pre || s.level <= 0.0 { continue; }
+            if s.from != from || s.pre != pre || s.ramp.is_silent() { continue; }
             let Some(b) = self.nodes[..self.n].iter().position(|n| *n == s.bus) else { continue };
-            let g = s.level * gain;
-            pdc.mix(key, s.bus, src, false, (g, g), self.buf(b, src.len()));
+            // Several taps of one send in a block (a rig with two masters)
+            // each start from the block's ramp.
+            let mut ramp = s.ramp;
+            if ramp.is_ramping() {
+                pdc.mix_ramped(key, s.bus, src, &mut ramp, gain, self.buf(b, src.len()));
+            } else {
+                let g = ramp.now().0 * gain;
+                pdc.mix(key, s.bus, src, false, (g, g), self.buf(b, src.len()));
+            }
+            s.next = ramp;
+            s.tapped = true;
         }
     }
+}
+
+/// One send's level as the bus hears it (#415): the table's level, reached
+/// over `gain_ramp::RAMP_S`. It outlives its table entry until it has faded
+/// out, so a send a part closes fades instead of stopping in one sample.
+#[derive(Clone, Copy, Debug)]
+struct SendFade {
+    from: SendSource,
+    bus: NodeId,
+    pre: bool,
+    /// The gain at the start of this block.
+    ramp: gain_ramp::GainRamp,
+    /// Where a tap of this block left it.
+    next: gain_ramp::GainRamp,
+    tapped: bool,
 }
 
 /// One source's output stage: the pre-fader send tap, its level, the strip
@@ -1314,7 +1340,7 @@ fn source_out(
     strips: &[(NodeId, StripMix)],
     graph: &Graph,
     solo_rigs: &[bool; MAX_RIGS],
-    sends: &[AuxSend],
+    sends: &mut [SendFade],
     taps: &mut BusTaps,
     pdc: &mut pdc::Pdc,
     node: NodeId,
@@ -1879,6 +1905,9 @@ pub struct GraphEngine {
     strips: Vec<(NodeId, StripMix)>,
     /// Sends into aux buses (SetSend, issue #5). Capacity MAX_SENDS, fixed.
     sends: Vec<AuxSend>,
+    /// What each send sounds like right now (#415): `sends` ramped, and the
+    /// sends still fading out. Capacity 2 * MAX_SENDS, fixed.
+    send_fades: Vec<SendFade>,
     /// The buses' send accumulators: MAX_BUSES stereo blocks back to back.
     bus_acc: Vec<f32>,
     /// Buses that play to their own output (SetBusOutput, #147). Capacity
@@ -2118,6 +2147,7 @@ impl GraphEngine {
             fx_done: Vec::with_capacity(16 * MAX_RIGS),
             fx_after_bus: Vec::with_capacity(16 * MAX_RIGS),
             sends: Vec::with_capacity(MAX_SENDS),
+            send_fades: Vec::with_capacity(2 * MAX_SENDS),
             bus_acc: vec![0.0; MAX_BUSES * BUS_SPAN],
             bus_outs: Vec::with_capacity(MAX_BUS_OUTS),
             out_routes: Vec::with_capacity(MAX_OUT_ROUTES),
@@ -4114,10 +4144,10 @@ impl GraphEngine {
             let solo = if source { solo_rigs } else { &[false; MAX_RIGS] };
             let strips = &self.strips;
             match taps.as_deref_mut() {
-                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, &mut self.pdc, node, None, false, &mut buf[..n2]),
+                Some(t) => source_out(strips, &self.graph, solo, &mut self.send_fades, t, &mut self.pdc, node, None, false, &mut buf[..n2]),
                 None => {
                     let mut none = BusTaps { nodes: [NodeId::MAX; MAX_BUSES], n: 0, acc: &mut [], span: 0 };
-                    source_out(strips, &self.graph, solo, &[], &mut none, &mut self.pdc, node, None, false, &mut buf[..n2]);
+                    source_out(strips, &self.graph, solo, &mut [], &mut none, &mut self.pdc, node, None, false, &mut buf[..n2]);
                 }
             }
             self.node_timer.record(node, node_t0.elapsed());
@@ -4836,6 +4866,51 @@ impl GraphEngine {
         self.mix_dirty = true;
     }
 
+    /// Head the heard level of one send for `to` over `gain_ramp::RAMP_S`
+    /// (#415). Allocation-free: with the table full of fading sends, the
+    /// new level lands at once.
+    fn fade_send(&mut self, from: SendSource, bus: NodeId, to: f32, pre: bool) {
+        let frames = (gain_ramp::RAMP_S * self.sample_rate) as u32;
+        let i = match self.send_fades.iter().position(|f| f.from == from && f.bus == bus) {
+            Some(i) => i,
+            None => {
+                if to <= 0.0 { return; }
+                if self.send_fades.len() >= self.send_fades.capacity() {
+                    // Give up the fade-out of a send that is gone already.
+                    let sends = &self.sends;
+                    match self.send_fades.iter().position(|f| !sends.iter().any(|s| s.from == f.from && s.bus == f.bus)) {
+                        Some(gone) => { self.send_fades.swap_remove(gone); }
+                        None => return,
+                    }
+                }
+                let silent = gain_ramp::GainRamp::at(0.0);
+                self.send_fades.push(SendFade { from, bus, pre, ramp: silent, next: silent, tapped: false });
+                self.send_fades.len() - 1
+            }
+        };
+        let f = &mut self.send_fades[i];
+        f.pre = pre;
+        f.ramp.set((to, to), frames);
+        // Not "nobody tapped it": the block that follows has not run yet.
+        f.next = f.ramp;
+        f.tapped = true;
+    }
+
+    /// Once per block, before its commands: every send moves on to where
+    /// the last block's tap left it. One nothing tapped (its source silenced
+    /// or asleep) lands on its level, and one that has faded out is dropped.
+    fn step_send_fades(&mut self) {
+        for f in self.send_fades.iter_mut() {
+            if f.tapped {
+                f.ramp = f.next;
+                f.tapped = false;
+            } else {
+                f.ramp.settle();
+            }
+        }
+        self.send_fades.retain(|f| !f.ramp.is_silent());
+    }
+
     /// One send into an aux bus (SetSend, or a CC bound to its level). False
     /// when `bus` is no bus, `from` cannot send (a bus, a node of a bus's
     /// chain: feedback) or the table is full. Allocation-free.
@@ -4857,7 +4932,9 @@ impl GraphEngine {
         };
         if let Some(l) = level { self.sends[i].level = if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 }; }
         if let Some(p) = pre { self.sends[i].pre = p; }
+        let (to, tap_pre) = (self.sends[i].level, self.sends[i].pre);
         self.sends.retain(|s| !s.is_default());
+        self.fade_send(from, bus, to, tap_pre);
         // A send that starts or stops sounding changes how late its bus is;
         // a level move does not. Replans without allocating: bus lines are
         // preallocated when the graph has a bus and any latent unit.
@@ -5702,6 +5779,7 @@ impl GraphEngine {
                 if self.strips.len() != strips_before { self.mix_dirty = true; }
                 let before = self.sends.len();
                 self.sends.retain(|s| s.bus != id && s.from != SendSource::Node(id));
+                self.send_fades.retain(|s| s.bus != id && s.from != SendSource::Node(id));
                 if self.sends.len() != before { self.mix_dirty = true; }
                 self.show_gates.forget_bus(id);
                 if self.bus_outs.iter().any(|o| o.bus == SendSource::Node(id)) {
@@ -5948,6 +6026,7 @@ impl GraphEngine {
                 self.zone_hands = Hands::default();
                 self.strips.clear();
                 self.sends.clear();
+                self.send_fades.clear();
                 self.bus_outs.clear();
                 self.out_routes.clear();
                 self.assign_out_slots();
@@ -6891,6 +6970,7 @@ impl GraphEngine {
         if let Some(rec) = &mut self.recorder {
             rec.drain_stems();
         }
+        self.step_send_fades();
         // Drain newly-attached voices BEFORE commands so per-node setup
         // commands (SetParam P_LEVEL, SetRigSource, SetRigDevice) pushed in
         // the same frame as VoiceMsg::AddBound find the voice already bound
@@ -7069,7 +7149,7 @@ impl GraphEngine {
             // (rule 53). Sends tap on either side of it; PDC keeps running
             // while bypassed so parallel paths stay aligned.
             s.gain.set((s.level, s.level), ramp);
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, Some(&mut s.gain), bypassed, &mut s.scratch[..n2]);
+            source_out(&self.strips, &self.graph, &solo_rigs, &mut self.send_fades, &mut taps, &mut self.pdc, s.node, Some(&mut s.gain), bypassed, &mut s.scratch[..n2]);
             // One clock read per voice: each ends where the next begins.
             let now = std::time::Instant::now();
             self.node_timer.record(s.node, now - node_t0);
@@ -7089,7 +7169,7 @@ impl GraphEngine {
             }
             let muted = !zone_of(&self.rig_zones, &self.graph, node).live
                 || strip_bypassed(&self.strips, node);
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, node, None, muted, &mut self.audio_in[i].buf[..n2]);
+            source_out(&self.strips, &self.graph, &solo_rigs, &mut self.send_fades, &mut taps, &mut self.pdc, node, None, muted, &mut self.audio_in[i].buf[..n2]);
         }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
@@ -7144,7 +7224,7 @@ impl GraphEngine {
                 }
                 let muted = !zone_of(&self.rig_zones, &self.graph, node).live
                     || strip_bypassed(&self.strips, node);
-                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, node, None, muted, &mut self.dsp[i].buf[..n2]);
+                source_out(&self.strips, &self.graph, &solo_rigs, &mut self.send_fades, &mut taps, &mut self.pdc, node, None, muted, &mut self.dsp[i].buf[..n2]);
             }
         }
         if counting_in_this_block {
@@ -7348,7 +7428,7 @@ impl GraphEngine {
                 let rig = self.graph.node(master).map(|n| n.rig as usize).unwrap_or(0).min(MAX_RIGS - 1);
                 let (open, gl, gr) = gains[mi];
                 let from = SendSource::Rig(rig as u8);
-                let sends = self.sends.iter().any(|s| s.from == from);
+                let sends = self.sends.iter().any(|s| s.from == from) || self.send_fades.iter().any(|s| s.from == from);
                 let live = open && (gl != 0.0 || gr != 0.0 || sends);
                 if self.rig_is_sleeping(rig) {
                     let target = if live { (gl, gr) } else { (0.0, 0.0) };
@@ -7409,9 +7489,9 @@ impl GraphEngine {
                     rig_buf.fill(0.0);
                 } else {
                     // Sends tap the rig bus on either side of its fader.
-                    if live && sends { taps.tap(&mut self.pdc, &self.sends, from, true, 1.0, rig_buf); }
+                    if live && sends { taps.tap(&mut self.pdc, &mut self.send_fades, from, true, 1.0, rig_buf); }
                     fader.apply(rig_buf);
-                    if live && sends { taps.tap(&mut self.pdc, &self.sends, from, false, 1.0, rig_buf); }
+                    if live && sends { taps.tap(&mut self.pdc, &mut self.send_fades, from, false, 1.0, rig_buf); }
                 }
                 self.rig_gain[rig] = fader;
                 self.pdc.rig_out(master, rig_buf);
@@ -13410,6 +13490,52 @@ mod send_tests {
             AuxSend { from: SendSource::Rig(0), bus: r.aux, level: 0.5, pre: false },
             AuxSend { from: SendSource::Rig(1), bus: r.aux, level: 0.75, pre: false },
         ]);
+    }
+
+    /// #415: a send level a setlist part recalls under a held tone moves
+    /// over the ramp, and a send that is closed fades out although its
+    /// table entry is gone at once.
+    #[test]
+    fn a_send_level_ramps_to_its_new_value_and_a_closed_send_fades_out() {
+        let mut r = Rack::new();
+        // What the bus takes in over `blocks` blocks, left channel.
+        fn heard(r: &mut Rack, blocks: usize) -> Vec<f32> {
+            let mut out = Vec::new();
+            for _ in 0..blocks {
+                r.render(1);
+                let d = r.engine.dsp.iter().find(|d| d.node == r.aux).expect("the bus slot");
+                out.extend(d.buf[..N * 2].chunks_exact(2).map(|f| f[0]));
+            }
+            out
+        }
+        let curve = |x: &[f32]| x.windows(3).map(|w| (w[2] - 2.0 * w[1] + w[0]).abs()).fold(0.0, f32::max);
+        r.send(SendSource::Rig(0), 0.2, false);
+        heard(&mut r, 4);
+        let pa = r.in_peak(0);
+        r.send(SendSource::Rig(0), 0.9, false);
+        let up = heard(&mut r, 3);
+        let steady = curve(&up[2 * N..]);
+        assert!(close(block_peak(&up[2 * N..]), 0.9 * pa), "the send lands on its level: {}", block_peak(&up[2 * N..]));
+        assert!(curve(&up) <= 3.0 * steady, "no step on the way up: {} against {steady} in the held tone", curve(&up));
+        let ramp = (gain_ramp::RAMP_S * 48000.0) as usize;
+        assert!(block_peak(&up[..ramp / 2]) < 0.6 * pa, "half way through the ramp it is not there yet: {}", block_peak(&up[..ramp / 2]));
+
+        r.send(SendSource::Rig(0), 0.0, false);
+        let down = heard(&mut r, 3);
+        assert!(r.engine.sends.is_empty(), "a closed send leaves the table at once: {:?}", r.engine.sends);
+        assert!(block_peak(&down[..ramp / 2]) > 0.3 * pa, "and still fades: {}", block_peak(&down[..ramp / 2]));
+        assert!(curve(&down) <= 3.0 * steady, "no step on the way down: {} against {steady}", curve(&down));
+        assert_eq!(block_peak(&down[N..]), 0.0, "silent once the ramp is through");
+        assert!(r.engine.send_fades.is_empty(), "and its fade is dropped");
+
+        // A send whose rig is muted is not tapped: its level lands at once,
+        // so the unmuted rig does not start with a stale ramp.
+        r.bus.send(Command::SetRigMix { rig: 0, vol: None, pan: None, mute: Some(true), solo: None });
+        r.send(SendSource::Rig(0), 0.5, false);
+        heard(&mut r, 3);
+        r.bus.send(Command::SetRigMix { rig: 0, vol: None, pan: None, mute: Some(false), solo: None });
+        let back = heard(&mut r, 3);
+        assert!(close(block_peak(&back[2 * N..]), 0.5 * pa), "the send is at its level: {}", block_peak(&back[2 * N..]));
     }
 
     #[test]

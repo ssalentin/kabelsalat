@@ -1559,23 +1559,29 @@ pub enum Template {
     /// into an amp and cabinet. Audio In picks the input device on its face
     /// (default = PipeWire's default source) and carries the tuner.
     GuitarRig,
+    /// The singer's and guitarist's stage rig (#415): a live input through
+    /// its own tone chain at show level, a hall and an echo on aux buses, and
+    /// a song whose parts each recall a send scene (dry verse, hall on the
+    /// chorus, hall and echo on the solo). Built-in units only.
+    StageSends,
 }
 
 impl Template {
-    pub const ALL: [Template; 6] = [
+    pub const ALL: [Template; 7] = [
         Template::CathedralOrgan,
         Template::JazzOrgan,
         Template::RockOrgan,
         Template::AmbientPad,
         Template::SynthLead,
         Template::GuitarRig,
+        Template::StageSends,
     ];
 
     /// A template whose instrument is a live input, not the keyboard: the
     /// validity test asks for Audio In → effects → Master instead of
     /// Keys → synth → Master.
     pub fn is_guitar(self) -> bool {
-        matches!(self, Template::GuitarRig)
+        matches!(self, Template::GuitarRig | Template::StageSends)
     }
 
     /// The name the agent tools take (`load_template`).
@@ -1587,6 +1593,7 @@ impl Template {
             Template::AmbientPad => "ambient_pad",
             Template::SynthLead => "synth_lead",
             Template::GuitarRig => "guitar_rig",
+            Template::StageSends => "stage_sends",
         }
     }
 
@@ -1600,6 +1607,7 @@ impl Template {
             "ambient" | "pad" => Template::AmbientPad,
             "lead" | "lead_reverb" => Template::SynthLead,
             "guitar" => Template::GuitarRig,
+            "vocal" | "vocals" | "singer" | "vocal_rig" | "send_scenes" => Template::StageSends,
             _ => return Template::ALL.into_iter().find(|t| t.id() == name),
         };
         Some(alias)
@@ -1613,6 +1621,7 @@ impl Template {
             Template::AmbientPad => "Ambient Pad",
             Template::SynthLead => "Synth Lead",
             Template::GuitarRig => "Guitar Rig",
+            Template::StageSends => "Stage Sends",
         }
     }
 
@@ -1625,6 +1634,7 @@ impl Template {
             Template::AmbientPad => "Surge pad, long delay, big reverb",
             Template::SynthLead => "Surge lead, slap delay, reverb",
             Template::GuitarRig => "Live input, stomps, amp, cabinet",
+            Template::StageSends => "Voice or guitar, hall and echo sends per song part",
         }
     }
 
@@ -1636,6 +1646,7 @@ impl Template {
             Template::RockOrgan => &["setbfree", "guitarix"],
             Template::AmbientPad | Template::SynthLead => &["surge-xt"],
             Template::GuitarRig => &["guitarix"],
+            Template::StageSends => &[],
         }
     }
 
@@ -1653,6 +1664,9 @@ impl Template {
         }
         for (node, plugin_id, data) in states {
             s.set_plugin_state(node, plugin_id, data);
+        }
+        if self == Template::StageSends {
+            stage_sends_show(&mut s);
         }
         s
     }
@@ -1837,9 +1851,68 @@ impl Template {
                     (master, P_WARM, 0.1),
                 ]);
             }
+            // Audio In → EQ → Limiter → Master is the input rig: no part
+            // names it, so it lives at show level and nothing switches it.
+            // HALL and ECHO are aux buses with one effect each, fully wet;
+            // the parts' send scenes decide what reaches them
+            // (`stage_sends_show`).
+            Template::StageSends => {
+                let ain = g.add_node(
+                    NodeKind::AudioIn { device: None, channels: AudioInChannel::MonoL },
+                    name_bytes("AUDIO IN"),
+                );
+                let eq = g.add_node(NodeKind::Dsp(DspKind::Eq3), name_bytes("TONE"));
+                let limiter = g.add_node(NodeKind::Dsp(DspKind::Limiter), name_bytes("LIMITER"));
+                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+                let hall = g.add_node(NodeKind::Dsp(DspKind::Bus), name_bytes(STAGE_HALL));
+                let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("HALL REVERB"));
+                let echo = g.add_node(NodeKind::Dsp(DspKind::Bus), name_bytes(STAGE_ECHO));
+                let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("ECHO DELAY"));
+                link(&mut g, ain, eq, 0, PortKind::Audio);
+                link(&mut g, eq, limiter, 0, PortKind::Audio);
+                link(&mut g, limiter, master, 0, PortKind::Audio);
+                link(&mut g, hall, verb, 0, PortKind::Audio);
+                link(&mut g, verb, master, 0, PortKind::Audio);
+                link(&mut g, echo, delay, 0, PortKind::Audio);
+                link(&mut g, delay, master, 0, PortKind::Audio);
+                defaults.extend([
+                    (verb, 0, 1.0), // a send effect is all wet
+                    (delay, P_TIME, 0.5),
+                    (delay, P_MIX, 1.0),
+                    (master, P_VOL, 0.75),
+                    (master, P_WARM, 0.1),
+                ]);
+            }
         }
         (g, defaults, states)
     }
+}
+
+/// The Stage Sends template's aux buses, by name.
+pub const STAGE_HALL: &str = "HALL";
+pub const STAGE_ECHO: &str = "ECHO";
+
+/// The Stage Sends template's song (#415): three parts, each with a send
+/// scene for the whole input rig, starting on the verse.
+fn stage_sends_show(s: &mut Session) {
+    use crate::control::{AuxSend, SendSource};
+    use crate::setlist::{Part, SendScene, SetlistPos, Song};
+    let bus = |name: &str| s.graph.nodes.iter().find(|n| crate::control::name_str(&n.name) == name).map(|n| n.id);
+    let (Some(hall), Some(echo)) = (bus(STAGE_HALL), bus(STAGE_ECHO)) else { return };
+    let rig = SendSource::Rig(0);
+    let part = |name: &str, hall_level: f32, echo_level: f32| {
+        let mut scene = SendScene::default();
+        scene.set_send(rig, hall, hall_level);
+        scene.set_send(rig, echo, echo_level);
+        let mut p = Part::new(name, Vec::new());
+        p.scene = Some(scene);
+        p
+    };
+    let parts = vec![part("Verse", 0.15, 0.0), part("Chorus", 0.5, 0.0), part("Solo", 0.3, 0.45)];
+    s.setlist.songs.push(Song::new("Song 1", parts));
+    s.setlist.active = Some(SetlistPos { song: 0, part: 0 });
+    // The patch opens on the verse's scene.
+    s.set_sends(vec![AuxSend { from: rig, bus: hall, level: 0.15, pre: false }]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2429,7 +2502,9 @@ mod tests {
     #[test]
     fn templates_name_their_plugins_and_answer_to_their_ids() {
         for t in Template::ALL {
-            assert!(!t.plugins().is_empty(), "{} needs a plugin", t.title());
+            // Stage Sends is built-in units only (#415); every other
+            // template hosts a plugin.
+            assert_eq!(t.plugins().is_empty(), t == Template::StageSends, "{}", t.title());
             for id in t.plugins() {
                 assert!(crate::catalog::find(id).is_some(), "{}: '{id}' is not in the catalog", t.title());
             }

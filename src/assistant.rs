@@ -796,6 +796,11 @@ fn system_prompt() -> String {
      - A click or monitor mix on the headphones only: set_bus_output plays one rig bus \
      (rig=) or aux bus (bus=) to its own sound card (name from list_audio_outputs) and \
      takes it out of the master mix; output null brings it back; get_bus_outputs lists them. \
+     - Stage outputs on ONE multi-channel interface (the click on outputs 3-4 for the \
+     in-ears while the master plays on 1-2 for the PA): set_output_route with source \
+     master, click or player (the backing track), or rig= / bus= for a bus, and output = \
+     the first output number (3 = outputs 3-4; mono=true = output 3 alone); get_output_routes \
+     lists them and how many outputs the interface has. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -1123,6 +1128,16 @@ pub(crate) fn tools() -> Value {
             "name":"set_bus_output",
             "description":"Play one rig bus (rig = 0-based index) OR one aux bus (bus = its node id) to a sound card of its own instead of the master's, e.g. the click or a monitor mix only on the headphones while the main mix goes to the PA. output: a name from list_audio_outputs; null or empty = back into the master. A bus on its own output is no longer in the master mix; its fader, pan, mute and inserts still act on it. At most 4 different outputs besides the master's. Saved with the session; while the device is unplugged the bus is silent, never on another output.",
             "parameters":{"type":"object","properties":{"rig":{"type":"integer","description":"Rig whose bus to route (0-based); give rig OR bus"},"bus":{"type":"integer","description":"Aux bus node id; give rig OR bus"},"output":{"type":["string","null"],"description":"Sink name from list_audio_outputs; null = master out"}},"required":[]}
+        }},
+        {"type":"function","function":{
+            "name":"set_output_route",
+            "description":"Stage output matrix: play one source on its own output channels of the audio interface kabelsalat plays to, e.g. the click on outputs 3-4 for the in-ear monitors while the master plays on 1-2 for the PA. Name ONE source: source = master, click (every metronome and the count-in) or player (the backing track or cue file), OR rig (0-based index, that rig's bus), OR bus (an aux bus's node id). output = the number of the first output channel (1 = the first): 3 means outputs 3-4, or output 3 alone with mono=true; null = no outputs of its own (the master plays on 1-2; click, player and buses play in the master mix). A click, player or bus on outputs of its own has left the master mix and passes no master limiter. level_db (default 0, at most 6) and pan (-1..1, the balance of a pair) set its level there. Saved with the session. While the interface has fewer outputs (a 2-channel laptop) the assignment is kept and the source plays where it would without one; get_output_routes says so.",
+            "parameters":{"type":"object","properties":{"source":{"type":"string","enum":["master","click","player"],"description":"master, click or player; omit when giving rig or bus"},"rig":{"type":"integer","description":"Rig whose bus to place (0-based); instead of source"},"bus":{"type":"integer","description":"Aux bus node id; instead of source"},"output":{"type":["integer","null"],"description":"First output channel, 1-based (3 = outputs 3-4); null = no assignment"},"mono":{"type":"boolean","description":"true = one output channel instead of a pair"},"level_db":{"type":"number","description":"Level on these outputs in dB, default 0"},"pan":{"type":"number","description":"Balance of the pair, -1..1, default 0"}},"required":[]}
+        }},
+        {"type":"function","function":{
+            "name":"get_output_routes",
+            "description":"List the stage output matrix: how many output channels the audio interface in use has, and for master, click, player, every rig bus and every aux bus the outputs it is assigned to (null = none) and where it plays right now.",
+            "parameters":{"type":"object","properties":{},"required":[]}
         }},
         {"type":"function","function":{
             "name":"get_bus_outputs",

@@ -136,6 +136,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   and any bus on its own sound card, such as a click to the headphones.
   → [System audio](docs/GUIDE.md#mix-the-other-apps-and-pick-your-sound-card),
   [Bus outputs](docs/GUIDE.md#send-a-bus-to-its-own-sound-card)
+- **Stage outputs on one interface:** the master to FOH on 1–2, the click
+  and backing track to the in-ears on 3–4, any bus to a wedge, each at its
+  own level. → [Stage outputs](docs/GUIDE.md#stage-outputs-foh-in-ears-and-click-on-one-interface)
 
 **Play live**
 - **A setlist of songs and parts** that switches without cutting held notes

@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::control::{AuxSend, BusOut, SendSource, SinkName};
+use crate::control::{AuxSend, BusOut, OutChannels, OutRoute, OutSource, SendSource, SinkName};
 use crate::control::MAX_RIGS;
 use crate::control::{
     split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
@@ -1242,6 +1242,12 @@ pub const MAX_SENDS: usize = 8 * MAX_RIGS;
 pub const MAX_OUTS: usize = 4;
 /// Buses that can leave the main mix: every rig bus and every aux bus.
 pub const MAX_BUS_OUTS: usize = MAX_RIGS + MAX_BUSES;
+/// Most channels of an audio interface the stage output matrix reaches
+/// (#399); a device with more plays its first `MAX_OUT_CH`.
+pub const MAX_OUT_CH: usize = 32;
+/// Assignments of the stage output matrix at once (#399): master, click and
+/// player, and sixteen buses (each has its own stereo mix).
+pub const MAX_OUT_ROUTES: usize = 3 + 16;
 /// An empty slot of the published bus-output table.
 pub const NO_BUS_OUT: BusOut = BusOut { bus: SendSource::Rig(0), sink: SinkName::NONE };
 
@@ -1457,6 +1463,8 @@ impl Default for GraphPub {
             strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
             sends: [NO_SEND; MAX_SENDS],
             bus_outs: [NO_BUS_OUT; MAX_BUS_OUTS],
+            out_routes: [None; MAX_OUT_ROUTES],
+            out_channels: 2,
             out_slots: [OutSlot::FREE; MAX_OUTS],
             system_gain: 0.0,
             master_mute: false,
@@ -1607,6 +1615,11 @@ pub struct GraphPub {
     /// they play to, same publication as `strips`.
     pub bus_outs: [BusOut; MAX_BUS_OUTS],
     pub out_slots: [OutSlot; MAX_OUTS],
+    /// The stage output matrix (#399): who plays on which channels of the
+    /// interface, and how many channels the open stream has (an assignment
+    /// past them plays where it would without one). Same publication.
+    pub out_routes: [Option<OutRoute>; MAX_OUT_ROUTES],
+    pub out_channels: u8,
     /// System-audio capture gain, published with the mix (same `mix_rev`).
     pub system_gain: f32,
     /// Whether Kabelsalat's master mix to Master out is muted, published with `mix_rev`.
@@ -1871,6 +1884,16 @@ pub struct GraphEngine {
     /// Buses that play to their own output (SetBusOutput, #147). Capacity
     /// MAX_BUS_OUTS, fixed.
     bus_outs: Vec<BusOut>,
+    /// The stage output matrix (SetOutRoute, #399), each assignment with the
+    /// gain it is ramping to. Capacity MAX_OUT_ROUTES, fixed; assignment `i`
+    /// mixes into `out_mix` slot `MAX_OUTS + i`.
+    out_routes: Vec<(OutRoute, gain_ramp::GainRamp)>,
+    /// Channels of the stream the last block rendered into.
+    out_ch: usize,
+    /// This block: the `out_mix` slot of the click while it has channels of
+    /// its own, and whether any assignment has its channels.
+    click_out: Option<usize>,
+    hw_active: bool,
     /// The extra outputs those buses play to: a slot is taken while a bus
     /// names its sink.
     out_slots: [OutSlot; MAX_OUTS],
@@ -2097,8 +2120,12 @@ impl GraphEngine {
             sends: Vec::with_capacity(MAX_SENDS),
             bus_acc: vec![0.0; MAX_BUSES * BUS_SPAN],
             bus_outs: Vec::with_capacity(MAX_BUS_OUTS),
+            out_routes: Vec::with_capacity(MAX_OUT_ROUTES),
+            out_ch: 2,
+            click_out: None,
+            hw_active: false,
             out_slots: [OutSlot::FREE; MAX_OUTS],
-            out_mix: vec![0.0; MAX_OUTS * BUS_SPAN],
+            out_mix: vec![0.0; (MAX_OUTS + MAX_OUT_ROUTES) * BUS_SPAN],
             out_tx,
             out_rx: Some(out_rx),
             out_epochs: Arc::new(std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0))),
@@ -4125,7 +4152,12 @@ impl GraphEngine {
         };
         for v in &self.voices { if v.node != NodeId::MAX { add(v.node, &v.scratch); } }
         for a in &self.audio_in { add(a.node, &a.buf); }
-        for d in &self.dsp { add(d.node, &d.buf); }
+        // A click on channels of its own (#399) feeds no cable.
+        let click_away = self.click_out.is_some();
+        for d in &self.dsp {
+            if click_away && d.kind == DspKind::Metronome { continue; }
+            add(d.node, &d.buf);
+        }
         for l in &self.lv2 { add(l.node, &l.buf); }
     }
 
@@ -4863,11 +4895,66 @@ impl GraphEngine {
             self.assign_out_slots();
             return false;
         }
+        if sink.is_some() {
+            // One place per bus: a sound card of its own takes it off the
+            // interface's channels (#399).
+            self.out_routes.retain(|(r, _)| r.source != OutSource::Bus(bus));
+        }
         if let SendSource::Rig(r) = bus {
             self.wake_rig(r as usize);
         }
         self.mix_dirty = true;
         true
+    }
+
+    /// Put `source` on channels of the audio interface (SetOutRoute, #399),
+    /// or back where it plays by default for `None`. False when `source` is
+    /// no bus, the channels are past `MAX_OUT_CH`, or the matrix is full.
+    /// A changed level or pan ramps (rule 202). Allocation-free.
+    fn set_out_route(&mut self, source: OutSource, to: Option<OutChannels>) -> bool {
+        if let OutSource::Bus(bus) = source {
+            let is_bus = match bus {
+                SendSource::Rig(r) => (r as usize) < MAX_RIGS,
+                SendSource::Node(n) => self.graph.is_bus(n),
+            };
+            if !is_bus { return false; }
+        }
+        let Some(to) = to.map(OutChannels::clamped) else {
+            let before = self.out_routes.len();
+            self.out_routes.retain(|(r, _)| r.source != source);
+            if self.out_routes.len() != before { self.mix_dirty = true; }
+            return true;
+        };
+        if !to.fits(MAX_OUT_CH) { return false; }
+        match self.out_routes.iter_mut().find(|(r, _)| r.source == source) {
+            // The same assignment keeps its place, so its ramp carries on.
+            Some((r, _)) => r.to = to,
+            None => {
+                if self.out_routes.len() >= MAX_OUT_ROUTES { return false; }
+                let (l, r) = to.gains();
+                self.out_routes.push((OutRoute { source, to }, gain_ramp::GainRamp::at_stereo(l, r)));
+            }
+        }
+        if let OutSource::Bus(bus) = source {
+            // One place per bus: channels of the interface take it off a
+            // sound card of its own.
+            if self.bus_outs.iter().any(|o| o.bus == bus) {
+                self.bus_outs.retain(|o| o.bus != bus);
+                self.assign_out_slots();
+            }
+            if let SendSource::Rig(r) = bus {
+                self.wake_rig(r as usize);
+            }
+        }
+        self.mix_dirty = true;
+        true
+    }
+
+    /// The `out_mix` slot of an assignment whose channels the open stream
+    /// has; `None` = `source` plays where it does without one.
+    fn route_slot(&self, source: OutSource) -> Option<usize> {
+        let i = self.out_routes.iter().position(|(r, _)| r.source == source)?;
+        self.out_routes[i].0.to.fits(self.out_ch).then_some(MAX_OUTS + i)
     }
 
     /// Fit the extra outputs to the sinks the buses name: a slot nobody
@@ -4903,8 +4990,11 @@ impl GraphEngine {
 
     /// The extra output `bus` plays to; `None` = the master.
     fn out_slot_of(&self, bus: SendSource) -> Option<usize> {
-        let sink = self.bus_outs.iter().find(|o| o.bus == bus)?.sink;
-        self.out_slots.iter().position(|s| s.sink == sink)
+        match self.bus_outs.iter().find(|o| o.bus == bus) {
+            Some(o) => self.out_slots.iter().position(|s| s.sink == o.sink),
+            // Or channels of the interface (#399), while it has them.
+            None => self.route_slot(OutSource::Bus(bus)),
+        }
     }
 
     /// The extra output a return plays to: that of the bus whose insert
@@ -5619,6 +5709,9 @@ impl GraphEngine {
                     self.assign_out_slots();
                     self.mix_dirty = true;
                 }
+                let routes_before = self.out_routes.len();
+                self.out_routes.retain(|(r, _)| r.source != OutSource::Bus(SendSource::Node(id)));
+                if self.out_routes.len() != routes_before { self.mix_dirty = true; }
                 self.audio_in.retain(|s| s.node != id);
                 self.arp.retain(|s| s.node != id);
                 if let Some(i) = self.lv2.iter().position(|s| s.node == id) {
@@ -5856,6 +5949,7 @@ impl GraphEngine {
                 self.strips.clear();
                 self.sends.clear();
                 self.bus_outs.clear();
+                self.out_routes.clear();
                 self.assign_out_slots();
                 if self.master_clock.is_counting_in() {
                     self.master_clock = MasterClock::Stopped;
@@ -6031,6 +6125,9 @@ impl GraphEngine {
             }
             Command::SetSend { from, bus, level, pre } => {
                 self.set_send(from, bus, level, pre);
+            }
+            Command::SetOutRoute { source, to } => {
+                self.set_out_route(source, to);
             }
             Command::SetBusOutput { bus, sink } => {
                 self.set_bus_output(bus, sink);
@@ -6872,6 +6969,11 @@ impl GraphEngine {
                     g.bus_outs = [NO_BUS_OUT; MAX_BUS_OUTS];
                     g.bus_outs[..self.bus_outs.len()].copy_from_slice(&self.bus_outs);
                     g.out_slots = self.out_slots;
+                    g.out_routes = [None; MAX_OUT_ROUTES];
+                    for (i, (r, _)) in self.out_routes.iter().enumerate() {
+                        g.out_routes[i] = Some(*r);
+                    }
+                    g.out_channels = self.out_ch.min(MAX_OUT_CH) as u8;
                     g.system_gain = self.system_gain;
                     g.master_mute = self.master_mute;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
@@ -6881,6 +6983,14 @@ impl GraphEngine {
             }
         }
 
+        // The stage output matrix (#399) follows the stream's channels: an
+        // assignment past them plays where it would without one.
+        if self.out_ch != ch {
+            self.out_ch = ch;
+            self.mix_dirty = true;
+        }
+        self.click_out = self.route_slot(OutSource::Click);
+        self.hw_active = self.out_routes.iter().any(|(r, _)| r.to.fits(ch));
         let frames = data.len() / ch;
         let cap = 8192;
         if frames > cap {
@@ -7201,13 +7311,15 @@ impl GraphEngine {
         let mut rig_v = std::mem::take(&mut self.rig_buf);
         // Buses that play to their own output (#147) sum into that output's
         // mix instead of the master's. Without one, nothing here runs.
-        let routed = !self.bus_outs.is_empty();
+        let routed = !self.bus_outs.is_empty() || self.hw_active;
         let mut outs_v = std::mem::take(&mut self.out_mix);
         if routed {
-            for k in 0..MAX_OUTS {
+            for k in 0..MAX_OUTS + self.out_routes.len() {
                 outs_v[k * BUS_SPAN..k * BUS_SPAN + n2].fill(0.0);
             }
         }
+        let click_out = self.click_out;
+        let mut hw_ready = false;
         if n_masters > 0 {
             // Per-rig mix gains, once per block (rig_mix changes only via
             // commands drained at block start), which each rig's fader ramps
@@ -7274,6 +7386,8 @@ impl GraphEngine {
                         }
                     }
                     for (i, d) in self.dsp.iter().enumerate() {
+                        // A click on channels of its own is in no rig.
+                        if click_out.is_some() && d.kind == DspKind::Metronome { continue; }
                         if d.kind != DspKind::Bus && !self.fx_after_bus[i] {
                             add_routed(&self.graph, &mut self.pdc, d.node, master, &d.buf[..n2], rig_buf);
                         }
@@ -7395,8 +7509,24 @@ impl GraphEngine {
                     }
                 }
                 if !has_routed_metro {
+                    let dest = match click_out {
+                        Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
+                        None => &mut acc[..],
+                    };
                     for i in 0..n2 {
-                        acc[i] += self.count_in_buf[i];
+                        dest[i] += self.count_in_buf[i];
+                    }
+                }
+            }
+            // The click on channels of its own (#399): every metronome that
+            // is cabled somewhere, past the rigs, the master and its limiter.
+            if let Some(k) = click_out {
+                let dest = &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2];
+                for d in &self.dsp {
+                    if d.kind != DspKind::Metronome || self.node_is_sleeping(d.node) { continue; }
+                    if !self.graph.edges.iter().any(|e| e.kind == PortKind::Audio && e.from.node == d.node) { continue; }
+                    for i in 0..n2 {
+                        dest[i] += d.buf[i];
                     }
                 }
             }
@@ -7408,8 +7538,12 @@ impl GraphEngine {
             }
             if ply {
                 let g = self.player_gain;
+                let dest = match self.route_slot(OutSource::Player) {
+                    Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
+                    None => &mut acc[..],
+                };
                 for i in 0..n2 {
-                    acc[i] += self.player_buf[i] * g;
+                    dest[i] += self.player_buf[i] * g;
                 }
             }
             // Master inserts (#77): FX nodes wired FROM a MasterOut node
@@ -7494,6 +7628,7 @@ impl GraphEngine {
             // output the user hears.
             self.meter.process(data, ch);
             self.guard_true_peak(post_at_block_start);
+            hw_ready = true;
             // The extra outputs: each mix, bounded like the master's last
             // stage (rule 62), into its ring. A ring nobody drains (its sink
             // is not there) is full, and the block is dropped whole.
@@ -7513,6 +7648,54 @@ impl GraphEngine {
         }
         if let Some(rec) = &mut self.recorder {
             rec.retro_block(data, ch);
+        }
+        // The stage output matrix (#399), last: the taps above heard the
+        // master on the first two channels, wherever it plays.
+        if hw_ready && self.hw_active {
+            // The master leaves outputs 1-2 first, so that whatever is
+            // assigned there lands on empty channels.
+            for (i, (r, _)) in self.out_routes.iter().enumerate() {
+                if r.source != OutSource::Master || !r.to.fits(ch) { continue; }
+                let mix = &mut outs_v[(MAX_OUTS + i) * BUS_SPAN..(MAX_OUTS + i) * BUS_SPAN + n2];
+                for (f, m) in data.chunks_mut(ch).zip(mix.chunks_exact_mut(2)) {
+                    m[0] = f[0];
+                    m[1] = f[1];
+                    f[0] = 0.0;
+                    f[1] = 0.0;
+                }
+            }
+            for (i, (r, gain)) in self.out_routes.iter_mut().enumerate() {
+                let (gl, gr) = r.to.gains();
+                if !r.to.fits(ch) {
+                    // Not playing here: no ramp to run when it returns.
+                    *gain = gain_ramp::GainRamp::at_stereo(gl, gr);
+                    continue;
+                }
+                let mix = &mut outs_v[(MAX_OUTS + i) * BUS_SPAN..(MAX_OUTS + i) * BUS_SPAN + n2];
+                gain.set((gl, gr), ramp);
+                gain.apply(mix);
+                // What passed no limiter is bounded like the master's last
+                // stage (rule 62).
+                let bound = r.source != OutSource::Master;
+                let first = r.to.first as usize;
+                for (f, m) in data.chunks_mut(ch).zip(mix.chunks_exact(2)) {
+                    let (mut l, mut r_) = (m[0], m[1]);
+                    if bound {
+                        l = if l.is_finite() { MasterLimiter::knee(l) } else { 0.0 };
+                        r_ = if r_.is_finite() { MasterLimiter::knee(r_) } else { 0.0 };
+                    }
+                    if r.to.mono {
+                        f[first] += l + r_;
+                    } else {
+                        f[first] += l;
+                        f[first + 1] += r_;
+                    }
+                }
+            }
+            // Channels that several assignments share stay inside full scale.
+            for x in data.iter_mut() {
+                *x = x.clamp(-1.0, 1.0);
+            }
         }
         self.node_timer.end_block();
         self.lv2_in = acc_v;
@@ -7787,6 +7970,8 @@ fn render_metronome(
 
 #[cfg(test)]
 mod held_notes;
+#[cfg(test)]
+mod out_route_tests;
 pub(crate) mod latent;
 mod pdc;
 mod probe;

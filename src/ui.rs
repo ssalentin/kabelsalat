@@ -30,7 +30,7 @@ use eframe::egui::{
 use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
     name_bytes, name_str, split_port, AudioInChannel, AuxSend, BusOut, Command, CommandBus, DspKind, Graph, Lv2Uri,
-    SendSource, SinkName,
+    OutRoute, OutSource, SendSource, SinkName,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
 };
 use crate::engine::{
@@ -182,6 +182,7 @@ mod levels;
 mod show_controls;
 mod show_mode;
 mod preshow;
+mod stage_outputs;
 mod audio_doctor;
 mod plugin_folders;
 mod shared;
@@ -1223,9 +1224,19 @@ fn remap_session(
         };
         Some(BusOut { bus, ..*o })
     }).collect();
+    // The stage output matrix (#399): bus assignments follow the same way.
+    let routes: Vec<OutRoute> = s.out_routes().iter().filter_map(|r| {
+        let source = match r.source {
+            OutSource::Bus(SendSource::Rig(x)) => OutSource::Bus(SendSource::Rig(rig_of(x)?)),
+            OutSource::Bus(SendSource::Node(n)) => OutSource::Bus(SendSource::Node(remap(n)?)),
+            other => other,
+        };
+        Some(OutRoute { source, ..*r })
+    }).collect();
     let setlist = s.setlist.remap(&rig_of, &remap);
     ns.set_sends(sends);
     ns.set_bus_outs(outs);
+    ns.set_out_routes(routes);
     // Setlist (#204): rig indices and stored part knobs follow the remap (rule 44).
     ns.setlist = setlist;
     ns
@@ -3570,6 +3581,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_engine_info", "reset_engine_peaks", "set_buffer_size",
     "get_strip_knobs", "set_strip_knob",
     "add_bus", "remove_bus", "set_send", "get_sends", "set_bus_output", "get_bus_outputs",
+    "set_output_route", "get_output_routes",
     "list_channels",
     "get_midi_clock", "set_midi_clock",
     "get_master_target", "set_master_target",
@@ -4249,6 +4261,9 @@ struct DemoApp {
     /// Buses that play to their own output (#147): the mirror of the
     /// engine's table (shares the sends' grace).
     bus_outs: Vec<BusOut>,
+    /// The stage output matrix (#399): who plays on which channels of the
+    /// audio interface (`ui/stage_outputs.rs`).
+    stage_out: stage_outputs::StageOutputs,
     /// A local send edit is on its way: the engine's older table waits.
     ui_send_grace: f32,
     /// A send knob being dragged: its send and the fader position so far.
@@ -4894,6 +4909,7 @@ impl DemoApp {
             strips: Vec::new(),
             sends: Vec::new(),
             bus_outs: Vec::new(),
+            stage_out: Default::default(),
             ui_send_grace: -1.0,
             send_drag: None,
             mixer_send_rects: Vec::new(),
@@ -6563,7 +6579,9 @@ impl DemoApp {
             if now >= self.ui_send_grace {
                 self.sends = g.sends.iter().copied().filter(|x| x.bus != u32::MAX).collect();
                 self.bus_outs = g.bus_outs.iter().copied().filter(|o| !o.sink.is_none()).collect();
+                self.stage_out.routes = g.out_routes.iter().flatten().copied().collect();
             }
+            self.stage_out.channels = (g.out_channels as usize).max(1);
             // Strip mirror (#73/#74): adopt the engine's per-node table the
             // same way (rule 33) — a remote SetStripMix/SetStripBypass shows
             // in the mixer without a rebuild. UI-side echoes are inside
@@ -7228,6 +7246,8 @@ impl DemoApp {
             "get_sends" => "Read sends".into(),
             "get_bus_outputs" => "Read bus outputs".into(),
             "set_bus_output" => "Bus output".into(),
+            "get_output_routes" => "Read stage outputs".into(),
+            "set_output_route" => "Stage output".into(),
             "set_send" => {
                 let bus = args.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 format!("Send → {}", self.unit_display_name(bus))
@@ -8917,6 +8937,7 @@ impl DemoApp {
         }
         s.set_sends(self.sends.clone());
         s.set_bus_outs(self.bus_outs.clone());
+        s.set_out_routes(self.stage_out.routes.clone());
         s.setlist = self.setlist.clone();
         s.setlist.prune_to_graph(&s.graph);
         let bindings = self.show_bindings();
@@ -9209,6 +9230,7 @@ impl DemoApp {
         self.strip_knobs = s.strip_knobs().clone();
         self.sends = s.sends().to_vec();
         self.bus_outs = s.bus_outs().to_vec();
+        self.stage_out.routes = s.out_routes().to_vec();
         self.mixer_knob_drag = None;
         self.send_all_strip_state();
         // The loudness target the session was saved with (#12). A session
@@ -9938,6 +9960,7 @@ impl DemoApp {
         self.strips.clear();
         self.sends.clear();
         self.bus_outs.clear();
+        self.stage_out.routes.clear();
         self.strip_order.clear();
         self.strip_knobs.clear();
         self.master_mute = false;
@@ -10981,6 +11004,18 @@ impl DemoApp {
             }
             "get_sends" => self.sends_json().to_string(),
             "get_bus_outputs" => self.bus_outputs_json().to_string(),
+            "get_output_routes" => self.out_routes_json().to_string(),
+            "set_output_route" => {
+                // One source on channels of the audio interface (#399).
+                match self.out_route_tool(args) {
+                    Ok(done) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.record(origin, "Stage output".to_string(), Vec::new(), now);
+                        done
+                    }
+                    Err(e) => format!("set_output_route NOT applied: {e}"),
+                }
+            }
             "set_bus_output" => {
                 // One rig bus or aux bus to its own output (#147).
                 let bus = match (args.get("rig").and_then(|v| v.as_u64()), args.get("bus").and_then(|v| v.as_u64())) {
@@ -15885,6 +15920,8 @@ impl DemoApp {
                 let _ = bus.send(Command::SetBusOutput { bus: o.bus, sink: Some(o.sink) });
             }
         }
+        // And the stage output matrix (#399).
+        self.resend_out_routes();
     }
 
     // -- buses on their own output (#147) -----------------------------------
@@ -15922,7 +15959,11 @@ impl DemoApp {
             }
         }
         self.bus_outs.retain(|o| o.bus != bus);
-        if let Some(s) = sink { self.bus_outs.push(BusOut { bus, sink: SinkName::new(s) }); }
+        if let Some(s) = sink {
+            self.bus_outs.push(BusOut { bus, sink: SinkName::new(s) });
+            // One place per bus, as in the engine (#399).
+            self.stage_out.routes.retain(|r| r.source != OutSource::Bus(bus));
+        }
         self.ui_send_grace = self.ui_time + 0.6;
         if let Some(b) = &self.bus {
             let _ = b.lock().unwrap().send(Command::SetBusOutput { bus, sink: sink.map(SinkName::new) });
@@ -15967,10 +16008,24 @@ impl DemoApp {
         let now = self.bus_output_of(bus);
         let raw = now.map(|s| s.as_str().to_string());
         let dev = raw.as_ref().and_then(|r| outputs.iter().find(|o| &o.raw == r));
-        let selected = match (&raw, dev) {
-            (None, _) => "→ Master out".to_string(),
-            (Some(_), Some(d)) => format!("→ {}", d.name),
-            (Some(_), None) => "→ not available".to_string(),
+        // Channels of the main interface (#399), offered next to the sound
+        // cards once there are more than two or the bus is assigned some.
+        let route = self.out_route_of(OutSource::Bus(bus));
+        let out_ch = self.stage_out.channels;
+        let same = |a: &crate::control::OutChannels, b: &crate::control::OutChannels| a.first == b.first && a.mono == b.mono;
+        let ch_opts: Vec<crate::control::OutChannels> = if out_ch > 2 || route.is_some() {
+            crate::out_routes::menu_options(out_ch, route).into_iter()
+                .filter(|o| o.first >= 2 || route.is_some_and(|r| same(&r, o))).collect()
+        } else {
+            Vec::new()
+        };
+        let route_missing = route.is_some_and(|r| !r.fits(out_ch));
+        let mut ch_pick: Option<crate::control::OutChannels> = None;
+        let selected = match (&raw, dev, route) {
+            (_, _, Some(r)) => format!("→ Out {}", r.label()),
+            (None, _, _) => "→ Master out".to_string(),
+            (Some(_), Some(d), _) => format!("→ {}", d.name),
+            (Some(_), None, _) => "→ not available".to_string(),
         };
         let key = match bus {
             SendSource::Rig(r) => (0u8, r as u32),
@@ -15982,28 +16037,47 @@ impl DemoApp {
             .popup_min_width(240.0)
             .text_size(10.5)
             .show_ui(ui, |menu| {
-                if menu.item(raw.is_none(), "Master out") { pick = Some(None); }
+                if menu.item(raw.is_none() && route.is_none(), "Master out") { pick = Some(None); }
+                for o in &ch_opts {
+                    let label = if o.mono { format!("Output {} (mono)", o.label()) } else { format!("Outputs {}", o.label()) };
+                    if menu.item(route.is_some_and(|r| same(&r, o)), &label) {
+                        ch_pick = Some(crate::control::OutChannels { first: o.first, mono: o.mono, ..route.unwrap_or(crate::control::OutChannels::MAIN) });
+                    }
+                }
                 for o in &outputs {
                     if menu.item(raw.as_deref() == Some(o.raw.as_str()), &o.name) { pick = Some(Some(o.raw.clone())); }
+                }
+                if let (Some(r), true) = (route, route_missing) {
+                    menu.note(&format!("{} are not there now: this bus plays in the master mix until they return", crate::out_routes::place(&r)));
                 }
                 if let (Some(r), None) = (&raw, dev) {
                     menu.note(&format!("{r} is not there now: this bus is silent until it returns"));
                 }
             });
         self.mixer_bus_out_rects.push((bus, resp.rect));
-        if raw.is_some() && dev.is_none() {
+        if (raw.is_some() && dev.is_none()) || route_missing {
             ui.painter().rect_stroke(resp.rect, 2.0, Stroke::new(1.5, theme::CABLE_AMBER), egui::StrokeKind::Inside);
         }
-        resp.on_hover_text(match (&raw, dev) {
-            (None, _) => "where this bus plays: the master, or a sound card of its own (it then leaves the main mix)".to_string(),
-            (Some(_), Some(d)) => format!("plays to {} only, past the master", d.name),
-            (Some(r), None) => format!("{r} is not there now: this bus is silent until it returns"),
+        resp.on_hover_text(match (&raw, dev, route) {
+            (_, _, Some(r)) if route_missing => format!("assigned to {}, which this output lacks: plays in the master mix until the stage interface is connected", crate::out_routes::place(&r)),
+            (_, _, Some(r)) => format!("plays on {} only, past the master", crate::out_routes::place(&r)),
+            (None, _, _) => "where this bus plays: the master, outputs of its own on the audio interface, or a sound card of its own (it then leaves the main mix)".to_string(),
+            (Some(_), Some(d), _) => format!("plays to {} only, past the master", d.name),
+            (Some(r), None, _) => format!("{r} is not there now: this bus is silent until it returns"),
         });
-        if let Some(p) = pick {
+        if pick.is_some() || ch_pick.is_some() {
             if self.rack_locked {
                 self.notify_rack_locked();
-            } else if let Err(e) = self.set_bus_output(bus, p.as_deref()) {
-                self.session_msg = e;
+            } else {
+                let done = match (ch_pick, pick) {
+                    (Some(c), _) => self.set_out_route(OutSource::Bus(bus), Some(c)),
+                    (None, Some(p)) => self.set_out_route(OutSource::Bus(bus), None)
+                        .and_then(|()| self.set_bus_output(bus, p.as_deref())),
+                    (None, None) => Ok(()),
+                };
+                if let Err(e) = done {
+                    self.session_msg = e;
+                }
             }
         }
     }
@@ -29309,6 +29383,7 @@ impl DemoApp {
         self.mixer_learn_rects.clear();
         self.mixer_send_rects.clear();
         self.mixer_bus_out_rects.clear();
+        self.stage_out.menu_rects.clear();
         let buses = self.bus_units();
         let mut switch: Option<usize> = None;
         // System audio (#31): other apps' streams + the output choice.
@@ -30081,6 +30156,9 @@ impl DemoApp {
             if let Some(c) = &out_current {
                 ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
             }
+            // The stage output matrix (#399): master, click and backing
+            // track on outputs of their own.
+            self.stage_outputs_ui(ui);
             ui.add_space(4.0);
             // Master inserts (#77): before the fixed limiter.
             let chain = self.master_chain();
@@ -35631,6 +35709,7 @@ impl DemoApp {
         self.pump_plugin_param_edits();
         self.pump_lv2_guis();
         self.adopt_hw_devices();
+        self.follow_output_channels();
         self.sync_instrument_maps();
         self.poll_plugin_scan();
         self.poll_install();
@@ -46755,6 +46834,7 @@ mod settings_and_dropdown_tests {
                 OutputDevice { raw: "alsa_output.m2".into(), name: "MOTU M2".into(), default: false },
             ],
             current: Some("alsa_output.speakers".into()),
+            current_channels: Some(2),
             streams: vec![AppStream {
                 index: 77, app: "Zen".into(),
                 title: "(2) Neo Soul Guitar Backing Track in A minor - YouTube".into(),

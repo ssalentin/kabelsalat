@@ -117,6 +117,10 @@ pub struct Session {
     /// Buses that play to their own output (#147), keyed by rig and node
     /// like the sends. The sink is kept by name, also while it is unplugged.
     bus_outs: Vec<crate::control::BusOut>,
+    /// The stage output matrix (#399): who plays on which channels of the
+    /// audio interface. Kept whatever interface is plugged in; one with
+    /// fewer channels plays the assignment where it plays without one.
+    out_routes: Vec<crate::control::OutRoute>,
     /// The master's loudness target with its trim (#12). `None` = this
     /// session says nothing about it (older files, templates, rig edits
     /// built from parts): a load then leaves the engine's target alone.
@@ -276,6 +280,7 @@ impl Session {
             strip_knobs: BTreeMap::new(),
             sends: Vec::new(),
             bus_outs: Vec::new(),
+            out_routes: Vec::new(),
             master_target: None,
             master_mute: false,
             rack_locked: false,
@@ -301,6 +306,7 @@ impl Session {
             && self.strip_knobs == other.strip_knobs
             && self.sends == other.sends
             && self.bus_outs == other.bus_outs
+            && self.out_routes == other.out_routes
             && self.master_target == other.master_target
             && self.master_mute == other.master_mute
             && self.rack_locked == other.rack_locked
@@ -473,10 +479,34 @@ impl Session {
 
     fn prune_bus_outs(&mut self) {
         let g = &self.graph;
-        self.bus_outs.retain(|o| match o.bus {
+        let has = |bus: crate::control::SendSource| match bus {
             crate::control::SendSource::Rig(r) => g.nodes.iter().any(|n| n.rig == r),
             crate::control::SendSource::Node(n) => g.is_bus(n),
+        };
+        self.bus_outs.retain(|o| has(o.bus));
+        self.out_routes.retain(|r| match r.source {
+            crate::control::OutSource::Bus(b) => has(b),
+            _ => true,
         });
+    }
+
+    /// The stage output matrix (#399).
+    pub fn out_routes(&self) -> &[crate::control::OutRoute] {
+        &self.out_routes
+    }
+
+    /// Replace the stage output matrix. One assignment per source; those of
+    /// a rig or an aux bus the patch lacks are dropped, and a bus that plays
+    /// to a sound card of its own (`bus_outs`) keeps that.
+    pub fn set_out_routes(&mut self, routes: Vec<crate::control::OutRoute>) {
+        self.out_routes.clear();
+        for r in routes {
+            let on_sink = matches!(r.source, crate::control::OutSource::Bus(b) if self.bus_outs.iter().any(|o| o.bus == b));
+            if !on_sink && !self.out_routes.iter().any(|x| x.source == r.source) {
+                self.out_routes.push(crate::control::OutRoute { to: r.to.clamped(), ..r });
+            }
+        }
+        self.prune_bus_outs();
     }
 
     fn prune_sends(&mut self) {
@@ -705,6 +735,7 @@ impl Session {
             strip_knobs: self.strip_knobs.clone(),
             sends: self.sends.clone(),
             bus_outs: self.bus_outs.clone(),
+            out_routes: self.out_routes.clone(),
             master_target: self.master_target,
             master_mute: self.master_mute,
             rack_locked: self.rack_locked,
@@ -758,6 +789,7 @@ impl Session {
             strip_knobs: manifest.strip_knobs,
             sends: manifest.sends,
             bus_outs: manifest.bus_outs,
+            out_routes: manifest.out_routes,
             master_target: manifest.master_target,
             master_mute: manifest.master_mute,
             rack_locked: manifest.rack_locked,
@@ -884,6 +916,9 @@ struct SessionFile {
     /// Buses on their own output (#147); older sessions have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bus_outs: Vec<crate::control::BusOut>,
+    /// The stage output matrix (#399); older sessions have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    out_routes: Vec<crate::control::OutRoute>,
     /// The master's loudness target (#12); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     master_target: Option<crate::meter::MasterTarget>,

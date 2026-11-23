@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::audio_in::InputDevice;
 use crate::audio_out::OutputDevice;
-use crate::control::{clap_plugin_key, name_str, MidiFxPlugin, Node, NodeKind, SendSource};
+use crate::control::{clap_plugin_key, name_str, MidiFxPlugin, Node, NodeKind, OutSource, SendSource};
 use crate::engine_info::LoadLevel;
 use crate::session::Session;
 
@@ -80,6 +80,8 @@ pub struct Facts {
     /// The running app's output stream: `Some(false)` = none is running.
     /// `None` outside the app.
     pub audio_running: Option<bool>,
+    /// Output channels of the running stream (#399); `None` outside the app.
+    pub out_channels: Option<usize>,
     pub inputs: Option<Vec<InputDevice>>,
     pub plugins: Option<Installed>,
     pub probe: Option<Probe>,
@@ -333,10 +335,32 @@ fn audio_output(s: &Session, f: &Facts) -> Outcome {
         };
         problems.push(format!("{bus} plays to {}, which is not connected: plug it in, or send it back to Master in the Mixer.", label(sink)));
     }
-    if problems.is_empty() {
-        Outcome::ok(main.unwrap_or_default())
-    } else {
+    // The stage output matrix (#399): an assignment the interface has no
+    // channels for still plays, but not where the stage expects it.
+    let mut notices = Vec::new();
+    if let Some(channels) = f.out_channels {
+        for r in s.out_routes() {
+            if r.to.fits(channels) {
+                continue;
+            }
+            let (who, falls) = match r.source {
+                OutSource::Master => ("The master".to_string(), "it plays on outputs 1–2"),
+                OutSource::Click => ("The click".to_string(), "it plays in the master mix, so the audience hears it"),
+                OutSource::Player => ("The backing track".to_string(), "it plays in the master mix"),
+                OutSource::Bus(SendSource::Rig(r)) => (rig_label(s, r), "it plays in the master mix"),
+                OutSource::Bus(SendSource::Node(id)) => (s.graph.node(id).map_or_else(|| format!("Bus {id}"), |n| node_label(s, n)), "it plays in the master mix"),
+            };
+            let n = if r.to.mono { "output" } else { "outputs" };
+            notices.push(format!("{who} is assigned to {n} {}, but this output has {channels} channels: {falls} until the stage interface is connected.", r.to.label()));
+        }
+    }
+    if !problems.is_empty() {
+        problems.extend(notices);
         Outcome::problem(problems.join(" "))
+    } else if !notices.is_empty() {
+        Outcome::warning(format!("{} {}", main.unwrap_or_default(), notices.join(" ")))
+    } else {
+        Outcome::ok(main.unwrap_or_default())
     }
 }
 
@@ -690,6 +714,7 @@ pub(crate) mod tests {
             outputs: Some(vec![OutputDevice { raw: M2.into(), name: "M2".into(), default: true }]),
             chosen_output: Some(M2.into()),
             audio_running: Some(true),
+            out_channels: Some(2),
             inputs: Some(vec![InputDevice { raw: "alsa_input.usb-MOTU_M2".into(), name: "M2".into(), channels: 2, default: true }]),
             plugins: Some(Installed { clap: vec![SURGE.into()], vst3: vec![], lv2: vec![(crate::organ::B_SYNTH.into(), true)] }),
             probe: Some(Probe { rigs: (0..rig_count(s) as u8).map(|r| (r, 0.3)).collect(), failed: vec![] }),
@@ -765,6 +790,21 @@ pub(crate) mod tests {
         f.midi_ports = Some(vec![]);
         let _ = run(&s, &f);
         assert_eq!(serde_json::to_string(&s.setlist).unwrap(), before);
+    }
+
+    #[test]
+    fn an_output_assignment_a_2_channel_output_lacks_is_a_clear_warning() {
+        use crate::control::{OutChannels, OutRoute};
+        let mut s = show();
+        s.set_out_routes(vec![OutRoute { source: OutSource::Click, to: OutChannels::pair(2) }]);
+        let mut f = healthy(&s);
+        let r = row(&run(&s, &f), "audio_output").clone();
+        assert_eq!(r.status, Status::Warning, "{}", r.text);
+        assert!(r.text.contains("The click is assigned to outputs 3–4, but this output has 2 channels: it plays in the master mix, so the audience hears it"), "{}", r.text);
+        f.out_channels = Some(4);
+        assert_eq!(row(&run(&s, &f), "audio_output").status, Status::Ok, "the stage interface has outputs 3–4");
+        f.out_channels = None;
+        assert_eq!(row(&run(&s, &f), "audio_output").status, Status::Ok, "outside the app nothing is known");
     }
 
     #[test]

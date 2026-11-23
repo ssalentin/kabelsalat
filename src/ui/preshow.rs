@@ -83,6 +83,7 @@ impl DemoApp {
             outputs: self.audio_out.lock().ok().map(|s| s.outputs.clone()).filter(|o| !o.is_empty()),
             chosen_output: self.wanted_output.lock().ok().and_then(|w| w.clone()),
             audio_running: Some(running),
+            out_channels: running.then_some(self.stage_out.channels),
             inputs: self.input_devices.lock().ok().map(|d| d.clone()).filter(|d| !d.is_empty()),
             plugins,
             xruns: running.then_some(c.xruns),

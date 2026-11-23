@@ -926,12 +926,88 @@ impl Lv2CrashMsgPub {
     }
 }
 
+pub(crate) struct Lv2EditorPollOut {
+    pub node: NodeId,
+    pub open: bool,
+    pub control_writes: Vec<(usize, f32, f32)>,
+    pub midi_events: Vec<[u8; 3]>,
+}
+
+enum Lv2UiCmd {
+    OpenEditor {
+        node: NodeId,
+        title: String,
+        reply: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
+    },
+    CloseEditor {
+        node: NodeId,
+    },
+    PollEditors {
+        reply: std::sync::mpsc::SyncSender<Vec<Lv2EditorPollOut>>,
+    },
+    SavePreset {
+        node: NodeId,
+        name: String,
+        reply: std::sync::mpsc::SyncSender<anyhow::Result<crate::lv2::Lv2Preset>>,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct Lv2LoaderClient {
+    tx: std::sync::mpsc::Sender<Lv2UiCmd>,
+}
+
+impl Lv2LoaderClient {
+    pub(crate) fn open_editor(&self, node: NodeId, title: String) -> anyhow::Result<()> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(Lv2UiCmd::OpenEditor {
+                node,
+                title,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("LV2 loader thread unavailable"))?;
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| anyhow::anyhow!("LV2 OpenEditor timeout: {e}"))?
+    }
+
+    pub(crate) fn close_editor(&self, node: NodeId) {
+        let _ = self.tx.send(Lv2UiCmd::CloseEditor { node });
+    }
+
+    pub(crate) fn poll_editors(&self) -> Vec<Lv2EditorPollOut> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        if self.tx.send(Lv2UiCmd::PollEditors { reply: reply_tx }).is_err() {
+            return Vec::new();
+        }
+        reply_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn save_preset(&self, node: NodeId, name: String) -> anyhow::Result<crate::lv2::Lv2Preset> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.tx
+            .send(Lv2UiCmd::SavePreset {
+                node,
+                name,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("LV2 loader thread unavailable"))?;
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| anyhow::anyhow!("LV2 SavePreset timeout: {e}"))?
+    }
+}
+
 /// Work the audio thread hands to the LV2 loader thread: instantiating a
 /// plugin (~200 ms for Vitalium), parsing its presets, saving state and
 /// freeing an instance all block far longer than one audio buffer.
 enum Lv2Request {
     Load { node: NodeId, uri: crate::control::Lv2Uri, gen: u64 },
-    Preset { node: NodeId, uri: crate::control::Lv2Uri, preset_uri: String },
+    Preset { node: NodeId, uri: crate::control::Lv2Uri, preset_uri: String, gen: u64 },
     /// A fresh instance with this state restored, to replace the node's.
     State { node: NodeId, uri: crate::control::Lv2Uri, gen: u64, state: Vec<u8> },
     Retire(Lv2Slot),
@@ -1079,11 +1155,64 @@ fn push_lv2_resp(resp: &mut rtrb::Producer<Lv2Response>, msg: Lv2Response) -> bo
 fn lv2_loader_loop(
     mut req: rtrb::Consumer<Lv2Request>,
     mut resp: rtrb::Producer<Lv2Response>,
+    ui_rx: Option<std::sync::mpsc::Receiver<Lv2UiCmd>>,
     sample_rate: f64,
     mut mains: Vec<(u64, NodeId, crate::host::SandboxLv2Main)>,
 ) {
     let mut last_recovery_poll = std::time::Instant::now();
     loop {
+        if let Some(rx) = ui_rx.as_ref() {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    Lv2UiCmd::OpenEditor { node, title, reply } => {
+                        let res = match mains.iter_mut().find(|(_, n, _)| *n == node) {
+                            Some((_, _, main)) => main.open_editor(&title),
+                            None => Err(anyhow::anyhow!("no sandboxed LV2 worker for node {node}")),
+                        };
+                        let _ = reply.send(res);
+                    }
+                    Lv2UiCmd::CloseEditor { node } => {
+                        if let Some((_, _, main)) = mains.iter_mut().find(|(_, n, _)| *n == node) {
+                            main.close_editor();
+                        }
+                    }
+                    Lv2UiCmd::PollEditors { reply } => {
+                        let mut out = Vec::new();
+                        for (_, node, main) in &mut mains {
+                            if !main.editor_open() {
+                                continue;
+                            }
+                            match main.poll_editor() {
+                                Ok((open, control_writes, midi_events)) => {
+                                    out.push(Lv2EditorPollOut {
+                                        node: *node,
+                                        open,
+                                        control_writes,
+                                        midi_events,
+                                    });
+                                }
+                                Err(_) => {
+                                    out.push(Lv2EditorPollOut {
+                                        node: *node,
+                                        open: false,
+                                        control_writes: Vec::new(),
+                                        midi_events: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                        let _ = reply.send(out);
+                    }
+                    Lv2UiCmd::SavePreset { node, name, reply } => {
+                        let res = match mains.iter_mut().find(|(_, n, _)| *n == node) {
+                            Some((_, _, main)) => main.save_preset(&name),
+                            None => Err(anyhow::anyhow!("no sandboxed LV2 worker for node {node}")),
+                        };
+                        let _ = reply.send(res);
+                    }
+                }
+            }
+        }
         if !mains.is_empty()
             && (mains.iter().any(|(_, _, m)| m.is_crashed())
                 || last_recovery_poll.elapsed() >= std::time::Duration::from_millis(20))
@@ -1130,10 +1259,39 @@ fn lv2_loader_loop(
                     None => Lv2Response::LoadFailed { node, gen },
                 },
             ),
-            Lv2Request::Preset { node, uri, preset_uri } => crate::lv2::discover_presets(uri.as_str())
-                .into_iter()
-                .find(|p| p.uri == preset_uri)
-                .map(|preset| Lv2Response::Preset { node, preset }),
+            Lv2Request::Preset { node, uri, preset_uri, gen } => {
+                if let Some(preset) = crate::lv2::discover_presets(uri.as_str())
+                    .into_iter()
+                    .find(|p| p.uri == preset_uri)
+                {
+                    if preset.has_state {
+                        if let Some((_, _, main)) = mains.iter_mut().find(|(_, n, _)| *n == node) {
+                            if let Err(e) = main.apply_preset_full(&preset) {
+                                eprintln!("lv2 node {node}: stateful preset restore failed: {e}");
+                            }
+                            Some(Lv2Response::Preset { node, preset })
+                        } else if !crate::host::sandbox_enabled() {
+                            match load_lv2_slot_hosted(node, uri.as_str(), sample_rate, None) {
+                                Some((mut slot, _)) => {
+                                    if let crate::host::HostedLv2::InProcess(ref mut p) = slot.plugin {
+                                        if let Err(e) = p.apply_preset_full(&preset) {
+                                            eprintln!("lv2 node {node}: stateful preset restore failed: {e}");
+                                        }
+                                    }
+                                    Some(Lv2Response::Restored { node, gen, slot })
+                                }
+                                None => Some(Lv2Response::Preset { node, preset }),
+                            }
+                        } else {
+                            Some(Lv2Response::Preset { node, preset })
+                        }
+                    } else {
+                        Some(Lv2Response::Preset { node, preset })
+                    }
+                } else {
+                    None
+                }
+            }
             Lv2Request::State { node, uri, gen, state } => Some(
                 match restored_lv2_slot_hosted(node, uri.as_str(), &state, sample_rate) {
                     Some((slot, main)) => {
@@ -2202,6 +2360,7 @@ pub struct GraphEngine {
     /// (tests, offline self-tests).
     lv2_req: Option<rtrb::Producer<Lv2Request>>,
     lv2_resp: Option<rtrb::Consumer<Lv2Response>>,
+    lv2_loader_client: Option<Lv2LoaderClient>,
     lv2_loader_handle: Option<std::thread::JoinHandle<()>>,
     /// Supervisors for sandboxed LV2 slots created before `spawn_lv2_loader()`
     /// (or when no loader thread runs); transferred to the loader thread on spawn.
@@ -2441,6 +2600,7 @@ impl GraphEngine {
             voices_dirty: true,
             lv2_req: None,
             lv2_resp: None,
+            lv2_loader_client: None,
             lv2_loader_handle: None,
             initial_lv2_mains,
             lv2_gen: 0,
@@ -2588,17 +2748,23 @@ impl GraphEngine {
     pub fn spawn_lv2_loader(&mut self) {
         let (req_tx, req_rx) = rtrb::RingBuffer::new(LV2_RING);
         let (resp_tx, resp_rx) = rtrb::RingBuffer::new(LV2_RING);
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
         let sr = self.sample_rate;
         let initial_mains = std::mem::take(&mut self.initial_lv2_mains);
         let handle = std::thread::Builder::new()
             .name("kabelsalat-lv2-loader".into())
-            .spawn(move || lv2_loader_loop(req_rx, resp_tx, sr, initial_mains))
+            .spawn(move || lv2_loader_loop(req_rx, resp_tx, Some(ui_rx), sr, initial_mains))
             .expect("spawn lv2 loader");
         self.lv2_req = Some(req_tx);
         self.lv2_resp = Some(resp_rx);
+        self.lv2_loader_client = Some(Lv2LoaderClient { tx: ui_tx });
         self.lv2_loader_handle = Some(handle);
         self.lv2.reserve(LV2_SLOT_CAP);
         self.lv2_retire_backlog.reserve(LV2_SLOT_CAP);
+    }
+
+    pub(crate) fn lv2_loader_client(&self) -> Option<Lv2LoaderClient> {
+        self.lv2_loader_client.clone()
     }
 
     /// Load `uri` for `node`: on the loader thread when there is one.
@@ -6429,14 +6595,25 @@ impl GraphEngine {
             Command::LoadLv2Preset { node, preset_uri } => {
                 if let Some(&NodeKind::Lv2 { uri }) = self.graph.nodes.iter().find(|n| n.id == node).map(|n| &n.kind) {
                     self.wake_node(node);
+                    let gen = self.lv2_gen;
                     if let Some(tx) = self.lv2_req.as_mut() {
-                        let _ = tx.push(Lv2Request::Preset { node, uri, preset_uri });
+                        let _ = tx.push(Lv2Request::Preset { node, uri, preset_uri, gen });
                         return;
                     }
                     let presets = crate::lv2::discover_presets(uri.as_str());
                     if let Some(preset) = presets.iter().find(|p| p.uri == preset_uri) {
+                        if preset.has_state {
+                            if let Some((_, _, main)) = self.initial_lv2_mains.iter_mut().find(|(_, n, _)| *n == node) {
+                                let _ = main.apply_preset_full(preset);
+                            }
+                        }
                         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
-                            s.plugin.apply_preset(preset);
+                            match (&mut s.plugin, preset.has_state) {
+                                (crate::host::HostedLv2::InProcess(p), true) => {
+                                    let _ = p.apply_preset_full(preset);
+                                }
+                                _ => s.plugin.apply_preset(preset),
+                            }
                         }
                     }
                 }

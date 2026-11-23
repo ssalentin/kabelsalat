@@ -59,6 +59,28 @@ fn format_tag(e: &Entry) -> &'static str {
     }
 }
 
+fn cycle_quick_add_filter(
+    view: Option<ShelfView>,
+    ty: Option<PluginType>,
+    step: isize,
+) -> (Option<ShelfView>, Option<PluginType>) {
+    let mut filters: Vec<(Option<ShelfView>, Option<PluginType>)> = Vec::with_capacity(3 + PluginType::ALL.len());
+    filters.push((None, None));
+    filters.push((Some(ShelfView::Favorites), None));
+    filters.push((Some(ShelfView::Recent), None));
+    for t in PluginType::ALL {
+        filters.push((None, Some(t)));
+    }
+    let cur = filters
+        .iter()
+        .position(|&(v, t)| v == view && t == ty)
+        .or_else(|| view.and_then(|v| filters.iter().position(|&(fv, _)| fv == Some(v))))
+        .or_else(|| ty.and_then(|t| filters.iter().position(|&(_, ft)| ft == Some(t))))
+        .unwrap_or(0);
+    let next = (cur as isize + step).rem_euclid(filters.len() as isize) as usize;
+    filters[next]
+}
+
 impl DemoApp {
     /// The star on a plugin card: filled when the plugin is a favorite.
     /// Returns whether it was clicked.
@@ -246,21 +268,44 @@ impl DemoApp {
         }
         let fresh = std::mem::take(&mut qa.fresh);
 
-        // Keys before the search field sees them. Shift+Enter is asked
-        // before Enter (rule 143).
-        let (up, down, alt_enter, enter, esc) = if fresh {
-            (false, false, false, false, false)
+        // Keys before the search field sees them. Shift+Enter / Shift+Tab are
+        // asked before unmodified Enter / Tab (rule 143).
+        let (up, down, page_up, page_down, home, end, prev_tab, next_tab, alt_enter, enter, esc) = if fresh {
+            (false, false, false, false, false, false, false, false, false, false, false)
         } else {
             ctx.input_mut(|i| {
+                let prev_tab = i.consume_key(Modifiers::SHIFT, Key::Tab);
+                let next_tab = !prev_tab && i.consume_key(Modifiers::NONE, Key::Tab);
+                if prev_tab || next_tab {
+                    i.events.retain(|ev| !matches!(ev, egui::Event::Text(t) if t == "\t"));
+                }
                 (
                     i.consume_key(Modifiers::NONE, Key::ArrowUp),
                     i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(Modifiers::NONE, Key::PageUp),
+                    i.consume_key(Modifiers::NONE, Key::PageDown),
+                    i.consume_key(Modifiers::NONE, Key::Home),
+                    i.consume_key(Modifiers::NONE, Key::End),
+                    prev_tab,
+                    next_tab,
                     i.consume_key(Modifiers::SHIFT, Key::Enter),
                     i.consume_key(Modifiers::NONE, Key::Enter),
                     i.consume_key(Modifiers::NONE, Key::Escape),
                 )
             })
         };
+
+        if prev_tab || next_tab {
+            let step = if prev_tab { -1 } else { 1 };
+            (qa.view, qa.ty) = cycle_quick_add_filter(qa.view, qa.ty, step);
+            qa.sel = 0;
+            qa.reveal = true;
+        }
+
+        let stage = self.stage_rect;
+        let width = 380.0_f32.min(stage.width() - 24.0).max(240.0);
+        let list_h = ((stage.height() - 190.0) / ROW_H).floor().clamp(3.0, 9.0) * ROW_H;
+        let page_rows = ((list_h / ROW_H).round() as usize).max(1);
 
         let scanning = !self.plugins_loaded;
         let (rows, total): (Vec<Row>, usize) = {
@@ -290,12 +335,25 @@ impl DemoApp {
                 qa.sel = (qa.sel + rows.len() - 1) % rows.len();
                 qa.reveal = true;
             }
+            if page_down {
+                qa.sel = (qa.sel + page_rows).min(rows.len() - 1);
+                qa.reveal = true;
+            }
+            if page_up {
+                qa.sel = qa.sel.saturating_sub(page_rows);
+                qa.reveal = true;
+            }
+            if home {
+                qa.sel = 0;
+                qa.reveal = true;
+            }
+            if end {
+                qa.sel = rows.len() - 1;
+                qa.reveal = true;
+            }
             qa.sel = qa.sel.min(rows.len() - 1);
         }
 
-        let stage = self.stage_rect;
-        let width = 380.0_f32.min(stage.width() - 24.0).max(240.0);
-        let list_h = ((stage.height() - 190.0) / ROW_H).floor().clamp(3.0, 9.0) * ROW_H;
         let pos = match qa.pos {
             Some(p) => p + Vec2::new(6.0, 6.0),
             None => Pos2::new(stage.center().x - width * 0.5, stage.top() + (stage.height() * 0.1).max(8.0)),
@@ -500,6 +558,7 @@ mod tests {
             is_instrument: false,
             is_midi_fx: false,
             has_ui: false,
+            bundle_path: String::new(),
         }];
         app
     }
@@ -1001,5 +1060,99 @@ mod tests {
             recent.plugin_shelf_view = Some(ShelfView::Recent);
             super::super::offline_shots::shot(&mut recent, size, &dir.join(format!("plugins-recent-{tag}.png")));
         }
+    }
+
+    #[test]
+    fn page_keys_home_end_and_tab_navigate_without_inserting_tab_chars() {
+        let mut app = app();
+        for i in 0..20 {
+            app.plugins_lv2.push(Lv2PluginInfo {
+                uri: format!("http://example.org/fx/{i}"),
+                name: format!("Extra FX {i:02}"),
+                author: "Example".into(),
+                lv2_class: "FilterPlugin".into(),
+                num_ports: 4,
+                is_instrument: false,
+                is_midi_fx: false,
+                has_ui: false,
+                bundle_path: String::new(),
+            });
+        }
+        let mut b = Bench::new(SIZE);
+        b.settle(&mut app);
+
+        b.key(&mut app, Key::Enter, Modifiers::NONE);
+        b.frame(&mut app);
+        let side_before = app.side;
+        assert_eq!(app.quick_add.as_ref().expect("open").sel, 0);
+
+        b.key(&mut app, Key::PageDown, Modifiers::NONE);
+        let after_pgdn = app.quick_add.as_ref().unwrap().sel;
+        assert!(after_pgdn > 1, "PageDown must advance multiple rows (got {after_pgdn})");
+
+        b.key(&mut app, Key::End, Modifiers::NONE);
+        let at_end = app.quick_add.as_ref().unwrap().sel;
+        assert!(at_end > after_pgdn, "End must jump to last visible row (got {at_end})");
+
+        b.key(&mut app, Key::PageUp, Modifiers::NONE);
+        let after_pgup = app.quick_add.as_ref().unwrap().sel;
+        assert!(after_pgup < at_end, "PageUp must move back up (got {after_pgup} vs {at_end})");
+
+        b.key(&mut app, Key::Home, Modifiers::NONE);
+        assert_eq!(app.quick_add.as_ref().unwrap().sel, 0);
+
+        // Simulate real Tab + Text("\t"): cycles filter chip, does not flip rack or insert '\t'.
+        b.frame_with(
+            &mut app,
+            vec![
+                egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+                egui::Event::Text("\t".into()),
+                egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            Modifiers::NONE,
+        );
+        b.frame(&mut app);
+        let qa = app.quick_add.as_ref().unwrap();
+        assert_eq!(qa.view, Some(ShelfView::Favorites), "Tab advances filter to Favorites");
+        assert!(qa.query.is_empty(), "Tab text event must not enter query: {:?}", qa.query);
+        assert!(!app.flip_requested && app.side == side_before, "Tab inside picker must not flip rack");
+
+        b.frame_with(
+            &mut app,
+            vec![
+                egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::SHIFT,
+                },
+                egui::Event::Text("\t".into()),
+                egui::Event::Key {
+                    key: Key::Tab,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Modifiers::SHIFT,
+                },
+            ],
+            Modifiers::SHIFT,
+        );
+        b.frame(&mut app);
+        let qa = app.quick_add.as_ref().unwrap();
+        assert_eq!((qa.view, qa.ty), (None, None), "Shift+Tab cycles back to All");
+        assert!(qa.query.is_empty(), "Shift+Tab text event must not enter query: {:?}", qa.query);
     }
 }

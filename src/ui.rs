@@ -4718,8 +4718,11 @@ struct DemoApp {
     /// Per-setlist windowed plugin loading state (#207).
     setlist_window: window_load::SetlistWindowState,
     lv2_editor_request: Option<(u32, String, String)>,
-    /// Open native LV2 plugin GUI windows, keyed by node id.
+    /// Open native LV2 plugin GUI windows hosted in-process (`KABELSALAT_SANDBOX=0`).
     lv2_guis: Vec<(u32, crate::lv2::ui::Lv2UiHandle)>,
+    /// Nodes with open native LV2 GUI windows co-hosted in `plugin-worker`.
+    lv2_sandbox_guis: Vec<u32>,
+    lv2_loader_client: Option<crate::engine::Lv2LoaderClient>,
     editor_status: String,
     /// Why the open editor's plugin window did not open.
     plugin_window_error: Option<String>,
@@ -5221,6 +5224,8 @@ impl DemoApp {
             setlist_window: window_load::SetlistWindowState::default(),
             lv2_editor_request: None,
             lv2_guis: Vec::new(),
+            lv2_sandbox_guis: Vec::new(),
+            lv2_loader_client: None,
             editor_status: String::new(),
             plugin_window_error: None,
             last_unit_click: None,
@@ -8622,7 +8627,9 @@ impl DemoApp {
     /// Returns `Some(is_open)` if `node_id` has a hosted CLAP/VST3/LV2 native GUI window.
     fn unit_native_gui_state(&mut self, node_id: u32) -> Option<bool> {
         if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
-            if self.lv2_guis.iter().any(|(n, _)| *n == node_id) {
+            if self.lv2_sandbox_guis.contains(&node_id)
+                || self.lv2_guis.iter().any(|(n, _)| *n == node_id)
+            {
                 return Some(true);
             }
             let has_ui = self
@@ -8644,10 +8651,34 @@ impl DemoApp {
     fn toggle_unit_native_gui(&mut self, node_id: u32) {
         if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
             self.plugin_window_error = None;
+            if let Some(pos) = self.lv2_sandbox_guis.iter().position(|&n| n == node_id) {
+                self.lv2_sandbox_guis.swap_remove(pos);
+                if let Some(ref client) = self.lv2_loader_client {
+                    client.close_editor(node_id);
+                }
+                return;
+            }
             if let Some(pos) = self.lv2_guis.iter().position(|(n, _)| *n == node_id) {
                 let (_, mut handle) = self.lv2_guis.swap_remove(pos);
                 handle.close();
                 return;
+            }
+            let title = format!("{} · kabelsalat", self.unit_display_name(node_id));
+            if crate::host::sandbox_enabled() {
+                if let Some(ref client) = self.lv2_loader_client {
+                    match client.open_editor(node_id, title.clone()) {
+                        Ok(()) => {
+                            self.lv2_sandbox_guis.push(node_id);
+                            return;
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            self.plugin_window_error = Some(msg.clone());
+                            self.session_msg = format!("Plugin GUI failed: {msg}");
+                            return;
+                        }
+                    }
+                }
             }
             let Some(info) = crate::lv2::discover_ui_for_uri(uri.as_str()) else {
                 let msg = "this LV2 plugin has no native GUI".to_string();
@@ -8683,7 +8714,6 @@ impl DemoApp {
                     .unwrap_or(c.default);
                 initial.push((port_idx, val.clamp(c.min, hi)));
             }
-            let title = format!("{} · kabelsalat", self.unit_display_name(node_id));
             match crate::lv2::ui::Lv2UiHandle::open(
                 uri.as_str(),
                 &title,
@@ -8723,7 +8753,7 @@ impl DemoApp {
     }
 
     fn pump_lv2_guis(&mut self) {
-        if self.lv2_guis.is_empty() {
+        if self.lv2_guis.is_empty() && self.lv2_sandbox_guis.is_empty() {
             return;
         }
         let mut idx = 0;
@@ -8750,6 +8780,35 @@ impl DemoApp {
                 h.close();
             } else {
                 idx += 1;
+            }
+        }
+        if !self.lv2_sandbox_guis.is_empty() {
+            if let Some(ref client) = self.lv2_loader_client {
+                let mut s_idx = 0;
+                while s_idx < self.lv2_sandbox_guis.len() {
+                    let node_id = self.lv2_sandbox_guis[s_idx];
+                    if !self
+                        .base_graph
+                        .node(node_id)
+                        .is_some_and(|n| matches!(n.kind, NodeKind::Lv2 { .. }))
+                    {
+                        self.lv2_sandbox_guis.swap_remove(s_idx);
+                        client.close_editor(node_id);
+                    } else {
+                        s_idx += 1;
+                    }
+                }
+                if !self.lv2_sandbox_guis.is_empty() {
+                    let polls = client.poll_editors();
+                    for p in &polls {
+                        for &(nth, native, norm) in &p.control_writes {
+                            ctrl_updates.push((p.node, nth, native, norm));
+                        }
+                        midi_updates.extend(p.midi_events.iter().copied());
+                    }
+                    self.lv2_sandbox_guis
+                        .retain(|&id| polls.iter().any(|p| p.node == id && p.open));
+                }
             }
         }
         let rm = self.reduce_motion;
@@ -9299,6 +9358,13 @@ impl DemoApp {
         // The editor and any LV2 native plugin GUI referenced the old graph; close them.
         for (_, mut handle) in self.lv2_guis.drain(..) {
             handle.close();
+        }
+        if let Some(ref client) = self.lv2_loader_client {
+            for node_id in self.lv2_sandbox_guis.drain(..) {
+                client.close_editor(node_id);
+            }
+        } else {
+            self.lv2_sandbox_guis.clear();
         }
         if std::mem::take(&mut self.editor_open) {
             self.editor_status = "editor closed (rack reloaded)".into();
@@ -21761,7 +21827,7 @@ impl DemoApp {
     fn start_plugin_scan(&mut self, retry_failed: bool) {
         let scan = move || {
             let clap = if retry_failed { crate::host::list_clap_plugins_retry_failed() } else { list_clap_plugins() };
-            let (lv2, mut unloadable) = crate::lv2::discover_with_unloadable();
+            let (lv2, mut unloadable) = crate::lv2::discover_with_unloadable_rescan(retry_failed);
             let (vst3, vst3_err) = if retry_failed {
                 (crate::vst3::list_vst3_plugins_retry_failed(), Vec::new())
             } else {
@@ -36670,7 +36736,10 @@ impl DemoApp {
         // animation / agent run is active; ~30 fps when unfocused and idle.
         if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
-        } else if self._surge_main.iter().any(|m| m.editor_open()) || !self.lv2_guis.is_empty() {
+        } else if self._surge_main.iter().any(|m| m.editor_open())
+            || !self.lv2_guis.is_empty()
+            || !self.lv2_sandbox_guis.is_empty()
+        {
             // Plugin editors paint from timers this frame loop runs.
             ctx.request_repaint_after(std::time::Duration::from_millis(15));
         } else {
@@ -36688,9 +36757,11 @@ impl DemoApp {
 
 impl eframe::App for DemoApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        // Tab belongs to the rack flip, ALWAYS. Strip it from raw input before
-        // egui processes anything, so its focus navigation can't steal it and
-        // bounce focus between the assistant field and the widgets.
+        // Tab belongs to the rack flip normally, except while the quick-add
+        // picker is open and uses Tab / Shift+Tab to cycle its filter chips.
+        if self.quick_add.is_some() {
+            return;
+        }
         let mut flip = false;
         raw_input.events.retain(|ev| {
             if matches!(ev, egui::Event::Key { key: Key::Tab, pressed: true, .. }) {
@@ -36716,6 +36787,13 @@ impl eframe::App for DemoApp {
         // Close any open native plugin GUI windows before teardown.
         for (_, mut handle) in self.lv2_guis.drain(..) {
             handle.close();
+        }
+        if let Some(ref client) = self.lv2_loader_client {
+            for node_id in self.lv2_sandbox_guis.drain(..) {
+                client.close_editor(node_id);
+            }
+        } else {
+            self.lv2_sandbox_guis.clear();
         }
         for main in &mut self._surge_main {
             main.close_editor();
@@ -37339,6 +37417,7 @@ impl EvalRig {
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(VOICE_RING);
         engine.set_voice_channels(voice_rx, retire_tx);
         engine.spawn_lv2_loader();
+        app.lv2_loader_client = engine.lv2_loader_client();
         let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
         engine.set_recorder(tap);
         recorder.set_retro_seconds(app.retro_minutes * 60);
@@ -37846,6 +37925,7 @@ struct BuiltAudio {
     audio_in_tx: rtrb::Producer<(u32, rtrb::Consumer<f32>)>,
     audio_in_levels: Arc<AudioInLevels>,
     clock_pos: Arc<crate::clocksend::ClockPos>,
+    lv2_loader_client: Option<crate::engine::Lv2LoaderClient>,
 }
 
 fn build_audio() -> anyhow::Result<BuiltAudio> {
@@ -37921,6 +38001,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     engine.set_audio_in_channel(audio_in_rx);
     let audio_in_levels = engine.audio_in_levels_handle();
     engine.spawn_lv2_loader();
+    let lv2_loader_client = engine.lv2_loader_client();
     let bus_outs = engine.take_out_taps()
         .map(|taps| crate::audio_out::BusOutputs::spawn(taps, graph_pub.clone(), sample_rate as u32));
     let engine = Arc::new(Mutex::new(engine));
@@ -37997,6 +38078,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         audio_in_tx,
         audio_in_levels,
         clock_pos,
+        lv2_loader_client,
     })
 }
 
@@ -38160,6 +38242,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             audio_in_tx,
                             audio_in_levels,
                             clock_pos,
+                            lv2_loader_client,
                         } = ba;
                         let bus = Arc::new(Mutex::new(bus));
                         // MIDI clock send: attach the engine and start the
@@ -38219,6 +38302,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             node_times,
                             audio_in_tx,
                             audio_in_levels,
+                            lv2_loader_client,
                         ));
                     }
                     Err(e) => {
@@ -38253,6 +38337,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     node_times,
                     audio_in_tx,
                     audio_in_levels,
+                    lv2_loader_client,
                 )) => {
                     app.shared_graph = shared_graph;
                     app.edge_levels = Some(edge_levels);
@@ -38269,6 +38354,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.recorder = Some(recorder);
                     app.audio_in_tx = Some(audio_in_tx);
                     app.audio_in_levels = Some(audio_in_levels);
+                    app.lv2_loader_client = lv2_loader_client;
                     app.with_audio(
                         mains,
                         controllers,
@@ -44823,6 +44909,7 @@ mod ui_polish_agent_tests {
         let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
         engine.set_graph_pub(graph_pub.clone());
         engine.spawn_lv2_loader();
+        app.lv2_loader_client = engine.lv2_loader_client();
         app.graph_pub = Some(graph_pub);
         app.bus = Some(bus.clone());
         app.plugins_lv2 = lv2_plugins;
@@ -56156,6 +56243,7 @@ mod precision_knob_tests {
                 is_instrument: false,
                 is_midi_fx: false,
                 has_ui: true,
+                bundle_path: String::new(),
             },
             Lv2PluginInfo {
                 uri: uri_no_ui.into(),
@@ -56166,6 +56254,7 @@ mod precision_knob_tests {
                 is_instrument: false,
                 is_midi_fx: false,
                 has_ui: false,
+                bundle_path: String::new(),
             },
         ];
         let cid = "0123456789ABCDEF0123456789ABCDEF";

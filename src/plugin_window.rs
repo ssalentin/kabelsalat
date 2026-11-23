@@ -86,7 +86,9 @@ impl PluginWindow {
         let wm_delete = atom("WM_DELETE_WINDOW")?;
         let net_wm_name = atom("_NET_WM_NAME")?;
         let utf8 = atom("UTF8_STRING")?;
+        let xdnd_aware = atom("XdndAware")?;
         conn.change_property32(PropMode::REPLACE, win, wm_protocols, AtomEnum::ATOM, &[wm_delete])?;
+        conn.change_property32(PropMode::REPLACE, win, xdnd_aware, AtomEnum::ATOM, &[5u32])?;
         conn.change_property8(PropMode::REPLACE, win, AtomEnum::WM_NAME, AtomEnum::STRING, title.as_bytes())?;
         conn.change_property8(PropMode::REPLACE, win, net_wm_name, utf8, title.as_bytes())?;
         conn.change_property8(
@@ -145,6 +147,67 @@ impl PluginWindow {
         (g.width > 1 && g.height > 1).then_some((g.width as u32, g.height as u32))
     }
 
+    /// Forward `XdndProxy` and `WM_NORMAL_HINTS` bounds from an embedded plugin
+    /// child window onto this toplevel host window.
+    pub fn attach_child(&self, child_win: u32, resizable: bool) {
+        if child_win == 0 {
+            return;
+        }
+        if let Ok(cookie) = self.conn.intern_atom(false, b"XdndProxy") {
+            if let Ok(reply) = cookie.reply() {
+                let _ = self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.win,
+                    reply.atom,
+                    AtomEnum::WINDOW,
+                    &[child_win],
+                );
+            }
+        }
+        if let Ok(cookie) = self.conn.get_property(
+            false,
+            child_win,
+            AtomEnum::WM_NORMAL_HINTS,
+            AtomEnum::WM_SIZE_HINTS,
+            0,
+            18,
+        ) {
+            if let Ok(reply) = cookie.reply() {
+                if let Some(vals) = reply.value32() {
+                    let child: Vec<u32> = vals.collect();
+                    if child.len() >= 9 {
+                        let host = self.base_size_hints(resizable, false);
+                        let merged = merge_child_size_hints(host, &child, resizable);
+                        let _ = self.conn.change_property32(
+                            PropMode::REPLACE,
+                            self.win,
+                            AtomEnum::WM_NORMAL_HINTS,
+                            AtomEnum::WM_SIZE_HINTS,
+                            &merged,
+                        );
+                    }
+                }
+            }
+        }
+        let _ = self.conn.flush();
+    }
+
+    /// Fallback resize for embedded child windows whose LV2 UI omits `ui:resize`.
+    pub fn resize_child(&self, child_win: u32, width: u32, height: u32) {
+        if child_win == 0 {
+            return;
+        }
+        let _ = self.conn.configure_window(
+            child_win,
+            &ConfigureWindowAux::new()
+                .x(0)
+                .y(0)
+                .width(clamp16(width) as u32)
+                .height(clamp16(height) as u32),
+        );
+        let _ = self.conn.flush();
+    }
+
     /// Drain pending X events without blocking.
     pub fn poll(&mut self) -> WindowEvents {
         let mut out = WindowEvents::default();
@@ -171,9 +234,7 @@ impl PluginWindow {
         out
     }
 
-    /// WM_NORMAL_HINTS: the program's position (centred on initial open) and
-    /// size and, for a fixed-size editor, min = max = its size.
-    fn set_size_hints(&self, resizable: bool, include_position: bool) -> Result<()> {
+    fn base_size_hints(&self, resizable: bool, include_position: bool) -> [u32; 18] {
         const P_POSITION: u32 = 1 << 2;
         const P_SIZE: u32 = 1 << 3;
         const P_MIN_SIZE: u32 = 1 << 4;
@@ -195,6 +256,13 @@ impl PluginWindow {
             hints[7] = w;
             hints[8] = h;
         }
+        hints
+    }
+
+    /// WM_NORMAL_HINTS: the program's position (centred on initial open) and
+    /// size and, for a fixed-size editor, min = max = its size.
+    fn set_size_hints(&self, resizable: bool, include_position: bool) -> Result<()> {
+        let hints = self.base_size_hints(resizable, include_position);
         self.conn.change_property32(
             PropMode::REPLACE,
             self.win,
@@ -204,6 +272,58 @@ impl PluginWindow {
         )?;
         Ok(())
     }
+}
+
+/// Merge an embedded plugin window's `WM_NORMAL_HINTS` bounds/increments/aspect
+/// onto `host` hints while keeping `host`'s position and size fields intact.
+fn merge_child_size_hints(host: [u32; 18], child: &[u32], resizable: bool) -> [u32; 18] {
+    const P_MIN_SIZE: u32 = 1 << 4;
+    const P_MAX_SIZE: u32 = 1 << 5;
+    const P_RESIZE_INC: u32 = 1 << 6;
+    const P_ASPECT: u32 = 1 << 7;
+    const P_BASE_SIZE: u32 = 1 << 8;
+    let mut out = host;
+    if !resizable {
+        out[0] |= P_MIN_SIZE | P_MAX_SIZE;
+        out[5] = host[3];
+        out[6] = host[4];
+        out[7] = host[3];
+        out[8] = host[4];
+        return out;
+    }
+    if child.len() < 9 {
+        return out;
+    }
+    let cflags = child[0];
+    if cflags & P_MIN_SIZE != 0 {
+        out[0] |= P_MIN_SIZE;
+        out[5] = child[5];
+        out[6] = child[6];
+    }
+    if cflags & P_MAX_SIZE != 0 {
+        out[0] |= P_MAX_SIZE;
+        out[7] = child[7];
+        out[8] = child[8];
+    }
+    if (out[0] & P_MIN_SIZE != 0) && (out[0] & P_MAX_SIZE != 0) {
+        out[7] = out[7].max(out[5]);
+        out[8] = out[8].max(out[6]);
+    }
+    if cflags & P_RESIZE_INC != 0 && child.len() >= 11 {
+        out[0] |= P_RESIZE_INC;
+        out[9] = child[9];
+        out[10] = child[10];
+    }
+    if cflags & P_ASPECT != 0 && child.len() >= 15 {
+        out[0] |= P_ASPECT;
+        out[11..15].copy_from_slice(&child[11..15]);
+    }
+    if cflags & P_BASE_SIZE != 0 && child.len() >= 17 {
+        out[0] |= P_BASE_SIZE;
+        out[15] = child[15];
+        out[16] = child[16];
+    }
+    out
 }
 
 impl Drop for PluginWindow {
@@ -460,5 +580,64 @@ mod tests {
     fn candidate_displays_sorts_numerically_and_skips_non_sockets() {
         let got = candidate_displays(["X10", "X1", "X0", "X1", "lock", "Xabc", "Y2"]);
         assert_eq!(got, vec![":0", ":1", ":10"]);
+    }
+
+    #[test]
+    fn merge_child_size_hints_preserves_host_position_and_applies_child_bounds() {
+        const P_POSITION: u32 = 1 << 2;
+        const P_SIZE: u32 = 1 << 3;
+        const P_MIN_SIZE: u32 = 1 << 4;
+        const P_MAX_SIZE: u32 = 1 << 5;
+        const P_RESIZE_INC: u32 = 1 << 6;
+        const P_ASPECT: u32 = 1 << 7;
+        const P_BASE_SIZE: u32 = 1 << 8;
+
+        let mut host = [0u32; 18];
+        host[0] = P_POSITION | P_SIZE;
+        host[1] = 120;
+        host[2] = 80;
+        host[3] = 640;
+        host[4] = 480;
+
+        let mut child = [0u32; 18];
+        child[0] = P_POSITION | P_SIZE | P_MIN_SIZE | P_MAX_SIZE | P_RESIZE_INC | P_ASPECT | P_BASE_SIZE;
+        child[1] = 999;
+        child[2] = 999;
+        child[3] = 100;
+        child[4] = 100;
+        child[5] = 320;
+        child[6] = 240;
+        // Intentionally inverted max < min in one dimension to verify clamping.
+        child[7] = 1280;
+        child[8] = 200;
+        child[9] = 8;
+        child[10] = 8;
+        child[11] = 4;
+        child[12] = 3;
+        child[13] = 16;
+        child[14] = 9;
+        child[15] = 16;
+        child[16] = 16;
+
+        let merged = merge_child_size_hints(host, &child, true);
+        assert_eq!(merged[1], 120);
+        assert_eq!(merged[2], 80);
+        assert_eq!(merged[3], 640);
+        assert_eq!(merged[4], 480);
+        assert_eq!(merged[5], 320);
+        assert_eq!(merged[6], 240);
+        assert_eq!(merged[7], 1280);
+        assert_eq!(merged[8], 240);
+        assert_eq!(merged[9], 8);
+        assert_eq!(merged[10], 8);
+        assert_eq!(&merged[11..15], &[4, 3, 16, 9]);
+        assert_eq!(merged[15], 16);
+        assert_eq!(merged[16], 16);
+
+        let fixed = merge_child_size_hints(host, &child, false);
+        assert_eq!(fixed[5], 640);
+        assert_eq!(fixed[6], 480);
+        assert_eq!(fixed[7], 640);
+        assert_eq!(fixed[8], 480);
     }
 }

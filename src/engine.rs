@@ -13645,10 +13645,13 @@ mod send_tests {
         r.render(40);
         let pa = r.in_peak(0);
         assert!(close(r.peak(gain), 0.25 * pa), "the insert hears the bus: {} vs {}", r.peak(gain), 0.25 * pa);
-        // Same block: a send closed now is gone from the insert's output now.
+        // Same block: a send closed now starts fading in the insert's output
+        // now (over the 5 ms ramp, #415), and is gone one block later.
         r.send(SendSource::Rig(0), 0.0, false);
         r.render(1);
-        assert_eq!(r.peak(gain), 0.0, "no block of delay between send and insert");
+        assert!(r.peak(gain) < 0.5 * 0.25 * pa, "no block of delay between send and insert: {}", r.peak(gain));
+        r.render(1);
+        assert_eq!(r.peak(gain), 0.0, "the closed send is gone");
         // A node of the chain cannot send (feedback), nor can a bus.
         r.bus.send(Command::SetSend { from: SendSource::Node(gain), bus: aux, level: Some(1.0), pre: None });
         r.bus.send(Command::SetSend { from: SendSource::Node(aux), bus: aux, level: Some(1.0), pre: None });

@@ -52417,6 +52417,38 @@ mod offline_shots {
         }
     }
 
+    /// The routing units (#308) are addable from the Plugins browser's path
+    /// and show their two inputs or two outputs, each on its own port.
+    #[test]
+    fn routing_units_show_their_two_inputs_and_outputs() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Crossfade), "A/B Crossfade");
+        app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Split), "Splitter");
+        let jacks = |kind: DspKind| -> Vec<(bool, usize, &'static str)> {
+            let u = app.units.iter().find(|u| matches!(&u.node_kind, UnitKind::Dsp(k) if *k == kind)).expect("unit");
+            u.jacks.iter().map(|j| (matches!(j.dir, Dir::In), j.port, j.label)).collect()
+        };
+        assert_eq!(jacks(DspKind::Crossfade), vec![(true, 0, "IN A"), (true, 1, "IN B"), (false, 0, "OUT")]);
+        let split = jacks(DspKind::Split);
+        assert_eq!(split.iter().filter(|j| !j.0).map(|j| j.1).collect::<Vec<_>>(), vec![0, 1]);
+        let x = app.units.iter().find(|u| matches!(&u.node_kind, UnitKind::Dsp(DspKind::Crossfade))).unwrap();
+        assert_eq!(x.knobs.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(), vec!["MIX", "MODE"]);
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat routing_unit_shots -- --ignored"]
+    fn routing_unit_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, back) in [("front", false), ("back", true)] {
+            let mut app = DemoApp::new_with_sink(None);
+            app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Crossfade), "A/B Crossfade");
+            app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Split), "Splitter");
+            if back { app.side = Side::Back; }
+            super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join(format!("routing-{name}.png")));
+        }
+    }
+
     #[test]
     #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored"]
     fn window_size_shots() {

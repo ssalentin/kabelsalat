@@ -274,7 +274,7 @@ with kind `midi_fx`).
 Two built-in units in **Plugins → Mixer & routing** (*Add to rig*, then patch
 them on the back with **Tab**), both with no latency:
 
-- **A/B Crossfade** has two stereo inputs, **IN A** and **IN B**, and one
+- **Crossfader** has two stereo inputs, **IN A** and **IN B**, and one
   output. **MIX** goes from A (left) to B (right); **MODE** picks *power*
   (equal power, for two different sources), *linear* (for a dry and a wet path
   of the same sound) or *switch* (A below the middle, B above it). Learn MIX

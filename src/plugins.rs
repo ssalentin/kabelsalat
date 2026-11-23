@@ -400,7 +400,7 @@ pub static BUILTIN_PLUGINS: &[BuiltinPlugin] = &[
     builtin("builtin.metronome", "Metronome", "tempo · tap · count-in", PluginSubtype::Metronome, BuiltinAction::Dsp(DspKind::Metronome)),
     builtin("builtin.gain", "Gain", "clean level trim · gain", PluginSubtype::MixerRouting, BuiltinAction::Dsp(DspKind::Gain)),
     builtin("builtin.pan", "Pan", "stereo balance · left to right", PluginSubtype::MixerRouting, BuiltinAction::Dsp(DspKind::Pan)),
-    builtin("builtin.crossfade", "A/B Crossfade", "a/b switch & crossfader · two inputs, one output", PluginSubtype::MixerRouting, BuiltinAction::Dsp(DspKind::Crossfade)),
+    builtin("builtin.crossfade", "Crossfader", "a/b switch & crossfader · two inputs, one output", PluginSubtype::MixerRouting, BuiltinAction::Dsp(DspKind::Crossfade)),
     builtin("builtin.split", "Splitter", "low/high, mid/side or left/right · one input, two outputs", PluginSubtype::MixerRouting, BuiltinAction::Dsp(DspKind::Split)),
 ];
 

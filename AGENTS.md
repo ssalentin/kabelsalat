@@ -2085,3 +2085,12 @@ Learned so far (2026-11-15, UI polish pass):
     (`SoundcheckShared::wait_ahead`), or an underrun shifts the take
     (`kabelsalat gig-test`).
 231. **A setlist cue is sent by entering a part, never by a table or a load:** publishing the cue table (a load, an edit, a reorder) only tells the cue thread which song it is in (`CueMsg::Table`), so a re-publish after a reorder neither repeats a song cue nor loses it; a cue goes out on `CueControl::enter` (app steps) or the engine's lock-free ring (foot switch), from the cue thread, never the audio thread or a UI frame. A follower phase-locks by comparing `base + n/24` with the engine's position at the clock's own kernel time and nudging a share per clock (`Command::NudgeBeats`), never by setting tempo from the phase error (`two_instances_stay_phase_locked_across_a_tempo_change`, `a_reorder_republishes_without_sending_and_keeps_the_song_it_is_in`).
+235. **Drop `Arc<OwnedWorld>` only inside `LILV_STATE` and match LV2 `sampleRate` / `resize-port` / UI `Tab` specs:**
+    `OwnedWorld::drop` calls `lilv_world_free` directly, so every world
+    owner (`Lv2Plugin.world`, `LILV_STATE.shared`) must drop under the
+    `LILV_STATE` lock (never return an `Arc<OwnedWorld>` out of a helper or
+    lock `EXTRA_BUNDLES -> LILV_STATE`); LV2 options use
+    `parameters#sampleRate` (not `lv2core#sampleRate`), `atom:AtomPort`
+    buffers allocate `resize-port:minimumSize` in 8-byte-aligned `Vec<u64>`,
+    and `raw_input_hook` yields `Key::Tab` while `quick_add.is_some()` so
+    filter cycling never flips the rack.

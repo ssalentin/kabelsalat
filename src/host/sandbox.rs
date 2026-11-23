@@ -453,9 +453,22 @@ enum CtrlReq {
         block: usize,
         state: Option<(String, String, Vec<u8>)>,
         controls: Vec<(usize, f32)>,
+        #[serde(default)]
+        bundle_path: Option<String>,
     },
     Lv2SaveState {
         key: String,
+    },
+    Lv2OpenEditor {
+        title: String,
+    },
+    Lv2CloseEditor,
+    Lv2EditorPoll,
+    Lv2SavePreset {
+        name: String,
+    },
+    Lv2ApplyPreset {
+        preset: Lv2Preset,
     },
     SaveState,
     LoadState { data: Vec<u8> },
@@ -511,6 +524,12 @@ enum CtrlResp {
     Latency(u32),
     Bool(bool),
     ParamEdits(Vec<(u32, f64)>),
+    Lv2EditorStatus {
+        open: bool,
+        control_writes: Vec<(usize, f32, f32)>,
+        midi_events: Vec<[u8; 3]>,
+    },
+    Lv2PresetSaved(Lv2Preset),
 }
 
 fn send_msg<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
@@ -721,8 +740,8 @@ pub fn run_plugin_worker(shm_fd: RawFd, ctrl_fd: RawFd) -> Result<()> {
     // and LV2 use distinct shared-memory layouts (`ShmBlock` vs `Lv2ShmBlock`).
     let (plugin_id, sample_rate, init_state) = match recv_msg::<CtrlReq>(&mut ctrl)? {
         CtrlReq::Init { plugin_id, sample_rate, state } => (plugin_id, sample_rate, state),
-        CtrlReq::InitLv2 { uri, sample_rate, block, state, controls } => {
-            return run_lv2_worker(shm_fd, ctrl, uri, sample_rate, block, state, controls);
+        CtrlReq::InitLv2 { uri, sample_rate, block, state, controls, bundle_path } => {
+            return run_lv2_worker(shm_fd, ctrl, uri, sample_rate, block, state, controls, bundle_path);
         }
         _ => {
             unsafe { libc::close(shm_fd); }
@@ -1045,7 +1064,12 @@ fn handle_worker_req(
             }
             CtrlReq::DrainParamEdits => CtrlResp::ParamEdits(Vec::new()),
             CtrlReq::Init { .. } | CtrlReq::InitLv2 { .. } | CtrlReq::Shutdown => CtrlResp::Ok,
-            CtrlReq::Lv2SaveState { .. } => CtrlResp::Err("unexpected Lv2SaveState on CLAP worker".into()),
+            CtrlReq::Lv2SaveState { .. }
+            | CtrlReq::Lv2OpenEditor { .. }
+            | CtrlReq::Lv2CloseEditor
+            | CtrlReq::Lv2EditorPoll
+            | CtrlReq::Lv2SavePreset { .. }
+            | CtrlReq::Lv2ApplyPreset { .. } => CtrlResp::Err("unexpected LV2 request on CLAP worker".into()),
         },
         WorkerMain::TestSynth(shared) => {
             let mut st = shared.lock().unwrap();
@@ -1075,7 +1099,12 @@ fn handle_worker_req(
                 | CtrlReq::Init { .. }
                 | CtrlReq::InitLv2 { .. }
                 | CtrlReq::Shutdown => CtrlResp::Ok,
-                CtrlReq::Lv2SaveState { .. } => CtrlResp::Err("unexpected Lv2SaveState on test worker".into()),
+                CtrlReq::Lv2SaveState { .. }
+                | CtrlReq::Lv2OpenEditor { .. }
+                | CtrlReq::Lv2CloseEditor
+                | CtrlReq::Lv2EditorPoll
+                | CtrlReq::Lv2SavePreset { .. }
+                | CtrlReq::Lv2ApplyPreset { .. } => CtrlResp::Err("unexpected LV2 request on test worker".into()),
                 CtrlReq::DrainParamEdits => CtrlResp::ParamEdits(Vec::new()),
                 CtrlReq::EditorOpen => CtrlResp::Bool(false),
             }
@@ -1091,13 +1120,19 @@ fn run_lv2_worker(
     block: usize,
     init_state: Option<(String, String, Vec<u8>)>,
     init_controls: Vec<(usize, f32)>,
+    bundle_path: Option<String>,
 ) -> Result<()> {
     crate::lv2::load_extra_bundles_from_env();
     let shm = Lv2ShmRegion::from_inherited_fd(shm_fd)?;
     shm.block().worker_pid.store(std::process::id(), Ordering::Release);
     shm.block().worker_alive.store(1, Ordering::Release);
 
-    let mut plugin = match Lv2Plugin::load(&uri, sample_rate, block.max(MAX_LV2_SHM_FRAMES)) {
+    let mut plugin = match Lv2Plugin::load_with_bundle(
+        &uri,
+        sample_rate,
+        block.max(MAX_LV2_SHM_FRAMES),
+        bundle_path.as_deref(),
+    ) {
         Ok(p) => p,
         Err(e) => {
             let _ = send_msg(&mut ctrl, &CtrlResp::Err(format!("{e:#}")));
@@ -1125,12 +1160,43 @@ fn run_lv2_worker(
     }
 
     let resolved_uri = plugin.uri().to_string();
+    let plugin_name = plugin.name().to_string();
     let is_instrument = plugin.is_instrument();
     let is_midi_fx = plugin.is_midi_fx();
     let reports_latency = plugin.reports_latency();
     let has_midi_in = plugin.has_midi_in();
     let latency = plugin.latency_frames();
     let controls = plugin.control_descs();
+    let raw_handle_addr = plugin.raw_handle() as usize;
+    let raw_desc_addr = plugin.raw_descriptor() as usize;
+    let shared_urid = Arc::clone(plugin.shared_urid_map());
+    let port_symbols = plugin.port_symbols().to_vec();
+    let control_out_ports = plugin.control_output_ports().to_vec();
+
+    let sym_to_port: HashMap<&str, u32> = port_symbols
+        .iter()
+        .map(|&(idx, ref sym)| (sym.as_str(), idx as u32))
+        .collect();
+    let ctrl_in_ports: Vec<(usize, u32)> = controls
+        .iter()
+        .filter_map(|c| sym_to_port.get(c.symbol.as_str()).map(|&p| (c.index, p)))
+        .collect();
+    let ctrl_in_shadow = Arc::new(
+        controls
+            .iter()
+            .map(|c| AtomicU32::new(c.value.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let ctrl_out_shadow = Arc::new(
+        control_out_ports
+            .iter()
+            .map(|&p| (p as u32, AtomicU32::new(0.0f32.to_bits())))
+            .collect::<Vec<_>>(),
+    );
+    let ui_active = Arc::new(AtomicBool::new(false));
+    let (mut ui_ctrl_tx, ui_ctrl_rx) = rtrb::RingBuffer::<(usize, f32)>::new(256);
+    let (mut ui_atom_tx, ui_atom_rx) = rtrb::RingBuffer::<(u32, Vec<u8>)>::new(256);
+    let (dsp_atom_tx, mut dsp_atom_rx) = rtrb::RingBuffer::<(u32, Vec<u8>)>::new(256);
 
     {
         let blk = shm.block_mut();
@@ -1151,13 +1217,26 @@ fn run_lv2_worker(
     let stop_bg = stop_audio.clone();
     let ready_bg = audio_ready.clone();
     let plugin_bg = plugin.clone();
+    let ui_active_bg = ui_active.clone();
+    let ctrl_in_bg = ctrl_in_shadow.clone();
+    let ctrl_out_bg = ctrl_out_shadow.clone();
     let shm_ptr = shm.ptr as usize;
     let audio_handle = std::thread::Builder::new()
         .name("kabelsalat-worker-audio".into())
         .spawn(move || {
             let blk = unsafe { &mut *(shm_ptr as *mut Lv2ShmBlock) };
             ready_bg.store(true, Ordering::Release);
-            lv2_worker_audio_loop(plugin_bg, blk, &stop_bg);
+            lv2_worker_audio_loop(
+                plugin_bg,
+                blk,
+                &stop_bg,
+                &ui_active_bg,
+                ui_ctrl_rx,
+                ui_atom_rx,
+                dsp_atom_tx,
+                &ctrl_in_bg,
+                &ctrl_out_bg,
+            );
         })
         .context("spawn lv2 worker audio thread")?;
     while !audio_ready.load(Ordering::Acquire) {
@@ -1167,19 +1246,31 @@ fn run_lv2_worker(
     send_msg(
         &mut ctrl,
         &CtrlResp::InitLv2Ok {
-            uri: resolved_uri,
+            uri: resolved_uri.clone(),
             is_instrument,
             is_midi_fx,
             reports_latency,
             has_midi_in,
             latency,
-            controls,
+            controls: controls.clone(),
         },
     )?;
+
+    ctrl.set_read_timeout(Some(Duration::from_millis(16)))?;
+    let mut editor: Option<crate::lv2::ui::Lv2UiHandle> = None;
+    let mut pending_ctrl_writes: Vec<(usize, f32, f32)> = Vec::new();
+    let mut pending_midi_events: Vec<[u8; 3]> = Vec::new();
+    let mut last_pump = Instant::now();
+
+
 
     loop {
         match recv_msg::<CtrlReq>(&mut ctrl) {
             Ok(CtrlReq::Shutdown) => {
+                if let Some(mut h) = editor.take() {
+                    h.close();
+                }
+                ui_active.store(false, Ordering::Release);
                 let _ = send_msg(&mut ctrl, &CtrlResp::Ok);
                 break;
             }
@@ -1194,15 +1285,185 @@ fn run_lv2_worker(
                     break;
                 }
             }
+            Ok(CtrlReq::Lv2OpenEditor { title }) => {
+                if let Some(mut h) = editor.take() {
+                    h.close();
+                }
+                while dsp_atom_rx.pop().is_ok() {}
+                pending_ctrl_writes.clear();
+                pending_midi_events.clear();
+                let resp = match crate::lv2::discover_ui_for_uri(&resolved_uri) {
+                    Some(info) => {
+                        let initial: Vec<(u32, f32)> = ctrl_in_ports
+                            .iter()
+                            .filter_map(|&(nth, port_idx)| {
+                                ctrl_in_shadow
+                                    .get(nth)
+                                    .map(|a| (port_idx, f32::from_bits(a.load(Ordering::Acquire))))
+                            })
+                            .collect();
+                        let syms_u32: Vec<(u32, String)> = port_symbols
+                            .iter()
+                            .map(|&(idx, ref sym)| (idx as u32, sym.clone()))
+                            .collect();
+                        let direct = crate::lv2::ui::Lv2DirectAccess {
+                            instance: raw_handle_addr as crate::lv2::Lv2Handle,
+                            descriptor: raw_desc_addr as *const crate::lv2::Lv2Descriptor,
+                        };
+                        let win_title = if title.is_empty() {
+                            format!("{plugin_name} · kabelsalat")
+                        } else {
+                            title
+                        };
+                        match crate::lv2::ui::Lv2UiHandle::open_cohosted(
+                            &resolved_uri,
+                            &win_title,
+                            sample_rate,
+                            &initial,
+                            &controls,
+                            &syms_u32,
+                            &info,
+                            Arc::clone(&shared_urid),
+                            Some(direct),
+                        ) {
+                            Ok(h) => {
+                                editor = Some(h);
+                                ui_active.store(true, Ordering::Release);
+                                pump_lv2_editor(
+    &mut editor,
+    &mut pending_ctrl_writes,
+    &mut pending_midi_events,
+    &ctrl_in_ports,
+    &ctrl_in_shadow,
+    &ctrl_out_shadow,
+    &ui_active,
+    &mut dsp_atom_rx,
+    &mut ui_ctrl_tx,
+    &mut ui_atom_tx,
+);
+                                CtrlResp::Ok
+                            }
+                            Err(e) => CtrlResp::Err(format!("{e:#}")),
+                        }
+                    }
+                    None => CtrlResp::Err(format!("{} has no hostable native GUI", resolved_uri)),
+                };
+                last_pump = Instant::now();
+                if send_msg(&mut ctrl, &resp).is_err() {
+                    break;
+                }
+            }
+            Ok(CtrlReq::Lv2CloseEditor) => {
+                if let Some(mut h) = editor.take() {
+                    h.close();
+                }
+                ui_active.store(false, Ordering::Release);
+                if send_msg(&mut ctrl, &CtrlResp::Ok).is_err() {
+                    break;
+                }
+            }
+            Ok(CtrlReq::Lv2EditorPoll) => {
+                pump_lv2_editor(
+    &mut editor,
+    &mut pending_ctrl_writes,
+    &mut pending_midi_events,
+    &ctrl_in_ports,
+    &ctrl_in_shadow,
+    &ctrl_out_shadow,
+    &ui_active,
+    &mut dsp_atom_rx,
+    &mut ui_ctrl_tx,
+    &mut ui_atom_tx,
+);
+                last_pump = Instant::now();
+                let resp = CtrlResp::Lv2EditorStatus {
+                    open: editor.is_some(),
+                    control_writes: std::mem::take(&mut pending_ctrl_writes),
+                    midi_events: std::mem::take(&mut pending_midi_events),
+                };
+                if send_msg(&mut ctrl, &resp).is_err() {
+                    break;
+                }
+            }
+            Ok(CtrlReq::Lv2SavePreset { name }) => {
+                let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
+                let resp = match guard.save_preset_bundle(&name) {
+                    Ok(preset) => CtrlResp::Lv2PresetSaved(preset),
+                    Err(e) => CtrlResp::Err(format!("{e:#}")),
+                };
+                drop(guard);
+                if send_msg(&mut ctrl, &resp).is_err() {
+                    break;
+                }
+            }
+            Ok(CtrlReq::Lv2ApplyPreset { preset }) => {
+                let mut guard = plugin.lock().unwrap_or_else(|e| e.into_inner());
+                let resp = match guard.apply_preset_full(&preset) {
+                    Ok(()) => {
+                        for (i, d) in guard.control_descs().iter().enumerate() {
+                            if let Some(a) = ctrl_in_shadow.get(i) {
+                                a.store(d.value.to_bits(), Ordering::Release);
+                            }
+                        }
+                        CtrlResp::Ok
+                    }
+                    Err(e) => CtrlResp::Err(format!("{e:#}")),
+                };
+                drop(guard);
+                if send_msg(&mut ctrl, &resp).is_err() {
+                    break;
+                }
+            }
             Ok(_) => {
                 if send_msg(&mut ctrl, &CtrlResp::Ok).is_err() {
                     break;
                 }
             }
-            Err(_) => break,
+            Err(e) => {
+                if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
+                    if matches!(ioe.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
+                        if editor.is_some() && last_pump.elapsed() >= Duration::from_millis(16) {
+                            pump_lv2_editor(
+    &mut editor,
+    &mut pending_ctrl_writes,
+    &mut pending_midi_events,
+    &ctrl_in_ports,
+    &ctrl_in_shadow,
+    &ctrl_out_shadow,
+    &ui_active,
+    &mut dsp_atom_rx,
+    &mut ui_ctrl_tx,
+    &mut ui_atom_tx,
+);
+                            last_pump = Instant::now();
+                        }
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        if editor.is_some() && last_pump.elapsed() >= Duration::from_millis(16) {
+            pump_lv2_editor(
+    &mut editor,
+    &mut pending_ctrl_writes,
+    &mut pending_midi_events,
+    &ctrl_in_ports,
+    &ctrl_in_shadow,
+    &ctrl_out_shadow,
+    &ui_active,
+    &mut dsp_atom_rx,
+    &mut ui_ctrl_tx,
+    &mut ui_atom_tx,
+);
+            last_pump = Instant::now();
         }
     }
 
+    if let Some(mut h) = editor.take() {
+        h.close();
+    }
+    ui_active.store(false, Ordering::Release);
     stop_audio.store(true, Ordering::Release);
     shm.block().worker_alive.store(0, Ordering::Release);
     futex_wake(&shm.block().host_seq);
@@ -1212,15 +1473,72 @@ fn run_lv2_worker(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn pump_lv2_editor(
+    editor: &mut Option<crate::lv2::ui::Lv2UiHandle>,
+    pending_ctrl: &mut Vec<(usize, f32, f32)>,
+    pending_midi: &mut Vec<[u8; 3]>,
+    ctrl_in_ports: &[(usize, u32)],
+    ctrl_in_shadow: &[AtomicU32],
+    ctrl_out_shadow: &[(u32, AtomicU32)],
+    ui_active: &AtomicBool,
+    dsp_atom_rx: &mut rtrb::Consumer<(u32, Vec<u8>)>,
+    ui_ctrl_tx: &mut rtrb::Producer<(usize, f32)>,
+    ui_atom_tx: &mut rtrb::Producer<(u32, Vec<u8>)>,
+) {
+    let Some(ref mut ed) = editor else {
+        ui_active.store(false, Ordering::Release);
+        return;
+    };
+    for &(nth, port_idx) in ctrl_in_ports {
+        if let Some(a) = ctrl_in_shadow.get(nth) {
+            ed.notify_control(port_idx, f32::from_bits(a.load(Ordering::Acquire)));
+        }
+    }
+    for &(port_idx, ref a) in ctrl_out_shadow {
+        ed.notify_control(port_idx, f32::from_bits(a.load(Ordering::Acquire)));
+    }
+    while let Ok((port_idx, atom_bytes)) = dsp_atom_rx.pop() {
+        ed.notify_atom(port_idx, &atom_bytes);
+    }
+    let res = ed.pump();
+    for &(nth, native, _) in &res.control_writes {
+        if let Some(a) = ctrl_in_shadow.get(nth) {
+            a.store(native.to_bits(), Ordering::Release);
+        }
+        let _ = ui_ctrl_tx.push((nth, native));
+    }
+    for (port_idx, atom_bytes) in res.atom_writes {
+        let _ = ui_atom_tx.push((port_idx, atom_bytes));
+    }
+    pending_ctrl.extend(res.control_writes);
+    pending_midi.extend(res.midi_events);
+    if res.closed {
+        if let Some(mut h) = editor.take() {
+            h.close();
+        }
+        ui_active.store(false, Ordering::Release);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lv2_worker_audio_loop(
     plugin: Arc<std::sync::Mutex<Lv2Plugin>>,
     blk: &mut Lv2ShmBlock,
     stop: &AtomicBool,
+    ui_active: &AtomicBool,
+    mut ui_ctrl_rx: rtrb::Consumer<(usize, f32)>,
+    mut ui_atom_rx: rtrb::Consumer<(u32, Vec<u8>)>,
+    mut dsp_atom_tx: rtrb::Producer<(u32, Vec<u8>)>,
+    ctrl_in_shadow: &[AtomicU32],
+    ctrl_out_shadow: &[(u32, AtomicU32)],
 ) {
     let mut last_seq = 0u32;
     let mut out_tmp = [0.0f32; MAX_LV2_SHM_FRAMES * 2];
     let mut in_tmp = [0.0f32; MAX_LV2_SHM_FRAMES * 2];
     let mut fx_out = Vec::with_capacity(MAX_LV2_MIDI_EVENTS);
+    let mut ctrl_out_tmp = Vec::with_capacity(ctrl_out_shadow.len().max(8));
+    let mut atom_out_tmp = Vec::with_capacity(32);
 
     while !stop.load(Ordering::Acquire) && blk.worker_alive.load(Ordering::Acquire) != 0 {
         let mut seq = blk.host_seq.load(Ordering::Acquire);
@@ -1250,9 +1568,22 @@ fn lv2_worker_audio_loop(
         if blk.controls_dirty != 0 {
             let cc = (blk.control_count as usize).min(MAX_LV2_CONTROLS);
             for i in 0..cc {
-                guard.set_control_native(i, blk.controls[i]);
+                let val = blk.controls[i];
+                guard.set_control_native(i, val);
+                if let Some(a) = ctrl_in_shadow.get(i) {
+                    a.store(val.to_bits(), Ordering::Release);
+                }
             }
             blk.controls_dirty = 0;
+        }
+        while let Ok((nth, val)) = ui_ctrl_rx.pop() {
+            guard.set_control_native(nth, val);
+            if let Some(a) = ctrl_in_shadow.get(nth) {
+                a.store(val.to_bits(), Ordering::Release);
+            }
+        }
+        while let Ok((port_idx, atom_bytes)) = ui_atom_rx.pop() {
+            guard.push_atom_in_raw(port_idx as usize, &atom_bytes);
         }
         let mc = (blk.midi_in_count as usize).min(MAX_LV2_MIDI_EVENTS);
         for i in 0..mc {
@@ -1280,6 +1611,20 @@ fn lv2_worker_audio_loop(
             guard.process(&in_tmp[..n2], &mut out_tmp[..n2], frames);
             blk.out_buf[..n2].copy_from_slice(&out_tmp[..n2]);
             blk.midi_out_count = 0;
+        }
+        if ui_active.load(Ordering::Relaxed) {
+            if !ctrl_out_shadow.is_empty() {
+                guard.copy_control_outputs(&mut ctrl_out_tmp);
+                for &(port_idx, val) in &ctrl_out_tmp {
+                    if let Some((_, atom)) = ctrl_out_shadow.iter().find(|&&(p, _)| p as usize == port_idx) {
+                        atom.store(val.to_bits(), Ordering::Release);
+                    }
+                }
+            }
+            guard.drain_atom_outs(&mut atom_out_tmp);
+            for (port_idx, atom_bytes) in atom_out_tmp.drain(..) {
+                let _ = dsp_atom_tx.push((port_idx, atom_bytes));
+            }
         }
         blk.latency_frames.store(guard.latency_frames(), Ordering::Release);
         blk.pending_worker_resp
@@ -1983,6 +2328,7 @@ fn spawn_lv2_worker(
             block,
             state,
             controls,
+            bundle_path: crate::lv2::bundle_path_for_uri(uri),
         },
     )?;
 
@@ -2387,6 +2733,7 @@ pub struct SandboxLv2Main {
     crash_count: u32,
     last_crash_reason: Option<String>,
     strip_notice: Option<String>,
+    editor_open: bool,
 }
 
 impl SandboxLv2Main {
@@ -2414,20 +2761,17 @@ impl SandboxLv2Main {
         self.crashed_gen.load(Ordering::Acquire) == self.spawn_gen
     }
 
-    pub fn save_state(&mut self, key: &str) -> Result<Vec<u8>> {
-        let ctrl = match self.ctrl.as_mut() {
-            Some(c) => c,
-            None => {
-                if let Some((k, _, blob)) = &self.last_state {
-                    if k == key {
-                        return Ok(blob.clone());
-                    }
-                }
-                bail!("lv2 worker unavailable");
-            }
+    pub fn editor_open(&self) -> bool {
+        self.editor_open
+    }
+
+    fn rpc(&mut self, req: &CtrlReq) -> Result<CtrlResp> {
+        let Some(ctrl) = self.ctrl.as_mut() else {
+            bail!("lv2 worker unavailable");
         };
-        if send_msg(ctrl, &CtrlReq::Lv2SaveState { key: key.to_string() }).is_err() {
+        if send_msg(ctrl, req).is_err() {
             self.ctrl = None;
+            self.editor_open = false;
             self.crashed_gen.store(self.spawn_gen, Ordering::Release);
             if self.last_crash_reason.is_none() {
                 self.last_crash_reason = Some("control socket closed".into());
@@ -2435,23 +2779,92 @@ impl SandboxLv2Main {
             bail!("lv2 control socket closed");
         }
         match recv_msg::<CtrlResp>(ctrl) {
-            Ok(CtrlResp::State(bytes)) => {
-                let kind = crate::lv2::state_format(&self.uri)
-                    .map_or("http://lv2plug.in/ns/ext/atom#Chunk", |f| f.kind)
-                    .to_string();
-                self.last_state = Some((key.to_string(), kind, bytes.clone()));
-                Ok(bytes)
-            }
-            Ok(CtrlResp::Err(e)) => bail!("{e}"),
-            Ok(_) => bail!("unexpected reply to Lv2SaveState"),
+            Ok(resp) => Ok(resp),
             Err(_) => {
                 self.ctrl = None;
+                self.editor_open = false;
                 self.crashed_gen.store(self.spawn_gen, Ordering::Release);
                 if self.last_crash_reason.is_none() {
                     self.last_crash_reason = Some("control socket error".into());
                 }
                 bail!("lv2 control socket error");
             }
+        }
+    }
+
+    pub fn open_editor(&mut self, title: &str) -> Result<()> {
+        match self.rpc(&CtrlReq::Lv2OpenEditor { title: title.to_string() })? {
+            CtrlResp::Ok => {
+                self.editor_open = true;
+                Ok(())
+            }
+            CtrlResp::Err(e) => bail!("{e}"),
+            _ => bail!("unexpected reply to Lv2OpenEditor"),
+        }
+    }
+
+    pub fn close_editor(&mut self) {
+        if !self.editor_open {
+            return;
+        }
+        self.editor_open = false;
+        let _ = self.rpc(&CtrlReq::Lv2CloseEditor);
+    }
+
+    pub fn poll_editor(&mut self) -> Result<(bool, Vec<(usize, f32, f32)>, Vec<[u8; 3]>)> {
+        match self.rpc(&CtrlReq::Lv2EditorPoll)? {
+            CtrlResp::Lv2EditorStatus { open, control_writes, midi_events } => {
+                self.editor_open = open;
+                for &(nth, native, _) in &control_writes {
+                    if let Some(a) = self.controls_shadow.get(nth) {
+                        a.store(native.to_bits(), Ordering::Release);
+                    }
+                }
+                Ok((open, control_writes, midi_events))
+            }
+            CtrlResp::Err(e) => {
+                self.editor_open = false;
+                bail!("{e}")
+            }
+            _ => bail!("unexpected reply to Lv2EditorPoll"),
+        }
+    }
+
+    pub fn save_preset(&mut self, name: &str) -> Result<Lv2Preset> {
+        match self.rpc(&CtrlReq::Lv2SavePreset { name: name.to_string() })? {
+            CtrlResp::Lv2PresetSaved(preset) => Ok(preset),
+            CtrlResp::Err(e) => bail!("{e}"),
+            _ => bail!("unexpected reply to Lv2SavePreset"),
+        }
+    }
+
+    pub fn apply_preset_full(&mut self, preset: &Lv2Preset) -> Result<()> {
+        match self.rpc(&CtrlReq::Lv2ApplyPreset { preset: preset.clone() })? {
+            CtrlResp::Ok => Ok(()),
+            CtrlResp::Err(e) => bail!("{e}"),
+            _ => bail!("unexpected reply to Lv2ApplyPreset"),
+        }
+    }
+
+    pub fn save_state(&mut self, key: &str) -> Result<Vec<u8>> {
+        if self.ctrl.is_none() {
+            if let Some((k, _, blob)) = &self.last_state {
+                if k == key {
+                    return Ok(blob.clone());
+                }
+            }
+            bail!("lv2 worker unavailable");
+        }
+        match self.rpc(&CtrlReq::Lv2SaveState { key: key.to_string() })? {
+            CtrlResp::State(bytes) => {
+                let kind = crate::lv2::state_format(&self.uri)
+                    .map_or("http://lv2plug.in/ns/ext/atom#Chunk", |f| f.kind)
+                    .to_string();
+                self.last_state = Some((key.to_string(), kind, bytes.clone()));
+                Ok(bytes)
+            }
+            CtrlResp::Err(e) => bail!("{e}"),
+            _ => bail!("unexpected reply to Lv2SaveState"),
         }
     }
 
@@ -2468,6 +2881,7 @@ impl SandboxLv2Main {
                     died_reason = Some(exit_reason(status));
                     self.child = None;
                     self.ctrl = None;
+                    self.editor_open = false;
                     self.crashed_gen.store(self.spawn_gen, Ordering::Release);
                 }
                 Ok(None) => {}
@@ -2475,9 +2889,11 @@ impl SandboxLv2Main {
                     died_reason = Some("wait failed".into());
                     self.child = None;
                     self.ctrl = None;
+                    self.editor_open = false;
                 }
             }
         } else if self.is_crashed() {
+            self.editor_open = false;
             died_reason = self.last_crash_reason.take().or_else(|| Some("worker lost".into()));
         }
 
@@ -2487,6 +2903,7 @@ impl SandboxLv2Main {
                 let _ = child.wait();
             }
             self.ctrl = None;
+            self.editor_open = false;
             died_reason = Some("hung (deadline exceeded)".into());
         }
 
@@ -2606,6 +3023,7 @@ pub fn spawn_sandboxed_lv2(
         crash_count: 0,
         last_crash_reason: None,
         strip_notice: None,
+        editor_open: false,
     };
     Ok((audio, main))
 }
@@ -3110,6 +3528,43 @@ mod tests {
         if let HostedLv2::InProcess(p) = hosted {
             crate::lv2::retire(p);
         }
+        crate::lv2::remove_bundle(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandboxed_lv2_cohosted_ui_supports_data_access_meters_and_bidirectional_atoms() {
+        let (dir, uri) = crate::lv2::ui::build_fixture_bundle("cohosted-lv2").unwrap();
+        let (mut lv2, mut main) = spawn_sandboxed_lv2(&uri, 48000.0, 256, None).unwrap();
+        main.open_editor("Co-hosted Fixture").unwrap();
+        assert!(main.editor_open());
+
+        let inp = vec![0.8f32; 256 * 2];
+        let mut out = vec![0.0f32; 256 * 2];
+        let mut writes = Vec::new();
+        for _ in 0..25 {
+            lv2.process(&inp, &mut out, 256);
+            let (open, w, _) = main.poll_editor().unwrap();
+            assert!(open, "co-hosted LV2 UI closed prematurely");
+            writes.extend(w);
+            if writes.iter().any(|&(nth, v, _)| nth == 0 && (v - 1.25).abs() < 1e-4) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
+
+        assert!(
+            writes.iter().any(|&(nth, v, _)| nth == 0 && (v - 0.75).abs() < 1e-4),
+            "expected initial UI show() write 0.75, got {writes:?}"
+        );
+        assert!(
+            writes.iter().any(|&(nth, v, _)| nth == 0 && (v - 1.25).abs() < 1e-4),
+            "expected co-hosted direct-access + meter + ping/pong handshake write 1.25, got {writes:?}"
+        );
+
+        main.close_editor();
+        assert!(!main.editor_open());
+        main.shutdown();
         crate::lv2::remove_bundle(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }

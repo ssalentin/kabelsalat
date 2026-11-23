@@ -62,17 +62,17 @@ struct LilvUI {
 
 /// LV2 plugin descriptor (lv2/core/lv2.h) — function pointers we call directly.
 /// `activate`/`deactivate` may be NULL per the spec.
-type Lv2Handle = *mut c_void;
+pub(crate) type Lv2Handle = *mut c_void;
 #[repr(C)]
-struct Lv2Descriptor {
-    uri: *const c_char,
-    instantiate: Option<extern "C" fn(*const Lv2Descriptor, f64, *const c_char, *const *const c_void) -> Lv2Handle>,
-    connect_port: Option<extern "C" fn(Lv2Handle, u32, *mut c_void)>,
-    activate: Option<extern "C" fn(Lv2Handle)>,
-    run: Option<extern "C" fn(Lv2Handle, u32)>,
-    deactivate: Option<extern "C" fn(Lv2Handle)>,
-    cleanup: Option<extern "C" fn(Lv2Handle)>,
-    extension_data: Option<extern "C" fn(*const c_char) -> *const c_void>,
+pub(crate) struct Lv2Descriptor {
+    pub uri: *const c_char,
+    pub instantiate: Option<extern "C" fn(*const Lv2Descriptor, f64, *const c_char, *const *const c_void) -> Lv2Handle>,
+    pub connect_port: Option<extern "C" fn(Lv2Handle, u32, *mut c_void)>,
+    pub activate: Option<extern "C" fn(Lv2Handle)>,
+    pub run: Option<extern "C" fn(Lv2Handle, u32)>,
+    pub deactivate: Option<extern "C" fn(Lv2Handle)>,
+    pub cleanup: Option<extern "C" fn(Lv2Handle)>,
+    pub extension_data: Option<extern "C" fn(*const c_char) -> *const c_void>,
 }
 
 /// lilv exposes this struct in the ABI so hosts can inline run/connect_port.
@@ -83,30 +83,42 @@ struct LilvInstance {
     pimpl: *mut c_void,
 }
 
+#[repr(C)]
+struct LilvState {
+    _private: [u8; 0],
+}
+
 /// LV2 feature (lv2/core/lv2.h) — passed to instantiate as a NULL-terminated
 /// array of pointers.
 #[repr(C)]
-struct Lv2Feature {
-    uri: *const c_char,
-    data: *mut c_void,
+pub(crate) struct Lv2Feature {
+    pub uri: *const c_char,
+    pub data: *mut c_void,
 }
 
 /// LV2_URID__map feature data (lv2/ext/urid).
 #[repr(C)]
-struct Lv2UridMap {
-    handle: *mut c_void,
-    map: extern "C" fn(*mut c_void, *const c_char) -> u32,
+pub(crate) struct Lv2UridMap {
+    pub handle: *mut c_void,
+    pub map: extern "C" fn(*mut c_void, *const c_char) -> u32,
+}
+
+/// LV2_URID__unmap feature data (lv2/ext/urid).
+#[repr(C)]
+pub(crate) struct Lv2UridUnmap {
+    pub handle: *mut c_void,
+    pub unmap: extern "C" fn(*mut c_void, u32) -> *const c_char,
 }
 
 /// LV2_OPTIONS__options entry (lv2/ext/options). Array is zero-terminated.
 #[repr(C)]
-struct Lv2Option {
-    context: u32,
-    subject: u32,
-    key: u32,
-    size: u32,
-    ty: u32,
-    value: *const c_void,
+pub(crate) struct Lv2Option {
+    pub context: u32,
+    pub subject: u32,
+    pub key: u32,
+    pub size: u32,
+    pub ty: u32,
+    pub value: *const c_void,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +174,8 @@ struct WorkerShared {
     req: Option<rtrb::Producer<WorkerMsg>>,
     /// The worker thread, `unpark`-ed by `schedule_work` to wake it.
     thread: std::thread::Thread,
+    /// Number of queued/executing worker jobs, used to drain before state save/restore.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What the spawned worker thread needs. Raw `instance` is `!Send`, so this is
@@ -170,6 +184,7 @@ struct WorkerShared {
 struct WorkerCtx {
     iface: Lv2WorkerInterface,
     instance: Lv2Handle,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 // SAFETY: `instance` points into the plugin, which joins this thread before the
@@ -183,6 +198,7 @@ struct Lv2Worker {
     iface: Lv2WorkerInterface,
     instance: Lv2Handle,
     resp_rx: rtrb::Consumer<WorkerMsg>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     join: Option<std::thread::JoinHandle<()>>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -205,13 +221,19 @@ extern "C" fn schedule_work_cb(handle: Lv2WorkerScheduleHandle, size: u32, data:
     // for its whole life; schedule_work is the sole writer of `req`.
     let shared = unsafe { &mut *(handle as *mut WorkerShared) };
     match shared.req.as_mut() {
-        Some(req) => match req.push(msg) {
-            Ok(()) => {
-                shared.thread.unpark();
-                WORKER_SUCCESS
+        Some(req) => {
+            shared.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match req.push(msg) {
+                Ok(()) => {
+                    shared.thread.unpark();
+                    WORKER_SUCCESS
+                }
+                Err(_) => {
+                    shared.in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    WORKER_ERR_NO_SPACE
+                }
             }
-            Err(_) => WORKER_ERR_NO_SPACE,
-        },
+        }
         None => WORKER_ERR_NO_SPACE,
     }
 }
@@ -254,6 +276,7 @@ fn worker_loop(
         };
         let resp_ptr = &mut resp_tx as *mut rtrb::Producer<WorkerMsg> as *mut c_void;
         (ctx.iface.work)(ctx.instance, respond_cb, resp_ptr, msg.len, msg.data.as_ptr() as *const c_void);
+        ctx.in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -278,31 +301,91 @@ impl Lv2Worker {
     }
 }
 
-/// Host-side URID map: assigns a stable u32 to each URI string.
-struct UridMap {
-    map: std::collections::HashMap<String, u32>,
-    next: u32,
+struct UridTable {
+    to_id: std::collections::HashMap<String, u32>,
+    /// 1-based URID -> heap-pinned NUL-terminated C string (`by_id[id - 1]`).
+    by_id: Vec<Box<std::ffi::CStr>>,
 }
 
-extern "C" fn urid_map_cb(handle: *mut c_void, uri: *const c_char) -> u32 {
-    unsafe {
-        let m = &mut *(handle as *mut UridMap);
-        let s = CStr::from_ptr(uri).to_string_lossy().into_owned();
-        if let Some(&id) = m.map.get(&s) {
+/// Thread-safe bidirectional URID mapper/unmapper shared between an LV2 DSP
+/// instance and any co-hosted native GUI running in the same process.
+pub(crate) struct SharedUridMap {
+    inner: std::sync::Mutex<UridTable>,
+}
+
+impl SharedUridMap {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner: std::sync::Mutex::new(UridTable {
+                to_id: std::collections::HashMap::new(),
+                by_id: Vec::new(),
+            }),
+        })
+    }
+
+    pub fn map_str(&self, uri: &str) -> u32 {
+        let mut t = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&id) = t.to_id.get(uri) {
             return id;
         }
-        let id = m.next;
-        m.next += 1;
-        m.map.insert(s, id);
+        let clean = uri.trim_end_matches('\0').replace('\0', "");
+        let cstr = std::ffi::CString::new(clean).unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+        let id = (t.by_id.len() + 1) as u32;
+        t.by_id.push(cstr.into_boxed_c_str());
+        t.to_id.insert(uri.to_string(), id);
         id
     }
+
+    pub fn map_cstr(&self, uri: *const c_char) -> u32 {
+        if uri.is_null() {
+            return 0;
+        }
+        let s = unsafe { CStr::from_ptr(uri).to_string_lossy() };
+        self.map_str(&s)
+    }
+
+    pub fn unmap_ptr(&self, id: u32) -> *const c_char {
+        if id == 0 {
+            return std::ptr::null();
+        }
+        let t = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        t.by_id.get((id - 1) as usize).map_or(std::ptr::null(), |cs| cs.as_ptr())
+    }
 }
+
+pub(crate) extern "C" fn shared_urid_map_cb(handle: *mut c_void, uri: *const c_char) -> u32 {
+    if handle.is_null() || uri.is_null() {
+        return 0;
+    }
+    let m = unsafe { &*(handle as *const SharedUridMap) };
+    m.map_cstr(uri)
+}
+
+pub(crate) extern "C" fn shared_urid_unmap_cb(handle: *mut c_void, id: u32) -> *const c_char {
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    let m = unsafe { &*(handle as *const SharedUridMap) };
+    m.unmap_ptr(id)
+}
+
+type LilvGetPortValueFn = Option<unsafe extern "C" fn(*const c_char, *mut c_void, *mut u32, *mut u32) -> *const c_void>;
+type LilvSetPortValueFn = Option<unsafe extern "C" fn(*const c_char, *mut c_void, *const c_void, u32, u32)>;
 
 #[link(name = "lilv-0")]
 extern "C" {
     fn lilv_world_new() -> *mut LilvWorld;
     fn lilv_world_free(world: *mut LilvWorld);
     fn lilv_world_load_all(world: *mut LilvWorld);
+    fn lilv_world_load_specifications(world: *mut LilvWorld);
+    fn lilv_world_load_plugin_classes(world: *mut LilvWorld);
+    fn lilv_world_load_resource(world: *mut LilvWorld, resource: *const LilvNode) -> i32;
+    fn lilv_world_find_nodes(
+        world: *mut LilvWorld,
+        subject: *const LilvNode,
+        predicate: *const LilvNode,
+        object: *const LilvNode,
+    ) -> *mut LilvNodes;
     fn lilv_world_get(
         world: *mut LilvWorld,
         subject: *const LilvNode,
@@ -321,6 +404,8 @@ extern "C" {
     fn lilv_plugin_get_class(plugin: *const LilvPlugin) -> *const LilvPluginClass;
     fn lilv_plugin_class_get_uri(class: *const LilvPluginClass) -> *const LilvNode;
     fn lilv_plugin_get_value(plugin: *const LilvPlugin, predicate: *const LilvNode) -> *mut LilvNodes;
+    fn lilv_plugin_get_bundle_uri(plugin: *const LilvPlugin) -> *const LilvNode;
+    fn lilv_plugin_get_required_features(plugin: *const LilvPlugin) -> *mut LilvNodes;
     fn lilv_nodes_begin(nodes: *const LilvNodes) -> *mut LilvIter;
     fn lilv_nodes_get(nodes: *const LilvNodes, i: *mut LilvIter) -> *const LilvNode;
     fn lilv_nodes_next(nodes: *const LilvNodes, i: *mut LilvIter) -> *mut LilvIter;
@@ -350,6 +435,11 @@ extern "C" {
     fn lilv_port_get_symbol(plugin: *const LilvPlugin, port: *const LilvPort) -> *const LilvNode;
     fn lilv_port_get_name(plugin: *const LilvPlugin, port: *const LilvPort) -> *mut LilvNode;
     fn lilv_port_is_a(plugin: *const LilvPlugin, port: *const LilvPort, class: *const LilvNode) -> bool;
+    fn lilv_port_supports_event(
+        plugin: *const LilvPlugin,
+        port: *const LilvPort,
+        event_type: *const LilvNode,
+    ) -> bool;
     fn lilv_port_has_property(plugin: *const LilvPlugin, port: *const LilvPort, property: *const LilvNode) -> bool;
     fn lilv_port_get(plugin: *const LilvPlugin, port: *const LilvPort, predicate: *const LilvNode) -> *mut LilvNode;
     fn lilv_port_get_value(plugin: *const LilvPlugin, port: *const LilvPort, predicate: *const LilvNode) -> *mut LilvNodes;
@@ -389,6 +479,49 @@ extern "C" {
     fn lilv_ui_is_a(ui: *const LilvUI, class_uri: *const LilvNode) -> bool;
     fn lilv_ui_get_bundle_uri(ui: *const LilvUI) -> *const LilvNode;
     fn lilv_ui_get_binary_uri(ui: *const LilvUI) -> *const LilvNode;
+    fn lilv_state_new_from_world(
+        world: *mut LilvWorld,
+        map: *mut Lv2UridMap,
+        node: *const LilvNode,
+    ) -> *mut LilvState;
+    fn lilv_state_new_from_file(
+        world: *mut LilvWorld,
+        map: *mut Lv2UridMap,
+        subject: *const LilvNode,
+        path: *const c_char,
+    ) -> *mut LilvState;
+    fn lilv_state_new_from_instance(
+        plugin: *const LilvPlugin,
+        instance: *mut LilvInstance,
+        map: *mut Lv2UridMap,
+        scratch_dir: *const c_char,
+        copy_dir: *const c_char,
+        link_dir: *const c_char,
+        save_dir: *const c_char,
+        get_value: LilvGetPortValueFn,
+        user_data: *mut c_void,
+        flags: u32,
+        features: *const *const Lv2Feature,
+    ) -> *mut LilvState;
+    fn lilv_state_restore(
+        state: *const LilvState,
+        instance: *mut LilvInstance,
+        set_value: LilvSetPortValueFn,
+        user_data: *mut c_void,
+        flags: u32,
+        features: *const *const Lv2Feature,
+    );
+    fn lilv_state_save(
+        world: *mut LilvWorld,
+        map: *mut Lv2UridMap,
+        unmap: *mut Lv2UridUnmap,
+        state: *const LilvState,
+        uri: *const c_char,
+        dir: *const c_char,
+        filename: *const c_char,
+    ) -> i32;
+    fn lilv_state_set_label(state: *mut LilvState, label: *const c_char);
+    fn lilv_state_free(state: *mut LilvState);
 }
 
 /// One MIDI event a MIDI-FX plugin wrote to its output port.
@@ -400,7 +533,7 @@ pub enum FxOutEvent {
     Midi([u8; 3]),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Lv2PluginInfo {
     pub uri: String,
     pub name: String,
@@ -415,16 +548,20 @@ pub struct Lv2PluginInfo {
     pub is_midi_fx: bool,
     /// True when the plugin declares a native UI we can host (`ui:X11UI` or `ui:showInterface`).
     pub has_ui: bool,
+    /// Bundle directory containing `manifest.ttl` (used by `plugin-worker` for fast single-bundle load).
+    #[serde(default)]
+    pub bundle_path: String,
 }
 
 /// Discovered native LV2 GUI metadata for one plugin.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lv2UiInfo {
     pub ui_uri: String,
     pub bundle_path: String,
     pub binary_path: String,
     pub is_x11: bool,
     pub resizable: bool,
+    pub needs_direct_access: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -464,11 +601,17 @@ pub struct Lv2ControlInfo {
     pub scale_points: Vec<Lv2ScalePoint>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Lv2Preset {
     pub name: String,
     pub uri: String,
     pub values: Vec<(String, f32)>,
+    /// Preset `.ttl` path when discovered on disk (`lilv_state_new_from_file`).
+    #[serde(default)]
+    pub file_path: Option<String>,
+    /// True when the preset declares `state:state` properties/files alongside port values.
+    #[serde(default)]
+    pub has_state: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -549,13 +692,165 @@ unsafe fn pin_plugin_library(plugin: *const LilvPlugin) {
 #[cfg(test)]
 pub(crate) static VITALIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Owns a `LilvWorld*` pointer; ONLY dropped while `LILV_STATE` is locked
+/// (or leaked deliberately for `NEVER_FREE` plugins) so lilv calls never race.
+struct OwnedWorld(*mut LilvWorld);
+unsafe impl Send for OwnedWorld {}
+unsafe impl Sync for OwnedWorld {}
+impl Drop for OwnedWorld {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { lilv_world_free(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+struct LilvStateData {
+    shared: Option<std::sync::Arc<OwnedWorld>>,
+    gen: u64,
+}
+
 /// Serializes every lilv world build/load, plugin instantiation and free:
 /// the app now does these from several threads (plugin scan, LV2 loader,
 /// editor), and plugin libraries keep process-global state.
-static LILV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LILV_STATE: std::sync::Mutex<LilvStateData> = std::sync::Mutex::new(LilvStateData {
+    shared: None,
+    gen: 1,
+});
+static WORLD_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn lilv_guard() -> std::sync::MutexGuard<'static, ()> {
-    LILV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+fn lilv_guard() -> std::sync::MutexGuard<'static, LilvStateData> {
+    LILV_STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Drop the cached shared `LilvWorld` (if any) so the next query reloads
+/// bundles from disk (used when bundles are added/removed or presets saved).
+pub fn invalidate_world_cache() {
+    let mut st = lilv_guard();
+    st.shared = None;
+    st.gen = st.gen.wrapping_add(1);
+    WORLD_GEN.store(st.gen, std::sync::atomic::Ordering::Release);
+}
+
+unsafe fn ensure_shared_world(st: &mut LilvStateData) -> Option<std::sync::Arc<OwnedWorld>> {
+    if let Some(w) = &st.shared {
+        return Some(std::sync::Arc::clone(w));
+    }
+    let w = new_world_with_extras();
+    if w.is_null() {
+        return None;
+    }
+    let arc = std::sync::Arc::new(OwnedWorld(w));
+    st.shared = Some(std::sync::Arc::clone(&arc));
+    Some(arc)
+}
+
+fn with_shared_world<R>(f: impl FnOnce(*mut LilvWorld) -> R) -> Option<R> {
+    with_shared_world_rescan(false, f)
+}
+
+fn with_shared_world_rescan<R>(
+    reset: bool,
+    f: impl FnOnce(*mut LilvWorld) -> R,
+) -> Option<R> {
+    let mut st = lilv_guard();
+    if reset {
+        st.shared = None;
+        st.gen = st.gen.wrapping_add(1);
+        WORLD_GEN.store(st.gen, std::sync::atomic::Ordering::Release);
+    }
+    let world = unsafe { ensure_shared_world(&mut st) }?;
+    Some(f(world.0))
+}
+
+const LV2_SPEC_BUNDLES: &[&str] = &[
+    "core.lv2",
+    "lv2core.lv2",
+    "atom.lv2",
+    "buf-size.lv2",
+    "data-access.lv2",
+    "dynmanifest.lv2",
+    "event.lv2",
+    "instance-access.lv2",
+    "log.lv2",
+    "midi.lv2",
+    "morph.lv2",
+    "options.lv2",
+    "parameters.lv2",
+    "patch.lv2",
+    "port-groups.lv2",
+    "port-props.lv2",
+    "presets.lv2",
+    "resize-port.lv2",
+    "schemas.lv2",
+    "state.lv2",
+    "time.lv2",
+    "ui.lv2",
+    "units.lv2",
+    "uri-map.lv2",
+    "urid.lv2",
+    "worker.lv2",
+];
+
+fn spec_bundle_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = lv2_standard_paths();
+    roots.push(std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu/lv2"));
+    roots.push(std::path::PathBuf::from("/usr/lib/aarch64-linux-gnu/lv2"));
+    roots
+}
+
+/// Fast single-bundle `LilvWorld` loader for `plugin-worker`: loads only the LV2
+/// standard spec TTLs + `bundle_dir`, avoiding parsing hundreds of unrelated bundles.
+/// Must be called while holding `LILV_STATE`. Returns `None` if core specs are missing.
+unsafe fn try_new_single_bundle_world(bundle_dir: &str) -> Option<std::sync::Arc<OwnedWorld>> {
+    if bundle_dir.is_empty() || !std::path::Path::new(bundle_dir).is_dir() {
+        return None;
+    }
+    let mut spec_dirs = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut has_core = false;
+    for root in spec_bundle_roots() {
+        if !root.is_dir() {
+            continue;
+        }
+        for &name in LV2_SPEC_BUNDLES {
+            if seen_names.contains(name) {
+                continue;
+            }
+            let cand = root.join(name);
+            if cand.is_dir() {
+                if name == "core.lv2" || name == "lv2core.lv2" {
+                    has_core = true;
+                }
+                seen_names.insert(name);
+                spec_dirs.push(cand);
+            }
+        }
+    }
+    if !has_core {
+        return None;
+    }
+    let world = lilv_world_new();
+    if world.is_null() {
+        return None;
+    }
+    let load_dir = |dir: &std::path::Path| {
+        if let Some(c) = bundle_cstring(dir) {
+            let node = lilv_new_file_uri(world, std::ptr::null(), c.as_ptr());
+            if !node.is_null() {
+                lilv_world_load_bundle(world, node);
+                lilv_node_free(node);
+            }
+        }
+    };
+    for spec in &spec_dirs {
+        load_dir(spec);
+    }
+    load_dir(std::path::Path::new(bundle_dir));
+    lilv_world_load_specifications(world);
+    lilv_world_load_plugin_classes(world);
+    Some(std::sync::Arc::new(OwnedWorld(world)))
 }
 
 const LV2_PARAMETERS_PREFIX: &str = "http://lv2plug.in/ns/ext/parameters#";
@@ -631,12 +926,7 @@ unsafe fn read_port_facts(world: *mut LilvWorld, plugin: *const LilvPlugin, port
 /// instantiating it. Loads a lilv world (blocking): call it from a worker
 /// thread, or use [`main_controls_cached`] from the UI.
 pub fn main_controls_for_uri(uri: &str) -> crate::main_controls::MainControls {
-    let _lilv = lilv_guard();
-    unsafe {
-        let world = new_world_with_extras();
-        if world.is_null() {
-            return Default::default();
-        }
+    with_shared_world(|world| unsafe {
         let plugin = find_plugin(world, uri);
         let candidates: Vec<_> = if plugin.is_null() {
             Vec::new()
@@ -647,9 +937,9 @@ pub fn main_controls_for_uri(uri: &str) -> crate::main_controls::MainControls {
                 .map(|(nth, meta)| control_candidate(nth, meta, &read_port_facts(world, plugin, meta.port_index)))
                 .collect()
         };
-        lilv_world_free(world);
         crate::main_controls::resolve(&[], &candidates)
-    }
+    })
+    .unwrap_or_default()
 }
 
 type MainControlsCache = std::sync::Mutex<Vec<(String, Option<crate::main_controls::MainControls>)>>;
@@ -739,14 +1029,9 @@ pub(crate) fn set_control_descs_for_test(uri: &str, found: Vec<Lv2ControlDesc>) 
 }
 
 pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
-    let _lilv = lilv_guard();
-    unsafe {
-        let world = new_world_with_extras();
-        if world.is_null() {
-            return Vec::new();
-        }
+    with_shared_world(|world| unsafe {
         let plugin = find_plugin(world, uri);
-        let descs = if plugin.is_null() {
+        if plugin.is_null() {
             Vec::new()
         } else {
             read_control_meta(world, plugin)
@@ -762,10 +1047,9 @@ pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
                     value: meta.default,
                 })
                 .collect()
-        };
-        lilv_world_free(world);
-        descs
-    }
+        }
+    })
+    .unwrap_or_default()
 }
 
 fn lv2_unit_symbol(uri: &str) -> Option<&'static str> {
@@ -918,23 +1202,15 @@ unsafe fn read_control_infos(world: *mut LilvWorld, plugin: *const LilvPlugin) -
 }
 
 pub fn control_infos_for_uri(uri: &str) -> Vec<Lv2ControlInfo> {
-    let _lilv = lilv_guard();
-    unsafe {
-        let world = lilv_world_new();
-        if world.is_null() {
-            return Vec::new();
-        }
-        lilv_world_load_all(world);
-        load_extra_bundles(world);
+    with_shared_world(|world| unsafe {
         let plugin = find_plugin(world, uri);
-        let infos = if plugin.is_null() {
+        if plugin.is_null() {
             Vec::new()
         } else {
             read_control_infos(world, plugin)
-        };
-        lilv_world_free(world);
-        infos
-    }
+        }
+    })
+    .unwrap_or_default()
 }
 
 type ControlInfosCache = std::sync::Mutex<Vec<(String, Option<Vec<Lv2ControlInfo>>)>>;
@@ -1277,7 +1553,121 @@ unsafe fn foreign_binary(plugin: *const LilvPlugin) -> Option<String> {
     crate::binarch::foreign(&file)
 }
 
-/// Discover all installed LV2 plugins (loads the lilv world, enumerates, frees).
+static BUNDLE_PATHS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Best-known bundle folder (`.../foo.lv2/`) for `uri`, learned during plugin
+/// discovery so `plugin-worker` can load only that bundle instead of all LV2 dirs.
+pub fn bundle_path_for_uri(uri: &str) -> Option<String> {
+    BUNDLE_PATHS
+        .lock()
+        .ok()
+        .and_then(|m| m.get(uri).cloned())
+}
+
+fn record_bundle_paths(plugins: &[Lv2PluginInfo]) {
+    if let Ok(mut map) = BUNDLE_PATHS.lock() {
+        for p in plugins {
+            if !p.bundle_path.is_empty() {
+                map.insert(p.uri.clone(), p.bundle_path.clone());
+            }
+        }
+    }
+}
+
+const LV2_SCAN_CACHE_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Lv2BundleStamp {
+    path: String,
+    dir_mtime_ns: u128,
+    content_mtime_ns: u128,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Lv2ScanCache {
+    version: u32,
+    search_paths: Vec<String>,
+    extra_bundles: Vec<String>,
+    bundles: Vec<Lv2BundleStamp>,
+    plugins: Vec<Lv2PluginInfo>,
+    unloadable: Vec<String>,
+}
+
+fn mtime_ns(p: &std::path::Path) -> u128 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos())
+}
+
+fn max_bundle_content_mtime_ns(dir: &std::path::Path) -> u128 {
+    let mut best = mtime_ns(&dir.join("manifest.ttl"));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            best = best.max(mtime_ns(&entry.path()));
+        }
+    }
+    best
+}
+
+fn collect_bundle_stamps() -> (Vec<String>, Vec<String>, Vec<Lv2BundleStamp>) {
+    let search_paths: Vec<String> = lv2_search_paths()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let extra_bundles: Vec<String> = extra_bundle_cstrings()
+        .into_iter()
+        .filter_map(|c| c.into_string().ok())
+        .collect();
+    let mut raw_bundles: Vec<std::path::PathBuf> = Vec::new();
+    for root in &search_paths {
+        let Ok(entries) = std::fs::read_dir(root) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir()
+                && (p.extension().and_then(|s| s.to_str()) == Some("lv2")
+                    || p.join("manifest.ttl").is_file())
+            {
+                raw_bundles.push(p);
+            }
+        }
+    }
+    for dir in &extra_bundles {
+        let p = std::path::PathBuf::from(dir.trim_end_matches('/'));
+        if p.is_dir() {
+            raw_bundles.push(p);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut stamps = Vec::new();
+    for b in raw_bundles {
+        let canon = std::fs::canonicalize(&b).unwrap_or_else(|_| b.clone());
+        if seen.insert(canon.clone()) {
+            stamps.push(Lv2BundleStamp {
+                path: canon.to_string_lossy().into_owned(),
+                dir_mtime_ns: mtime_ns(&canon),
+                content_mtime_ns: max_bundle_content_mtime_ns(&canon),
+            });
+        }
+    }
+    stamps.sort_by(|a, b| a.path.cmp(&b.path));
+    (search_paths, extra_bundles, stamps)
+}
+
+fn default_scan_cache_path() -> Option<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return Some(std::path::PathBuf::from(xdg).join("kabelsalat").join("lv2-scan.json"));
+        }
+    }
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
+    Some(std::path::PathBuf::from(home).join(".cache").join("kabelsalat").join("lv2-scan.json"))
+}
+
+/// Discover all installed LV2 plugins (uses persistent disk cache when valid).
 pub fn discover() -> Vec<Lv2PluginInfo> {
     discover_with_unloadable().0
 }
@@ -1286,16 +1676,70 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
 /// another CPU or system. Those are not listed: lilv reads only their
 /// Turtle files, and they could never be instantiated.
 pub fn discover_with_unloadable() -> (Vec<Lv2PluginInfo>, Vec<String>) {
-    let _lilv = lilv_guard();
-    unsafe {
-        let world = new_world_with_extras();
-        if world.is_null() {
-            return (Vec::new(), Vec::new());
+    discover_with_unloadable_rescan(false)
+}
+
+/// Same as [`discover_with_unloadable`], with `force_rescan = true` bypassing
+/// the on-disk scan cache and rebuilding the shared lilv world.
+pub fn discover_with_unloadable_rescan(force_rescan: bool) -> (Vec<Lv2PluginInfo>, Vec<String>) {
+    let cache = if cfg!(test) {
+        None
+    } else {
+        default_scan_cache_path()
+    };
+    discover_with_unloadable_cache_path(cache.as_deref(), force_rescan)
+}
+
+pub(crate) fn discover_with_unloadable_cache_path(
+    cache_path: Option<&std::path::Path>,
+    force_rescan: bool,
+) -> (Vec<Lv2PluginInfo>, Vec<String>) {
+    let (search_paths, extra_bundles, bundles) = if cache_path.is_some() {
+        collect_bundle_stamps()
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    if !force_rescan {
+        if let Some(path) = cache_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(cached) = serde_json::from_slice::<Lv2ScanCache>(&bytes) {
+                    if cached.version == LV2_SCAN_CACHE_VERSION
+                        && cached.search_paths == search_paths
+                        && cached.extra_bundles == extra_bundles
+                        && cached.bundles == bundles
+                    {
+                        record_bundle_paths(&cached.plugins);
+                        return (cached.plugins, cached.unloadable);
+                    }
+                }
+            }
         }
-        let found = collect_plugins(world);
-        lilv_world_free(world);
-        found
     }
+    let found = with_shared_world_rescan(force_rescan || cache_path.is_some(), |world| unsafe {
+        collect_plugins(world)
+    })
+    .unwrap_or_default();
+    record_bundle_paths(&found.0);
+    if let Some(path) = cache_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let payload = Lv2ScanCache {
+            version: LV2_SCAN_CACHE_VERSION,
+            search_paths,
+            extra_bundles,
+            bundles,
+            plugins: found.0.clone(),
+            unloadable: found.1.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+    found
 }
 
 unsafe fn new_world_with_extras() -> *mut LilvWorld {
@@ -1325,6 +1769,71 @@ unsafe fn parse_file_node_path(node: *const LilvNode) -> Option<String> {
     Some(out)
 }
 
+fn is_bridge_ui(ui_uri: &str, bundle_path: &str, binary_path: &str) -> bool {
+    for s in [ui_uri, bundle_path, binary_path] {
+        let lower = s.to_ascii_lowercase().replace('_', "-");
+        if lower.contains("lv2-gtk-ui-bridge")
+            || lower.contains("lv2-gtk2-ui-bridge")
+            || lower.contains("gtk-ui-bridge")
+            || lower.contains("gtk2-ui-bridge")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `(supported, is_direct_access_feature)` for LV2 UI `requiredFeature` / `optionalFeature` URIs.
+fn lv2_ui_feature_supported(uri: &str) -> (bool, bool) {
+    match uri {
+        "http://lv2plug.in/ns/ext/instance-access"
+        | "http://lv2plug.in/ns/ext/data-access" => (true, true),
+        "http://lv2plug.in/ns/extensions/ui#parent"
+        | "http://lv2plug.in/ns/extensions/ui#resize"
+        | "http://lv2plug.in/ns/extensions/ui#portMap"
+        | "http://lv2plug.in/ns/extensions/ui#portSubscribe"
+        | "http://lv2plug.in/ns/extensions/ui#touch"
+        | "http://lv2plug.in/ns/extensions/ui#idleInterface"
+        | "http://lv2plug.in/ns/extensions/ui#showInterface"
+        | "http://lv2plug.in/ns/extensions/ui#fixedSize"
+        | "http://lv2plug.in/ns/extensions/ui#noUserResize"
+        | "http://lv2plug.in/ns/ext/urid#map"
+        | "http://lv2plug.in/ns/ext/urid#unmap"
+        | "http://lv2plug.in/ns/ext/options#options" => (true, false),
+        _ => (false, false),
+    }
+}
+
+unsafe fn ui_feature_uris(
+    world: *mut LilvWorld,
+    ui_node: *const LilvNode,
+    p1: *const LilvNode,
+    p2: *const LilvNode,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for pred in [p1, p2] {
+        if pred.is_null() {
+            continue;
+        }
+        let nodes = lilv_world_find_nodes(world, ui_node, pred, std::ptr::null());
+        if !nodes.is_null() {
+            let mut it = lilv_nodes_begin(nodes);
+            while !lilv_nodes_is_end(nodes, it) {
+                let n = lilv_nodes_get(nodes, it);
+                if !n.is_null() && lilv_node_is_uri(n) {
+                    let u = node_borrowed(n);
+                    if !u.is_empty() && !out.contains(&u) {
+                        out.push(u);
+                    }
+                }
+                it = lilv_nodes_next(nodes, it);
+            }
+            lilv_nodes_free(nodes);
+        }
+    }
+    out
+}
+
 unsafe fn inspect_plugin_ui(world: *mut LilvWorld, plugin: *const LilvPlugin) -> Option<Lv2UiInfo> {
     let uis = lilv_plugin_get_uis(plugin);
     if uis.is_null() {
@@ -1335,12 +1844,16 @@ unsafe fn inspect_plugin_ui(world: *mut LilvWorld, plugin: *const LilvPlugin) ->
     let lv2_ext = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#extensionData\0".as_ptr() as *const c_char);
     let ui_ext = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#extensionData\0".as_ptr() as *const c_char);
     let opt_feat = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#optionalFeature\0".as_ptr() as *const c_char);
+    let ui_opt_feat = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#optionalFeature\0".as_ptr() as *const c_char);
     let req_feat = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#requiredFeature\0".as_ptr() as *const c_char);
+    let ui_req_feat = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#requiredFeature\0".as_ptr() as *const c_char);
     let fixed_size = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#fixedSize\0".as_ptr() as *const c_char);
     let no_user_resize = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#noUserResize\0".as_ptr() as *const c_char);
 
-    let mut best_x11: Option<Lv2UiInfo> = None;
-    let mut best_show: Option<Lv2UiInfo> = None;
+    let mut best_x11_clean: Option<Lv2UiInfo> = None;
+    let mut best_x11_direct: Option<Lv2UiInfo> = None;
+    let mut best_show_clean: Option<Lv2UiInfo> = None;
+    let mut best_show_direct: Option<Lv2UiInfo> = None;
 
     let mut it = lilv_uis_begin(uis);
     while !it.is_null() && !lilv_uis_is_end(uis, it) {
@@ -1358,22 +1871,62 @@ unsafe fn inspect_plugin_ui(world: *mut LilvWorld, plugin: *const LilvPlugin) ->
                     bundle_path.push('/');
                 }
                 let binary_path = parse_file_node_path(lilv_ui_get_binary_uri(ui)).unwrap_or_default();
-                if !ui_uri.is_empty() && !binary_path.is_empty() {
-                    let fixed = lilv_world_ask(world, ui_node, opt_feat, fixed_size)
-                        || lilv_world_ask(world, ui_node, req_feat, fixed_size)
-                        || lilv_world_ask(world, ui_node, opt_feat, no_user_resize)
-                        || lilv_world_ask(world, ui_node, req_feat, no_user_resize);
-                    let info = Lv2UiInfo {
-                        ui_uri,
-                        bundle_path,
-                        binary_path,
-                        is_x11,
-                        resizable: !fixed,
-                    };
-                    if is_x11 && best_x11.is_none() {
-                        best_x11 = Some(info);
-                    } else if has_show && best_show.is_none() {
-                        best_show = Some(info);
+                let native_bin = !binary_path.is_empty()
+                    && crate::binarch::foreign(std::path::Path::new(&binary_path)).is_none();
+                if !ui_uri.is_empty()
+                    && native_bin
+                    && !is_bridge_ui(&ui_uri, &bundle_path, &binary_path)
+                {
+                    let reqs = ui_feature_uris(world, ui_node, req_feat, ui_req_feat);
+                    let opts = ui_feature_uris(world, ui_node, opt_feat, ui_opt_feat);
+                    let mut all_supported = true;
+                    let mut requires_direct = false;
+                    for feat in &reqs {
+                        let (ok, direct) = lv2_ui_feature_supported(feat);
+                        if !ok {
+                            all_supported = false;
+                            break;
+                        }
+                        if direct {
+                            requires_direct = true;
+                        }
+                    }
+                    if all_supported {
+                        let wants_direct = requires_direct
+                            || opts.iter().any(|f| lv2_ui_feature_supported(f).1);
+                        let fixed = lilv_world_ask(world, ui_node, opt_feat, fixed_size)
+                            || lilv_world_ask(world, ui_node, req_feat, fixed_size)
+                            || lilv_world_ask(world, ui_node, ui_opt_feat, fixed_size)
+                            || lilv_world_ask(world, ui_node, ui_req_feat, fixed_size)
+                            || lilv_world_ask(world, ui_node, opt_feat, no_user_resize)
+                            || lilv_world_ask(world, ui_node, req_feat, no_user_resize)
+                            || lilv_world_ask(world, ui_node, ui_opt_feat, no_user_resize)
+                            || lilv_world_ask(world, ui_node, ui_req_feat, no_user_resize);
+                        let info = Lv2UiInfo {
+                            ui_uri,
+                            bundle_path,
+                            binary_path,
+                            is_x11,
+                            resizable: !fixed,
+                            needs_direct_access: requires_direct,
+                        };
+                        if is_x11 {
+                            if !wants_direct && best_x11_clean.is_none() {
+                                best_x11_clean = Some(info);
+                            } else if !requires_direct && best_x11_clean.is_none() {
+                                best_x11_clean = Some(info);
+                            } else if best_x11_direct.is_none() {
+                                best_x11_direct = Some(info);
+                            }
+                        } else if has_show {
+                            if !wants_direct && best_show_clean.is_none() {
+                                best_show_clean = Some(info);
+                            } else if !requires_direct && best_show_clean.is_none() {
+                                best_show_clean = Some(info);
+                            } else if best_show_direct.is_none() {
+                                best_show_direct = Some(info);
+                            }
+                        }
                     }
                 }
             }
@@ -1386,27 +1939,30 @@ unsafe fn inspect_plugin_ui(world: *mut LilvWorld, plugin: *const LilvPlugin) ->
     lilv_node_free(lv2_ext);
     lilv_node_free(ui_ext);
     lilv_node_free(opt_feat);
+    lilv_node_free(ui_opt_feat);
     lilv_node_free(req_feat);
+    lilv_node_free(ui_req_feat);
     lilv_node_free(fixed_size);
     lilv_node_free(no_user_resize);
     lilv_uis_free(uis);
 
-    best_x11.or(best_show)
+    best_x11_clean
+        .or(best_x11_direct)
+        .or(best_show_clean)
+        .or(best_show_direct)
 }
 
 /// Discover native GUI metadata (`ui:X11UI` preferred, `ui:showInterface` fallback) for a plugin URI.
 pub fn discover_ui_for_uri(uri: &str) -> Option<Lv2UiInfo> {
-    let _lilv = lilv_guard();
-    unsafe {
-        let world = new_world_with_extras();
-        if world.is_null() {
-            return None;
-        }
+    with_shared_world(|world| unsafe {
         let plugin = find_plugin(world, uri);
-        let found = if plugin.is_null() { None } else { inspect_plugin_ui(world, plugin) };
-        lilv_world_free(world);
-        found
-    }
+        if plugin.is_null() {
+            None
+        } else {
+            inspect_plugin_ui(world, plugin)
+        }
+    })
+    .flatten()
 }
 
 type UiInfoCache = std::sync::Mutex<Vec<(String, Option<Option<Lv2UiInfo>>)>>;
@@ -1451,12 +2007,7 @@ pub(crate) fn set_ui_info_for_test(uri: &str, found: Option<Lv2UiInfo>) {
 
 /// Return `(port_index, port_symbol)` pairs for every LV2 port of `uri`.
 pub fn port_symbols_for_uri(uri: &str) -> Vec<(u32, String)> {
-    let _lilv = lilv_guard();
-    unsafe {
-        let world = new_world_with_extras();
-        if world.is_null() {
-            return Vec::new();
-        }
+    with_shared_world(|world| unsafe {
         let plugin = find_plugin(world, uri);
         let mut out = Vec::new();
         if !plugin.is_null() {
@@ -1471,9 +2022,9 @@ pub fn port_symbols_for_uri(uri: &str) -> Vec<(u32, String)> {
                 }
             }
         }
-        lilv_world_free(world);
         out
-    }
+    })
+    .unwrap_or_default()
 }
 
 /// What [`discover_with_unloadable`] reports for the plugins `world` holds.
@@ -1506,6 +2057,11 @@ unsafe fn collect_plugins(world: *mut LilvWorld) -> (Vec<Lv2PluginInfo>, Vec<Str
                     };
                     let ui_info = inspect_plugin_ui(world, plugin);
                     let has_ui = ui_info.is_some();
+                    let mut bundle_path =
+                        parse_file_node_path(lilv_plugin_get_bundle_uri(plugin)).unwrap_or_default();
+                    if !bundle_path.is_empty() && !bundle_path.ends_with('/') {
+                        bundle_path.push('/');
+                    }
                     out.push(Lv2PluginInfo {
                         uri: node_borrowed(lilv_plugin_get_uri(plugin)),
                         name: node_owned(lilv_plugin_get_name(plugin)),
@@ -1515,6 +2071,7 @@ unsafe fn collect_plugins(world: *mut LilvWorld) -> (Vec<Lv2PluginInfo>, Vec<Str
                         is_instrument,
                         is_midi_fx,
                         has_ui,
+                        bundle_path,
                     });
                 }
                 iter = lilv_plugins_next(plugins, iter);
@@ -1620,18 +2177,23 @@ pub fn host_test() -> anyhow::Result<()> {
         let control = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#ControlPort\0".as_ptr() as *const c_char);
         let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
 
-        // Host URID-map feature (most plugins require it for atom/option URIs).
-        let mut urid = UridMap { map: std::collections::HashMap::new(), next: 1 };
-        let handle = &mut urid as *mut UridMap as *mut c_void;
-        let map_data = Lv2UridMap { handle, map: urid_map_cb };
+        // Host URID-map + unmap features (most plugins require urid#map).
+        let urid = SharedUridMap::new();
+        let handle = std::sync::Arc::as_ptr(&urid) as *mut c_void;
+        let map_data = Lv2UridMap { handle, map: shared_urid_map_cb };
+        let unmap_data = Lv2UridUnmap { handle, unmap: shared_urid_unmap_cb };
         let map_feature = Lv2Feature {
             uri: b"http://lv2plug.in/ns/ext/urid#map\0".as_ptr() as *const c_char,
             data: &map_data as *const Lv2UridMap as *mut c_void,
         };
+        let unmap_feature = Lv2Feature {
+            uri: b"http://lv2plug.in/ns/ext/urid#unmap\0".as_ptr() as *const c_char,
+            data: &unmap_data as *const Lv2UridUnmap as *mut c_void,
+        };
 
-        // Options feature: sampleRate + maxBlockLength (Carla et al. require it).
-        let map_uri = |s: &[u8]| urid_map_cb(handle, s.as_ptr() as *const c_char);
-        let sr_key = map_uri(b"http://lv2plug.in/ns/lv2core#sampleRate\0");
+        // Options feature: parameters#sampleRate + maxBlockLength.
+        let map_uri = |s: &[u8]| shared_urid_map_cb(handle, s.as_ptr() as *const c_char);
+        let sr_key = map_uri(b"http://lv2plug.in/ns/ext/parameters#sampleRate\0");
         let bl_key = map_uri(b"http://lv2plug.in/ns/ext/buf-size#maxBlockLength\0");
         let float_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Float\0");
         let int_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Int\0");
@@ -1646,7 +2208,7 @@ pub fn host_test() -> anyhow::Result<()> {
             uri: b"http://lv2plug.in/ns/ext/options#options\0".as_ptr() as *const c_char,
             data: options.as_ptr() as *mut c_void,
         };
-        let features: [*const Lv2Feature; 3] = [&map_feature, &options_feature, std::ptr::null()];
+        let features: [*const Lv2Feature; 4] = [&map_feature, &unmap_feature, &options_feature, std::ptr::null()];
 
         // Try several simple audio plugins until one instantiates.
         let candidates = ["audiogain_s", "audiogain", "amp", "gx_amp", "fluida", "simple"];
@@ -1824,23 +2386,14 @@ pub fn parse_midnam_programs(xml: &str) -> Vec<(u8, String)> {
 /// not declare the interface. Instantiates the plugin to ask it, so this
 /// belongs on a scan or loader thread (rule 46), never the audio or UI thread.
 pub fn midi_programs(uri: &str) -> Vec<(u8, String)> {
-    let declared = {
-        let _lilv = lilv_guard();
-        unsafe {
-            let world = lilv_world_new();
-            if world.is_null() {
-                return Vec::new();
-            }
-            lilv_world_load_all(world);
-            load_extra_bundles(world);
-            let plugin = find_plugin(world, uri);
-            let ext = lilv_new_uri(world, LV2_MIDNAM_INTERFACE_URI.as_ptr() as *const c_char);
-            let declared = !plugin.is_null() && lilv_plugin_has_extension_data(plugin, ext);
-            lilv_node_free(ext);
-            lilv_world_free(world);
-            declared
-        }
-    };
+    let declared = with_shared_world(|world| unsafe {
+        let plugin = find_plugin(world, uri);
+        let ext = lilv_new_uri(world, LV2_MIDNAM_INTERFACE_URI.as_ptr() as *const c_char);
+        let yes = !plugin.is_null() && lilv_plugin_has_extension_data(plugin, ext);
+        lilv_node_free(ext);
+        yes
+    })
+    .unwrap_or(false);
     if !declared {
         return Vec::new();
     }
@@ -1854,36 +2407,381 @@ pub fn midi_programs(uri: &str) -> Vec<(u8, String)> {
 // Reusable LV2 plugin wrapper (foundation for engine rig nodes)
 // ---------------------------------------------------------------------------
 
+const LV2_STATE_MAP_PATH_URI: &[u8] = b"http://lv2plug.in/ns/ext/state#mapPath\0";
+const LV2_STATE_MAKE_PATH_URI: &[u8] = b"http://lv2plug.in/ns/ext/state#makePath\0";
+const LV2_STATE_FREE_PATH_URI: &[u8] = b"http://lv2plug.in/ns/ext/state#freePath\0";
+
+#[repr(C)]
+struct Lv2StateMapPath {
+    handle: *mut c_void,
+    abstract_path: extern "C" fn(*mut c_void, *const c_char) -> *mut c_char,
+    absolute_path: extern "C" fn(*mut c_void, *const c_char) -> *mut c_char,
+}
+
+#[repr(C)]
+struct Lv2StateMakePath {
+    handle: *mut c_void,
+    path: extern "C" fn(*mut c_void, *const c_char) -> *mut c_char,
+}
+
+#[repr(C)]
+struct Lv2StateFreePath {
+    handle: *mut c_void,
+    free_path: extern "C" fn(*mut c_void, *mut c_char),
+}
+
+struct StatePathCtx {
+    base_dir: Option<std::path::PathBuf>,
+    scratch_dir: std::path::PathBuf,
+}
+
+fn cstring_raw(s: &str) -> *mut c_char {
+    let clean = s.replace('\0', "");
+    std::ffi::CString::new(clean)
+        .unwrap_or_else(|_| std::ffi::CString::new("").unwrap())
+        .into_raw()
+}
+
+extern "C" fn state_abstract_path_cb(handle: *mut c_void, abs_ptr: *const c_char) -> *mut c_char {
+    if abs_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let abs_str = unsafe { CStr::from_ptr(abs_ptr).to_string_lossy() };
+    if !handle.is_null() {
+        let ctx = unsafe { &*(handle as *const StatePathCtx) };
+        if let Some(base) = &ctx.base_dir {
+            if let Ok(rel) = std::path::Path::new(&*abs_str).strip_prefix(base) {
+                return cstring_raw(&rel.to_string_lossy());
+            }
+        }
+    }
+    cstring_raw(&abs_str)
+}
+
+extern "C" fn state_absolute_path_cb(handle: *mut c_void, raw_ptr: *const c_char) -> *mut c_char {
+    if raw_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let s = unsafe { CStr::from_ptr(raw_ptr).to_string_lossy() };
+    let p = std::path::Path::new(&*s);
+    if p.is_absolute() || handle.is_null() {
+        return cstring_raw(&s);
+    }
+    let ctx = unsafe { &*(handle as *const StatePathCtx) };
+    let root = ctx.base_dir.as_deref().unwrap_or(&ctx.scratch_dir);
+    cstring_raw(&root.join(p).to_string_lossy())
+}
+
+extern "C" fn state_make_path_cb(handle: *mut c_void, rel_ptr: *const c_char) -> *mut c_char {
+    if handle.is_null() || rel_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ctx = unsafe { &*(handle as *const StatePathCtx) };
+    let rel_str = unsafe { CStr::from_ptr(rel_ptr).to_string_lossy() };
+    let root = ctx.base_dir.as_deref().unwrap_or(&ctx.scratch_dir);
+    let mut target = root.to_path_buf();
+    for comp in std::path::Path::new(rel_str.trim_start_matches('/')).components() {
+        if let std::path::Component::Normal(seg) = comp {
+            target.push(seg);
+        }
+    }
+    if rel_str.ends_with('/') {
+        let _ = std::fs::create_dir_all(&target);
+    } else if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    cstring_raw(&target.to_string_lossy())
+}
+
+extern "C" fn state_free_path_cb(_handle: *mut c_void, path: *mut c_char) {
+    if !path.is_null() {
+        unsafe {
+            drop(std::ffi::CString::from_raw(path));
+        }
+    }
+}
+
+struct Lv2StateFeatureSet {
+    _ctx: Box<StatePathCtx>,
+    map_path: Lv2StateMapPath,
+    make_path: Lv2StateMakePath,
+    free_path: Lv2StateFreePath,
+}
+
+impl Lv2StateFeatureSet {
+    fn new(base_dir: Option<std::path::PathBuf>) -> Box<Self> {
+        let scratch_dir = std::env::temp_dir().join(format!("kabelsalat-lv2-state-{}", std::process::id()));
+        let mut ctx = Box::new(StatePathCtx { base_dir, scratch_dir });
+        let handle = &mut *ctx as *mut StatePathCtx as *mut c_void;
+        Box::new(Self {
+            _ctx: ctx,
+            map_path: Lv2StateMapPath {
+                handle,
+                abstract_path: state_abstract_path_cb,
+                absolute_path: state_absolute_path_cb,
+            },
+            make_path: Lv2StateMakePath {
+                handle,
+                path: state_make_path_cb,
+            },
+            free_path: Lv2StateFreePath {
+                handle,
+                free_path: state_free_path_cb,
+            },
+        })
+    }
+}
+
+#[repr(C)]
+struct RuntimeOptionVals {
+    sample_rate: f32,
+    min_block: i32,
+    nominal_block: i32,
+    max_block: i32,
+}
+
+struct Lv2RuntimeOptions {
+    _vals: Box<RuntimeOptionVals>,
+    table: [Lv2Option; 5],
+}
+
+impl Lv2RuntimeOptions {
+    fn new(urid: &SharedUridMap, sample_rate: f64, block: usize) -> Box<Self> {
+        let vals = Box::new(RuntimeOptionVals {
+            sample_rate: sample_rate as f32,
+            min_block: 1,
+            nominal_block: block as i32,
+            max_block: block as i32,
+        });
+        let sr_key = urid.map_str("http://lv2plug.in/ns/ext/parameters#sampleRate");
+        let min_bl_key = urid.map_str("http://lv2plug.in/ns/ext/buf-size#minBlockLength");
+        let nom_bl_key = urid.map_str("http://lv2plug.in/ns/ext/buf-size#nominalBlockLength");
+        let max_bl_key = urid.map_str("http://lv2plug.in/ns/ext/buf-size#maxBlockLength");
+        let float_ty = urid.map_str("http://lv2plug.in/ns/ext/atom#Float");
+        let int_ty = urid.map_str("http://lv2plug.in/ns/ext/atom#Int");
+        let table = [
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: sr_key,
+                size: 4,
+                ty: float_ty,
+                value: &vals.sample_rate as *const f32 as *const c_void,
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: min_bl_key,
+                size: 4,
+                ty: int_ty,
+                value: &vals.min_block as *const i32 as *const c_void,
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: nom_bl_key,
+                size: 4,
+                ty: int_ty,
+                value: &vals.nominal_block as *const i32 as *const c_void,
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: max_bl_key,
+                size: 4,
+                ty: int_ty,
+                value: &vals.max_block as *const i32 as *const c_void,
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: 0,
+                size: 0,
+                ty: 0,
+                value: std::ptr::null(),
+            },
+        ];
+        Box::new(Self { _vals: vals, table })
+    }
+}
+
+fn lv2_dsp_feature_supported(uri: &str) -> bool {
+    matches!(
+        uri,
+        "http://lv2plug.in/ns/ext/urid#map"
+            | "http://lv2plug.in/ns/ext/urid#unmap"
+            | "http://lv2plug.in/ns/ext/options#options"
+            | "http://lv2plug.in/ns/ext/buf-size#boundedBlockLength"
+            | "http://lv2plug.in/ns/ext/worker#schedule"
+            | "http://lv2plug.in/ns/ext/state#mapPath"
+            | "http://lv2plug.in/ns/ext/state#makePath"
+            | "http://lv2plug.in/ns/ext/state#freePath"
+            | "http://lv2plug.in/ns/ext/state#loadDefaultState"
+            | "http://lv2plug.in/ns/lv2core#hardRTCapable"
+            | "http://lv2plug.in/ns/lv2core#inPlaceBroken"
+            | "http://lv2plug.in/ns/lv2core#isLive"
+    )
+}
+
+unsafe fn port_atom_capacity(
+    world: *mut LilvWorld,
+    plugin: *const LilvPlugin,
+    port: *const LilvPort,
+    default_bytes: usize,
+) -> usize {
+    let pred = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/resize-port#minimumSize\0".as_ptr() as *const c_char);
+    let mut cap = default_bytes;
+    let nodes = lilv_port_get_value(plugin, port, pred);
+    if !nodes.is_null() {
+        let mut it = lilv_nodes_begin(nodes);
+        while !lilv_nodes_is_end(nodes, it) {
+            let n = lilv_nodes_get(nodes, it);
+            if !n.is_null() {
+                let requested = if lilv_node_is_int(n) {
+                    lilv_node_as_int(n).max(0) as usize
+                } else if lilv_node_is_float(n) {
+                    lilv_node_as_float(n).max(0.0).ceil() as usize
+                } else {
+                    0
+                };
+                cap = cap.max(requested);
+            }
+            it = lilv_nodes_next(nodes, it);
+        }
+        lilv_nodes_free(nodes);
+    }
+    lilv_node_free(pred);
+    // Align to 8 bytes and ensure minimum 64 bytes for headers + payload.
+    ((cap.max(64) + 7) & !7).max(64)
+}
+
+struct AtomInPort {
+    port_index: usize,
+    supports_midi: bool,
+    buf: Vec<u64>,
+}
+
+struct AtomOutPort {
+    port_index: usize,
+    buf: Vec<u64>,
+}
+
+fn atom_bytes_mut(buf: &mut [u64]) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 8) }
+}
+
+fn atom_bytes(buf: &[u64]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) }
+}
+
+struct RestorePortCtx<'a> {
+    by_symbol: &'a std::collections::HashMap<String, usize>,
+    buffers: &'a mut [Vec<f32>],
+    urid_float: u32,
+    urid_double: u32,
+    urid_int: u32,
+}
+
+unsafe extern "C" fn set_port_value_cb(
+    port_symbol: *const c_char,
+    user_data: *mut c_void,
+    value: *const c_void,
+    size: u32,
+    ty: u32,
+) {
+    if port_symbol.is_null() || user_data.is_null() || value.is_null() {
+        return;
+    }
+    let ctx = &mut *(user_data as *mut RestorePortCtx<'_>);
+    let sym = CStr::from_ptr(port_symbol).to_string_lossy();
+    let Some(&port_idx) = ctx.by_symbol.get(sym.as_ref()) else { return };
+    let v = if ty == ctx.urid_float && size as usize >= 4 {
+        Some(std::ptr::read_unaligned(value as *const f32))
+    } else if ty == ctx.urid_double && size as usize >= 8 {
+        Some(std::ptr::read_unaligned(value as *const f64) as f32)
+    } else if ty == ctx.urid_int && size as usize >= 4 {
+        Some(std::ptr::read_unaligned(value as *const i32) as f32)
+    } else {
+        None
+    };
+    if let Some(val) = v {
+        if let Some(buf) = ctx.buffers.get_mut(port_idx) {
+            buf[0] = val;
+        }
+    }
+}
+
+struct GetPortValueCtx<'a> {
+    port_symbols: &'a [(usize, String)],
+    control_in: &'a [usize],
+    buffers: &'a [Vec<f32>],
+    urid_float: u32,
+}
+
+unsafe extern "C" fn get_port_value_cb(
+    port_symbol: *const c_char,
+    user_data: *mut c_void,
+    size: *mut u32,
+    ty: *mut u32,
+) -> *const c_void {
+    if port_symbol.is_null() || user_data.is_null() {
+        return std::ptr::null();
+    }
+    let ctx = &*(user_data as *const GetPortValueCtx<'_>);
+    let sym = CStr::from_ptr(port_symbol).to_string_lossy();
+    let Some((port_idx, _)) = ctx.port_symbols.iter().find(|(_, s)| s == sym.as_ref()) else {
+        return std::ptr::null();
+    };
+    if !ctx.control_in.contains(port_idx) {
+        return std::ptr::null();
+    }
+    let Some(buf) = ctx.buffers.get(*port_idx) else {
+        return std::ptr::null();
+    };
+    if !size.is_null() {
+        *size = 4;
+    }
+    if !ty.is_null() {
+        *ty = ctx.urid_float;
+    }
+    buf.as_ptr() as *const c_void
+}
+
 /// A hosted LV2 plugin instance with audio buffers, ready to process blocks.
 /// Owns the lilv world + instance and the persistent URID-map feature data.
 /// `process` is allocation-free (buffers preallocated); `load` and `Drop`
 /// block (world load, instantiate, free) and belong on the engine's LV2
 /// loader thread, never the audio thread.
 pub struct Lv2Plugin {
-    world: *mut LilvWorld,
+    world: Option<std::sync::Arc<OwnedWorld>>,
     instance: *mut LilvInstance,
     buffers: Vec<Vec<f32>>,
     audio_in: Vec<usize>,
     audio_out: Vec<usize>,
     control_in: Vec<usize>,
+    control_out: Vec<usize>,
     control_ranges: Vec<(f32, f32)>,
     control_meta: Vec<ControlMeta>,
     control_by_symbol: std::collections::HashMap<String, usize>,
-    // MIDI/atom instrument support.
-    atom_in: Option<usize>,
-    atom_buf: Vec<u8>,
+    port_symbols: Vec<(usize, String)>,
+    // MIDI/atom instrument & UI messaging support (8-byte aligned buffers).
+    atom_in: Vec<AtomInPort>,
     /// The last MIDI event handed to the plugin (verification only).
     last_event: Option<[u8; 3]>,
     /// Atom OUTPUT ports (#38): a u64-backed (8-byte aligned) buffer each;
     /// the header is reset to an empty Chunk of full capacity before run().
-    atom_out: Vec<(usize, Vec<u64>)>,
+    atom_out: Vec<AtomOutPort>,
     urid_chunk: u32,
     urid_sequence: u32,
     urid_midi: u32,
+    urid_float: u32,
     is_inst: bool,
     is_midi_fx: bool,
-    _urid: Box<UridMap>,
+    _urid: std::sync::Arc<SharedUridMap>,
     _map_data: Box<Lv2UridMap>,
+    _unmap_data: Box<Lv2UridUnmap>,
+    _runtime_options: Box<Lv2RuntimeOptions>,
+    _state_features: Box<Lv2StateFeatureSet>,
     // Worker extension: the schedule feature handed to instantiate, the shared
     // handle it points into (kept alive for the instance's life), and the
     // per-instance worker thread when the plugin exposes `worker#interface`.
@@ -1892,6 +2790,7 @@ pub struct Lv2Plugin {
     worker: Option<Box<Lv2Worker>>,
     block: usize,
     uri: String,
+    name: String,
     sample_rate: f64,
     /// The control output the plugin writes its latency to
     /// (`lv2:reportsLatency`), when it has one.
@@ -1943,17 +2842,32 @@ unsafe fn load_extra_bundles(world: *mut LilvWorld) {
 /// `LV2_PATH` is the whole process's).
 pub fn add_bundle(dir: &std::path::Path) {
     let Some(path) = bundle_cstring(dir) else { return };
-    let mut extra = EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
-    if !extra.contains(&path) {
-        extra.push(path);
+    let changed = {
+        let mut extra = EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
+        if extra.contains(&path) {
+            false
+        } else {
+            extra.push(path);
+            true
+        }
+    };
+    if changed {
+        invalidate_world_cache();
     }
 }
 
 /// Remove a bundle folder registered via [`add_bundle`] before deleting it on disk.
 pub fn remove_bundle(dir: &std::path::Path) {
     let Some(path) = bundle_cstring(dir) else { return };
-    let mut extra = EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
-    extra.retain(|p| p != &path);
+    let changed = {
+        let mut extra = EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
+        let before = extra.len();
+        extra.retain(|p| p != &path);
+        extra.len() != before
+    };
+    if changed {
+        invalidate_world_cache();
+    }
 }
 
 /// Colon-separated extra LV2 bundle paths for child workers (`plugin-worker`).
@@ -2025,59 +2939,117 @@ pub fn parked_count(uri_part: &str) -> usize {
 
 // SAFETY: one thread owns an instance at a time (moved over the engine's
 // rings: loader → audio thread for `process`, back to the loader to free);
-// world/instance creation and freeing hold `LILV_LOCK`, so lilv is never
+// world/instance creation and freeing hold `LILV_STATE`, so lilv is never
 // used from two threads at once.
 unsafe impl Send for Lv2Plugin {}
 
 impl Lv2Plugin {
     /// Load the first plugin whose URI contains `needle`, instantiate it with
-    /// urid-map + options features, classify ports, and connect buffers.
+    /// urid-map/unmap + options + buf-size + worker + state path features,
+    /// classify ports, and connect 8-byte-aligned buffers.
     pub fn load(needle: &str, sample_rate: f64, block: usize) -> anyhow::Result<Self> {
+        Self::load_with_bundle(needle, sample_rate, block, None)
+    }
+
+    /// Like [`Lv2Plugin::load`], with an optional `bundle_hint` folder so
+    /// child workers can load just that one bundle instead of scanning LV2_PATH.
+    pub fn load_with_bundle(
+        needle: &str,
+        sample_rate: f64,
+        block: usize,
+        bundle_hint: Option<&str>,
+    ) -> anyhow::Result<Self> {
         if let Some(p) = Self::take_parked(needle, sample_rate, block) {
             return Ok(p);
         }
-        let _lilv = lilv_guard();
+        let mut st = lilv_guard();
         unsafe {
-            let world = lilv_world_new();
-            anyhow::ensure!(!world.is_null(), "lilv_world_new failed");
-            lilv_world_load_all(world);
-            load_extra_bundles(world);
-            let plugin = find_plugin(world, needle);
+            let bundle_dir = bundle_hint
+                .map(|s| s.to_string())
+                .or_else(|| bundle_path_for_uri(needle));
+            let single = bundle_dir
+                .as_deref()
+                .and_then(|dir| try_new_single_bundle_world(dir))
+                .filter(|w| !find_plugin(w.0, needle).is_null());
+            let world = match single {
+                Some(w) => w,
+                None => ensure_shared_world(&mut *st)
+                    .ok_or_else(|| anyhow::anyhow!("lilv_world_new failed"))?,
+            };
+            let plugin = find_plugin(world.0, needle);
             anyhow::ensure!(!plugin.is_null(), "LV2 plugin not found: {needle}");
             let uri = node_borrowed(lilv_plugin_get_uri(plugin));
+            let name = node_owned(lilv_plugin_get_name(plugin));
+            // Pre-check required features before calling instantiate() so a
+            // plugin with an unsupported requirement rejects cleanly.
+            let req_nodes = lilv_plugin_get_required_features(plugin);
+            if !req_nodes.is_null() {
+                let mut missing = Vec::new();
+                let mut it = lilv_nodes_begin(req_nodes);
+                while !lilv_nodes_is_end(req_nodes, it) {
+                    let n = lilv_nodes_get(req_nodes, it);
+                    if !n.is_null() && lilv_node_is_uri(n) {
+                        let feat_uri = node_borrowed(n);
+                        if !feat_uri.is_empty() && !lv2_dsp_feature_supported(&feat_uri) {
+                            missing.push(feat_uri);
+                        }
+                    }
+                    it = lilv_nodes_next(req_nodes, it);
+                }
+                lilv_nodes_free(req_nodes);
+                anyhow::ensure!(
+                    missing.is_empty(),
+                    "{uri} requires unsupported LV2 feature(s): {}",
+                    missing.join(", ")
+                );
+            }
+
             // A control output like any other: it is connected below.
             let latency_port = lilv_plugin_has_latency(plugin).then(|| lilv_plugin_get_latency_port_index(plugin) as usize);
 
-            let mut urid = Box::new(UridMap { map: std::collections::HashMap::new(), next: 1 });
-            let handle = &mut *urid as *mut UridMap as *mut c_void;
-            let mut map_data = Box::new(Lv2UridMap { handle, map: urid_map_cb });
+            let urid = SharedUridMap::new();
+            let handle = std::sync::Arc::as_ptr(&urid) as *mut c_void;
+            let map_data = Box::new(Lv2UridMap { handle, map: shared_urid_map_cb });
+            let unmap_data = Box::new(Lv2UridUnmap { handle, unmap: shared_urid_unmap_cb });
+            let runtime_options = Lv2RuntimeOptions::new(&urid, sample_rate, block);
+            let state_features = Lv2StateFeatureSet::new(None);
             let map_feature = Lv2Feature {
                 uri: b"http://lv2plug.in/ns/ext/urid#map\0".as_ptr() as *const c_char,
-                data: &mut *map_data as *mut Lv2UridMap as *mut c_void,
+                data: &*map_data as *const Lv2UridMap as *mut c_void,
             };
-            let map_uri = |s: &[u8]| urid_map_cb(handle, s.as_ptr() as *const c_char);
-            let sr_key = map_uri(b"http://lv2plug.in/ns/lv2core#sampleRate\0");
-            let bl_key = map_uri(b"http://lv2plug.in/ns/ext/buf-size#maxBlockLength\0");
-            let float_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Float\0");
-            let int_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Int\0");
-            let sr_val: f32 = sample_rate as f32;
-            let bl_val: i32 = block as i32;
-            let options = [
-                Lv2Option { context: 0, subject: 0, key: sr_key, size: 4, ty: float_ty, value: &sr_val as *const f32 as *const c_void },
-                Lv2Option { context: 0, subject: 0, key: bl_key, size: 4, ty: int_ty, value: &bl_val as *const i32 as *const c_void },
-                Lv2Option { context: 0, subject: 0, key: 0, size: 0, ty: 0, value: std::ptr::null() },
-            ];
+            let unmap_feature = Lv2Feature {
+                uri: b"http://lv2plug.in/ns/ext/urid#unmap\0".as_ptr() as *const c_char,
+                data: &*unmap_data as *const Lv2UridUnmap as *mut c_void,
+            };
             let options_feature = Lv2Feature {
                 uri: b"http://lv2plug.in/ns/ext/options#options\0".as_ptr() as *const c_char,
-                data: options.as_ptr() as *mut c_void,
+                data: runtime_options.table.as_ptr() as *mut c_void,
+            };
+            let bounded_block_feature = Lv2Feature {
+                uri: b"http://lv2plug.in/ns/ext/buf-size#boundedBlockLength\0".as_ptr() as *const c_char,
+                data: std::ptr::null_mut(),
+            };
+            let map_path_feature = Lv2Feature {
+                uri: LV2_STATE_MAP_PATH_URI.as_ptr() as *const c_char,
+                data: &state_features.map_path as *const Lv2StateMapPath as *mut c_void,
+            };
+            let make_path_feature = Lv2Feature {
+                uri: LV2_STATE_MAKE_PATH_URI.as_ptr() as *const c_char,
+                data: &state_features.make_path as *const Lv2StateMakePath as *mut c_void,
+            };
+            let free_path_feature = Lv2Feature {
+                uri: LV2_STATE_FREE_PATH_URI.as_ptr() as *const c_char,
+                data: &state_features.free_path as *const Lv2StateFreePath as *mut c_void,
             };
 
             // Worker schedule feature: the handle points at a heap block that
             // stays put for the instance's life; the request ring is filled in
             // below once we know the plugin exposes the worker interface.
+            let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut worker_shared = Box::new(WorkerShared {
                 req: None,
                 thread: std::thread::current(),
+                in_flight: std::sync::Arc::clone(&in_flight),
             });
             let worker_shared_ptr = &mut *worker_shared as *mut WorkerShared as *mut c_void;
             let worker_schedule = Box::new(Lv2WorkerSchedule {
@@ -2088,7 +3060,17 @@ impl Lv2Plugin {
                 uri: LV2_WORKER_SCHEDULE_URI.as_ptr() as *const c_char,
                 data: &*worker_schedule as *const Lv2WorkerSchedule as *mut c_void,
             };
-            let features: [*const Lv2Feature; 4] = [&map_feature, &options_feature, &worker_feature, std::ptr::null()];
+            let features: [*const Lv2Feature; 9] = [
+                &map_feature,
+                &unmap_feature,
+                &options_feature,
+                &bounded_block_feature,
+                &worker_feature,
+                &map_path_feature,
+                &make_path_feature,
+                &free_path_feature,
+                std::ptr::null(),
+            ];
 
             if let Some(reason) = foreign_binary(plugin) {
                 anyhow::bail!("{uri}: {reason}");
@@ -2107,54 +3089,83 @@ impl Lv2Plugin {
                 let (resp_tx, resp_rx) = rtrb::RingBuffer::<WorkerMsg>::new(WORKER_RING_CAP);
                 let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let shutdown2 = std::sync::Arc::clone(&shutdown);
-                let ctx = WorkerCtx { iface, instance: h0 };
+                let ctx = WorkerCtx {
+                    iface,
+                    instance: h0,
+                    in_flight: std::sync::Arc::clone(&in_flight),
+                };
                 let join = std::thread::Builder::new()
                     .name("kabelsalat-lv2-worker".into())
                     .spawn(move || worker_loop(req_rx, resp_tx, ctx, shutdown2))
                     .expect("spawn lv2 worker");
                 worker_shared.req = Some(req_tx);
                 worker_shared.thread = join.thread().clone();
-                Box::new(Lv2Worker { iface, instance: h0, resp_rx, join: Some(join), shutdown })
+                Box::new(Lv2Worker {
+                    iface,
+                    instance: h0,
+                    resp_rx,
+                    in_flight,
+                    join: Some(join),
+                    shutdown,
+                })
             });
 
-            let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
-            let control = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#ControlPort\0".as_ptr() as *const c_char);
-            let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
-            let atom_class = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
-            let urid_sequence = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/atom#Sequence\0".as_ptr() as *const c_char);
-            let urid_midi = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/midi#MidiEvent\0".as_ptr() as *const c_char);
-            let urid_chunk = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/atom#Chunk\0".as_ptr() as *const c_char);
+            let audio = lilv_new_uri(world.0, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
+            let control = lilv_new_uri(world.0, b"http://lv2plug.in/ns/lv2core#ControlPort\0".as_ptr() as *const c_char);
+            let input = lilv_new_uri(world.0, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
+            let atom_class = lilv_new_uri(world.0, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
+            let midi_event_node = lilv_new_uri(world.0, b"http://lv2plug.in/ns/ext/midi#MidiEvent\0".as_ptr() as *const c_char);
+            let urid_sequence = urid.map_str("http://lv2plug.in/ns/ext/atom#Sequence");
+            let urid_midi = urid.map_str("http://lv2plug.in/ns/ext/midi#MidiEvent");
+            let urid_chunk = urid.map_str("http://lv2plug.in/ns/ext/atom#Chunk");
+            let urid_float = urid.map_str("http://lv2plug.in/ns/ext/atom#Float");
             let nports = lilv_plugin_get_num_ports(plugin);
             let mut buffers: Vec<Vec<f32>> = (0..nports).map(|_| vec![0.0f32; block]).collect();
             let mut audio_in = Vec::new();
             let mut audio_out = Vec::new();
             let mut control_in = Vec::new();
+            let mut control_out = Vec::new();
             let mut control_ranges = Vec::new();
             let mut control_meta = Vec::new();
             let mut control_by_symbol = std::collections::HashMap::new();
-            let mut atom_in: Option<usize> = None;
-            let mut atom_buf = vec![0u8; 4096];
-            let mut atom_out: Vec<(usize, Vec<u64>)> = Vec::new();
+            let mut port_symbols = Vec::with_capacity(nports as usize);
+            let mut atom_in: Vec<AtomInPort> = Vec::new();
+            let mut atom_out: Vec<AtomOutPort> = Vec::new();
             let desc = &*(*instance).lv2_descriptor;
             let h = (*instance).lv2_handle;
             let connect_port = desc.connect_port.expect("no connect_port");
             for i in 0..nports {
                 let port = lilv_plugin_get_port_by_index(plugin, i);
+                let symbol = node_borrowed(lilv_port_get_symbol(plugin, port));
+                if !symbol.is_empty() {
+                    port_symbols.push((i as usize, symbol.clone()));
+                }
                 let is_audio = lilv_port_is_a(plugin, port, audio);
                 let is_control = lilv_port_is_a(plugin, port, control);
                 let is_atom = lilv_port_is_a(plugin, port, atom_class);
                 let is_in = lilv_port_is_a(plugin, port, input);
                 if is_atom && is_in {
-                    atom_in = Some(i as usize);
-                    init_atom_sequence(&mut atom_buf, urid_sequence);
-                    connect_port(h, i, atom_buf.as_mut_ptr() as *mut c_void);
+                    let cap = port_atom_capacity(world.0, plugin, port, ATOM_IN_BYTES);
+                    let mut buf = vec![0u64; cap / 8];
+                    init_atom_sequence(atom_bytes_mut(&mut buf), urid_sequence);
+                    connect_port(h, i, buf.as_mut_ptr() as *mut c_void);
+                    let supports_midi = lilv_port_supports_event(plugin, port, midi_event_node);
+                    atom_in.push(AtomInPort {
+                        port_index: i as usize,
+                        supports_midi,
+                        buf,
+                    });
                     continue;
                 }
                 if is_atom {
-                    let mut buf = vec![0u64; ATOM_OUT_BYTES / 8];
+                    let cap = port_atom_capacity(world.0, plugin, port, ATOM_OUT_BYTES);
+                    let mut buf = vec![0u64; cap / 8];
                     reset_atom_output(&mut buf, urid_chunk);
                     connect_port(h, i, buf.as_mut_ptr() as *mut c_void);
-                    atom_out.push((i as usize, buf)); // the heap block never moves
+                    atom_out.push(AtomOutPort {
+                        port_index: i as usize,
+                        buf,
+                    });
                     continue;
                 }
                 if is_audio && is_in {
@@ -2163,7 +3174,6 @@ impl Lv2Plugin {
                     audio_out.push(i as usize);
                 } else if is_control && is_in {
                     let (d, lo, hi) = read_port_range(plugin, port);
-                    let symbol = node_borrowed(lilv_port_get_symbol(plugin, port));
                     let name = node_owned(lilv_port_get_name(plugin, port));
                     buffers[i as usize][0] = d;
                     control_in.push(i as usize);
@@ -2177,6 +3187,8 @@ impl Lv2Plugin {
                         max: hi,
                         default: d,
                     });
+                } else if is_control && !is_in {
+                    control_out.push(i as usize);
                 }
                 connect_port(h, i, buffers[i as usize].as_mut_ptr() as *mut c_void);
             }
@@ -2184,13 +3196,50 @@ impl Lv2Plugin {
             lilv_node_free(control);
             lilv_node_free(input);
             lilv_node_free(atom_class);
-            let is_midi_fx = classify_midi_fx(world, plugin);
+            lilv_node_free(midi_event_node);
+            let is_midi_fx = classify_midi_fx(world.0, plugin);
             anyhow::ensure!(!audio_out.is_empty() || is_midi_fx, "{uri} has no audio output");
-            anyhow::ensure!(!audio_in.is_empty() || atom_in.is_some(), "{uri} has no audio/atom input");
+            anyhow::ensure!(!audio_in.is_empty() || !atom_in.is_empty(), "{uri} has no audio/atom input");
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            let mut fresh = Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), is_midi_fx, _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate, latency_port };
+            let is_inst = classify_instrument(world.0, plugin);
+            drop(st);
+            let mut fresh = Self {
+                world: Some(world),
+                instance,
+                buffers,
+                audio_in,
+                audio_out,
+                control_in,
+                control_out,
+                control_ranges,
+                control_meta,
+                control_by_symbol,
+                port_symbols,
+                atom_in,
+                last_event: None,
+                atom_out,
+                urid_chunk,
+                urid_sequence,
+                urid_midi,
+                urid_float,
+                is_inst,
+                is_midi_fx,
+                _urid: urid,
+                _map_data: map_data,
+                _unmap_data: unmap_data,
+                _runtime_options: runtime_options,
+                _state_features: state_features,
+                _worker_schedule: Some(worker_schedule),
+                _worker_shared: Some(worker_shared),
+                worker,
+                block,
+                uri,
+                name,
+                sample_rate,
+                latency_port,
+            };
             fresh.remember_init_state();
             Ok(fresh)
         }
@@ -2226,7 +3275,9 @@ impl Lv2Plugin {
         for &i in p.audio_in.iter().chain(p.audio_out.iter()) {
             if let Some(b) = p.buffers.get_mut(i) { b.fill(0.0); }
         }
-        if p.atom_in.is_some() { init_atom_sequence(&mut p.atom_buf, p.urid_sequence); }
+        for port in &mut p.atom_in {
+            init_atom_sequence(atom_bytes_mut(&mut port.buf), p.urid_sequence);
+        }
         // What the last unit left sounding ends before the next one plays:
         // a note whose note-off never reached a run(), and its effect tails
         // (All Sound Off, All Notes Off).
@@ -2261,6 +3312,10 @@ impl Lv2Plugin {
         &self.uri
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Whether the plugin reports a latency (`lv2:reportsLatency`), which
     /// may then change with any block.
     pub fn reports_latency(&self) -> bool {
@@ -2277,6 +3332,38 @@ impl Lv2Plugin {
     /// Number of control-input ports (knobs).
     pub fn control_count(&self) -> usize {
         self.control_in.len()
+    }
+
+    /// All control-output port indices (`lv2:ControlPort` + `lv2:OutputPort`).
+    pub fn control_output_ports(&self) -> &[usize] {
+        &self.control_out
+    }
+
+    /// Read current control-output port values (`(port_index, value)`). Allocation-free when `out` has capacity.
+    pub fn copy_control_outputs(&self, out: &mut Vec<(usize, f32)>) {
+        out.clear();
+        for &port_idx in &self.control_out {
+            if let Some(buf) = self.buffers.get(port_idx) {
+                out.push((port_idx, buf[0]));
+            }
+        }
+    }
+
+    /// `(port_index, symbol)` for every port of this instance.
+    pub fn port_symbols(&self) -> &[(usize, String)] {
+        &self.port_symbols
+    }
+
+    pub(crate) fn raw_handle(&self) -> Lv2Handle {
+        unsafe { (*self.instance).lv2_handle }
+    }
+
+    pub(crate) fn raw_descriptor(&self) -> *const Lv2Descriptor {
+        unsafe { (*self.instance).lv2_descriptor }
+    }
+
+    pub(crate) fn shared_urid_map(&self) -> &std::sync::Arc<SharedUridMap> {
+        &self._urid
     }
 
     /// Set the nth control port from a normalized 0..1 knob, mapped to the
@@ -2303,6 +3390,23 @@ impl Lv2Plugin {
         }
     }
 
+    /// Native value of a control input port by its raw LV2 port index.
+    pub fn control_native_by_port(&self, port_index: usize) -> Option<f32> {
+        if !self.control_in.contains(&port_index) {
+            return None;
+        }
+        self.buffers.get(port_index).and_then(|b| b.first().copied())
+    }
+
+    /// Write a native value to a control input port by its raw LV2 port index. Allocation-free.
+    pub fn set_control_native_by_port(&mut self, port_index: usize, value: f32) {
+        if self.control_in.contains(&port_index) {
+            if let Some(buf) = self.buffers.get_mut(port_index) {
+                buf[0] = value;
+            }
+        }
+    }
+
     /// Describe all control-input ports with their current buffer values.
     pub fn control_descs(&self) -> Vec<Lv2ControlDesc> {
         self.control_meta
@@ -2320,13 +3424,233 @@ impl Lv2Plugin {
             .collect()
     }
 
-    /// Apply a preset by setting matching control-input port buffers by symbol.
+    /// Apply a preset's control-input port values by symbol.
     pub fn apply_preset(&mut self, preset: &Lv2Preset) {
         for (sym, val) in &preset.values {
             if let Some(&port) = self.control_by_symbol.get(sym) {
                 self.buffers[port][0] = *val;
             }
         }
+    }
+
+    /// Wait up to `timeout` for any in-flight `worker#interface::work()` job
+    /// to complete and deliver its `work_response`/`end_run` on the caller's thread.
+    /// Must NOT be called concurrently with `process()`.
+    pub fn worker_wait_until_idle(&mut self, timeout: std::time::Duration) {
+        let Some(ref mut w) = self.worker else { return };
+        let start = std::time::Instant::now();
+        while w.in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 && start.elapsed() < timeout {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if !w.resp_rx.is_empty() {
+            w.drain_responses();
+            w.end_run();
+        }
+    }
+
+    /// Restore a full LV2 preset (control port values + `state:state` properties/files
+    /// via `lilv_state_new_from_file` / `lilv_state_new_from_world` + `lilv_state_restore`).
+    pub fn apply_preset_full(&mut self, preset: &Lv2Preset) -> anyhow::Result<()> {
+        self.apply_preset(preset);
+        if !preset.has_state {
+            return Ok(());
+        }
+        self.worker_wait_until_idle(std::time::Duration::from_millis(500));
+        let urid_float = self._urid.map_str("http://lv2plug.in/ns/ext/atom#Float");
+        let urid_double = self._urid.map_str("http://lv2plug.in/ns/ext/atom#Double");
+        let urid_int = self._urid.map_str("http://lv2plug.in/ns/ext/atom#Int");
+        let base_dir = preset
+            .file_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()));
+        let sf = Lv2StateFeatureSet::new(base_dir);
+        let map_f = Lv2Feature {
+            uri: LV2_STATE_MAP_PATH_URI.as_ptr() as *const c_char,
+            data: &sf.map_path as *const Lv2StateMapPath as *mut c_void,
+        };
+        let make_f = Lv2Feature {
+            uri: LV2_STATE_MAKE_PATH_URI.as_ptr() as *const c_char,
+            data: &sf.make_path as *const Lv2StateMakePath as *mut c_void,
+        };
+        let free_f = Lv2Feature {
+            uri: LV2_STATE_FREE_PATH_URI.as_ptr() as *const c_char,
+            data: &sf.free_path as *const Lv2StateFreePath as *mut c_void,
+        };
+        let features: [*const Lv2Feature; 4] = [&map_f, &make_f, &free_f, std::ptr::null()];
+
+        {
+            let mut st = lilv_guard();
+            unsafe {
+                let state = if let Some(ref path) = preset.file_path {
+                    let world = self
+                        .world
+                        .as_ref()
+                        .map(|w| w.0)
+                        .or_else(|| ensure_shared_world(&mut *st).map(|w| w.0))
+                        .ok_or_else(|| anyhow::anyhow!("lilv world unavailable"))?;
+                    let c_path = std::ffi::CString::new(path.as_str())?;
+                    let subj = if !preset.uri.is_empty() && !preset.uri.starts_with("file://") {
+                        let c_uri = std::ffi::CString::new(preset.uri.as_str())?;
+                        lilv_new_uri(world, c_uri.as_ptr())
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    let mut s = lilv_state_new_from_file(world, &mut *self._map_data, subj, c_path.as_ptr());
+                    if s.is_null() && !subj.is_null() {
+                        s = lilv_state_new_from_file(world, &mut *self._map_data, std::ptr::null_mut(), c_path.as_ptr());
+                    }
+                    if !subj.is_null() {
+                        lilv_node_free(subj);
+                    }
+                    s
+                } else {
+                    let world = ensure_shared_world(&mut *st)
+                        .ok_or_else(|| anyhow::anyhow!("lilv world unavailable"))?;
+                    let c_uri = std::ffi::CString::new(preset.uri.as_str())?;
+                    let node = lilv_new_uri(world.0, c_uri.as_ptr());
+                    let _ = lilv_world_load_resource(world.0, node);
+                    let s = lilv_state_new_from_world(world.0, &mut *self._map_data, node);
+                    lilv_node_free(node);
+                    s
+                };
+                anyhow::ensure!(!state.is_null(), "failed to load LV2 preset state: {}", preset.uri);
+                let mut ctx = RestorePortCtx {
+                    by_symbol: &self.control_by_symbol,
+                    buffers: &mut self.buffers,
+                    urid_float,
+                    urid_double,
+                    urid_int,
+                };
+                lilv_state_restore(
+                    state,
+                    self.instance,
+                    Some(set_port_value_cb),
+                    &mut ctx as *mut RestorePortCtx<'_> as *mut c_void,
+                    0,
+                    features.as_ptr(),
+                );
+                lilv_state_free(state);
+            }
+        }
+        self.worker_wait_until_idle(std::time::Duration::from_millis(500));
+        Ok(())
+    }
+
+    /// Save the instance's current ports + state as a standard LV2 preset bundle
+    /// under `root_dir/<slug>.lv2/` using `lilv_state_new_from_instance` +
+    /// `lilv_state_save`.
+    pub fn save_preset_bundle_to(
+        &mut self,
+        root_dir: &std::path::Path,
+        preset_name: &str,
+    ) -> anyhow::Result<Lv2Preset> {
+        let trimmed = preset_name.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "preset name must not be empty");
+        let slug: String = trimmed
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let slug = slug.trim_matches('_');
+        let slug = if slug.is_empty() { "preset" } else { slug };
+        std::fs::create_dir_all(root_dir)?;
+        let mut bundle_dir = root_dir.join(format!("{slug}.lv2"));
+        if bundle_dir.exists() {
+            let mut n = 2usize;
+            loop {
+                let cand = root_dir.join(format!("{slug}_{n}.lv2"));
+                if !cand.exists() {
+                    bundle_dir = cand;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        std::fs::create_dir_all(&bundle_dir)?;
+        let filename = format!("{slug}.ttl");
+        let ttl_path = bundle_dir.join(&filename);
+
+        self.worker_wait_until_idle(std::time::Duration::from_millis(500));
+        let values: Vec<(String, f32)> = self
+            .control_meta
+            .iter()
+            .map(|m| (m.symbol.clone(), self.buffers[m.port_index][0]))
+            .collect();
+
+        let sf = Lv2StateFeatureSet::new(Some(bundle_dir.clone()));
+        let free_f = Lv2Feature {
+            uri: LV2_STATE_FREE_PATH_URI.as_ptr() as *const c_char,
+            data: &sf.free_path as *const Lv2StateFreePath as *mut c_void,
+        };
+        let features: [*const Lv2Feature; 2] = [&free_f, std::ptr::null()];
+        let c_dir = std::ffi::CString::new(bundle_dir.to_string_lossy().as_ref())?;
+        let c_file = std::ffi::CString::new(filename.as_str())?;
+        let c_label = std::ffi::CString::new(trimmed)?;
+        let preset_uri = format!("file://{}", ttl_path.display());
+        let c_uri = std::ffi::CString::new(preset_uri.as_str())?;
+
+        {
+            let st = lilv_guard();
+            unsafe {
+                let world = self
+                    .world
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("plugin has no lilv world"))?;
+                let plugin = find_plugin(world.0, &self.uri);
+                anyhow::ensure!(!plugin.is_null(), "plugin missing from world: {}", self.uri);
+                let mut get_ctx = GetPortValueCtx {
+                    port_symbols: &self.port_symbols,
+                    control_in: &self.control_in,
+                    buffers: &self.buffers,
+                    urid_float: self.urid_float,
+                };
+                let state = lilv_state_new_from_instance(
+                    plugin,
+                    self.instance,
+                    &mut *self._map_data,
+                    c_dir.as_ptr(),
+                    c_dir.as_ptr(),
+                    c_dir.as_ptr(),
+                    c_dir.as_ptr(),
+                    Some(get_port_value_cb),
+                    &mut get_ctx as *mut GetPortValueCtx<'_> as *mut c_void,
+                    0,
+                    features.as_ptr(),
+                );
+                anyhow::ensure!(!state.is_null(), "lilv_state_new_from_instance failed");
+                lilv_state_set_label(state, c_label.as_ptr());
+                let rc = lilv_state_save(
+                    world.0,
+                    &mut *self._map_data,
+                    &mut *self._unmap_data,
+                    state,
+                    c_uri.as_ptr(),
+                    c_dir.as_ptr(),
+                    c_file.as_ptr(),
+                );
+                lilv_state_free(state);
+                anyhow::ensure!(rc == 0, "lilv_state_save failed (rc {rc})");
+            }
+            drop(st);
+        }
+        invalidate_world_cache();
+
+        Ok(Lv2Preset {
+            name: trimmed.to_string(),
+            uri: preset_uri,
+            values,
+            file_path: Some(ttl_path.to_string_lossy().into_owned()),
+            has_state: true,
+        })
+    }
+
+    /// Save the instance's current state as a user preset bundle under `~/.lv2/`.
+    pub fn save_preset_bundle(&mut self, preset_name: &str) -> anyhow::Result<Lv2Preset> {
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+        let root = std::path::PathBuf::from(home).join(".lv2");
+        self.save_preset_bundle_to(&root, preset_name)
     }
 
     /// True if this is an instrument (atom/MIDI input + audio output).
@@ -2341,7 +3665,7 @@ impl Lv2Plugin {
 
     /// True when the plugin declares an atom/MIDI input port.
     pub fn has_midi_in(&self) -> bool {
-        self.atom_in.is_some()
+        !self.atom_in.is_empty()
     }
 
     /// Queue one raw 3-byte channel-voice message (channel kept) for the
@@ -2350,14 +3674,74 @@ impl Lv2Plugin {
         self.queue_midi(ev);
     }
 
+    /// Queue a raw serialized `LV2_Atom` (`[size: u32, type: u32, payload...]`)
+    /// onto a specific atom-input `port_index` (`u32::MAX as usize` falls back
+    /// to the first atom input port). Allocation-free.
+    pub fn push_atom_in_raw(&mut self, port_index: usize, atom_bytes: &[u8]) -> bool {
+        if atom_bytes.len() < 8 {
+            return false;
+        }
+        let body_size = u32::from_le_bytes(atom_bytes[0..4].try_into().unwrap()) as usize;
+        let body_type = u32::from_le_bytes(atom_bytes[4..8].try_into().unwrap());
+        if 8 + body_size > atom_bytes.len() {
+            return false;
+        }
+        let idx = if port_index == u32::MAX as usize {
+            0
+        } else {
+            self.atom_in
+                .iter()
+                .position(|p| p.port_index == port_index)
+                .unwrap_or(0)
+        };
+        let Some(p) = self.atom_in.get_mut(idx) else {
+            return false;
+        };
+        append_atom_event(
+            atom_bytes_mut(&mut p.buf),
+            body_type,
+            0,
+            &atom_bytes[8..8 + body_size],
+        )
+    }
+
+    /// Collect all LV2 atom events written to every atom output port during the
+    /// last `run()` as `(port_index as u32, raw_lv2_atom_bytes)` pairs.
+    pub fn drain_atom_outs(&self, out: &mut Vec<(u32, Vec<u8>)>) {
+        out.clear();
+        for port in &self.atom_out {
+            let bytes = atom_bytes(&port.buf);
+            if bytes.len() < 8 {
+                continue;
+            }
+            let size = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+            let ty = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            if ty == self.urid_sequence {
+                let end = (8 + size).min(bytes.len());
+                let mut at = 16;
+                while at + 16 <= end {
+                    let n = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+                    let body = at + 16;
+                    if body + n > end {
+                        break;
+                    }
+                    out.push((port.port_index as u32, bytes[at + 8..body + n].to_vec()));
+                    at = body + ((n + 7) & !7);
+                }
+            } else if ty != self.urid_chunk && ty != 0 && 8 + size <= bytes.len() {
+                out.push((port.port_index as u32, bytes[0..8 + size].to_vec()));
+            }
+        }
+    }
+
     /// Append the MIDI events the plugin wrote to its first atom output in
     /// the last run() into `out` (bounded by `out`'s capacity, so a
     /// preallocated vector never allocates). Note-on/off arrive as such,
     /// other channel-voice messages as raw bytes.
     pub fn read_midi_out(&self, out: &mut Vec<FxOutEvent>) {
-        let Some((_, buf)) = self.atom_out.first() else { return };
+        let Some(port) = self.atom_out.first() else { return };
         // The chunk header was rewritten by the plugin into a sequence atom.
-        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+        let bytes = atom_bytes(&port.buf);
         let size = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let ty = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         if ty != self.urid_sequence {
@@ -2427,10 +3811,28 @@ impl Lv2Plugin {
         self.midi(&[0xD0, value & 0x7F]);
     }
 
+    fn append_midi_to_ports(&mut self, msg: &[u8]) -> bool {
+        let mut wrote = false;
+        let urid_midi = self.urid_midi;
+        let any_explicit = self.atom_in.iter().any(|p| p.supports_midi);
+        for port in &mut self.atom_in {
+            if any_explicit && !port.supports_midi {
+                continue;
+            }
+            if append_midi_event(atom_bytes_mut(&mut port.buf), urid_midi, 0, msg) {
+                wrote = true;
+            }
+            if !any_explicit {
+                break;
+            }
+        }
+        wrote
+    }
+
     /// Queue one channel message as it goes on the wire, 2 or 3 bytes
     /// (allocation-free).
     pub fn midi(&mut self, msg: &[u8]) {
-        if self.atom_in.is_some() && msg.len() <= 3 && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, msg) {
+        if msg.len() <= 3 && self.append_midi_to_ports(msg) {
             let mut last = [0; 3];
             last[..msg.len()].copy_from_slice(msg);
             self.last_event = Some(last);
@@ -2440,7 +3842,8 @@ impl Lv2Plugin {
     /// Queue a MIDI programme change for the next run() (allocation-free).
     pub fn program_change(&mut self, program: u8) {
         let program = program.min(127);
-        if self.atom_in.is_some() && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, &[0xC0, program]) {
+        let ev = [0xC0, program];
+        if self.append_midi_to_ports(&ev) {
             self.last_event = Some([0xC0, program, 0]);
         }
     }
@@ -2472,6 +3875,7 @@ impl Lv2Plugin {
     /// loader thread, before the instance goes to the audio thread.
     pub fn restore_state(&mut self, properties: &[(&str, &str, &[u8])]) -> anyhow::Result<()> {
         let restore = self.state_interface()?.restore.ok_or_else(|| anyhow::anyhow!("{} has no state restore", self.uri))?;
+        self.worker_wait_until_idle(std::time::Duration::from_millis(500));
         // The JUCE wrapper pushes a control port to the plugin only when it
         // differs from the value it saw last; one block lets it see the
         // ports as they are now (a reused instance comes back at defaults),
@@ -2479,14 +3883,28 @@ impl Lv2Plugin {
         let silence = vec![0.0f32; 2];
         let mut out = vec![0.0f32; 2];
         self.process(&silence, &mut out, 1);
-        let urid = &mut *self._urid as *mut UridMap as *mut c_void;
-        let map = |uri: &str| {
-            let c = std::ffi::CString::new(uri).unwrap_or_default();
-            urid_map_cb(urid, c.as_ptr())
+        let props: Vec<StateProperty<'_>> = properties
+            .iter()
+            .map(|(k, t, v)| StateProperty {
+                key: self._urid.map_str(k),
+                kind: self._urid.map_str(t),
+                value: v,
+            })
+            .collect();
+        let map_f = Lv2Feature {
+            uri: LV2_STATE_MAP_PATH_URI.as_ptr() as *const c_char,
+            data: &self._state_features.map_path as *const Lv2StateMapPath as *mut c_void,
         };
-        let props: Vec<StateProperty<'_>> = properties.iter().map(|(k, t, v)| StateProperty { key: map(k), kind: map(t), value: v }).collect();
+        let make_f = Lv2Feature {
+            uri: LV2_STATE_MAKE_PATH_URI.as_ptr() as *const c_char,
+            data: &self._state_features.make_path as *const Lv2StateMakePath as *mut c_void,
+        };
+        let free_f = Lv2Feature {
+            uri: LV2_STATE_FREE_PATH_URI.as_ptr() as *const c_char,
+            data: &self._state_features.free_path as *const Lv2StateFreePath as *mut c_void,
+        };
         unsafe {
-            let features: [*const Lv2Feature; 1] = [std::ptr::null()];
+            let features: [*const Lv2Feature; 4] = [&map_f, &make_f, &free_f, std::ptr::null()];
             let status = restore((*self.instance).lv2_handle, state_retrieve, &props as *const Vec<StateProperty<'_>> as *mut c_void, 0, features.as_ptr());
             anyhow::ensure!(status == 0, "{} refused the state (status {status})", self.uri);
         }
@@ -2497,11 +3915,23 @@ impl Lv2Plugin {
     /// Same thread rules as `restore_state`.
     pub fn saved_state(&mut self, key: &str) -> anyhow::Result<Vec<u8>> {
         let save = self.state_interface()?.save.ok_or_else(|| anyhow::anyhow!("{} has no state save", self.uri))?;
+        self.worker_wait_until_idle(std::time::Duration::from_millis(500));
         let mut saved: Vec<(u32, u32, Vec<u8>)> = Vec::new();
-        let c = std::ffi::CString::new(key)?;
-        let key = urid_map_cb(&mut *self._urid as *mut UridMap as *mut c_void, c.as_ptr());
+        let key = self._urid.map_str(key);
+        let map_f = Lv2Feature {
+            uri: LV2_STATE_MAP_PATH_URI.as_ptr() as *const c_char,
+            data: &self._state_features.map_path as *const Lv2StateMapPath as *mut c_void,
+        };
+        let make_f = Lv2Feature {
+            uri: LV2_STATE_MAKE_PATH_URI.as_ptr() as *const c_char,
+            data: &self._state_features.make_path as *const Lv2StateMakePath as *mut c_void,
+        };
+        let free_f = Lv2Feature {
+            uri: LV2_STATE_FREE_PATH_URI.as_ptr() as *const c_char,
+            data: &self._state_features.free_path as *const Lv2StateFreePath as *mut c_void,
+        };
         unsafe {
-            let features: [*const Lv2Feature; 1] = [std::ptr::null()];
+            let features: [*const Lv2Feature; 4] = [&map_f, &make_f, &free_f, std::ptr::null()];
             let status = save((*self.instance).lv2_handle, state_store, &mut saved as *mut _ as *mut c_void, 0, features.as_ptr());
             anyhow::ensure!(status == 0, "{} could not save its state (status {status})", self.uri);
         }
@@ -2519,7 +3949,7 @@ impl Lv2Plugin {
     }
 
     fn queue_midi(&mut self, ev: [u8; 3]) {
-        if self.atom_in.is_some() && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, &ev) {
+        if self.append_midi_to_ports(&ev) {
             self.last_event = Some(ev);
         }
     }
@@ -2537,7 +3967,7 @@ impl Lv2Plugin {
     /// Bytes the plugin wrote to its first atom output in the last run()
     /// (the sequence body; 8 = an empty sequence). None without atom outputs.
     pub fn atom_output_size(&self) -> Option<u32> {
-        self.atom_out.first().map(|(_, b)| (b[0] & 0xffff_ffff) as u32)
+        self.atom_out.first().map(|p| (p.buf[0] & 0xffff_ffff) as u32)
     }
 
     /// True while a worker-thread response waits to be delivered in `process()`.
@@ -2566,15 +3996,15 @@ impl Lv2Plugin {
                 }
             }
             // Atom outputs: an empty Chunk of full capacity before every run (#38).
-            for (_, buf) in self.atom_out.iter_mut() {
-                reset_atom_output(buf, self.urid_chunk);
+            for port in self.atom_out.iter_mut() {
+                reset_atom_output(&mut port.buf, self.urid_chunk);
             }
             let desc = &*(*self.instance).lv2_descriptor;
             (desc.run.expect("no run"))((*self.instance).lv2_handle, frames as u32);
         }
         // Inputs are consumed by run(): never deliver the same events twice.
-        if self.atom_in.is_some() {
-            init_atom_sequence(&mut self.atom_buf, self.urid_sequence);
+        for port in &mut self.atom_in {
+            init_atom_sequence(atom_bytes_mut(&mut port.buf), self.urid_sequence);
         }
         if let Some(w) = self.worker.as_ref() {
             w.end_run();
@@ -2597,10 +4027,19 @@ impl Drop for Lv2Plugin {
         // into), never freed.
         if never_free(&self.uri) {
             self.set_active(false);
-            std::mem::forget(std::mem::replace(&mut self._urid, Box::new(UridMap { map: Default::default(), next: 1 })));
-            std::mem::forget(std::mem::replace(&mut self._map_data, Box::new(Lv2UridMap { handle: std::ptr::null_mut(), map: urid_map_cb })));
+            let old_urid = std::mem::replace(&mut self._urid, SharedUridMap::new());
+            let old_map = std::mem::replace(&mut self._map_data, Box::new(Lv2UridMap { handle: std::ptr::null_mut(), map: shared_urid_map_cb }));
+            let old_unmap = std::mem::replace(&mut self._unmap_data, Box::new(Lv2UridUnmap { handle: std::ptr::null_mut(), unmap: shared_urid_unmap_cb }));
+            let old_opts = std::mem::replace(&mut self._runtime_options, Lv2RuntimeOptions::new(&self._urid, self.sample_rate, self.block));
+            let old_sf = std::mem::replace(&mut self._state_features, Lv2StateFeatureSet::new(None));
+            std::mem::forget(old_urid);
+            std::mem::forget(old_map);
+            std::mem::forget(old_unmap);
+            std::mem::forget(old_opts);
+            std::mem::forget(old_sf);
+            std::mem::forget(self.world.take());
             std::mem::forget(std::mem::take(&mut self.buffers));
-            std::mem::forget(std::mem::take(&mut self.atom_buf));
+            std::mem::forget(std::mem::take(&mut self.atom_in));
             std::mem::forget(std::mem::take(&mut self.atom_out));
             // A parked never-free instance keeps its worker thread alive too.
             std::mem::forget(self.worker.take());
@@ -2630,9 +4069,7 @@ impl Drop for Lv2Plugin {
                 }
                 lilv_instance_free(self.instance);
             }
-            if !self.world.is_null() {
-                lilv_world_free(self.world);
-            }
+            drop(self.world.take());
         }
     }
 }
@@ -2669,7 +4106,8 @@ pub fn voice_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Capacity of each atom output port buffer, in bytes.
+/// Default capacity of each atom input / output port buffer, in bytes.
+const ATOM_IN_BYTES: usize = 8192;
 const ATOM_OUT_BYTES: usize = 8192;
 
 /// Before run(), an atom OUTPUT port holds an atom:Chunk whose size is the
@@ -2680,26 +4118,40 @@ fn reset_atom_output(buf: &mut [u64], chunk_urid: u32) {
     buf[0] = capacity | ((chunk_urid as u64) << 32); // atom.size | atom.type (LE)
 }
 
-/// Append one MIDI event to an atom:Sequence (8-byte aligned, per the LV2
+/// Append one typed atom event to an atom:Sequence (8-byte aligned, per the LV2
 /// atom spec). False (event dropped) if the buffer is full. Allocation-free.
-fn append_midi_event(buf: &mut [u8], midi_urid: u32, frame: i64, midi: &[u8]) -> bool {
+fn append_atom_event(buf: &mut [u8], body_type: u32, frame: i64, body: &[u8]) -> bool {
+    if buf.len() < 16 {
+        return false;
+    }
     let size = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize; // body bytes
     let e = 8 + size; // next event offset (body starts at 8; seq header is 8 of it)
-    let padded = (16 + midi.len() + 7) & !7;
+    let padded = (16 + body.len() + 7) & !7;
     if e + padded > buf.len() {
         return false;
     }
     buf[e..e + padded].fill(0);
     buf[e..e + 8].copy_from_slice(&frame.to_le_bytes()); // time.frames
-    buf[e + 8..e + 12].copy_from_slice(&(midi.len() as u32).to_le_bytes()); // body.size
-    buf[e + 12..e + 16].copy_from_slice(&midi_urid.to_le_bytes()); // body.type
-    buf[e + 16..e + 16 + midi.len()].copy_from_slice(midi);
+    buf[e + 8..e + 12].copy_from_slice(&(body.len() as u32).to_le_bytes()); // body.size
+    buf[e + 12..e + 16].copy_from_slice(&body_type.to_le_bytes()); // body.type
+    if !body.is_empty() {
+        buf[e + 16..e + 16 + body.len()].copy_from_slice(body);
+    }
     buf[0..4].copy_from_slice(&((size + padded) as u32).to_le_bytes());
     true
 }
 
+/// Append one MIDI event to an atom:Sequence (8-byte aligned, per the LV2
+/// atom spec). False (event dropped) if the buffer is full. Allocation-free.
+fn append_midi_event(buf: &mut [u8], midi_urid: u32, frame: i64, midi: &[u8]) -> bool {
+    append_atom_event(buf, midi_urid, frame, midi)
+}
+
 /// Initialize an atom:Sequence buffer as empty (time unit = audio frames).
 fn init_atom_sequence(buf: &mut [u8], seq_urid: u32) {
+    if buf.len() < 16 {
+        return;
+    }
     buf[0..4].copy_from_slice(&8u32.to_le_bytes()); // atom.size = unit+pad only
     buf[4..8].copy_from_slice(&seq_urid.to_le_bytes()); // atom.type = Sequence
     buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // body.unit = 0 (frames)
@@ -2864,6 +4316,7 @@ fn default_ttl_prefixes() -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     m.insert("lv2".to_string(), LV2_CORE_PREFIX.to_string());
     m.insert("pset".to_string(), LV2_PSET_PREFIX.to_string());
+    m.insert("state".to_string(), "http://lv2plug.in/ns/ext/state#".to_string());
     m.insert("rdfs".to_string(), RDFS_PREFIX.to_string());
     m.insert("rdf".to_string(), "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
     m
@@ -2876,9 +4329,14 @@ struct ParsedPresetStmt {
     see_also: Vec<String>,
     label: Option<String>,
     values: Vec<(String, f32)>,
+    has_state: bool,
 }
 
 fn parse_turtle_presets(src: &str) -> Vec<ParsedPresetStmt> {
+    parse_turtle_preset_stmts(src, true)
+}
+
+fn parse_turtle_preset_stmts(src: &str, require_preset_type: bool) -> Vec<ParsedPresetStmt> {
     let toks = tokenize_turtle(src);
     let mut prefixes = default_ttl_prefixes();
     let mut out = Vec::new();
@@ -2888,6 +4346,7 @@ fn parse_turtle_presets(src: &str) -> Vec<ParsedPresetStmt> {
     let port_pred = format!("{LV2_CORE_PREFIX}port");
     let symbol_pred = format!("{LV2_CORE_PREFIX}symbol");
     let value_pred = format!("{LV2_PSET_PREFIX}value");
+    let state_pred = "http://lv2plug.in/ns/ext/state#state".to_string();
     let label_pred = format!("{RDFS_PREFIX}label");
     let see_also_pred = format!("{RDFS_PREFIX}seeAlso");
 
@@ -2948,6 +4407,7 @@ fn parse_turtle_presets(src: &str) -> Vec<ParsedPresetStmt> {
             see_also: Vec::new(),
             label: None,
             values: Vec::new(),
+            has_state: false,
         };
 
         // Parse predicate-object pairs separated by Semi at depth 0.
@@ -2960,6 +4420,9 @@ fn parse_turtle_presets(src: &str) -> Vec<ParsedPresetStmt> {
             let Some(pred) = resolve_term(&stmt[j], &prefixes) else {
                 break;
             };
+            if pred == state_pred {
+                parsed.has_state = true;
+            }
             j += 1;
             // Parse comma-separated objects until Semi or end of stmt.
             while j < stmt.len() && stmt[j] != TtlTok::Semi {
@@ -2995,10 +4458,18 @@ fn parse_turtle_presets(src: &str) -> Vec<ParsedPresetStmt> {
                                         sym = Some(s.clone());
                                     }
                                 } else if ip == value_pred {
-                                    if let TtlTok::Word(w) = &inner[k + 1] {
-                                        if let Ok(v) = w.parse::<f32>() {
-                                            val = Some(v);
+                                    match &inner[k + 1] {
+                                        TtlTok::Word(w) => {
+                                            if let Ok(v) = w.parse::<f32>() {
+                                                val = Some(v);
+                                            }
                                         }
+                                        TtlTok::Str(s) => {
+                                            if let Ok(v) = s.parse::<f32>() {
+                                                val = Some(v);
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -3042,7 +4513,10 @@ fn parse_turtle_presets(src: &str) -> Vec<ParsedPresetStmt> {
             }
         }
 
-        if parsed.is_preset {
+        if parsed.is_preset
+            || (!require_preset_type
+                && (!parsed.values.is_empty() || parsed.has_state || parsed.label.is_some()))
+        {
             out.push(parsed);
         }
     }
@@ -3100,60 +4574,100 @@ fn resolve_preset_uri(subject: &str, file_path: &std::path::Path) -> String {
 
 /// Discover installed LV2 presets (`pset:Preset`) that apply to `plugin_uri`.
 pub fn discover_presets(plugin_uri: &str) -> Vec<Lv2Preset> {
-    let mut presets = Vec::new();
-    let mut seen_uris = std::collections::HashSet::new();
-
+    let mut bundles: Vec<std::path::PathBuf> = Vec::new();
     for root in lv2_search_paths() {
         let Ok(entries) = std::fs::read_dir(&root) else { continue };
         for entry in entries.flatten() {
             let bundle = entry.path();
-            if !bundle.is_dir() {
+            if bundle.is_dir() {
+                bundles.push(bundle);
+            }
+        }
+    }
+    for extra in extra_bundle_cstrings() {
+        if let Ok(s) = extra.into_string() {
+            let p = std::path::PathBuf::from(s.trim_end_matches('/'));
+            if p.is_dir() {
+                bundles.push(p);
+            }
+        }
+    }
+    discover_presets_in_bundles(plugin_uri, &bundles)
+}
+
+pub(crate) fn discover_presets_in_bundles(
+    plugin_uri: &str,
+    bundles: &[std::path::PathBuf],
+) -> Vec<Lv2Preset> {
+    let mut presets = Vec::new();
+    let mut seen_uris = std::collections::HashSet::new();
+    let mut seen_bundles = std::collections::HashSet::new();
+
+    for bundle in bundles {
+        if !bundle.is_dir() {
+            continue;
+        }
+        let canon_bundle = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.clone());
+        if !seen_bundles.insert(canon_bundle) {
+            continue;
+        }
+        let manifest_path = bundle.join("manifest.ttl");
+        let Ok(manifest_src) = std::fs::read_to_string(&manifest_path) else { continue };
+        for m_stmt in parse_turtle_presets(&manifest_src) {
+            if !m_stmt.applies_to.is_empty() && !m_stmt.applies_to.iter().any(|u| u == plugin_uri) {
                 continue;
             }
-            let manifest_path = bundle.join("manifest.ttl");
-            let Ok(manifest_src) = std::fs::read_to_string(&manifest_path) else { continue };
-            for m_stmt in parse_turtle_presets(&manifest_src) {
-                if !m_stmt.applies_to.is_empty() && !m_stmt.applies_to.iter().any(|u| u == plugin_uri) {
-                    continue;
-                }
-                if m_stmt.see_also.is_empty() {
-                    if m_stmt.applies_to.iter().any(|u| u == plugin_uri) && !m_stmt.values.is_empty() {
-                        let uri = resolve_preset_uri(&m_stmt.subject, &manifest_path);
-                        if seen_uris.insert(uri.clone()) {
-                            let name = m_stmt.label.unwrap_or_else(|| uri.clone());
-                            presets.push(Lv2Preset { name, uri, values: m_stmt.values });
-                        }
-                    }
-                    continue;
-                }
-                for rel in m_stmt.see_also {
-                    let target = bundle.join(&rel);
-                    let Ok(preset_src) = std::fs::read_to_string(&target) else { continue };
-                    for p_stmt in parse_turtle_presets(&preset_src) {
-                        let applies = p_stmt.applies_to.iter().any(|u| u == plugin_uri)
-                            || (p_stmt.applies_to.is_empty() && m_stmt.applies_to.iter().any(|u| u == plugin_uri));
-                        if !applies {
-                            continue;
-                        }
-                        let subj = if p_stmt.subject.is_empty() { &m_stmt.subject } else { &p_stmt.subject };
-                        let uri = resolve_preset_uri(subj, &target);
-                        if !seen_uris.insert(uri.clone()) {
-                            continue;
-                        }
-                        let name = p_stmt.label
-                            .or_else(|| m_stmt.label.clone())
-                            .unwrap_or_else(|| {
-                                target.file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or(&uri)
-                                    .replace('_', " ")
-                            });
+            if m_stmt.see_also.is_empty() {
+                if m_stmt.applies_to.iter().any(|u| u == plugin_uri)
+                    && (!m_stmt.values.is_empty() || m_stmt.has_state)
+                {
+                    let uri = resolve_preset_uri(&m_stmt.subject, &manifest_path);
+                    if seen_uris.insert(uri.clone()) {
+                        let name = m_stmt.label.unwrap_or_else(|| uri.clone());
                         presets.push(Lv2Preset {
                             name,
                             uri,
-                            values: p_stmt.values,
+                            values: m_stmt.values,
+                            file_path: Some(manifest_path.to_string_lossy().into_owned()),
+                            has_state: m_stmt.has_state,
                         });
                     }
+                }
+                continue;
+            }
+            for rel in m_stmt.see_also {
+                let target = if let Some(p) = rel.strip_prefix("file://") {
+                    std::path::PathBuf::from(p)
+                } else {
+                    bundle.join(&rel)
+                };
+                let Ok(preset_src) = std::fs::read_to_string(&target) else { continue };
+                for p_stmt in parse_turtle_preset_stmts(&preset_src, false) {
+                    let applies = p_stmt.applies_to.iter().any(|u| u == plugin_uri)
+                        || (p_stmt.applies_to.is_empty() && m_stmt.applies_to.iter().any(|u| u == plugin_uri));
+                    if !applies {
+                        continue;
+                    }
+                    let subj = if p_stmt.subject.is_empty() { &m_stmt.subject } else { &p_stmt.subject };
+                    let uri = resolve_preset_uri(subj, &target);
+                    if !seen_uris.insert(uri.clone()) {
+                        continue;
+                    }
+                    let name = p_stmt.label
+                        .or_else(|| m_stmt.label.clone())
+                        .unwrap_or_else(|| {
+                            target.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(&uri)
+                                .replace('_', " ")
+                        });
+                    presets.push(Lv2Preset {
+                        name,
+                        uri,
+                        values: p_stmt.values,
+                        file_path: Some(target.to_string_lossy().into_owned()),
+                        has_state: p_stmt.has_state || m_stmt.has_state,
+                    });
                 }
             }
         }
@@ -3659,7 +5173,12 @@ mod tests {
         let state = Box::new(TestInstanceState::default());
         let instance = &*state as *const TestInstanceState as Lv2Handle;
 
-        let mut shared = Box::new(WorkerShared { req: None, thread: std::thread::current() });
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut shared = Box::new(WorkerShared {
+            req: None,
+            thread: std::thread::current(),
+            in_flight: std::sync::Arc::clone(&in_flight),
+        });
         let shared_ptr = &mut *shared as *mut WorkerShared as *mut c_void;
         let iface = Lv2WorkerInterface { work: fake_work, work_response: fake_work_response, end_run: Some(fake_end_run) };
 
@@ -3667,11 +5186,22 @@ mod tests {
         let (resp_tx, resp_rx) = rtrb::RingBuffer::<WorkerMsg>::new(WORKER_RING_CAP);
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown2 = std::sync::Arc::clone(&shutdown);
-        let ctx = WorkerCtx { iface, instance };
+        let ctx = WorkerCtx {
+            iface,
+            instance,
+            in_flight: std::sync::Arc::clone(&in_flight),
+        };
         let join = std::thread::spawn(move || worker_loop(req_rx, resp_tx, ctx, shutdown2));
         shared.req = Some(req_tx);
         shared.thread = join.thread().clone();
-        let mut worker = Lv2Worker { iface, instance, resp_rx, join: Some(join), shutdown };
+        let mut worker = Lv2Worker {
+            iface,
+            instance,
+            resp_rx,
+            in_flight,
+            join: Some(join),
+            shutdown,
+        };
 
         // Audio thread: schedule a request through the feature callback.
         let payload = [0x90u8, 60, 100, 0x42];
@@ -3827,6 +5357,266 @@ mod tests {
         assert_eq!(parse_lv2_control_text(&bypass, "off"), Some(0.0));
         assert_eq!(parse_lv2_control_text(&bypass, "on"), Some(1.0));
     }
+
+    #[test]
+    fn bridge_uis_and_unsupported_required_features_are_filtered() {
+        assert!(is_bridge_ui("urn:test:ui", "/usr/lib/lv2/foo.lv2/", "/usr/lib/lv2/lv2-gtk-ui-bridge.so"));
+        assert!(is_bridge_ui("urn:test:ui", "/tmp/lv2_gtk2_ui_bridge.lv2/", "/tmp/ui.so"));
+        assert!(!is_bridge_ui("urn:test:ui", "/tmp/real.lv2/", "/tmp/real_x11.so"));
+
+        let dir = std::env::temp_dir().join(format!("kabelsalat-lv2-ui-filter-{}", std::process::id()));
+        let bundle = dir.join("filter.lv2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), bundle.join("dsp.so")).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), bundle.join("lv2-gtk-ui-bridge.so")).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), bundle.join("real_ui.so")).unwrap();
+
+        let p_only_bad = "urn:kabelsalat:test:ui-filter:only-bad";
+        let p_mixed = "urn:kabelsalat:test:ui-filter:mixed";
+        let bridge_ui = "urn:kabelsalat:test:ui:bridge";
+        let unsupported_ui = "urn:kabelsalat:test:ui:unsupported";
+        let good_ui = "urn:kabelsalat:test:ui:good";
+
+        std::fs::write(
+            bundle.join("manifest.ttl"),
+            format!(
+                "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 @prefix ui: <http://lv2plug.in/ns/extensions/ui#> .\n\
+                 <{p_only_bad}> a lv2:Plugin ; lv2:binary <dsp.so> ; rdfs:seeAlso <plugin.ttl> .\n\
+                 <{p_mixed}> a lv2:Plugin ; lv2:binary <dsp.so> ; rdfs:seeAlso <plugin.ttl> .\n\
+                 <{bridge_ui}> a ui:X11UI ; ui:binary <lv2-gtk-ui-bridge.so> .\n\
+                 <{unsupported_ui}> a ui:X11UI ; ui:binary <real_ui.so> .\n\
+                 <{good_ui}> a ui:X11UI ; ui:binary <real_ui.so> .\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join("plugin.ttl"),
+            format!(
+                "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+                 @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
+                 @prefix ui: <http://lv2plug.in/ns/extensions/ui#> .\n\
+                 <{p_only_bad}> a lv2:Plugin ; doap:name \"Only Bad\" ;\n\
+                     ui:ui <{bridge_ui}>, <{unsupported_ui}> .\n\
+                 <{p_mixed}> a lv2:Plugin ; doap:name \"Mixed\" ;\n\
+                     ui:ui <{bridge_ui}>, <{unsupported_ui}>, <{good_ui}> .\n\
+                 <{unsupported_ui}> ui:requiredFeature <http://example.org/lv2#unsupportedUiFeature> .\n\
+                 <{good_ui}> ui:requiredFeature <http://lv2plug.in/ns/ext/urid#map>, <http://lv2plug.in/ns/extensions/ui#parent> .\n"
+            ),
+        )
+        .unwrap();
+
+        let _st = lilv_guard();
+        let (only_bad_res, mixed_res, plugins) = unsafe {
+            let world = lilv_world_new();
+            let c = bundle_cstring(&bundle).unwrap();
+            let n = lilv_new_file_uri(world, std::ptr::null(), c.as_ptr());
+            lilv_world_load_bundle(world, n);
+            lilv_node_free(n);
+            let bad = find_plugin(world, p_only_bad);
+            let mix = find_plugin(world, p_mixed);
+            let r_bad = inspect_plugin_ui(world, bad);
+            let r_mix = inspect_plugin_ui(world, mix);
+            let (plugins, _) = collect_plugins(world);
+            lilv_world_free(world);
+            (r_bad, r_mix, plugins)
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(only_bad_res, None, "bridge & unsupported UIs must be rejected");
+        assert_eq!(mixed_res.as_ref().map(|u| u.ui_uri.as_str()), Some(good_ui));
+        assert!(!plugins.iter().find(|p| p.uri == p_only_bad).unwrap().has_ui);
+        assert!(plugins.iter().find(|p| p.uri == p_mixed).unwrap().has_ui);
+    }
+
+    #[test]
+    fn scan_cache_hits_and_invalidates_on_bundle_change() {
+        let dir = std::env::temp_dir().join(format!("kabelsalat-lv2-cache-{}", std::process::id()));
+        let bundle = dir.join("cached.lv2");
+        let cache_file = dir.join("lv2-scan.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), bundle.join("cached.so")).unwrap();
+
+        let uri = "urn:kabelsalat:test:scan-cache";
+        let manifest = format!(
+            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+             @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
+             <{uri}> a lv2:Plugin ; doap:name \"Real Name\" ; lv2:binary <cached.so> .\n"
+        );
+        std::fs::write(bundle.join("manifest.ttl"), &manifest).unwrap();
+        add_bundle(&bundle);
+
+        let (first, _) = discover_with_unloadable_cache_path(Some(&cache_file), true);
+        assert!(cache_file.is_file(), "scan cache JSON should be written");
+        assert_eq!(first.iter().find(|p| p.uri == uri).unwrap().name, "Real Name");
+        assert!(bundle_path_for_uri(uri).is_some(), "bundle_path_for_uri must be populated");
+
+        // Mutate the cached JSON in place so we can prove cache hits skip lilv.
+        let mut cached: Lv2ScanCache = serde_json::from_slice(&std::fs::read(&cache_file).unwrap()).unwrap();
+        cached.plugins.iter_mut().find(|p| p.uri == uri).unwrap().name = "From Cache".into();
+        std::fs::write(&cache_file, serde_json::to_vec(&cached).unwrap()).unwrap();
+
+        let (hit, _) = discover_with_unloadable_cache_path(Some(&cache_file), false);
+        assert_eq!(hit.iter().find(|p| p.uri == uri).unwrap().name, "From Cache");
+
+        // Touch manifest.ttl with a newer mtime -> cache invalidates -> rescans disk.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            bundle.join("manifest.ttl"),
+            manifest.replace("Real Name", "Updated Name"),
+        )
+        .unwrap();
+
+        let (miss, _) = discover_with_unloadable_cache_path(Some(&cache_file), false);
+        assert_eq!(miss.iter().find(|p| p.uri == uri).unwrap().name, "Updated Name");
+
+        remove_bundle(&bundle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dsp_load_provides_options_unmap_resize_port_multi_atom_and_rejects_unsupported_required() {
+        let (dir, uri) = ui::build_fixture_bundle("dsp-compliance").unwrap();
+        let mut plugin = Lv2Plugin::load_with_bundle(
+            &uri,
+            48000.0,
+            256,
+            Some(dir.to_string_lossy().as_ref()),
+        )
+        .unwrap();
+
+        #[repr(C)]
+        struct FixtureExt {
+            magic: extern "C" fn(Lv2Handle) -> u32,
+            feature_flags: extern "C" fn(Lv2Handle) -> u32,
+            atom_out_cap: extern "C" fn(Lv2Handle) -> u32,
+        }
+        let ext = unsafe {
+            let ext_fn = (*plugin.raw_descriptor()).extension_data.expect("fixture extension_data");
+            let p = ext_fn(c"urn:kabelsalat:fixture:ext".as_ptr());
+            assert!(!p.is_null(), "fixture ext missing");
+            &*(p as *const FixtureExt)
+        };
+        assert_eq!((ext.magic)(plugin.raw_handle()), 0x4B53_4C54);
+        let flags = (ext.feature_flags)(plugin.raw_handle());
+        assert_eq!(
+            flags & 0x7f,
+            0x7f,
+            "expected all 7 DSP features (urid#map/unmap, options, boundedBlockLength, state mapPath/makePath/freePath), got {flags:#b}"
+        );
+
+        let urid_ping = plugin.shared_urid_map().map_str("urn:kabelsalat:fixture:ping");
+        let urid_pong = plugin.shared_urid_map().map_str("urn:kabelsalat:fixture:pong");
+        let mut ping_atom = Vec::new();
+        ping_atom.extend_from_slice(&4u32.to_le_bytes());
+        ping_atom.extend_from_slice(&urid_ping.to_le_bytes());
+        ping_atom.extend_from_slice(&42u32.to_le_bytes());
+        assert!(plugin.push_atom_in_raw(6, &ping_atom));
+
+        let inp = vec![0.5f32; 256 * 2];
+        let mut out = vec![0.0f32; 256 * 2];
+        plugin.process(&inp, &mut out, 256);
+
+        let out_cap = (ext.atom_out_cap)(plugin.raw_handle());
+        assert!(out_cap >= 16384 - 8, "rsz:minimumSize 16384 not honored (cap={out_cap})");
+        let mut outs = Vec::new();
+        plugin.drain_atom_outs(&mut outs);
+        assert!(
+            outs.iter().any(|(port, bytes)| *port == 7
+                && bytes.len() >= 12
+                && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) == urid_pong),
+            "expected pong atom on port 7, got {outs:?}"
+        );
+        let mut ctrl_outs = Vec::new();
+        plugin.copy_control_outputs(&mut ctrl_outs);
+        assert!(ctrl_outs.iter().any(|&(p, v)| p == 5 && v > 0.1), "meter control output missing: {ctrl_outs:?}");
+
+        drop(plugin);
+        remove_bundle(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Verify plugins declaring an unsupported lv2:requiredFeature fail before instantiate.
+        let bad_dir = std::env::temp_dir().join(format!("kabelsalat-lv2-reqfeat-{}", std::process::id()));
+        let bad_bundle = bad_dir.join("reqfeat.lv2");
+        let _ = std::fs::remove_dir_all(&bad_dir);
+        std::fs::create_dir_all(&bad_bundle).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), bad_bundle.join("reqfeat.so")).unwrap();
+        let bad_uri = "urn:kabelsalat:test:unsupported-required";
+        std::fs::write(
+            bad_bundle.join("manifest.ttl"),
+            format!(
+                "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+                 @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
+                 <{bad_uri}> a lv2:Plugin ; doap:name \"Unsupported Required\" ;\n\
+                     lv2:requiredFeature <http://example.org/lv2#missingHostFeature> ;\n\
+                     lv2:binary <reqfeat.so> .\n"
+            ),
+        )
+        .unwrap();
+        add_bundle(&bad_bundle);
+        let err = match Lv2Plugin::load(bad_uri, 48000.0, 256) {
+            Ok(_) => panic!("plugin with unsupported requiredFeature must fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        remove_bundle(&bad_bundle);
+        let _ = std::fs::remove_dir_all(&bad_dir);
+        assert!(err.contains("unsupported LV2 feature"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn save_and_restore_full_preset_bundle_preserves_controls_and_state() {
+        let (dir, uri) = ui::build_fixture_bundle("full-preset").unwrap();
+        let preset_root = std::env::temp_dir().join(format!("kabelsalat-lv2-preset-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&preset_root);
+
+        let mut p1 = Lv2Plugin::load(&uri, 48000.0, 256).unwrap();
+        p1.set_control_native(0, 1.4);
+        let bias: f32 = 0.25;
+        p1.restore_state(&[(
+            "urn:kabelsalat:fixture:state_bias",
+            "http://lv2plug.in/ns/ext/atom#Chunk",
+            &bias.to_le_bytes(),
+        )])
+        .unwrap();
+        let saved = p1.save_preset_bundle_to(&preset_root, "Warm Fixture").unwrap();
+        assert!(saved.has_state && saved.file_path.is_some(), "saved preset metadata incomplete: {saved:?}");
+
+        let bundle_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&preset_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        let discovered = discover_presets_in_bundles(&uri, &bundle_dirs);
+        let found = discovered
+            .into_iter()
+            .find(|p| p.name == "Warm Fixture")
+            .expect("saved preset bundle not discovered");
+        assert!(found.has_state, "discovered preset must detect state:state");
+
+        let mut p2 = Lv2Plugin::load(&uri, 48000.0, 256).unwrap();
+        let inp = vec![1.0f32; 256 * 2];
+        let mut out = vec![0.0f32; 256 * 2];
+        p2.process(&inp, &mut out, 256);
+        assert!((out[0] - 1.0).abs() < 1e-4, "fresh instance should output 1.0, got {}", out[0]);
+
+        p2.apply_preset_full(&found).unwrap();
+        p2.process(&inp, &mut out, 256);
+        // 1.4 gain * 0.25 state_bias = 0.35
+        assert!(
+            (out[0] - 0.35).abs() < 1e-3,
+            "full preset restore should combine gain=1.4 and bias=0.25 -> 0.35, got {}",
+            out[0]
+        );
+
+        drop(p1);
+        drop(p2);
+        remove_bundle(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&preset_root);
+    }
 }
 
 /// Instrument-detection self-test: load LV2 instruments and confirm atom-port
@@ -3856,7 +5646,7 @@ pub fn instrument_test() -> anyhow::Result<()> {
                     p.uri(),
                     is_inst,
                     p.control_count(),
-                    p.atom_in.is_some(),
+                    !p.atom_in.is_empty(),
                     peak
                 );
                 if is_inst {

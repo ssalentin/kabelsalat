@@ -9,8 +9,9 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 
 use super::{
-    discover, discover_ui_for_uri, port_symbols_for_uri, control_descs_for_uri,
-    Lv2ControlDesc, Lv2Feature, Lv2Plugin, Lv2UiInfo, Lv2UridMap,
+    control_descs_for_uri, discover, discover_ui_for_uri, port_symbols_for_uri,
+    shared_urid_map_cb, shared_urid_unmap_cb, Lv2ControlDesc, Lv2Descriptor, Lv2Feature,
+    Lv2Handle, Lv2Option, Lv2Plugin, Lv2UiInfo, Lv2UridMap, Lv2UridUnmap, SharedUridMap,
 };
 use crate::plugin_window::PluginWindow;
 
@@ -24,6 +25,19 @@ const LV2_UI_SHOW_INTERFACE_URI: &[u8] = b"http://lv2plug.in/ns/extensions/ui#sh
 const LV2_URID_MAP_URI: &[u8] = b"http://lv2plug.in/ns/ext/urid#map\0";
 const LV2_URID_UNMAP_URI: &[u8] = b"http://lv2plug.in/ns/ext/urid#unmap\0";
 const LV2_OPTIONS_URI: &[u8] = b"http://lv2plug.in/ns/ext/options#options\0";
+const LV2_INSTANCE_ACCESS_URI: &[u8] = b"http://lv2plug.in/ns/ext/instance-access\0";
+const LV2_DATA_ACCESS_URI: &[u8] = b"http://lv2plug.in/ns/ext/data-access\0";
+
+/// Direct DSP instance access passed to co-hosted LV2 UIs inside `plugin-worker`.
+pub(crate) struct Lv2DirectAccess {
+    pub instance: Lv2Handle,
+    pub descriptor: *const Lv2Descriptor,
+}
+
+#[repr(C)]
+struct Lv2ExtensionDataFeature {
+    data_access: Option<extern "C" fn(*const c_char) -> *const c_void>,
+}
 
 const LV2_UI_FLOAT_PROTOCOL: &str = "http://lv2plug.in/ns/extensions/ui#floatProtocol";
 const LV2_ATOM_EVENT_TRANSFER: &str = "http://lv2plug.in/ns/ext/atom#eventTransfer";
@@ -121,22 +135,6 @@ struct Lv2UiShowInterface {
     hide: Option<extern "C" fn(ui: Lv2UiHandlePtr) -> c_int>,
 }
 
-#[repr(C)]
-struct Lv2UridUnmap {
-    handle: *mut c_void,
-    unmap: extern "C" fn(handle: *mut c_void, urid: u32) -> *const c_char,
-}
-
-#[repr(C)]
-struct Lv2Option {
-    context: u32,
-    subject: u32,
-    key: u32,
-    size: u32,
-    ty: u32,
-    value: *const c_void,
-}
-
 /// Events collected by [`Lv2UiHandle::pump`] on the UI thread.
 #[derive(Debug, Default)]
 pub struct Lv2UiPumpResult {
@@ -145,67 +143,12 @@ pub struct Lv2UiPumpResult {
     pub control_writes: Vec<(usize, f32, f32)>,
     /// 3-byte MIDI channel-voice messages emitted via `atom:eventTransfer`.
     pub midi_events: Vec<[u8; 3]>,
-}
-
-/// Persistent URID map supporting both `map` and `unmap` for an LV2 UI.
-struct UiUridMap {
-    map: HashMap<String, u32>,
-    by_id: Vec<CString>,
-}
-
-impl UiUridMap {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            // 0 is invalid per LV2 URID spec; start at 1.
-            by_id: vec![CString::default()],
-        }
-    }
-
-    fn map_str(&mut self, uri: &str) -> u32 {
-        if let Some(&id) = self.map.get(uri) {
-            return id;
-        }
-        let Ok(cs) = CString::new(uri) else { return 0 };
-        let id = self.by_id.len() as u32;
-        self.by_id.push(cs);
-        self.map.insert(uri.to_string(), id);
-        id
-    }
-
-    fn unmap_id(&self, urid: u32) -> *const c_char {
-        if urid == 0 {
-            return std::ptr::null();
-        }
-        self.by_id
-            .get(urid as usize)
-            .map_or(std::ptr::null(), |s| s.as_ptr())
-    }
-}
-
-extern "C" fn ui_urid_map_cb(handle: *mut c_void, uri: *const c_char) -> u32 {
-    if handle.is_null() || uri.is_null() {
-        return 0;
-    }
-    unsafe {
-        let m = &mut *(handle as *mut UiUridMap);
-        let s = CStr::from_ptr(uri).to_string_lossy();
-        m.map_str(&s)
-    }
-}
-
-extern "C" fn ui_urid_unmap_cb(handle: *mut c_void, urid: u32) -> *const c_char {
-    if handle.is_null() {
-        return std::ptr::null();
-    }
-    unsafe {
-        let m = &*(handle as *const UiUridMap);
-        m.unmap_id(urid)
-    }
+    /// Non-MIDI `atom:eventTransfer` writes: `(port_index, raw_lv2_atom_bytes)`.
+    pub atom_writes: Vec<(u32, Vec<u8>)>,
 }
 
 struct UiShared {
-    urid_map: Box<UiUridMap>,
+    _urid_map: std::sync::Arc<SharedUridMap>,
     port_to_control: HashMap<u32, (usize, f32, f32)>,
     symbol_to_port: HashMap<String, u32>,
     urid_float_protocol: u32,
@@ -213,6 +156,7 @@ struct UiShared {
     urid_midi_event: u32,
     outgoing_controls: Vec<(usize, f32, f32)>,
     outgoing_midi: Vec<[u8; 3]>,
+    outgoing_atoms: Vec<(u32, Vec<u8>)>,
     grabbed_ports: HashSet<u32>,
     pending_resize: Option<(u32, u32)>,
 }
@@ -254,6 +198,8 @@ extern "C" fn ui_write_cb(
                     msg[..payload.len()].copy_from_slice(payload);
                     shared.outgoing_midi.push(msg);
                 }
+            } else if bytes.len() >= 8 + atom_size {
+                shared.outgoing_atoms.push((port_index, bytes[..8 + atom_size].to_vec()));
             }
         }
     }
@@ -327,6 +273,7 @@ pub struct Lv2UiHandle {
     show_iface: Option<Lv2UiShowInterface>,
     resize_iface: Option<Lv2UiResize>,
     window: Option<PluginWindow>,
+    child_win: Option<u32>,
     resizable: bool,
     shared: Box<UiShared>,
     control_to_port: HashMap<usize, (u32, f32, f32)>,
@@ -336,6 +283,7 @@ pub struct Lv2UiHandle {
     _port_map_data: Box<Lv2UiPortMap>,
     _port_sub_data: Box<Lv2UiPortSubscribe>,
     _touch_data: Box<Lv2UiTouch>,
+    _data_access_data: Option<Box<Lv2ExtensionDataFeature>>,
     last_sent: HashMap<u32, f32>,
     closed: bool,
 }
@@ -354,6 +302,38 @@ impl Lv2UiHandle {
         port_symbols: &[(u32, String)],
         info: &Lv2UiInfo,
     ) -> Result<Self> {
+        Self::open_cohosted(
+            plugin_uri,
+            title,
+            sample_rate,
+            initial_controls,
+            controls,
+            port_symbols,
+            info,
+            SharedUridMap::new(),
+            None,
+        )
+    }
+
+    /// Open a native LV2 GUI co-hosted with its DSP instance in the same process,
+    /// sharing `urid_map` and optionally passing `instance-access` + `data-access`.
+    pub(crate) fn open_cohosted(
+        plugin_uri: &str,
+        title: &str,
+        sample_rate: f64,
+        initial_controls: &[(u32, f32)],
+        controls: &[Lv2ControlDesc],
+        port_symbols: &[(u32, String)],
+        info: &Lv2UiInfo,
+        urid_map: std::sync::Arc<SharedUridMap>,
+        direct: Option<Lv2DirectAccess>,
+    ) -> Result<Self> {
+        if info.needs_direct_access && direct.is_none() {
+            anyhow::bail!(
+                "LV2 UI {} requires instance-access/data-access (sandbox worker co-hosting required)",
+                info.ui_uri
+            );
+        }
         crate::binarch::ensure_loadable(Path::new(&info.binary_path))
             .map_err(|reason| anyhow!("{reason}"))?;
 
@@ -398,7 +378,6 @@ impl Lv2UiHandle {
             anyhow::bail!("{} does not expose LV2 UI {}", info.binary_path, info.ui_uri);
         }
 
-        let mut urid_map = Box::new(UiUridMap::new());
         let urid_float_protocol = urid_map.map_str(LV2_UI_FLOAT_PROTOCOL);
         let urid_event_transfer = urid_map.map_str(LV2_ATOM_EVENT_TRANSFER);
         let urid_midi_event = urid_map.map_str(LV2_MIDI_EVENT);
@@ -422,8 +401,9 @@ impl Lv2UiHandle {
             }
         }
 
+        let urid_handle = std::sync::Arc::as_ptr(&urid_map) as *mut c_void;
         let mut shared = Box::new(UiShared {
-            urid_map,
+            _urid_map: urid_map,
             port_to_control,
             symbol_to_port,
             urid_float_protocol,
@@ -431,18 +411,18 @@ impl Lv2UiHandle {
             urid_midi_event,
             outgoing_controls: Vec::new(),
             outgoing_midi: Vec::new(),
+            outgoing_atoms: Vec::new(),
             grabbed_ports: HashSet::new(),
             pending_resize: None,
         });
 
-        let urid_handle = &mut *shared.urid_map as *mut UiUridMap as *mut c_void;
         let mut urid_map_data = Box::new(Lv2UridMap {
             handle: urid_handle,
-            map: ui_urid_map_cb,
+            map: shared_urid_map_cb,
         });
         let mut urid_unmap_data = Box::new(Lv2UridUnmap {
             handle: urid_handle,
-            unmap: ui_urid_unmap_cb,
+            unmap: shared_urid_unmap_cb,
         });
         let shared_ptr = &mut *shared as *mut UiShared as *mut c_void;
         let mut resize_feature_data = Box::new(Lv2UiResize {
@@ -550,6 +530,19 @@ impl Lv2UiHandle {
             uri: LV2_UI_PARENT_URI.as_ptr() as *const c_char,
             data: w.id() as usize as *mut c_void,
         });
+        let mut data_access_data = direct.as_ref().map(|d| {
+            Box::new(Lv2ExtensionDataFeature {
+                data_access: unsafe { (*d.descriptor).extension_data },
+            })
+        });
+        let inst_feat = direct.as_ref().map(|d| Lv2Feature {
+            uri: LV2_INSTANCE_ACCESS_URI.as_ptr() as *const c_char,
+            data: d.instance,
+        });
+        let data_feat = data_access_data.as_mut().map(|da| Lv2Feature {
+            uri: LV2_DATA_ACCESS_URI.as_ptr() as *const c_char,
+            data: &mut **da as *mut Lv2ExtensionDataFeature as *mut c_void,
+        });
 
         let mut feature_ptrs: Vec<*const Lv2Feature> = vec![
             &map_feat,
@@ -562,6 +555,12 @@ impl Lv2UiHandle {
         ];
         if let Some(ref p) = parent_feat {
             feature_ptrs.push(p);
+        }
+        if let Some(ref i) = inst_feat {
+            feature_ptrs.push(i);
+        }
+        if let Some(ref da) = data_feat {
+            feature_ptrs.push(da);
         }
         feature_ptrs.push(std::ptr::null());
 
@@ -602,13 +601,19 @@ impl Lv2UiHandle {
             (!p.is_null()).then(|| std::ptr::read(p as *const Lv2UiResize))
         });
 
+        let mut child_win = None;
         if let Some(win) = window.as_mut() {
+            let cw = (!widget.is_null()).then_some(widget as usize as u32).filter(|&id| id != 0);
+            child_win = cw;
             if let Some((rw, rh)) = shared.pending_resize.take() {
                 let _ = win.resize(rw, rh, info.resizable);
-            } else if !widget.is_null() {
-                if let Some((cw, ch)) = win.child_geometry(widget as usize as u32) {
-                    let _ = win.resize(cw, ch, info.resizable);
+            } else if let Some(cw_id) = cw {
+                if let Some((c_w, c_h)) = win.child_geometry(cw_id) {
+                    let _ = win.resize(c_w, c_h, info.resizable);
                 }
+            }
+            if let Some(cw_id) = cw {
+                win.attach_child(cw_id, info.resizable);
             }
         } else {
             let Some(ref show) = show_iface else {
@@ -651,6 +656,7 @@ impl Lv2UiHandle {
             show_iface,
             resize_iface,
             window,
+            child_win,
             resizable: info.resizable,
             shared,
             control_to_port,
@@ -660,9 +666,26 @@ impl Lv2UiHandle {
             _port_map_data: port_map_data,
             _port_sub_data: port_sub_data,
             _touch_data: touch_data,
+            _data_access_data: data_access_data,
             last_sent,
             closed: false,
         })
+    }
+
+    /// Forward an `LV2_Atom` (`atom:eventTransfer`) received from DSP into the plugin UI.
+    pub fn notify_atom(&mut self, port_index: u32, atom_bytes: &[u8]) {
+        if self.closed || self.ui.is_null() || atom_bytes.len() < 8 {
+            return;
+        }
+        if let Some(port_event) = unsafe { (*self.desc).port_event } {
+            port_event(
+                self.ui,
+                port_index,
+                atom_bytes.len() as u32,
+                self.shared.urid_event_transfer,
+                atom_bytes.as_ptr() as *const c_void,
+            );
+        }
     }
 
     /// Push a control port value change into the plugin UI unless the user is
@@ -729,14 +752,17 @@ impl Lv2UiHandle {
                 return out;
             }
             if let Some((w, h)) = events.resized.filter(|_| self.resizable) {
-                if let Some(ref resize) = self.resize_iface {
-                    if let Some(f) = resize.ui_resize {
-                        f(self.ui, w as c_int, h as c_int);
-                    }
+                if let Some(f) = self.resize_iface.as_ref().and_then(|r| r.ui_resize) {
+                    f(self.ui, w as c_int, h as c_int);
+                } else if let Some(cw) = self.child_win {
+                    win.resize_child(cw, w, h);
                 }
             }
             if let Some((rw, rh)) = self.shared.pending_resize.take() {
                 let _ = win.resize(rw, rh, self.resizable);
+                if let Some(cw) = self.child_win {
+                    win.attach_child(cw, self.resizable);
+                }
             }
         }
         if let Some(ref idle) = self.idle_iface {
@@ -749,6 +775,7 @@ impl Lv2UiHandle {
         }
         out.control_writes = std::mem::take(&mut self.shared.outgoing_controls);
         out.midi_events = std::mem::take(&mut self.shared.outgoing_midi);
+        out.atom_writes = std::mem::take(&mut self.shared.outgoing_atoms);
         out
     }
 
@@ -826,9 +853,14 @@ pub fn build_fixture_bundle(tag: &str) -> Result<(std::path::PathBuf, String)> {
             "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
              @prefix doap: <http://usefulinc.com/ns/doap#> .\n\
              @prefix ui: <http://lv2plug.in/ns/extensions/ui#> .\n\
+             @prefix atom: <http://lv2plug.in/ns/ext/atom#> .\n\
+             @prefix midi: <http://lv2plug.in/ns/ext/midi#> .\n\
+             @prefix rsz: <http://lv2plug.in/ns/ext/resize-port#> .\n\
+             @prefix state: <http://lv2plug.in/ns/ext/state#> .\n\
              <{plugin_uri}> a lv2:Plugin, lv2:AmplifierPlugin ;\n\
                  doap:name \"Kabelsalat LV2 UI Fixture\" ;\n\
                  ui:ui <{ui_uri}> ;\n\
+                 lv2:extensionData state:interface ;\n\
                  lv2:port [\n\
                      a lv2:InputPort, lv2:AudioPort ;\n\
                      lv2:index 0 ; lv2:symbol \"in_l\" ; lv2:name \"In L\" ;\n\
@@ -845,9 +877,26 @@ pub fn build_fixture_bundle(tag: &str) -> Result<(std::path::PathBuf, String)> {
                      a lv2:InputPort, lv2:ControlPort ;\n\
                      lv2:index 4 ; lv2:symbol \"gain\" ; lv2:name \"Gain\" ;\n\
                      lv2:default 1.0 ; lv2:minimum 0.0 ; lv2:maximum 2.0 ;\n\
+                 ] , [\n\
+                     a lv2:OutputPort, lv2:ControlPort ;\n\
+                     lv2:index 5 ; lv2:symbol \"meter\" ; lv2:name \"Meter\" ;\n\
+                     lv2:default 0.0 ; lv2:minimum 0.0 ; lv2:maximum 2.0 ;\n\
+                 ] , [\n\
+                     a lv2:InputPort, atom:AtomPort ;\n\
+                     lv2:index 6 ; lv2:symbol \"events_in\" ; lv2:name \"Events In\" ;\n\
+                     atom:bufferType atom:Sequence ;\n\
+                     atom:supports midi:MidiEvent ;\n\
+                     rsz:minimumSize 16384 ;\n\
+                 ] , [\n\
+                     a lv2:OutputPort, atom:AtomPort ;\n\
+                     lv2:index 7 ; lv2:symbol \"events_out\" ; lv2:name \"Events Out\" ;\n\
+                     atom:bufferType atom:Sequence ;\n\
+                     rsz:minimumSize 16384 ;\n\
                  ] .\n\
              <{ui_uri}> a ui:UI ;\n\
                  ui:extensionData ui:idleInterface, ui:showInterface ;\n\
+                 lv2:optionalFeature <http://lv2plug.in/ns/ext/instance-access>,\n\
+                                     <http://lv2plug.in/ns/ext/data-access> ;\n\
                  ui:requiredFeature <http://lv2plug.in/ns/ext/urid#map> .\n"
         ),
     )?;
@@ -949,6 +998,7 @@ mod tests {
             binary_path: so_path.to_string_lossy().into_owned(),
             is_x11: false,
             resizable: false,
+            needs_direct_access: false,
         };
         let err = match Lv2UiHandle::open("urn:example:plugin", "Test", 48_000.0, &[], &[], &[], &info) {
             Ok(_) => panic!("foreign LV2 UI binary must be refused"),

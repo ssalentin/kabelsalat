@@ -1509,6 +1509,7 @@ mod tests {
             is_instrument,
             is_midi_fx,
             has_ui: false,
+            bundle_path: String::new(),
         }
     }
 

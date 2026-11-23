@@ -142,9 +142,9 @@ agents are in [AGENTS.md](../AGENTS.md).
   deactivates, activates and sends a new set. `start_processing` and
   `stop_processing` run on the thread that renders. The test plugin in
   `src/host/probe.rs` records the thread of every call.
-- `host/sandbox.rs` — out-of-process CLAP plugin hosting (#209): each hosted
-  plugin runs in its own `kabelsalat plugin-worker <shm_fd> <ctrl_fd>` child
-  process communicating over anonymous Linux shared memory (`memfd_create` +
+- `host/sandbox.rs` — out-of-process CLAP and VST3 plugin hosting (#209, #285):
+  each hosted plugin runs in its own `kabelsalat plugin-worker <shm_fd> <ctrl_fd>`
+  child process communicating over anonymous Linux shared memory (`memfd_create` +
   `mmap(MAP_SHARED)` + cross-process futex) for RT audio and a `UnixStream`
   socketpair for non-RT control RPC (params, state save/restore, X11 plugin
   editor). On a block deadline miss or worker crash (`SIGSEGV`/`SIGABRT`), the
@@ -154,25 +154,34 @@ agents are in [AGENTS.md](../AGENTS.md).
   (old regions return to the main thread for `munmap`). `KABELSALAT_SANDBOX=0`
   disables sandboxing; `kabelsalat sandbox-test` verifies `SIGSEGV` recovery
   and measures IPC round-trip latency at 64 and 256 frames.
-- `lv2.rs` — hand-written lilv FFI; LV2 effects and instruments, presets,
-  MIDNAM programme names, loader thread, `LILV_LOCK`.
-- `plugins.rs` — what kind of plugin each one is. Every built-in unit, CLAP
-  and LV2 plugin becomes one classified `Entry` (`PluginType`: instrument,
+- `vst3/` — native Linux and yabridge-bridged Windows VST3 hosting (#285):
+  out-of-process scanner (`scan.rs` / `scan-vst3`), COM host traits (`com.rs`:
+  `IPlugFrame`, `Linux::IRunLoop`, `IComponentHandler`), and RT-safe
+  `Vst3Voice`/`Vst3VoiceMain` (`mod.rs`: `IComponent`/`IAudioProcessor`/
+  `IEditController`/`IMidiMapping`/`IPlugView`, monotonic `param_seq` queue
+  ordering, `"KSV3"` state envelope), routed via `"vst3:<CID>"` keys through
+  `ClapVoice`/`HostedClapMain` and `plugin-worker`.
+- `lv2.rs` / `lv2_ui.rs` — hand-written lilv FFI and native LV2 GUI host (#70);
+  LV2 effects, instruments, presets, MIDNAM programme names, loader thread,
+  `LILV_LOCK`, plus `ui:X11UI` embedding in `PluginWindow` and
+  `ui:showInterface`/`ui:idleInterface` control/MIDI synchronization.
+- `plugins.rs` — what kind of plugin each one is. Every built-in unit, CLAP,
+  VST3, and LV2 plugin becomes one classified `Entry` (`PluginType`: instrument,
   effect, MIDI FX, utility; `PluginSubtype`: Synths, Organs, Delay & Reverb,
   Dynamics, Analyzers, …). LV2 plugins are sorted by the scan's instrument /
-  MIDI flags (rule 72) and then their lv2core class, CLAP plugins by their
-  declared features. The Plugins stage, the Mixer's insert picker, the in-app
-  assistant and MCP `list_plugins` all filter this one list
-  (`PluginListFilter`), so they never disagree about a plugin. Both CLAP
-  instruments and CLAP audio effects / utilities can be hosted (as rack units,
-  strip inserts, aux bus inserts and master inserts); CLAP note effects are
-  listed and marked as not hostable yet.
+  MIDI flags (rule 72) and then their lv2core class, CLAP by features, and VST3
+  by `sub_categories` and name. The Plugins stage, the Mixer's insert picker,
+  the in-app assistant and MCP `list_plugins` all filter this one list
+  (`PluginListFilter`), so they never disagree about a plugin. CLAP and VST3
+  instruments/audio effects/utilities can be hosted (as rack units, strip
+  inserts, aux bus inserts and master inserts); CLAP note effects are listed
+  and marked as not hostable yet.
 - `sounds.rs` — one sound library per instrument a rig can hold. The
-  instrument (`Instrument`: a CLAP id or an LV2 URI) is the key and
+  instrument (`Instrument`: a CLAP id, VST3 CID, or LV2 URI) is the key and
   `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge
   voices, an LV2 plugin's `pset:Preset` files plus the MIDI programmes its
   MIDNAM document names (setBfree), or a plugin's own stepped "Preset"
-  parameter (YANES). Aeolus has no presets and starts with every stop off:
+  parameter (YANES / VST3). Aeolus has no presets and starts with every stop off:
   `aeolus.rs` holds its organ's stop table and a set of registrations, each
   written as the plugin's JSON state; a freshly instantiated Aeolus gets the
   default registration in `ClapVoice::instantiate_entry`. Its stops are no

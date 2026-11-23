@@ -1067,6 +1067,9 @@ fn spawn_worker(plugin_id: &str, sample_rate: f64, state: Option<Vec<u8>>) -> Re
 
     let exe = std::env::current_exe().context("current_exe")?;
     let mut cmd = Command::new(&exe);
+    if let Some(extra_vst3) = crate::vst3::scan::extra_bundles_env() {
+        cmd.env("KABELSALAT_EXTRA_VST3_BUNDLES", extra_vst3);
+    }
     #[cfg(test)]
     {
         cmd.arg("--exact")
@@ -1645,5 +1648,37 @@ mod tests {
         main.load_state(&blob).unwrap();
         assert!((main.param_value(0).unwrap() - 0.75).abs() < 1e-4);
         main.shutdown();
+    }
+
+    #[test]
+    fn sandbox_hosts_vst3_probe_fixture_and_restores_state() {
+        let (bundle, synth_cid, _) = crate::vst3::build_fixture_bundle("sandbox").unwrap();
+        let key = crate::vst3::voice_key(&synth_cid);
+        let (mut voice, mut main) = spawn_sandboxed_clap(48000.0, &key, None).unwrap();
+
+        let params = main.param_list();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "Gain");
+        assert!((main.param_value(0).unwrap() - 1.0).abs() < 1e-4);
+
+        let mut buf = [0.0f32; 128 * 2];
+        voice.note_on(69, 1.0);
+        voice.render(&mut buf, Transport::default());
+        let p = crate::analysis::peak(&buf);
+        assert!(p > 0.25, "sandboxed VST3 synth should emit audio: {p}");
+
+        voice.push_rt(VoiceCmd::Param(ClapId::new(0), 0.3));
+        voice.render(&mut buf, Transport::default());
+        assert!((main.param_value(0).unwrap() - 0.3).abs() < 1e-4);
+
+        let blob = main.save_state().unwrap();
+        assert!(blob.starts_with(b"KSV3"));
+        voice.push_rt(VoiceCmd::Param(ClapId::new(0), 0.9));
+        voice.render(&mut buf, Transport::default());
+        main.load_state(&blob).unwrap();
+        assert!((main.param_value(0).unwrap() - 0.3).abs() < 1e-4);
+
+        main.shutdown();
+        let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
     }
 }

@@ -1,0 +1,3 @@
+### Added
+- **VST3 plugin hosting & yabridge support (#285):** Scan and host Linux-native and yabridge-bridged Windows `.vst3` instruments and audio effects out-of-process inside the per-plugin `plugin-worker` sandbox with shared-memory audio, state save/restore (`KSV3`), MIDI CC mapping (`IMidiMapping`), parameter automation, and native `IPlugView` X11 editor windows (`kabelsalat vst3-test`).
+- **LV2 native GUI windows (#70):** Host LV2 `ui:X11UI` views inside a dedicated host `PluginWindow` (with `ui:showInterface` and `ui:idleInterface` support) toggled from the unit context menu or LV2 parameter editor, keeping parameter controls and MIDI events synchronized bidirectionally with the rack and engine (`kabelsalat lv2-ui-test`).

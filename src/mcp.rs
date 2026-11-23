@@ -114,7 +114,7 @@ struct McpServer {
 /// Arguments for `add_node`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AddNodeArgs {
-    /// Node kind: "keys", "clap", "dsp", "audio_in", "system_audio" or "master_out".
+    /// Node kind: "keys", "clap", "vst3", "dsp", "lv2", "arp", "midi_fx", "audio_in", "system_audio" or "master_out".
     kind: String,
     /// Display name (max 31 bytes; defaults to the kind).
     name: Option<String>,
@@ -122,6 +122,8 @@ struct AddNodeArgs {
     dsp: Option<String>,
     /// For kind "clap": CLAP plugin id (defaults to Surge XT).
     plugin_id: Option<String>,
+    /// For kind "vst3": 32-char hex TUID CID (see list_plugins).
+    cid: Option<String>,
     /// For kind "lv2": the LV2 plugin URI (see list_plugins).
     uri: Option<String>,
     /// For kind "audio_in": the PipeWire source (node name from
@@ -137,13 +139,16 @@ struct AddNodeArgs {
 }
 
 /// Arguments for `add_rig`.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct AddRigArgs {
     /// Optional rig name (default "Rig A/B/C…").
     name: Option<String>,
     /// Optional CLAP plugin id (from list_plugins): the rig is Keys → that
     /// plugin → Master instead of the default Surge rig.
     plugin_id: Option<String>,
+    /// Optional VST3 32-char CID (from list_plugins): the rig is Keys → that
+    /// VST3 instrument → Master instead of the default Surge rig.
+    cid: Option<String>,
 }
 
 /// Arguments for `clone_rig`.
@@ -1134,9 +1139,9 @@ struct ListParamsArgs {
 /// Arguments for `inspect_plugin`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct InspectPluginArgs {
-    /// Plugin name, CLAP id, LV2 URI, built-in DSP kind, or catalog id.
+    /// Plugin name, CLAP id, VST3 CID, LV2 URI, built-in DSP kind, or catalog id.
     query: Option<String>,
-    /// Optional format filter: "all" | "builtin" | "clap" | "lv2" | "catalog".
+    /// Optional format filter: "all" | "builtin" | "clap" | "vst3" | "lv2" | "catalog".
     format: Option<String>,
     /// Optional live rack node id to inspect its active plugin and configuration.
     node: Option<NodeId>,
@@ -1297,11 +1302,11 @@ struct ListPluginsArgs {
     plugin_type: Option<String>,
     /// Filter by subcategory (e.g. "synth", "organ", "sampler", "delay_reverb", "eq_filter", "dynamics", "drive_amp", "modulation", "pitch_spatial", "multi_fx", "analyzer").
     category: Option<String>,
-    /// Filter by format: "all", "builtin", "clap", or "lv2".
+    /// Filter by format: "all", "builtin", "clap", "vst3", or "lv2".
     format: Option<String>,
-    /// Free-text search across name, author/vendor, id/uri, and category.
+    /// Free-text search across name, author/vendor, cid/id/uri, and category.
     query: Option<String>,
-    /// Maximum CLAP / LV2 entries returned (default 60, max 300).
+    /// Maximum CLAP / VST3 / LV2 entries returned (default 60, max 300).
     limit: Option<u64>,
 }
 
@@ -1310,7 +1315,7 @@ struct ListPluginsArgs {
 struct AddInsertArgs {
     /// The strip's source node id; omit for a MASTER insert.
     source: Option<NodeId>,
-    /// "dsp" (with dsp=…), "lv2" (with uri=…), or "clap" (with plugin_id=…).
+    /// "dsp" (with dsp=…), "lv2" (with uri=…), "clap" (with plugin_id=…), or "vst3" (with cid=…).
     kind: String,
     /// Built-in effect: gain, pan, eq3, filter, limiter, saturation, delay, reverb.
     dsp: Option<String>,
@@ -1318,6 +1323,8 @@ struct AddInsertArgs {
     uri: Option<String>,
     /// CLAP effect plugin_id (list_plugins).
     plugin_id: Option<String>,
+    /// VST3 effect 32-char CID (list_plugins).
+    cid: Option<String>,
     /// Optional display name for the new unit.
     name: Option<String>,
 }
@@ -1475,7 +1482,7 @@ fn headless_active_rig(st: &State) -> usize {
 /// instrument node is, as the app classifies it.
 fn headless_rig_type(st: &State, rig: usize) -> Value {
     let detected = st.graph.nodes.iter()
-        .find(|n| n.rig as usize == rig && matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }))
+        .find(|n| n.rig as usize == rig && (n.kind.is_hosted_voice() || matches!(n.kind, NodeKind::Lv2 { .. })))
         .map(|n| crate::keyboard::classify_instrument(&n.kind, None, Some(crate::control::name_str(&n.name)), &[]));
     let mark = st.rig_types.get(rig).copied().flatten();
     let name = st.rigs.lock().ok().and_then(|s| s.rigs.get(rig).map(|m| m.name.clone())).filter(|n| !n.is_empty())
@@ -1694,6 +1701,17 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
         "clap" => Ok(NodeKind::Clap {
             plugin_id: crate::control::ClapId::new(args.plugin_id.as_deref().unwrap_or(SURGE_ID)),
         }),
+        "vst3" => {
+            let raw = args
+                .cid
+                .as_deref()
+                .or(args.plugin_id.as_deref())
+                .ok_or_else(|| "kind 'vst3' requires the 'cid' field".to_string())?;
+            let cid = crate::vst3::strip_vst3_key(raw).unwrap_or(raw);
+            Ok(NodeKind::Vst3 {
+                plugin_id: crate::control::ClapId::new(&cid.to_ascii_uppercase()),
+            })
+        }
         "dsp" => {
             let dsp = args
                 .dsp
@@ -1791,6 +1809,9 @@ fn graph_json(g: &Graph) -> Value {
                 NodeKind::Keys => json!({"type": "keys"}),
                 NodeKind::Clap { plugin_id } => {
                     json!({"type": "clap", "plugin_id": plugin_id.as_str()})
+                }
+                NodeKind::Vst3 { plugin_id } => {
+                    json!({"type": "vst3", "cid": plugin_id.as_str(), "plugin_id": plugin_id.as_str()})
                 }
                 NodeKind::Dsp(k) => json!({"type": "dsp", "dsp": dsp_kind_str(k)}),
                 NodeKind::Lv2 { uri } => json!({"type": "lv2", "uri": uri.as_str()}),
@@ -2222,7 +2243,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|midi_fx|audio_in|system_audio|master_out; midi_fx = a MIDI-effect unit in the rig's MIDI chain (AUM MIDI strips: arpeggiator, chord tool, transposer): give uri (an LV2 MIDI plugin from list_midi_fx) or neither for the built-in transposer (semis); it is inserted between the rig's Keys and its instruments; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|vst3|dsp|lv2|midi_fx|audio_in|system_audio|master_out; midi_fx = a MIDI-effect unit in the rig's MIDI chain (AUM MIDI strips: arpeggiator, chord tool, transposer): give uri (an LV2 MIDI plugin from list_midi_fx) or neither for the built-in transposer (semis); it is inserted between the rig's Keys and its instruments; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); vst3 nodes need 'cid' (32-char hex TUID from list_plugins); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, vst3 instrument, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap/vst3 node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -2231,6 +2252,7 @@ impl McpServer {
         let label = args.name.clone().unwrap_or_else(|| match &kind {
             NodeKind::Keys => "KEYS".into(),
             NodeKind::Clap { .. } => "CLAP".into(),
+            NodeKind::Vst3 { .. } => "VST3".into(),
             NodeKind::Dsp(k) => dsp_kind_str(k).to_ascii_uppercase(),
             NodeKind::AudioIn { .. } => "AUDIO IN".into(),
             NodeKind::Lv2 { uri } => uri
@@ -2260,6 +2282,9 @@ impl McpServer {
         let wire = match &kind {
             NodeKind::Clap { plugin_id } => {
                 !crate::plugins::clap_id_is_effect(plugin_id.as_str(), &crate::host::list_clap_plugins())
+            }
+            NodeKind::Vst3 { plugin_id } => {
+                !crate::plugins::vst3_id_is_effect(plugin_id.as_str(), &crate::vst3::list_vst3_plugins())
             }
             NodeKind::Lv2 { uri } => {
                 let lv2 = crate::lv2::discover();
@@ -2530,14 +2555,14 @@ impl McpServer {
                 let norm = args.normalized.or(args.value).unwrap_or(0.8).clamp(0.0, 1.0);
                 (pid, pname.to_string(), norm, norm, format!("{:.0}%", norm * 100.0))
             }
-            NodeKind::Clap { .. } => {
+            NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => {
                 if (args.param == Some(crate::engine::P_LEVEL) && (target_is_knob || args.target.is_none()))
                     || name_q.is_some_and(|n| n.eq_ignore_ascii_case("level"))
                 {
                     let norm = args.normalized.or(args.value).unwrap_or(1.0).clamp(0.0, 1.0);
                     (crate::engine::P_LEVEL, "LEVEL".into(), norm, norm, format!("{:.0}%", norm * 100.0))
                 } else {
-                    return tool_err("CLAP internal parameter editing needs the running app (kabelsalat mcp --attach)");
+                    return tool_err("CLAP/VST3 internal parameter editing needs the running app (kabelsalat mcp --attach)");
                 }
             }
             _ => {
@@ -3064,7 +3089,7 @@ impl McpServer {
                 return Ok((c.id, crate::matrix::CcTarget::Knob));
             }
         }
-        if matches!(kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }) {
+        if kind.is_hosted_voice() || matches!(kind, NodeKind::Lv2 { .. }) {
             if let Some(cc) = crate::matrix::parse_midi_cc_name(knob) {
                 return Ok((cc, crate::matrix::CcTarget::MidiCc));
             }
@@ -3404,8 +3429,8 @@ impl McpServer {
                     .collect();
                 (infos.len(), list)
             }
-            NodeKind::Clap { .. } => {
-                return tool_err("CLAP parameter listing needs the running app (kabelsalat mcp --attach)");
+            NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => {
+                return tool_err("CLAP/VST3 parameter listing needs the running app (kabelsalat mcp --attach)");
             }
             other => {
                 let choices: Vec<(u32, String)> = match other {
@@ -3556,6 +3581,24 @@ impl McpServer {
                 }
             }
         }
+        if matches!(format.as_str(), "all" | "vst3" | "vst") {
+            for p in crate::vst3::list_vst3_plugins() {
+                let hay = format!("{} {} {} {}", p.cid, p.name, p.vendor, p.sub_categories.join(" ")).to_lowercase();
+                if words.iter().all(|w| hay.contains(w)) {
+                    matches.push(json!({
+                        "format": "vst3",
+                        "cid": p.cid,
+                        "name": p.name,
+                        "vendor": p.vendor,
+                        "version": p.version,
+                        "sub_categories": p.sub_categories,
+                        "is_yabridge": p.is_yabridge,
+                        "is_instrument": crate::plugins::vst3_is_instrument(&p),
+                        "is_effect": crate::plugins::vst3_is_audio_insert(&p),
+                    }));
+                }
+            }
+        }
         ok_json(json!({"query": query, "count": matches.len(), "matches": matches}))
     }
 
@@ -3624,8 +3667,8 @@ impl McpServer {
                     reset_names.push(pname.to_string());
                 }
             }
-            NodeKind::Clap { .. } => {
-                return tool_err("CLAP parameter reset needs the running app (kabelsalat mcp --attach)");
+            NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => {
+                return tool_err("CLAP/VST3 parameter reset needs the running app (kabelsalat mcp --attach)");
             }
             _ => return tool_err("this node has no resettable parameters"),
         }
@@ -3726,7 +3769,7 @@ impl McpServer {
         tool_err("redo needs the running app (kabelsalat mcp --attach)")
     }
 
-    #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master (or Keys -> <plugin_id> -> Master for any installed CLAP instrument from list_plugins; needs the running app), wired and playable (headless mcp hosts two Surge XT voices: a rig past them is returned in silent_clap_nodes). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
+    #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master (or Keys -> <plugin_id|cid> -> Master for any installed CLAP/VST3 instrument from list_plugins; needs the running app), wired and playable (headless mcp hosts two Surge XT voices: a rig past them is returned in silent_clap_nodes). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
     fn add_rig(&self, Parameters(args): Parameters<AddRigArgs>) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
         if remote {
@@ -3735,10 +3778,11 @@ impl McpServer {
             let mut a = json!({});
             if let Some(n) = &args.name { a["name"] = json!(n); }
             if let Some(p) = &args.plugin_id { a["plugin_id"] = json!(p); }
+            if let Some(c) = &args.cid { a["cid"] = json!(c); }
             return Self::ui_bridge_tool("add_rig", a);
         }
-        if args.plugin_id.is_some() {
-            return tool_err("add_rig with plugin_id needs the running app (kabelsalat mcp --attach)");
+        if args.plugin_id.is_some() || args.cid.is_some() {
+            return tool_err("add_rig with plugin_id/cid needs the running app (kabelsalat mcp --attach)");
         }
         self.edit_rigs(None, args.name)
     }
@@ -4055,6 +4099,9 @@ impl McpServer {
             NodeKind::Clap { plugin_id } => {
                 !crate::plugins::clap_id_is_effect(plugin_id.as_str(), &crate::host::list_clap_plugins())
             }
+            NodeKind::Vst3 { plugin_id } => {
+                !crate::plugins::vst3_id_is_effect(plugin_id.as_str(), &crate::vst3::list_vst3_plugins())
+            }
             NodeKind::Lv2 { uri } => {
                 crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
             }
@@ -4195,13 +4242,14 @@ impl McpServer {
     }
 
     /// Add an insert to a strip's chain (#74).
-    #[tool(name = "add_insert", description = "Add an effect at the end of a strip's insert chain (#74) — the chain IS the rack cables, so the rack re-wires with it and the sound changes. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb), kind=lv2 with uri= (an installed LV2 effect, see list_plugins), or kind=clap with plugin_id= (an installed CLAP audio effect, see list_plugins). source = the strip's source node id; omit source for a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain. Needs the running app (kabelsalat mcp --attach).")]
+    #[tool(name = "add_insert", description = "Add an effect at the end of a strip's insert chain (#74) — the chain IS the rack cables, so the rack re-wires with it and the sound changes. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb), kind=lv2 with uri= (an installed LV2 effect, see list_plugins), kind=clap with plugin_id= (an installed CLAP audio effect, see list_plugins), or kind=vst3 with cid= (an installed VST3 audio effect, see list_plugins). source = the strip's source node id; omit source for a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain. Needs the running app (kabelsalat mcp --attach).")]
     fn add_insert(&self, Parameters(args): Parameters<AddInsertArgs>) -> Result<CallToolResult, McpError> {
         let mut a = json!({"kind": args.kind});
         if let Some(s) = args.source { a["source"] = json!(s); }
         if let Some(d) = &args.dsp { a["dsp"] = json!(d); }
         if let Some(u) = &args.uri { a["uri"] = json!(u); }
         if let Some(p) = &args.plugin_id { a["plugin_id"] = json!(p); }
+        if let Some(c) = &args.cid { a["cid"] = json!(c); }
         if let Some(n) = &args.name { a["name"] = json!(n); }
         if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
             return tool_err("add_insert needs the running app (kabelsalat mcp --attach): it edits the rack's cables");
@@ -4536,8 +4584,8 @@ impl McpServer {
         Self::ui_bridge_tool("list_channels", json!({ "filter": args.filter }))
     }
 
-    /// List built-in units and installed CLAP and LV2 plugins, organized by type.
-    #[tool(name = "list_plugins", description = "List built-in units and installed CLAP/LV2 plugins organized by type (instrument, effect, midi_fx, utility) and subcategory (delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, analyzer, synth, organ, sampler, …). Optional filters: type, category, format, query, limit.")]
+    /// List built-in units and installed CLAP, VST3, and LV2 plugins, organized by type.
+    #[tool(name = "list_plugins", description = "List built-in units and installed CLAP/VST3/LV2 plugins organized by type (instrument, effect, midi_fx, utility) and subcategory (delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, analyzer, synth, organ, sampler, …). Optional filters: type, category, format, query, limit.")]
     fn list_plugins(&self, Parameters(args): Parameters<ListPluginsArgs>) -> Result<CallToolResult, McpError> {
         let filter_args = json!({
             "type": args.plugin_type,
@@ -4552,7 +4600,8 @@ impl McpServer {
         };
         let clap = crate::host::list_clap_plugins();
         let lv2 = crate::lv2::discover();
-        ok_json(crate::plugins::list_plugins_json(&clap, &lv2, &filter))
+        let vst3 = crate::vst3::list_vst3_plugins();
+        ok_json(crate::plugins::list_plugins_json(&clap, &lv2, &vst3, &filter))
     }
 
     /// List the MIDI-effect units a rig can host.
@@ -4739,7 +4788,7 @@ impl McpServer {
         let rig_name = rigs.get(rig).map(|m| m.name.clone())
             .unwrap_or_else(|| format!("Rig {}", control::rig_letter(rig)));
         let inst = st.graph.nodes.iter().find(|n| {
-            n.rig as usize == rig && (matches!(n.kind, NodeKind::Clap { .. })
+            n.rig as usize == rig && (n.kind.is_hosted_voice()
                 || crate::organ::is_organ(&n.kind)
                 || matches!(&n.kind, NodeKind::Lv2 { uri } if crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument)))
         });
@@ -5868,7 +5917,7 @@ mod tests {
         };
         let mut buf = vec![0.0f32; 64 * 2];
         // Single-graph demo (2 Surge stacks) → becomes rig 0; rig 1 is new.
-        let added = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Bass".into()), plugin_id: None })));
+        let added = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Bass".into()), ..Default::default() })));
         assert_eq!(added["rigs"].as_array().unwrap().len(), 2);
         assert_eq!(added["rigs"][1]["name"], json!("Bass"));
         assert_eq!(added["active"], json!(1));
@@ -5896,7 +5945,7 @@ mod tests {
             v.get("isError").and_then(Value::as_bool) == Some(true)
         };
         let mut buf = vec![0.0f32; 64 * 2];
-        let _ = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Lead".into()), plugin_id: None })));
+        let _ = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Lead".into()), ..Default::default() })));
         engine.render(&mut buf, 64);
         let _ = tool_json(&server.set_rig_mix(Parameters(SetRigMixArgs {
             rig: 1,
@@ -5931,7 +5980,7 @@ mod tests {
     fn save_load_list_rig_presets_headless() {
         let (server, mut engine) = local_server();
         let mut buf = vec![0.0f32; 64 * 2];
-        let _ = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Lead".into()), plugin_id: None })));
+        let _ = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Lead".into()), ..Default::default() })));
         engine.render(&mut buf, 64);
         let _ = tool_json(&server.set_rig_mix(Parameters(SetRigMixArgs {
             rig: 1,
@@ -6013,6 +6062,7 @@ mod tests {
             name: Some("METRO".into()),
             dsp: Some("metronome".into()),
             plugin_id: None,
+            cid: None,
             uri: None,
             device: None,
             channels: None,
@@ -6700,5 +6750,38 @@ mod tests {
         let byp = tool_json(&server.set_node_bypass(Parameters(SetNodeBypassArgs { node: dup_id, bypass: Some(true) })));
         assert_eq!(byp, json!({"node": dup_id, "bypass": true}));
         engine.render(&mut buf, 2);
+    }
+
+    #[test]
+    fn mcp_vst3_add_node_graph_json_and_list_plugins() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let cid = "0123456789abcdef0123456789abcdef";
+        let added = tool_json(&server.add_node(Parameters(AddNodeArgs {
+            kind: "vst3".into(),
+            name: Some("Probe VST3".into()),
+            dsp: None,
+            plugin_id: None,
+            cid: Some(cid.into()),
+            uri: None,
+            device: None,
+            channels: None,
+            rig: Some(0),
+            semis: None,
+        })));
+        let node = added["id"].as_u64().unwrap() as u32;
+        engine.render(&mut buf, 2);
+
+        let graph = tool_json(&server.get_graph());
+        let found = graph["nodes"].as_array().unwrap().iter().find(|n| n["id"] == json!(node)).unwrap();
+        assert_eq!(found["kind"]["type"], json!("vst3"));
+        assert_eq!(found["kind"]["cid"], json!(cid.to_ascii_uppercase()));
+
+        let listed = tool_json(&server.list_plugins(Parameters(ListPluginsArgs {
+            format: Some("vst3".into()),
+            ..Default::default()
+        })));
+        assert!(listed.get("vst3").is_some(), "{listed}");
+        assert!(listed.get("vst3_count").is_some(), "{listed}");
     }
 }

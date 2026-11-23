@@ -37,16 +37,25 @@ pub fn inputs() -> Option<Vec<crate::audio_in::InputDevice>> {
 }
 
 impl Installed {
-    pub fn of(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo]) -> Self {
+    pub fn of(
+        clap: &[ClapPluginInfo],
+        lv2: &[Lv2PluginInfo],
+        vst3: &[crate::vst3::Vst3PluginInfo],
+    ) -> Self {
         Self {
             clap: clap.iter().map(|p| p.id.clone()).collect(),
+            vst3: vst3.iter().map(|p| p.cid.clone()).collect(),
             lv2: lv2.iter().map(|p| (p.uri.clone(), p.is_instrument)).collect(),
         }
     }
 }
 
 pub fn installed() -> Installed {
-    Installed::of(&crate::host::list_clap_plugins(), &crate::lv2::discover())
+    Installed::of(
+        &crate::host::list_clap_plugins(),
+        &crate::lv2::discover(),
+        &crate::vst3::list_vst3_plugins(),
+    )
 }
 
 /// Every backing track the setlist names, read up to its chunk headers.

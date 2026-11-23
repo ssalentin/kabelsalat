@@ -61,9 +61,10 @@ mod transport;
 mod ui;
 mod unsampled_piano;
 mod vital;
+mod vst3;
 mod watchdog;
 
-const MODES: &str = "app [--headless], crash-test, sandbox-test, preview, analysis-test [--save <dir>], audio-doctor [--json], audio-test, audio-backend-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, engine-bench [--json] [--reps N] [part...], ui-bench [frames] [scene...] [--json], session-load-bench (--builtin | <package.ksalat>...) [--rounds N] [--json], startup-bench [--with-plugins] [--json], capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, demo-test, preset-test, state-race-test [seconds] [patch.fxp...], add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, setlist-test, setlist-switch-test, setlist-window-test, levels-test [--save <dir>], preshow-check <session.ksalat>, send-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
+const MODES: &str = "app [--headless], crash-test, sandbox-test, preview, analysis-test [--save <dir>], audio-doctor [--json], audio-test, audio-backend-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, engine-bench [--json] [--reps N] [part...], ui-bench [frames] [scene...] [--json], session-load-bench (--builtin | <package.ksalat>...) [--rounds N] [--json], startup-bench [--with-plugins] [--json], capture-test, player-test, lv2-test, lv2-ui-test [uri...], lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, scan-vst3 <bundle-path>, vst3-test [cid...], edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, demo-test, preset-test, state-race-test [seconds] [patch.fxp...], add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, setlist-test, setlist-switch-test, setlist-window-test, levels-test [--save <dir>], preshow-check <session.ksalat>, send-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     plugin_window::ensure_x11_egl_platform();
@@ -122,6 +123,13 @@ fn main() -> anyhow::Result<()> {
             host::run_scan_clap(std::path::Path::new(&path))
         }
         "clap-scan-test" => host::run_clap_scan_test(),
+        "scan-vst3" => {
+            let path = std::env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("usage: kabelsalat scan-vst3 <bundle-path>"))?;
+            vst3::run_scan_vst3(std::path::Path::new(&path))
+        }
+        "vst3-test" => vst3::run_vst3_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "catalog-install-test" => catalog::install_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "session-test" => ui::run_session_test(),
         "engine-bench" => engine::bench(),
@@ -134,6 +142,7 @@ fn main() -> anyhow::Result<()> {
         "capture-test" => capture::run_test(),
         "player-test" => player::run_test(),
         "lv2-test" => lv2::run_test(),
+        "lv2-ui-test" => lv2::ui::run_lv2_ui_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "lv2-host-test" => lv2::host_test(),
         "lv2-voice-test" => lv2::voice_test(),
         "lv2-engine-test" => engine::lv2_engine_test(),

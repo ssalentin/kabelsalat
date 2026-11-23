@@ -139,6 +139,12 @@ impl PluginWindow {
         Ok(self.conn.query_tree(self.win)?.reply()?.children.len())
     }
 
+    /// Geometry `(width, height)` of an embedded child X11 window, when > 1×1.
+    pub fn child_geometry(&self, child_win: u32) -> Option<(u32, u32)> {
+        let g = self.conn.get_geometry(child_win).ok()?.reply().ok()?;
+        (g.width > 1 && g.height > 1).then_some((g.width as u32, g.height as u32))
+    }
+
     /// Drain pending X events without blocking.
     pub fn poll(&mut self) -> WindowEvents {
         let mut out = WindowEvents::default();

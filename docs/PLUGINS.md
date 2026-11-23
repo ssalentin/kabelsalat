@@ -16,7 +16,7 @@ hardware or another CPU, or fix a plugin-specific bug.
 | **Headless** | Verified headlessly (`catalog-install-test`, `analysis-test`, or unit test) — interactive app/hardware play still untested. |
 | **Partial** | Loads or works in part; see Notes for what is missing or blocked. |
 | **Untested** | Not yet run against the real plugin binary (install plan / SHA-256 may still be unit-tested). |
-| **N/A** | Does not apply (e.g. sound library for an effect, or native GUI window for LV2). |
+| **N/A** | Does not apply (e.g. sound library for an effect, or custom-face instrument without generic editor). |
 
 Most plugin runs to date were on **aarch64 (Arch Linux / Asahi)**. Unless noted
 otherwise, **x86_64** prebuilt release and Arch package runs are still untested
@@ -31,7 +31,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 | **setBfree** (`setbfree`) | LV2 | **Works** (`aarch64` Arch; CI Ubuntu `x86_64`+`aarch64`) | **Works** (`organ-test`, `lv2-instrument-engine-test`, CI `setbfree_plays_a_note`) | **Works** (MIDNAM programs) | **Works** (control ports) | **N/A** (custom organ face) | Custom drawbar/Leslie/percussion face. Arch `x86_64` package untested. |
 | **Surge XT** (`surge-xt`) | CLAP | **Works** (`aarch64` Arch) | **Works** (reference plugin; `host-test`, `many-voices-test`, `state-race-test`, `analysis-test`, `agent-eval`) | **Works** (~3000 `.fxp` patches) | **Works** (`session-test`, `state-race-test`) | **Works** (`editor-test` + live XWayland) | Reference instrument. Macro names follow loaded patch. `x86_64` untested. |
 | **Dexed** (`dexed`) | CLAP | **Works** (`aarch64` Arch) | **Works** (`dexed_load_patch_changes_state_and_renders`) | **Works** (DX7 `.syx` cartridges) | **Works** (CLAP state + `.syx` write) | **Works** (`editor-test`) | In `CLAP_NEVER_FREE` (#52): parked and reused because its destructor segfaults while other plugins render. `x86_64` untested. |
-| **Vitalium** (`vitalium`) | LV2 | **Works** (`aarch64` source) | **Works** (`lv2-instrument-engine-test`, `midifx-test`, `vital-test` w/ aftertouch) | **Works** (`.vital` + `.vitalbank` drop + LV2 presets) | **Works** (`urn:juce:stateBinary` JSON) | **N/A** (LV2 GUI not hosted) | In LV2 `NEVER_FREE` (rule 56). `vital::check_patch` guards against modal-alert hangs (rule 118). Open test issue #174; `x86_64` source build untested. |
+| **Vitalium** (`vitalium`) | LV2 | **Works** (`aarch64` source) | **Works** (`lv2-instrument-engine-test`, `midifx-test`, `vital-test` w/ aftertouch) | **Works** (`.vital` + `.vitalbank` drop + LV2 presets) | **Works** (`urn:juce:stateBinary` JSON) | **Untested** (LV2 native GUI untested) | In LV2 `NEVER_FREE` (rule 56). `vital::check_patch` guards against modal-alert hangs (rule 118). Open test issue #174; `x86_64` source build untested. |
 | **YANES** (`yanes`) | CLAP | **Works** (`aarch64` source) | **Works** (`sound-library-test`, `agent-eval` `yanes_bass`) | **Works** (146 built-in presets via `PresetParameter`) | **Partial** (standard CLAP path; not stress-tested) | **Works** (`editor-test`) | `x86_64` source build untested. |
 | **Odin 2** (`odin2`) | CLAP | **Works** (`aarch64` Arch + GitHub `Factory Presets` data) | **Works** (`catalog-install-test`, `sound-library-test`) | **Works** (260 `.odin` `ValueTree` patches) | **Works** (`.odin` → CLAP state) | **Works** (`editor-test`) | Returns `false` from `gui.show` while still showing its editor (handled by host). `x86_64` untested. |
 | **OB-Xf** (`ob-xf`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.331) | **Untested** | **Untested** | **Untested** | Interactive install/play in open bench test #186. State, GUI window, `x86_64` untested. |
@@ -43,7 +43,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 | **Unsampled Piano** (`unsampled-piano`) | CLAP | **Works** (`aarch64` source + GitHub `presets` data); **Untested** (`x86_64` release `v0.2.1`; plan/SHA-256 unit-tested) | **Works** (`aarch64` live + headless; single-threaded plugin) | **Works** (5 CPU/room profiles: Full, Balanced, Light, Dry, Light Dry via CLAP state) | **Works** (length-prefixed JSON CLAP state; `sound-library-test`) | **Works** (`aarch64` live Wayland w/ `EGL_PLATFORM=x11` #391) | Physically modelled grand with half-pedal, sostenuto and una corda; no sample download. Catalog install copies `presets/` into `~/.local/share/unsampled-piano/presets` for the plugin editor (upstream `main` currently ships `Concert grand/concert_grand.toml` while older presets are in `archive/presets/` being redone). Passed live bench test #253 on `aarch64`. **DSP load:** the upstream plugin runs single-threaded at `Full` quality (because `nice-plug` lacks CLAP `thread-pool`), using ~7% idle, ~40% for 1 note, and ~76% avg / 112% peak for a 10-note chord + sustain on Apple M1 P-cores at 48 kHz / 256 frames (sustain pedal alone wakes all 88 sympathetic strings to ~42%). Selecting **CPU / Light** or **CPU / Light Dry** in Sounds cuts this to ~25–28% avg (~46–49% peak) and ~0.4% idle (`Light Dry`); raising the buffer to 512 frames also absorbs onset spikes. `x86_64` prebuilt release untested at runtime. |
 | **OneTrick CHONK** (`ot-chonk`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.281) | **Untested** | **Untested** | **Untested** | Interactive play, state, GUI window, `x86_64` untested. |
 | **OneTrick CRYPTID** (`ot-cryptid`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (probe chord peak 0.812; 12 output ports) | **Untested** | **Untested** | **Untested** | Plays GM drum notes (36/38). Interactive install/play in open bench test #186. State, GUI window, `x86_64` untested. |
-| **AVL Drumkits** (`avldrums`) | LV2 | **Headless** (`aarch64` source via `catalog-install-test`) | **Headless** (all 5 kits sound, peaks 0.516–0.685) | **N/A** (5 kit URIs) | **Untested** | **N/A** (LV2 GUI not hosted) | Async SF2 sample load handled with wall-clock wait (rule 178). Interactive play, state, `x86_64` untested. |
+| **AVL Drumkits** (`avldrums`) | LV2 | **Headless** (`aarch64` source via `catalog-install-test`) | **Headless** (all 5 kits sound, peaks 0.516–0.685) | **N/A** (5 kit URIs) | **Untested** | **Untested** (LV2 native GUI untested) | Async SF2 sample load handled with wall-clock wait (rule 178). Interactive play, state, `x86_64` untested. |
 | **Starbreath** (`starbreath`) | CLAP | **Untested** (`x86_64` release `v0.9.0`; no `aarch64` release) | **Partial** (hand-installed `aarch64` beta passes `catalog-install-test` w/ CC2 breath) | **Untested** | **Untested** | **Untested** | Proprietary freeware for wind controllers (breath on CC2/CC11/aftertouch). Public `x86_64` release download & playback is open bench test #186. |
 | **Floe** (`floe`) | CLAP | **Untested** (`x86_64` release `v2.0.5` only; plan/SHA-256 unit-tested) | **Untested** | **Untested** | **Untested** | **Untested** | Requires external sample libraries from floe.audio. No `aarch64` build; never run on `x86_64` yet. |
 | **Aeolus** (`aeolus`) | CLAP | **Works** (`aarch64` source); **Untested** (`x86_64` release `v0.3.0`) | **Works** (`aarch64` `catalog-install-test` peak 0.281, `sound-library-test`) | **Works** (12 built-in registrations) | **Works** (initial principal chorus JSON + stop toggle readback) | **Works** (`editor-test`) | Custom stop-jamb panel on rack face verified in real app (#66). `x86_64` prebuilt release untested at runtime. |
@@ -54,7 +54,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 
 | Card (`id`) | Format | Install | Audio / Engine | State / Session | Plugin GUI | Notes & untested gaps |
 |---|---|---|---|---|---|---|
-| **Guitarix** (`guitarix`) | LV2 | **Works** (`aarch64` Arch) | **Works** (`guitar-rig-test`, `guitarix_amps_process_from_the_first_block`) | **Works** (control ports) | **N/A** (LV2 GUI not hosted) | Powers the `⇧F5` Guitar rig (`Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master`). Browser add-to-rig flow in open bench test #177; `x86_64` untested. |
+| **Guitarix** (`guitarix`) | LV2 | **Works** (`aarch64` Arch) | **Works** (`guitar-rig-test`, `guitarix_amps_process_from_the_first_block`) | **Works** (control ports) | **Untested** (LV2 native GUI untested) | Powers the `⇧F5` Guitar rig (`Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master`). Browser add-to-rig flow in open bench test #177; `x86_64` untested. |
 | **Dragonfly Reverb** (`dragonfly-reverb`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (Hall reverb: `catalog-install-test` peak 0.564, `analysis-test` `clap_effect`) | **Untested** | **Untested** | Hall tested; Room, Plate and Early Reflections bundles not individually tested. Interactive rig/aux/master use, state, GUI window, `x86_64` untested. |
 | **Airwindows Consolidated** (`airwindows`) | CLAP | **Untested** (`x86_64` release + source; plan/SHA-256 unit-tested) | **Untested** | **Untested** | **Untested** | Added in #197; neither the `x86_64` prebuilt release nor the `aarch64` source build has been installed or run yet. |
 
@@ -64,7 +64,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 
 | Card (`id`) | Format | Install | MIDI / Engine | State / Session | Plugin GUI | Notes & untested gaps |
 |---|---|---|---|---|---|---|
-| **x42 MIDI filters** (`x42-midifilter`) | LV2 | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (all 6 catalog URIs pass notes out) | **Untested** | **N/A** (LV2 GUI not hosted) | Bundle ships 36 MIDI tools; the 6 catalog URIs (`midichord`, `miditranspose`, `monolegato`, `velocityscale`, `mapcc`, `midistrum`) passed `catalog-install-test`. Remaining 30 tools, live controller use, and `x86_64` untested. |
+| **x42 MIDI filters** (`x42-midifilter`) | LV2 | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (all 6 catalog URIs pass notes out) | **Untested** | **Untested** (LV2 native GUI untested) | Bundle ships 36 MIDI tools; the 6 catalog URIs (`midichord`, `miditranspose`, `monolegato`, `velocityscale`, `mapcc`, `midistrum`) passed `catalog-install-test`. Remaining 30 tools, live controller use, and `x86_64` untested. |
 
 ---
 
@@ -82,8 +82,8 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 
 - **`x86_64` runtime installs:** Prebuilt `x86_64` release routes (`six-sines`, `starbreath`, `floe`, `aeolus`, `airwindows`) and Arch `x86_64` packages are covered by install-plan and SHA-256 unit tests, but have not been run on an `x86_64` host (only Ubuntu `setbfree` runs in `x86_64` CI).
 - **CLAP note-effect plugins:** Discovered and listed, but hosting is deferred (#115).
-- **LV2 native X11 GUIs:** Not hosted yet (LV2 plugins use kabelsalat's native egui controls and custom faces such as setBfree's organ face).
-- **VST3 plugins:** Not hosted.
+- **LV2 native X11 / `ui:showInterface` GUIs (#70):** Implemented (`ui:X11UI` embedded in `PluginWindow` plus `ui:showInterface`/`ui:idleInterface` fallback) and verified headlessly with a fixture UI via `lv2-ui-test` (under `Xvfb`), but real desktop LV2 plugin UIs (e.g. Vitalium, Guitarix, LSP, x42) remain **Untested** on a desktop display.
+- **VST3 plugins (#285):** Out-of-process scan (`scan-vst3`), native Linux + yabridge Windows bridging, shared-memory `plugin-worker` sandboxing, state (`"KSV3"`), MIDI CC mapping, and X11 `IPlugView` editor hosting are verified headlessly against a C probe fixture (`vst3-test`, `sandbox-test`), while third-party installed `.vst3` and yabridge plugins remain **Untested** on real audio/display hardware.
 - **Open plugin bench tests:**
   - `#177` — Plugins browser add-to-rig / Master FX / mixer `+ insert` with Surge XT, Guitarix, and LSP.
   - `#186` — Cardinal (`cardinal-data`), Starbreath (`x86_64` release), and live app play of OB-Xf, KR-106, OneTrick KEYS, and OneTrick CRYPTID.
@@ -102,8 +102,11 @@ or fetched plugins:
 # Sound libraries (patches, cartridges, registrations, Vital patches):
 ./target/debug/kabelsalat sound-library-test [id=query...]
 
-# CLAP native X11 editor windows (open, attach, close, reopen):
+# Native plugin X11 / GUI & VST3 self-tests:
 ./target/debug/kabelsalat editor-test [plugin_id...]
+./target/debug/kabelsalat lv2-ui-test [plugin_uri...]
+./target/debug/kabelsalat vst3-test
+./target/debug/kabelsalat sandbox-test
 
 # Engine & host self-tests with real plugins:
 ./target/debug/kabelsalat host-test

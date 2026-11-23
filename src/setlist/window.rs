@@ -34,12 +34,13 @@ impl SongLoadState {
     }
 }
 
-/// True when `node` hosts an external plugin (CLAP synth/effect, LV2
-/// instrument/effect, or LV2 MIDI effect).
+/// True when `node` hosts an external plugin (CLAP synth/effect, VST3
+/// instrument/effect, LV2 instrument/effect, or LV2 MIDI effect).
 pub fn is_plugin_node(node: &Node) -> bool {
     matches!(
         node.kind,
         NodeKind::Clap { .. }
+            | NodeKind::Vst3 { .. }
             | NodeKind::Lv2 { .. }
             | NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { .. } }
     )

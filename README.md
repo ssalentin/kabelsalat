@@ -32,7 +32,7 @@ own keyboard, and a setlist switches between songs without a gap.
 
 It is for keyboard players, organists, guitarists and anyone who wants a
 stage rig on a Linux laptop or a Raspberry Pi: think AUM on the iPad or
-MainStage on the Mac. It hosts any CLAP or LV2 plugin.
+MainStage on the Mac. It hosts any CLAP, VST3 or LV2 plugin.
 
 ## Quick start
 
@@ -102,13 +102,16 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 
 **Plugins**
 - **Browse by what a plugin does**, not by its format: instruments, effects,
-  MIDI FX. → [Browse plugins](docs/GUIDE.md#browse-and-install-plugins-by-type)
+  MIDI FX across CLAP, VST3 (native Linux and Windows plugins via yabridge), and
+  LV2, with native plugin GUI windows for all three formats.
+  → [Browse plugins](docs/GUIDE.md#browse-and-install-plugins-by-type),
+  [VST3 & plugin GUIs](docs/GUIDE.md#vst3-plugins-and-native-plugin-guis)
 - **Install 23 tested plugins with one click** (Surge XT, Dexed, Vitalium,
   setBfree, Aeolus, Guitarix, …). → [Catalog](docs/GUIDE.md#install-instruments-from-the-catalog),
   [tested plugins](docs/PLUGINS.md)
-- **Out-of-process plugin sandboxing:** each CLAP plugin runs in its own helper
-  process over shared memory — a crash silences only that strip and restarts it
-  with its last saved state while every other rig keeps playing.
+- **Out-of-process plugin sandboxing:** each CLAP and VST3 plugin runs in its
+  own helper process over shared memory — a crash silences only that strip and
+  restarts it with its last saved state while every other rig keeps playing.
   → [Plugin crash isolation](docs/GUIDE.md#plugin-crash-isolation)
 
 **Mix**
@@ -161,7 +164,7 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 | Flatpak, tarball | | on the [releases page](https://github.com/ssalentin/kabelsalat/releases); the Flatpak is sandboxed: no realtime priority yet, and `kabelsalat mcp --attach` cannot reach it |
 
 **You need** Linux with PipeWire (recommended), JACK or ALSA. **Plugins:**
-kabelsalat hosts the CLAP and LV2 plugins installed on your system; install
+kabelsalat hosts the CLAP, VST3 and LV2 plugins installed on your system; install
 more from **Plugins → Install** or from your distribution (Arch: `surge-xt-clap`,
 optional `dexed-clap`, `lv2-plugins`). Nightly builds of `main` are on the
 [releases page](https://github.com/ssalentin/kabelsalat/releases/tag/nightly).
@@ -185,9 +188,10 @@ Packaging details: [docs/PACKAGING.md](docs/PACKAGING.md).
   checks the buffer, realtime priority, CPU governor and USB power saving and
   offers a fix for each. In a terminal: `kabelsalat audio-doctor`.
 - **A plugin is missing from the browser:** kabelsalat looks in `~/.clap`,
-  `~/.lv2`, `/usr/lib/{clap,lv2}` and `/usr/local/lib/{clap,lv2}`. Add other
-  folders with `CLAP_PATH` or `LV2_PATH`. A plugin built for another CPU says
-  so instead of loading.
+  `~/.vst3`, `~/.lv2`, `/usr/lib/{clap,vst3,lv2}` and
+  `/usr/local/lib/{clap,vst3,lv2}`. Add other folders with `CLAP_PATH`,
+  `VST3_PATH` or `LV2_PATH`. A plugin built for another CPU says so instead of
+  loading.
 - **Typing Chinese, Japanese or Korean:** start with `KABELSALAT_IME=1`; text
   fields otherwise read the keyboard directly.
 - **It crashed:** it restarts by itself and reopens your session. The report
@@ -202,10 +206,10 @@ instruments built by the community. Fast, professional, easy to use.**
 
 | Version | Theme |
 |---|---|
-| **0.3** | **The MainStage for Linux: a whole gig from one setlist** |
+| **0.3** | **The MainStage for Linux: a whole gig from one setlist (plus VST3 & LV2 GUIs)** |
 | 0.4 | Trust it on stage: a plugin crash never stops the show |
 | 0.5 | Instruments by the community: SFZ instruments and an open catalog |
-| 0.6 | Runs everywhere, plays everything: VST3 and packages for your distribution |
+| 0.6 | Runs everywhere, plays everything: packages for your distribution |
 | 0.7 | Controllers and remote |
 | 0.8 | Practise and create: looper, practice tools, multi-take recording |
 | 0.9 | The assistant, on your terms: local models |
@@ -230,9 +234,11 @@ How it is built: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   realtime thread; 256-frame buffer by default (≈ 5.3 ms at 48 kHz).
   Hardware MIDI reaches the engine from its own thread, so sound never waits
   for the screen.
-- **Plugins:** CLAP via [clack](https://github.com/prokopyl/clack), scanned
-  in a separate process so a crashing plugin cannot take the app down; LV2
-  via lilv on a loader thread. A plugin's own editor opens in its own window.
+- **Plugins:** CLAP via [clack](https://github.com/prokopyl/clack) and VST3
+  (including yabridge-bridged Windows `.vst3` bundles), scanned out of process
+  and hosted in isolated per-plugin worker sandboxes; LV2 via lilv on a loader
+  thread with native `ui:X11UI` / `ui:showInterface` GUIs. A plugin's own
+  editor opens in its own window.
 - **Rigs:** every rig is a graph of units and cables; the rigs are merged into
   one engine graph and mixed per rig. A routing change releases held notes
   first, checked exhaustively by a test.

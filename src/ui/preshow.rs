@@ -75,7 +75,9 @@ impl DemoApp {
             .collect();
         let c = self.engine_counters();
         let running = c.sample_rate > 0 && c.callback_frames > 0;
-        let plugins = self.plugin_lists_ready().then(|| Installed::of(&self.plugins_clap, &self.plugins_lv2));
+        let plugins = self.plugin_lists_ready().then(|| {
+            Installed::of(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3)
+        });
         Facts {
             midi_ports: Some(midi_ports),
             outputs: self.audio_out.lock().ok().map(|s| s.outputs.clone()).filter(|o| !o.is_empty()),

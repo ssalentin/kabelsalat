@@ -35,9 +35,11 @@ finish-args:
   # Flathub's LinuxAudio plugin extensions (at /app/extensions/Plugins).
   - --filesystem=~/.clap:create
   - --filesystem=~/.lv2:create
+  - --filesystem=~/.vst3:create
   - --filesystem=host-os:ro
   - --env=CLAP_PATH=/app/extensions/Plugins/clap:/run/host/usr/lib/clap:/run/host/usr/lib64/clap:/run/host/usr/local/lib/clap
   - --env=LV2_PATH=/app/lib/lv2:/app/extensions/Plugins/lv2:/run/host/usr/lib/lv2:/run/host/usr/lib64/lv2:/run/host/usr/local/lib/lv2
+  - --env=VST3_PATH=/app/extensions/Plugins/vst3:/run/host/usr/lib/vst3:/run/host/usr/lib64/vst3:/run/host/usr/local/lib/vst3
 
 add-extensions:
   org.freedesktop.LinuxAudio.Plugins:

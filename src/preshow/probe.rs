@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use super::{Installed, Probe, Render, Session, HEARD};
-use crate::control::{bind_voices, clap_plugin_key, command_bus, Command, CommandBus, Graph, MidiFxPlugin, Node, NodeId, NodeKind, PortKind};
+use crate::control::{bind_voices, command_bus, Command, CommandBus, Graph, MidiFxPlugin, Node, NodeId, NodeKind, PortKind};
 use crate::engine::{GraphEngine, VoiceBack, VoiceMsg};
 use crate::host::{ClapVoice, ClapVoiceMain};
 use crate::matrix::SourceId;
@@ -129,7 +129,9 @@ impl Rack {
 /// instrument, or an LV2 node the scan does not know)?
 fn is_instrument(n: &Node, g: &Graph, installed: &Installed) -> bool {
     match &n.kind {
-        NodeKind::Clap { .. } => !g.edges.iter().any(|e| e.kind == PortKind::Audio && e.to.node == n.id),
+        NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => {
+            !g.edges.iter().any(|e| e.kind == PortKind::Audio && e.to.node == n.id)
+        }
         NodeKind::Lv2 { uri } => installed.lv2_instrument(uri.as_str()) || !installed.lv2.iter().any(|(u, _)| u == uri.as_str()),
         _ => false,
     }
@@ -148,20 +150,27 @@ pub fn run(s: &Session, installed: &Installed, buffer_frames: u32, sample_rate: 
     let graph = s.graph.clone();
     let mut probe = Probe::default();
 
-    // One voice per CLAP node whose plugin is installed, each with the state
-    // of the node the engine will bind it to (rule 103).
+    // One voice per CLAP or VST3 node whose plugin is installed, each with the
+    // state of the node the engine will bind it to (rule 103).
     let mut voices: Vec<(NodeId, ClapVoice)> = Vec::new();
     let mut mains: Vec<(u64, ClapVoiceMain)> = Vec::new();
     let mut keys: Vec<(u64, String)> = Vec::new();
     for n in &graph.nodes {
-        let NodeKind::Clap { plugin_id } = &n.kind else { continue };
-        let key = clap_plugin_key(plugin_id.as_str());
-        if !installed.clap.iter().any(|c| c == key) {
+        let Some(key) = n.kind.voice_plugin_key() else { continue };
+        let is_installed = match &n.kind {
+            NodeKind::Clap { .. } => installed.clap.iter().any(|c| c == &key),
+            NodeKind::Vst3 { plugin_id } => {
+                let raw = crate::vst3::strip_vst3_key(plugin_id.as_str()).unwrap_or(plugin_id.as_str());
+                installed.vst3.iter().any(|c| c.eq_ignore_ascii_case(raw))
+            }
+            _ => false,
+        };
+        if !is_installed {
             continue;
         }
-        match ClapVoice::new_plugin(sample_rate, key) {
+        match ClapVoice::new_plugin(sample_rate, &key) {
             Ok((voice, main)) => {
-                keys.push((voice.voice_id(), key.to_string()));
+                keys.push((voice.voice_id(), key));
                 mains.push((voice.voice_id(), main));
                 voices.push((NodeId::MAX, voice));
             }
@@ -280,7 +289,7 @@ mod tests {
     #[test]
     fn an_lv2_unit_is_attached_first_and_a_state_it_refuses_is_named() {
         crate::engine::latent::install().unwrap();
-        let installed = Installed { clap: vec![], lv2: vec![(crate::engine::latent::URI.into(), false)] };
+        let installed = Installed { clap: vec![], vst3: vec![], lv2: vec![(crate::engine::latent::URI.into(), false)] };
         let mut g = Graph::default();
         let input = g.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes("IN"));
         let fx = g.add_node(crate::engine::latent::kind(), name_bytes("LATENT"));

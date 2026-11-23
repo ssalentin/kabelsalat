@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{Level, PartRig, Setlist, MAX_RIGS};
-use crate::control::{clap_plugin_key, DspKind, Graph, Node, NodeId, NodeKind, PortKind, PortRef};
+use crate::control::{DspKind, Graph, Node, NodeId, NodeKind, PortKind, PortRef};
 use crate::session::PluginState;
 
 /// Per-part bypass state of one audio effect node on a rig's chain (#275).
@@ -132,11 +132,11 @@ impl ShowInstances {
     }
 }
 
-/// True when `node` is a hosted plugin instrument (CLAP synth or LV2 instrument).
+/// True when `node` is a hosted plugin instrument (CLAP/VST3 synth or LV2 instrument).
 pub fn is_instrument_node(graph: &Graph, node: &Node) -> bool {
     let has_audio_in = graph.edges.iter().any(|e| e.kind == PortKind::Audio && e.to.node == node.id);
     match &node.kind {
-        NodeKind::Clap { .. } => !has_audio_in,
+        NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => !has_audio_in,
         NodeKind::Lv2 { .. } => {
             if crate::organ::is_organ(&node.kind) {
                 return true;
@@ -154,17 +154,18 @@ pub fn is_audio_effect(graph: &Graph, node: &Node) -> bool {
     match &node.kind {
         NodeKind::Dsp(k) => !matches!(k, DspKind::Metronome | DspKind::Bus),
         NodeKind::Lv2 { .. } => !is_instrument_node(graph, node),
-        NodeKind::Clap { .. } => graph.edges.iter().any(|e| e.kind == PortKind::Audio && e.to.node == node.id),
+        NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => {
+            graph.edges.iter().any(|e| e.kind == PortKind::Audio && e.to.node == node.id)
+        }
         _ => false,
     }
 }
 
 fn plugin_key(kind: &NodeKind) -> Option<String> {
-    match kind {
-        NodeKind::Clap { plugin_id } => Some(clap_plugin_key(plugin_id.as_str()).to_string()),
+    kind.voice_plugin_key().or_else(|| match kind {
         NodeKind::Lv2 { uri } => Some(uri.as_str().to_string()),
         _ => None,
-    }
+    })
 }
 
 /// Ordered instrument signature of one rig: `(plugin_key, saved_state_bytes)`

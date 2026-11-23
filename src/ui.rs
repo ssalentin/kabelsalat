@@ -3381,9 +3381,108 @@ struct Xform {
     lc: Vec2,     // rack-local center
     sx: f32,
     sy: f32,
+    /// Rack viewport zoom (#309) and the screen point it scales about.
+    /// `p`/`rect` answer in DRAW space (the rack at 100 %); the rack's
+    /// painted shapes are scaled by `view()` afterwards (`zoom_shapes`).
+    zoom: f32,
+    pivot: Pos2,
+}
+
+/// Rack viewport zoom limits and the ladder `Ctrl+=` / `Ctrl+-` step on.
+const RACK_ZOOM_MIN: f32 = 0.25;
+const RACK_ZOOM_MAX: f32 = 3.0;
+const RACK_ZOOM_STEPS: [f32; 11] = [0.25, 0.33, 0.5, 0.67, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
+
+/// The font size a zoomed rack text is laid out at: floored onto a ladder
+/// that gets coarser with size, so a continuous zoom meets a bounded set of
+/// sizes (rule 17: the font atlas must not grow with every zoom value).
+/// Flooring keeps the text inside the box it fitted at 100 %.
+fn zoom_font_size(size: f32) -> f32 {
+    let s = size.clamp(2.0, 96.0);
+    let step = if s < 12.0 { 0.5 } else if s < 24.0 { 1.0 } else if s < 48.0 { 2.0 } else { 4.0 };
+    ((s / step + 1e-3).floor() * step).max(2.0)
+}
+
+/// One painted rack shape through the viewport zoom. Text is laid out again
+/// at a quantized size (`zoom_font_size`) and centred on its scaled box, so
+/// it stays sharp; a rect that sat on device pixels is snapped again after
+/// the transform and keeps a hairline stroke (rule 167).
+fn zoom_shape(shape: &mut Shape, t: egui::emath::TSTransform, ppp: f32, layout: &dyn Fn(egui::text::LayoutJob) -> Arc<Galley>) {
+    match shape {
+        Shape::Vec(v) => for s in v { zoom_shape(s, t, ppp, layout); },
+        Shape::Text(ts) => {
+            let z = t.scaling;
+            let mut job = (*ts.galley.job).clone();
+            for sec in &mut job.sections {
+                sec.leading_space *= z;
+                let f = &mut sec.format;
+                f.font_id.size = zoom_font_size(f.font_id.size * z);
+                f.extra_letter_spacing *= z;
+                if let Some(h) = &mut f.line_height { *h *= z; }
+                f.underline.width *= z;
+                f.strikethrough.width *= z;
+                f.expand_bg *= z;
+            }
+            if job.wrap.max_width.is_finite() { job.wrap.max_width = job.wrap.max_width * z + 0.5; }
+            job.first_row_min_height *= z;
+            let new = layout(job);
+            let rot = egui::emath::Rot2::from_angle(ts.angle);
+            let centre = t * (ts.pos + rot * ts.galley.rect.center().to_vec2());
+            ts.pos = centre - rot * new.rect.center().to_vec2();
+            ts.underline.width *= z;
+            ts.galley = new;
+        }
+        Shape::Rect(_) => {
+            let (was, width) = match shape { Shape::Rect(r) => (r.rect, r.stroke.width), _ => unreachable!() };
+            let on_px = |v: f32| ((v * ppp).round() - v * ppp).abs() < 0.01;
+            let snapped = was.is_finite() && on_px(was.min.x) && on_px(was.min.y) && on_px(was.max.x) && on_px(was.max.y);
+            shape.transform(t);
+            if let (true, Shape::Rect(r)) = (snapped, shape) {
+                r.rect = egui::emath::GuiRounding::round_to_pixels(r.rect, ppp);
+                if width > 0.0 && width <= 1.0 / ppp + 1e-3 { r.stroke.width = width; }
+            }
+        }
+        _ => shape.transform(t),
+    }
+}
+
+/// Scale everything `painter`'s layer got since `first` by `t` (the rack's
+/// draw pass at a zoom other than 100 %). The shapes are taken out of the
+/// paint list before any text is laid out: layout needs the context's fonts,
+/// and the paint list is behind the same lock (egui 0.37 deadlock rule).
+fn zoom_shapes(painter: &egui::Painter, first: egui::layers::ShapeIdx, t: egui::emath::TSTransform) {
+    use egui::layers::ShapeIdx;
+    let end = painter.add(Shape::Noop);
+    let (ctx, layer, ppp) = (painter.ctx().clone(), painter.layer_id(), painter.pixels_per_point());
+    let mut taken: Vec<egui::epaint::ClippedShape> = ctx.graphics_mut(|g| {
+        let list = g.entry(layer);
+        (first.0..end.0).map(|i| {
+            let mut out = egui::epaint::ClippedShape { clip_rect: Rect::NOTHING, shape: Shape::Noop, transform_after_tessellation: egui::emath::TSTransform::IDENTITY };
+            list.mutate_shape(ShapeIdx(i), |cs| std::mem::swap(cs, &mut out));
+            out
+        }).collect()
+    });
+    let layout = |job: egui::text::LayoutJob| ctx.fonts_mut(|f| f.layout_job(job));
+    for cs in &mut taken {
+        cs.clip_rect = t * cs.clip_rect;
+        zoom_shape(&mut cs.shape, t, ppp, &layout);
+    }
+    ctx.graphics_mut(|g| {
+        let list = g.entry(layer);
+        for (i, cs) in (first.0..end.0).zip(taken) { list.set(ShapeIdx(i), cs.clip_rect, cs.shape); }
+    });
 }
 
 impl Xform {
+    /// Draw space → screen: the viewport zoom about `pivot` (identity at 100 %).
+    fn view(&self) -> egui::emath::TSTransform {
+        egui::emath::TSTransform::new(self.pivot.to_vec2() * (1.0 - self.zoom), self.zoom)
+    }
+    /// Where rack-local `l` is on screen (what a pointer or a popup needs).
+    fn screen(&self, l: Vec2) -> Pos2 { self.view() * self.p(l) }
+    fn screen_rect(&self, r: Rect) -> Rect {
+        Rect::from_min_max(self.screen(r.min.to_vec2()), self.screen(r.max.to_vec2()))
+    }
     fn p(&self, l: Vec2) -> Pos2 {
         Pos2::new(
             self.center.x + (l.x - self.lc.x) * self.sx,
@@ -3393,7 +3492,9 @@ impl Xform {
     fn rect(&self, r: Rect) -> Rect {
         Rect::from_min_max(self.p(r.min.to_vec2()), self.p(r.max.to_vec2()))
     }
+    /// Screen → rack-local (through the viewport zoom).
     fn inv(&self, s: Pos2) -> Vec2 {
+        let s = self.pivot + (s - self.pivot) / self.zoom;
         Vec2::new(
             self.lc.x + (s.x - self.center.x) / self.sx,
             self.lc.y + (s.y - self.center.y) / self.sy,
@@ -3829,6 +3930,15 @@ struct DemoApp {
     /// The stacks are laid out in one row (a short, wide window).
     rack_flat: bool,
     rack_pan: Vec2,
+    /// Rack viewport zoom (#309): 1.0 = the laid-out rack. `rack_pan` is in
+    /// screen points at this zoom.
+    rack_zoom: f32,
+    /// Zoom and pan a key command eases to (`step_rack_zoom`).
+    rack_zoom_goal: Option<(f32, Vec2)>,
+    /// The node `Ctrl+Shift+F` zoomed onto (a second press zooms back out).
+    rack_focus: Option<u32>,
+    /// The stage part the rack is shown in (zoom pivot = its centre).
+    rack_view: Rect,
     rack_clip: Option<Rect>,
     /// Unsimulated time carried to the next frame (fixed rope step).
     rope_acc: f32,
@@ -4602,6 +4712,10 @@ impl DemoApp {
             rack_chrome: RackChrome::ROOMY,
             rack_flat: false,
             rack_pan: Vec2::ZERO,
+            rack_zoom: 1.0,
+            rack_zoom_goal: None,
+            rack_focus: None,
+            rack_view: Rect::NOTHING,
             rack_clip: None,
             rack_h: 560.0,
             rope_acc: 0.0,
@@ -4612,7 +4726,7 @@ impl DemoApp {
             stack_cols: Vec::new(),
             layout_rows: 1,
             base_graph: Graph::demo_patch(),
-            xf: Xform { center: Pos2::ZERO, lc: Vec2::ZERO, sx: 1.0, sy: 1.0 },
+            xf: Xform { center: Pos2::ZERO, lc: Vec2::ZERO, sx: 1.0, sy: 1.0, zoom: 1.0, pivot: Pos2::ZERO },
             toolbar_top: 0.0,
             text_alpha: 1.0,
             wordmark_g: None,
@@ -5472,6 +5586,8 @@ impl DemoApp {
                 (&["drag"], "jack to jack to patch a cable"),
                 (&["drag plug"], "onto a jack to move it · tug off to unplug"),
                 (&["Ctrl", "drag"], "a unit to rearrange the rack"),
+                (&["Ctrl", "scroll"], "zoom the rack · Ctrl+0 resets or fits all"),
+                (&["Ctrl", "Shift", "F"], "zoom onto the selected unit (again: back)"),
                 (&["click"], "a cable to select its path"),
                 (&["Del"], "remove the selected cable"),
                 (&["B", "F9"], "plugin browser"),
@@ -5622,8 +5738,10 @@ impl DemoApp {
             Pos2::new(rect.left() + side_m, rect.top() + ch.top),
             Pos2::new(rect.right() - side_m, rect.bottom() - ch.hint),
         );
-        let ov = Vec2::new((self.rack_w - view.width()).max(0.0), (self.rack_h - view.height()).max(0.0));
-        if ov != self.rack_overflow {
+        self.rack_view = view;
+        let zoom = self.rack_zoom;
+        let ov = self.rack_overflow_at(zoom);
+        if ov != self.rack_overflow && zoom == 1.0 {
             eprintln!("rack layout: stage {:.0}x{:.0} rack {:.0}x{:.0} unit_h {:.0} rows {} → overflow {:.0},{:.0}",
                 rect.width(), rect.height(), self.rack_w, self.rack_h, self.unit_h, rows, ov.x, ov.y);
         }
@@ -5635,9 +5753,12 @@ impl DemoApp {
         // The clip keeps 8 px of air around the view, except into the hint line.
         self.rack_clip = (ov.x > 0.0 || ov.y > 0.0)
             .then_some(Rect::from_min_max(view.min - Vec2::splat(8.0), Pos2::new(view.max.x + 8.0, view.max.y)));
+        // The zoom scales about the view's centre, so the pan (screen
+        // points) is 1/zoom of itself in draw space.
+        let pivot = Pos2::new(rect.center().x, view.center().y);
         let origin = Pos2::new(
-            rect.center().x - self.rack_w / 2.0 + self.rack_pan.x,
-            view.center().y - self.rack_h / 2.0 + self.rack_pan.y,
+            pivot.x - self.rack_w / 2.0 + self.rack_pan.x / zoom,
+            pivot.y - self.rack_h / 2.0 + self.rack_pan.y / zoom,
         );
         // Flip transform.
         let mut sy = 1.0f32;
@@ -5651,9 +5772,98 @@ impl DemoApp {
         self.xf = Xform {
             center: origin + Vec2::new(self.rack_w / 2.0, self.rack_h / 2.0),
             lc: Vec2::new(self.rack_w / 2.0, self.rack_h / 2.0),
-            sx, sy,
+            sx, sy, zoom, pivot,
         };
         self.text_alpha = ((sy - 0.30) / 0.45).clamp(0.0, 1.0);
+    }
+
+    /// How far the rack at `zoom` is larger than its view (screen points).
+    fn rack_overflow_at(&self, zoom: f32) -> Vec2 {
+        Vec2::new(
+            (self.rack_w * zoom - self.rack_view.width()).max(0.0),
+            (self.rack_h * zoom - self.rack_view.height()).max(0.0),
+        )
+    }
+
+    fn clamp_rack_pan(&self, pan: Vec2, zoom: f32) -> Vec2 {
+        let ov = self.rack_overflow_at(zoom);
+        Vec2::new(pan.x.clamp(-ov.x / 2.0, ov.x / 2.0), pan.y.clamp(-ov.y / 2.0, ov.y / 2.0))
+    }
+
+    /// Zoom at once to `zoom`, keeping the rack point under screen point
+    /// `at` where it is (`Ctrl+scroll`, pinch). Close to 100 % snaps to it.
+    fn zoom_rack_at(&mut self, zoom: f32, at: Pos2) {
+        let mut z = zoom.clamp(RACK_ZOOM_MIN, RACK_ZOOM_MAX);
+        if (z - 1.0).abs() < 0.03 { z = 1.0; }
+        let d = at - self.xf.pivot;
+        let pan = d - (d - self.rack_pan) * (z / self.rack_zoom);
+        self.rack_pan = self.clamp_rack_pan(pan, z);
+        self.rack_zoom = z;
+        self.rack_zoom_goal = None;
+        self.rack_focus = None;
+    }
+
+    /// `Ctrl+=` / `Ctrl+-`: ease to the next step of the zoom ladder.
+    fn zoom_rack_step(&mut self, dir: i8) {
+        let from = self.rack_zoom_goal.map_or(self.rack_zoom, |(z, _)| z);
+        let z = if dir > 0 {
+            RACK_ZOOM_STEPS.iter().copied().find(|&s| s > from + 0.005).unwrap_or(RACK_ZOOM_MAX)
+        } else {
+            RACK_ZOOM_STEPS.iter().rev().copied().find(|&s| s < from - 0.005).unwrap_or(RACK_ZOOM_MIN)
+        };
+        let pan = self.clamp_rack_pan(self.rack_pan * (z / self.rack_zoom), z);
+        self.rack_zoom_goal = Some((z, pan));
+        self.rack_focus = None;
+    }
+
+    /// The zoom at which the whole rack fits its view (never above 100 %).
+    fn rack_fit_zoom(&self) -> f32 {
+        let v = self.rack_view;
+        if !v.is_positive() || self.rack_w <= 0.0 || self.rack_h <= 0.0 { return 1.0; }
+        (v.width() / self.rack_w).min(v.height() / self.rack_h).clamp(RACK_ZOOM_MIN, 1.0)
+    }
+
+    /// `Ctrl+0`: back to 100 %; at 100 % a rack larger than its view zooms
+    /// out until all of it shows (and the next press returns to 100 %).
+    fn zoom_rack_reset(&mut self) {
+        let at = self.rack_zoom_goal.map_or(self.rack_zoom, |(z, _)| z);
+        let fit = self.rack_fit_zoom();
+        let z = if (at - 1.0).abs() < 0.005 && fit < 0.995 { fit } else { 1.0 };
+        self.rack_zoom_goal = Some((z, self.clamp_rack_pan(Vec2::ZERO, z)));
+        self.rack_focus = None;
+    }
+
+    /// `Ctrl+Shift+F`: fill the view with unit `ui`; on the focused unit
+    /// again, back to 100 %.
+    fn zoom_rack_focus(&mut self, ui: usize) {
+        let Some(&r) = self.unit_rects.get(ui) else { return };
+        let Some(node) = self.units.get(ui).map(|u| u.node_id) else { return };
+        if !self.visible(ui) || !r.is_positive() || !r.min.is_finite() || !r.max.is_finite() { return; }
+        if self.rack_focus == Some(node) {
+            self.rack_zoom_goal = Some((1.0, self.clamp_rack_pan(Vec2::ZERO, 1.0)));
+            self.rack_focus = None;
+            return;
+        }
+        let v = self.rack_view;
+        let z = ((v.width() - 24.0) / r.width()).min((v.height() - 24.0) / r.height()).clamp(RACK_ZOOM_MIN, RACK_ZOOM_MAX);
+        let lc = Vec2::new(self.rack_w / 2.0, self.rack_h / 2.0);
+        let pan = self.clamp_rack_pan((lc - r.center().to_vec2()) * z, z);
+        self.rack_zoom_goal = Some((z, pan));
+        self.rack_focus = Some(node);
+    }
+
+    /// Ease the zoom towards a key command's goal; true while it moves.
+    fn step_rack_zoom(&mut self, dt: f32) -> bool {
+        let Some((z, pan)) = self.rack_zoom_goal else { return false };
+        let k = 1.0 - (-dt * 16.0).exp();
+        self.rack_zoom += (z - self.rack_zoom) * k;
+        self.rack_pan += (pan - self.rack_pan) * k;
+        if (self.rack_zoom - z).abs() < 0.004 * z {
+            self.rack_zoom = z;
+            self.rack_pan = pan;
+            self.rack_zoom_goal = None;
+        }
+        true
     }
 
     fn jack_pos(&self, unit: usize, jack: usize) -> Vec2 {
@@ -16080,7 +16290,7 @@ impl DemoApp {
         let ov = self.rack_overflow;
         if ov.x <= 0.0 && ov.y <= 0.0 { return; }
         let c = r.center();
-        let target = Vec2::new(self.rack_w * 0.5 - c.x, self.rack_h * 0.5 - c.y);
+        let target = Vec2::new(self.rack_w * 0.5 - c.x, self.rack_h * 0.5 - c.y) * self.rack_zoom;
         self.rack_pan = Vec2::new(
             target.x.clamp(-ov.x * 0.5, ov.x * 0.5),
             target.y.clamp(-ov.y * 0.5, ov.y * 0.5),
@@ -27783,9 +27993,15 @@ impl DemoApp {
         // Pan an overflowing rack with the wheel / trackpad — only over the
         // bare stage (never over a panel or window that scrolls itself).
         let ov = self.rack_overflow;
-        if !self.show_help && !expanded_console && self.stage_view == StageView::Rack && (ov.x > 0.0 || ov.y > 0.0) {
-            let over_stage = ctx.pointer_hover_pos().is_some_and(|p| self.stage_rect.contains(p)
+        if !self.show_help && !expanded_console && self.stage_view == StageView::Rack {
+            let over_stage = ctx.pointer_hover_pos().filter(|&p| self.stage_rect.contains(p)
                 && ctx.layer_id_at(p).map_or(true, |l| l.order == egui::Order::Background));
+            // Ctrl+scroll (and a trackpad pinch) zooms about the pointer (#309).
+            let zd = ctx.input(|i| i.zoom_delta());
+            if let (Some(at), true) = (over_stage, zd != 1.0 && zd.is_finite() && zd > 0.0) {
+                self.zoom_rack_at(self.rack_zoom_goal.map_or(self.rack_zoom, |(z, _)| z) * zd, at);
+            }
+            let over_stage = over_stage.is_some() && (ov.x > 0.0 || ov.y > 0.0);
             let d = ctx.input(|i| i.smooth_scroll_delta());
             if over_stage && d != Vec2::ZERO {
                 // A plain wheel (y only) pans sideways when only x overflows.
@@ -27813,6 +28029,29 @@ impl DemoApp {
                 return;
             }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
+            // Rack viewport zoom (#309). Ctrl+Shift+F before any later
+            // Ctrl+F: egui matches the pattern's Shift loosely (rule 143).
+            if self.stage_view == StageView::Rack && !self.show_help {
+                if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F) {
+                    let hovered = match self.hover {
+                        Some(Hit::Unit(u)) | Some(Hit::Knob { unit: u, .. }) | Some(Hit::Jack { unit: u, .. }) => Some(u),
+                        _ => None,
+                    };
+                    let unit = self.selected_unit
+                        .and_then(|n| self.units.iter().position(|u| u.node_id == n))
+                        .filter(|&u| self.visible(u))
+                        .or(hovered);
+                    match unit {
+                        Some(u) => self.zoom_rack_focus(u),
+                        None => self.notify_patch("Select or point at a unit to zoom onto it"),
+                    }
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::Equals) || i.consume_key(Modifiers::COMMAND, Key::Plus) {
+                    self.zoom_rack_step(1);
+                }
+                if i.consume_key(Modifiers::COMMAND, Key::Minus) { self.zoom_rack_step(-1); }
+                if i.consume_key(Modifiers::COMMAND, Key::Num0) { self.zoom_rack_reset(); }
+            }
             // Unit shortcuts (Ctrl+E bypass, Ctrl+D duplicate, Ctrl+R randomize;
             // checked BEFORE plain R so egui never swallows Ctrl+R as R — rule 143).
             if self.selected_unit.is_some() && self.stage_view == StageView::Rack {
@@ -28749,6 +28988,12 @@ impl DemoApp {
         let rack = self.xf.rect(rack_local);
         let mut rp = painter.clone();
         if let Some(clip) = self.rack_clip { rp.set_clip_rect(clip.intersect(rect)); }
+        // Zoomed (#309): the rack is drawn as at 100 % and its shapes are
+        // scaled afterwards, so the clip is the screen clip in draw space.
+        let view_t = self.xf.view();
+        let zoomed = self.xf.zoom != 1.0;
+        if zoomed { rp.set_clip_rect(view_t.inverse() * rp.clip_rect()); }
+        let first_shape = rp.add(Shape::Noop);
         rp.set_opacity(self.load_fade);
         rp.rect_filled(rack, self.rack_chrome.radius, CHASSIS);
 
@@ -28759,6 +29004,8 @@ impl DemoApp {
                 Side::Back => self.draw_back(&rp),
             }
         }
+        if zoomed { zoom_shapes(&rp, first_shape, view_t); }
+        let rack = self.xf.screen_rect(rack_local);
 
         self.draw_pan_bars(&painter);
         if self.rack_locked && !self.show_help && (rack.top() - rect.top()) >= 24.0 {
@@ -28874,7 +29121,7 @@ impl DemoApp {
         let ov = self.rack_overflow;
         if ov.x > 0.0 {
             let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 2.0), Pos2::new(view.right() - 40.0, view.bottom() + 5.0));
-            let frac = view.width() / self.rack_w;
+            let frac = view.width() / (self.rack_w * self.rack_zoom);
             let t = 0.5 - self.rack_pan.x / ov.x.max(1.0); // pan +ov/2 = left end
             let w = track.width() * frac;
             let x = track.left() + (track.width() - w) * t.clamp(0.0, 1.0);
@@ -28883,7 +29130,7 @@ impl DemoApp {
         }
         if ov.y > 0.0 {
             let track = Rect::from_min_max(Pos2::new(view.right() + 4.0, view.top() + 20.0), Pos2::new(view.right() + 7.0, view.bottom() - 20.0));
-            let frac = view.height() / self.rack_h;
+            let frac = view.height() / (self.rack_h * self.rack_zoom);
             let t = 0.5 - self.rack_pan.y / ov.y.max(1.0);
             let h = track.height() * frac;
             let y = track.top() + (track.height() - h) * t.clamp(0.0, 1.0);
@@ -33596,6 +33843,13 @@ impl DemoApp {
             painter.with_clip_rect(hint_clip).galley(pos, ng, theme::AGENT_TEXT);
             return;
         }
+        // A zoomed rack says so, and how to get back (#309).
+        if self.rack_zoom != 1.0 {
+            let msg = format!("zoom {:.0} % · Ctrl+scroll or Ctrl+= / Ctrl+\u{2212} zooms · Ctrl+0 back to 100 % · Ctrl+Shift+F focuses a unit", self.rack_zoom * 100.0);
+            let ng = painter.layout_no_wrap(msg, FontId::proportional(12.5), theme::INK_2);
+            painter.with_clip_rect(hint_clip).galley(pos, ng, theme::INK_2);
+            return;
+        }
         let hint_right = (pos.x + g.size().x).min(hint_clip.right());
         painter.with_clip_rect(hint_clip).galley(pos, g.clone(), col);
         // Info line fallback (narrow window): right-aligned on the hint row,
@@ -33759,7 +34013,7 @@ impl DemoApp {
         }
         let Some(Hit::Jack { unit, jack }) = self.hover else { return };
         let Some(info) = self.jack_tooltip_info(unit, jack) else { return };
-        let anchor = self.xf.p(self.jack_pos(unit, jack)) + Vec2::new(18.0, -10.0);
+        let anchor = self.xf.screen(self.jack_pos(unit, jack)) + Vec2::new(18.0, -10.0);
         let family_col = info.kind.color();
         let constrain = if self.stage_rect.is_positive() { self.stage_rect } else { ctx.content_rect() };
         egui::Area::new(egui::Id::unique("jack_port_tooltip"))
@@ -35279,11 +35533,12 @@ impl DemoApp {
         self.sync_main_knobs();
         self.sync_midi_knobs();
         self.sync_aeolus_faces();
+        if self.step_rack_zoom(dt) { ctx.request_repaint(); }
         self.layout(rect);
         if let Some(node) = self.nav_pan_target.take() {
             let old_pan = self.rack_pan;
             self.pan_rack_to_unit(node);
-            self.xf.center += self.rack_pan - old_pan;
+            self.xf.center += (self.rack_pan - old_pan) / self.rack_zoom;
         }
         if self.mixer_flash.is_some_and(|(_, exp)| self.ui_time >= exp) {
             self.mixer_flash = None;
@@ -50670,6 +50925,8 @@ pub use headless::run as run_headless;
 mod recovery;
 #[cfg(test)]
 mod hw_ports_tests;
+#[cfg(test)]
+mod zoom_tests;
 
 #[cfg(test)]
 mod window_size_layout_tests {

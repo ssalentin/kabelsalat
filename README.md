@@ -94,6 +94,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **Patch with real cables** on the back of the rack; they light up when
   signal flows. Lock the rack once it is dialled in.
   → [Patch with real cables](docs/GUIDE.md#patch-with-real-cables)
+- **Zoom the rack** with **Ctrl+scroll**, fit it all with **Ctrl+0**, or
+  fill the window with one unit (**Ctrl+Shift+F**), on front and back.
+  → [Zoom the rack](docs/GUIDE.md#zoom-the-rack)
 - **Run up to 32 rigs at once**, each on its own keyboard, with splits,
   layers and velocity ranges. → [Several rigs](docs/GUIDE.md#run-several-rigs-at-once),
   [MIDI matrix](docs/GUIDE.md#route-midi-anywhere)

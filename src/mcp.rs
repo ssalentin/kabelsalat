@@ -94,11 +94,34 @@ struct State {
     record_sync: bool,
     /// Single-rig preset directory (isolated in unit tests).
     rig_presets_dir: std::path::PathBuf,
+    /// Default folder for standalone saved setlists (isolated in unit tests).
+    setlists_dir_default: std::path::PathBuf,
+    /// Custom user-configured setlists folder (`None` uses `setlists_dir_default`).
+    setlists_dir_custom: Option<std::path::PathBuf>,
+    /// Name of the currently open saved setlist (`<name>.ksalat-setlist`), if any.
+    open_setlist: Option<String>,
     /// Each rig's instrument-type mark by rig index (#198, headless
     /// mirror of the app's); `None` = the rig follows its instrument.
     rig_types: Vec<Option<crate::keyboard::KeyboardType>>,
     /// Headless setlist mirror (#204); in Remote mode the GUI app owns it.
     setlist: crate::setlist::Setlist,
+}
+
+impl State {
+    fn effective_setlists_dir(&self) -> &std::path::Path {
+        self.setlists_dir_custom.as_deref().unwrap_or(&self.setlists_dir_default)
+    }
+
+    fn setlists_folder_meta(&self) -> Value {
+        let cur = self.effective_setlists_dir();
+        json!({
+            "folder": crate::plugin_dirs::display(cur),
+            "folder_path": cur.to_string_lossy(),
+            "default_folder": crate::plugin_dirs::display(&self.setlists_dir_default),
+            "is_custom": self.setlists_dir_custom.is_some(),
+            "open_setlist": self.open_setlist,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -244,6 +267,118 @@ fn send_show_gates(st: &mut State) -> Result<(), String> {
         send_cmd(st, c)?;
     }
     Ok(())
+}
+
+fn capture_headless_session(st: &State, name: &str) -> Result<crate::session::Session, String> {
+    let mut s = crate::session::Session::new(name, st.graph.clone());
+    let meta = rig_meta(st)?;
+    if meta.len() > 1 || meta.first().is_some_and(|m| !m.name.is_empty()) {
+        s.rig_names = meta.into_iter().map(|m| m.name).collect();
+    }
+    s.rig_types = st.rig_types.clone();
+    s.setlist = st.setlist.clone();
+    if let Some(gp) = &st.graph_pub {
+        if let Ok(g) = gp.lock() {
+            s.master_mute = g.master_mute;
+            if g.master_target != crate::meter::MasterTarget::OFF {
+                s.master_target = Some(g.master_target);
+            }
+            if g.transport.time_sig != crate::transport::TimeSig::FOUR_FOUR {
+                s.time_sig = Some(g.transport.time_sig);
+            }
+            for sp in g.strips.iter() {
+                if sp.node != u32::MAX && !sp.mix.is_default() {
+                    s.set_strip(crate::session::StripSaved {
+                        node: sp.node,
+                        pan: sp.mix.pan,
+                        mute: sp.mix.mute,
+                        solo: sp.mix.solo,
+                        bypass: sp.mix.bypass,
+                        ..Default::default()
+                    });
+                }
+            }
+            let sends: Vec<_> = g.sends.iter().copied().filter(|x| x.bus != NodeId::MAX && !x.is_default()).collect();
+            if !sends.is_empty() {
+                s.set_sends(sends);
+            }
+            let outs: Vec<_> = g.bus_outs.iter().cloned().filter(|x| !x.sink.is_none()).collect();
+            if !outs.is_empty() {
+                s.set_bus_outs(outs);
+            }
+            let routes: Vec<_> = g.out_routes.iter().flatten().copied().collect();
+            if !routes.is_empty() {
+                s.set_out_routes(routes);
+            }
+        }
+    }
+    Ok(s)
+}
+
+fn apply_headless_session(st: &mut State, mut s: crate::session::Session) -> Result<usize, String> {
+    let (graphs, _) = control::split_rigs(&s.graph);
+    let rig_count = graphs.len().max(1);
+    if (graphs.len() > 1 || !s.rig_names.is_empty()) && !graphs.is_empty() {
+        let rigs: Vec<Rig> = graphs.iter().enumerate().map(|(i, g)| {
+            let name = s.rig_names.get(i).filter(|n| !n.trim().is_empty()).cloned()
+                .unwrap_or_else(|| format!("Rig {}", control::rig_letter(i)));
+            Rig::new(name, g.clone(), None)
+        }).collect();
+        send_cmd(st, Command::LoadRigs { rigs: rigs.clone(), active: 0 })?;
+        st.graph = merge_rigs(&rigs);
+        let metas: Vec<crate::control::RigMeta> = rigs.iter()
+            .map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+        if let Ok(mut snap) = st.rigs.lock() {
+            snap.rigs = metas;
+            snap.active = 0;
+        }
+    } else {
+        send_cmd(st, Command::LoadGraph { graph: s.graph.clone() })?;
+        st.graph = s.graph.clone();
+        if let Ok(mut snap) = st.rigs.lock() {
+            snap.rigs.clear();
+            snap.active = 0;
+        }
+    }
+    for p in s.params() {
+        let _ = send_cmd(st, Command::SetParam { node: p.node, param: p.param, value: p.value });
+    }
+    let _ = send_cmd(st, Command::SetMasterMute { muted: s.master_mute });
+    if let Some(sig) = s.time_sig {
+        let _ = send_cmd(st, Command::SetTimeSignature { num: sig.num, den: sig.den });
+    }
+    if let Some(target) = s.master_target {
+        let _ = send_cmd(st, Command::RestoreMasterTarget { target });
+    }
+    for strip in s.strips() {
+        let _ = send_cmd(st, Command::SetStripMix {
+            node: strip.node, pan: Some(strip.pan), mute: Some(strip.mute), solo: Some(strip.solo),
+        });
+        let _ = send_cmd(st, Command::SetStripBypass { node: strip.node, bypass: strip.bypass });
+    }
+    for send in s.sends() {
+        let _ = send_cmd(st, Command::SetSend {
+            from: send.from, bus: send.bus, level: Some(send.level), pre: Some(send.pre),
+        });
+    }
+    for bo in s.bus_outs() {
+        let sink = if bo.sink.is_none() { None } else { Some(bo.sink.clone()) };
+        let _ = send_cmd(st, Command::SetBusOutput { bus: bo.bus, sink });
+    }
+    for r in s.out_routes() {
+        let _ = send_cmd(st, Command::SetOutRoute { source: r.source, to: Some(r.to) });
+    }
+    st.rig_types = s.rig_types;
+    s.setlist.prune_to_graph(&st.graph);
+    st.setlist = s.setlist;
+    if st.setlist.active.is_some() || !st.setlist.songs.is_empty() {
+        let _ = send_show_gates(st);
+    }
+    if st.setlist.window_enabled() {
+        let mask = st.setlist.window_rigs_mask(&st.graph);
+        let _ = send_cmd(st, Command::SetHostedRigs { mask, for_next_load: false });
+    }
+    Ok(rig_count)
 }
 
 fn setlist_json(st: &State) -> Value {
@@ -940,6 +1075,28 @@ struct SetSetlistWindowArgs {
     /// song (1..=8), or null / 0 to disable windowing and keep every rig loaded.
     #[serde(skip_serializing_if = "Option::is_none")]
     load_ahead: Option<u8>,
+}
+
+/// Arguments for `save_setlist`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SaveSetlistArgs {
+    /// Setlist name (no slashes).
+    name: String,
+}
+
+/// Arguments for `load_setlist`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct LoadSetlistArgs {
+    /// Saved setlist name (see `list_setlists`).
+    name: String,
+}
+
+/// Arguments for `set_setlist_folder`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetSetlistFolderArgs {
+    /// Full folder path (starting with `/` or `~`), or `null` to reset to the default `~/kabelsalat-setlists`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 /// Arguments for `set_show_control`.
@@ -5502,6 +5659,117 @@ impl McpServer {
         ok_json(setlist_json(&st))
     }
 
+    /// Save the current setlist and its loaded rigs/mix as a standalone `.ksalat-setlist` package.
+    #[tool(name = "save_setlist", description = "Save the current setlist (songs, parts, sets, levels, show controls) together with its loaded rigs, plugin state blobs, knobs, mix and MIDI routes as a named `.ksalat-setlist` package in the configured setlists folder (default ~/kabelsalat-setlists).")]
+    fn save_setlist(&self, Parameters(args): Parameters<SaveSetlistArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("save_setlist", json!({"name": args.name}));
+        }
+        let trimmed = args.name.trim().to_string();
+        let sess = match capture_headless_session(&st, &trimmed) {
+            Ok(s) => s,
+            Err(e) => return tool_err(e),
+        };
+        let saved = crate::session::SavedSetlist::new(&trimmed, sess);
+        let path = match crate::session::SavedSetlist::package_path(st.effective_setlists_dir(), &trimmed) {
+            Ok(p) => p,
+            Err(e) => return tool_err(format!("{e:#}")),
+        };
+        if let Err(e) = saved.save(&path) {
+            return tool_err(format!("save_setlist failed: {e:#}"));
+        }
+        st.open_setlist = Some(saved.name.clone());
+        let rigs = control::split_rigs(&st.graph).0.len().max(1);
+        let mut out = st.setlists_folder_meta();
+        out["saved"] = json!(saved.name);
+        out["path"] = json!(path.to_string_lossy());
+        out["songs"] = json!(st.setlist.songs.len());
+        out["rigs"] = json!(rigs);
+        ok_json(out)
+    }
+
+    /// Load a saved setlist package from the configured setlists folder.
+    #[tool(name = "load_setlist", description = "Load a saved `.ksalat-setlist` package by name from the configured setlists folder, restoring all rigs, sounds, mix, MIDI routes, songs, parts, sets, levels and show controls.")]
+    fn load_setlist(&self, Parameters(args): Parameters<LoadSetlistArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("load_setlist", json!({"name": args.name}));
+        }
+        let path = match crate::session::SavedSetlist::package_path(st.effective_setlists_dir(), &args.name) {
+            Ok(p) => p,
+            Err(e) => return tool_err(format!("{e:#}")),
+        };
+        let saved = match crate::session::SavedSetlist::load(&path) {
+            Ok(s) => s,
+            Err(e) => return tool_err(format!("load_setlist failed: {e:#}")),
+        };
+        let loaded_name = saved.name.clone();
+        let rigs = match apply_headless_session(&mut st, saved.session) {
+            Ok(n) => n,
+            Err(e) => return tool_err(e),
+        };
+        st.open_setlist = Some(loaded_name.clone());
+        let mut out = st.setlists_folder_meta();
+        out["loaded"] = json!(loaded_name);
+        out["songs"] = json!(st.setlist.songs.len());
+        out["rigs"] = json!(rigs);
+        out["setlist"] = setlist_json(&st);
+        ok_json(out)
+    }
+
+    /// List saved setlist packages in the configured setlists folder.
+    #[tool(name = "list_setlists", description = "List saved setlist names (`.ksalat-setlist`) in the configured setlists folder and return the folder path.")]
+    fn list_setlists(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("list_setlists", json!({}));
+        }
+        let setlists = crate::session::list_setlists(st.effective_setlists_dir());
+        let mut out = st.setlists_folder_meta();
+        out["setlists"] = json!(setlists);
+        ok_json(out)
+    }
+
+    /// Configure the folder where saved setlists are stored and listed.
+    #[tool(name = "set_setlist_folder", description = "Set the folder where saved setlists (`.ksalat-setlist`) are stored and listed, or pass path=null to reset to the default ~/kabelsalat-setlists.")]
+    fn set_setlist_folder(&self, Parameters(args): Parameters<SetSetlistFolderArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+            drop(st);
+            return Self::ui_bridge_tool("set_setlist_folder", v);
+        }
+        let raw = match args.path.as_deref() {
+            None => None,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => match crate::session::normalize_folder_path(s) {
+                Ok(p) => Some(p),
+                Err(e) => return tool_err(e),
+            },
+        };
+        let saved = crate::session::save_setlists_dir(raw.as_deref());
+        st.setlists_dir_custom = raw;
+        let cur = st.effective_setlists_dir().to_path_buf();
+        let shown = crate::plugin_dirs::display(&cur);
+        let msg = if st.setlists_dir_custom.is_some() {
+            format!("Setlists folder set to {shown}")
+        } else {
+            format!("Setlists folder reset to {shown}")
+        };
+        if let Err(e) = saved {
+            return tool_err(format!("{msg}, but saving the folder failed: {e}"));
+        }
+        let setlists = crate::session::list_setlists(&cur);
+        let mut out = st.setlists_folder_meta();
+        out["result"] = json!(msg);
+        out["setlists"] = json!(setlists);
+        ok_json(out)
+    }
+
     /// Configure master transport count-in.
     #[tool(name = "set_count_in", description = "Configure master transport count-in (Command::SetCountIn): plays N bars (1..=4, default 1) of metronome clicks before the song clock starts at beat 0. Pass enabled (bool) and/or bars (0 disables, 1..=4 enables).")]
     fn set_count_in(&self, Parameters(args): Parameters<SetCountInArgs>) -> Result<CallToolResult, McpError> {
@@ -5985,6 +6253,9 @@ pub fn run() -> anyhow::Result<()> {
         record: audio.record,
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
+        setlists_dir_default: crate::session::default_setlists_dir(),
+        setlists_dir_custom: crate::session::setlists_dir_configured(),
+        open_setlist: None,
         rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
     }));
@@ -6024,6 +6295,9 @@ pub fn run_attach() -> anyhow::Result<()> {
         record: Arc::new(crate::record::RecorderShared::new()),
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
+        setlists_dir_default: crate::session::default_setlists_dir(),
+        setlists_dir_custom: crate::session::setlists_dir_configured(),
+        open_setlist: None,
         rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
     };
@@ -6170,6 +6444,18 @@ mod tests {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir)
                 .join(format!("test-mcp-rig-presets-{}", std::process::id())),
+            setlists_dir_default: {
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let dir = std::env::var_os("CARGO_TARGET_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("test-mcp-setlists")
+                    .join(format!("{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+                let _ = std::fs::remove_dir_all(&dir);
+                dir
+            },
+            setlists_dir_custom: None,
+            open_setlist: None,
             rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
         };
@@ -7197,5 +7483,97 @@ mod tests {
         })));
         assert!(listed.get("vst3").is_some(), "{listed}");
         assert!(listed.get("vst3_count").is_some(), "{listed}");
+    }
+
+    #[test]
+    fn save_load_list_and_configure_setlist_folder_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = [0.0f32; 128];
+
+        let initial = tool_json(&server.list_setlists());
+        assert_eq!(initial["setlists"], json!([]));
+        assert_eq!(initial["is_custom"], json!(false));
+
+        let bad_dir = server.set_setlist_folder(Parameters(SetSetlistFolderArgs {
+            path: Some("relative/path".into()),
+        }));
+        assert_eq!(
+            serde_json::to_value(bad_dir.unwrap()).unwrap().get("isError").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let custom = std::env::temp_dir().join(format!("ksalat-mcp-setlists-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&custom);
+
+        let set_folder = tool_json(&server.set_setlist_folder(Parameters(SetSetlistFolderArgs {
+            path: Some(custom.to_string_lossy().into_owned()),
+        })));
+        assert_eq!(set_folder["is_custom"], json!(true));
+        assert_eq!(set_folder["folder_path"], json!(custom.to_string_lossy()));
+
+        tool_json(&server.load_rigs(Parameters(LoadRigsArgs {
+            rigs: vec![
+                RigArg { name: "Stage Piano".into(), graph: rig_graph_json("Keys"), midi_device: None },
+                RigArg { name: "Warm Pad".into(), graph: rig_graph_json("Pad"), midi_device: None },
+            ],
+            active: Some(0),
+        })));
+        engine.render(&mut buf, 64);
+
+        tool_json(&server.set_setlist_song(Parameters(SetSetlistSongArgs {
+            song: None,
+            name: Some("Opener".into()),
+            bpm: Some(Some(124.0)),
+            time_signature: None,
+            backing: None,
+            parts: Some(vec![
+                SetlistPartArg {
+                    name: "Intro".into(),
+                    rigs: Some(vec![SetlistPartRigArg {
+                        rig: 0, key_lo: Some(36), key_hi: Some(96),
+                        transpose: None, level: None, pan: None,
+                        vel_lo: None, vel_hi: None, vel_curve: None, float: None,
+                    }]),
+                    fx: None, buses: None, capture_knobs: None, scene: None,
+                },
+            ]),
+            move_to: None,
+            remove: None,
+        })));
+
+        let saved = tool_json(&server.save_setlist(Parameters(SaveSetlistArgs { name: "Tour 2026".into() })));
+        assert_eq!(saved["saved"], json!("Tour 2026"));
+        assert_eq!(saved["songs"], json!(1));
+        assert_eq!(saved["rigs"], json!(2));
+
+        let listed = tool_json(&server.list_setlists());
+        assert_eq!(listed["setlists"], json!(["Tour 2026"]));
+        assert_eq!(listed["open_setlist"], json!("Tour 2026"));
+
+        tool_json(&server.set_setlist_song(Parameters(SetSetlistSongArgs {
+            song: None, name: Some("Temporary".into()), bpm: None, time_signature: None,
+            backing: None, parts: None, move_to: None, remove: None,
+        })));
+        assert_eq!(tool_json(&server.get_setlist())["songs"].as_array().unwrap().len(), 2);
+
+        let loaded = tool_json(&server.load_setlist(Parameters(LoadSetlistArgs { name: "Tour 2026".into() })));
+        assert_eq!(loaded["loaded"], json!("Tour 2026"));
+        assert_eq!(loaded["songs"], json!(1));
+        engine.render(&mut buf, 64);
+
+        let sl = tool_json(&server.get_setlist());
+        assert_eq!(sl["songs"].as_array().unwrap().len(), 1);
+        assert_eq!(sl["songs"][0]["name"], json!("Opener"));
+        let rigs = tool_json(&server.get_rigs());
+        assert_eq!(rigs["rigs"][0]["name"], json!("Stage Piano"));
+        assert_eq!(rigs["rigs"][1]["name"], json!("Warm Pad"));
+
+        let reset = tool_json(&server.set_setlist_folder(Parameters(SetSetlistFolderArgs { path: None })));
+        assert_eq!(reset["is_custom"], json!(false));
+        assert_eq!(reset["setlists"], json!([]));
+
+        let default_dir = server.state.lock().unwrap().setlists_dir_default.clone();
+        let _ = std::fs::remove_dir_all(&custom);
+        let _ = std::fs::remove_dir_all(&default_dir);
     }
 }

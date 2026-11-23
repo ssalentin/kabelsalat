@@ -676,6 +676,18 @@ session** pulls a saved session into the gig as a new song (reusing matching
 hosted instruments by default), and the
 assistant and MCP agents can read, build and step the setlist.
 
+Save a complete show with **Save setlist…** / **Load setlist…** (as a
+standalone `<name>.ksalat-setlist` package storing songs, parts, sets, levels,
+show controls, loaded rigs, plugin state, knobs, mix and MIDI routes). Saved
+setlists live in `~/kabelsalat-setlists` by default — change the folder directly
+from the Save/Load dialogs, **Settings → Session → Setlists folder**,
+`KABELSALAT_SETLISTS_DIR`, or the `set_setlist_folder` agent/MCP tool, and
+browse or load saved setlists anytime under **Library → Setlists** or the
+top-bar **Session** popover. You can also verify a saved setlist offline with
+`kabelsalat preshow-check <path.ksalat-setlist>`, and manage setlists via the
+`save_setlist`, `load_setlist`, `list_setlists` and `set_setlist_folder`
+assistant and MCP tools.
+
 <p align="center"><img src="shots/setlist.png" width="85%" alt="The Setlist view: songs with tempo and time signature on the left, parts with per-rig key ranges, transpose, level, velocity range and curve, floating split and knob capture on the right, and the song/part stepper in the top bar"/></p>
 
 ### Keep what stays through the whole show

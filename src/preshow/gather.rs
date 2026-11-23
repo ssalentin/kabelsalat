@@ -204,7 +204,13 @@ pub fn submit(job: impl FnOnce() + Send + 'static) -> bool {
 
 pub fn check_package(path: &Path) -> anyhow::Result<Report> {
     let t = Instant::now();
-    let session = Session::load(path)?;
+    let is_setlist = path.extension().is_some_and(|e| e == crate::session::SETLIST_EXT)
+        || path.join(crate::session::SETLIST_FILE).exists();
+    let session = if is_setlist {
+        crate::session::SavedSetlist::load(path)?.session
+    } else {
+        Session::load(path)?
+    };
     let facts = machine_facts(&session);
     Ok(Report::of(&session, &facts, t.elapsed()))
 }

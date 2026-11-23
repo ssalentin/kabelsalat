@@ -187,6 +187,7 @@ mod preshow;
 mod stage_outputs;
 mod audio_doctor;
 mod plugin_folders;
+mod setlist_files;
 mod shared;
 mod window_load;
 mod hotplug;
@@ -3136,6 +3137,7 @@ enum SettingsAction {
     SetAudioOutput(Option<String>),
     SetBufferSize(u32),
     SetRetroMinutes(u32),
+    SetSetlistsDir(Option<std::path::PathBuf>),
     Plugins(plugin_folders::FolderAction),
 }
 
@@ -3162,6 +3164,7 @@ enum RailTab {
 enum LibraryTab {
     #[default]
     Sessions,
+    Setlists,
     Rigs,
     Templates,
 }
@@ -3625,6 +3628,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo", "set_show_mode", "set_rack_locked", "panic", "set_plugin_favorite",
     "get_setlist", "set_setlist_song", "set_part_sends", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check", "audio_doctor",
+    "save_setlist", "load_setlist", "list_setlists", "set_setlist_folder",
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
     "record_save_last",
@@ -3652,6 +3656,8 @@ fn tool_changes_only_system(name: &str) -> bool {
         name,
         "install_instrument"
             | "save_rig"
+            | "save_setlist"
+            | "set_setlist_folder"
             | "reset_engine_peaks"
             | "set_buffer_size"
             | "set_audio_backend"
@@ -4453,6 +4459,20 @@ struct DemoApp {
     load_rig_dialog: Option<Option<usize>>,
     /// Rig preset storage dir (isolated per test under `cfg(test)`).
     rig_presets_dir: std::path::PathBuf,
+    /// Name of the currently open saved setlist (`<name>.ksalat-setlist`), if any.
+    open_setlist: Option<String>,
+    /// Default setlists storage dir (isolated per test under `cfg(test)`).
+    setlists_dir_default: std::path::PathBuf,
+    /// Custom user-configured setlists folder (`None` uses `setlists_dir_default`).
+    setlists_dir_custom: Option<std::path::PathBuf>,
+    /// Save-setlist modal state.
+    save_setlist_dialog: Option<setlist_files::SaveSetlistDialog>,
+    /// Load-setlist modal state.
+    load_setlist_dialog: Option<setlist_files::LoadSetlistDialog>,
+    /// Inline setlists-folder editor state in Settings → Session.
+    setlist_folder_edit: Option<setlist_files::FolderPrompt>,
+    /// Pending confirm action for a saved setlist row (Delete / Overwrite).
+    confirm_setlist: Option<setlist_files::SetlistConfirm>,
     /// Rig names of the session being applied (load path names its rigs).
     session_rig_names: Vec<String>,
     /// Rig devices of the session being applied, in this run's indices (#227).
@@ -5049,6 +5069,17 @@ impl DemoApp {
             save_rig_dialog: None,
             load_rig_dialog: None,
             rig_presets_dir: Self::default_rig_presets_dir(),
+            open_setlist: None,
+            setlists_dir_default: Self::default_setlists_dir_for_app(),
+            setlists_dir_custom: if cfg!(test) {
+                None
+            } else {
+                crate::session::setlists_dir_configured()
+            },
+            save_setlist_dialog: None,
+            load_setlist_dialog: None,
+            setlist_folder_edit: None,
+            confirm_setlist: None,
             session_rig_names: Vec::new(),
             session_rig_devices: Vec::new(),
             load_as_rigs: None,
@@ -7473,6 +7504,16 @@ impl DemoApp {
                 Some(n) if n > 0 => format!("Setlist window (+{n} songs)"),
                 _ => "Setlist window off (all loaded)".into(),
             },
+            "save_setlist" => match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) if !n.trim().is_empty() => format!("Save setlist · {n}"),
+                _ => "Save setlist".into(),
+            },
+            "load_setlist" => match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) if !n.trim().is_empty() => format!("Load setlist · {n}"),
+                _ => "Load setlist".into(),
+            },
+            "list_setlists" => "List setlists".into(),
+            "set_setlist_folder" => "Set setlists folder".into(),
             "get_midi_clock" => "MIDI clock status".into(),
             "set_midi_clock" => "Set MIDI clock".into(),
             "record_start" => "Start recording".into(),
@@ -10018,6 +10059,7 @@ impl DemoApp {
         self.push_user_undo();
         let s = t.session();
         self.open_session = None;
+        self.open_setlist = None;
         self.autosave_rebase();
         let msg = match self.apply_session(&s) {
             Ok(_) => format!("Loaded template '{}'", t.title()),
@@ -10070,6 +10112,7 @@ impl DemoApp {
         self.push_user_undo();
         let s = crate::session::Session::new("Demo patch", Graph::demo_patch());
         self.open_session = None;
+        self.open_setlist = None;
         self.autosave_rebase();
         let msg = match self.apply_session(&s) {
             Ok(_) => "Loaded demo patch".to_string(),
@@ -10086,6 +10129,7 @@ impl DemoApp {
     fn load_multi_rig_demo(&mut self) {
         self.push_user_undo();
         self.open_session = None;
+        self.open_setlist = None;
         self.autosave_rebase();
         fn mk_rig(name: &str, with_delay: bool) -> crate::control::Rig {
             let mut g = Graph::default();
@@ -11770,6 +11814,9 @@ impl DemoApp {
                 }
                 Err(e) => format!("error: {e}"),
             },
+            "save_setlist" | "load_setlist" | "list_setlists" | "set_setlist_folder" => {
+                self.setlist_file_tool(name, args, origin, now)
+            }
             "set_setlist_song" => match self.exec_setlist_song(args) {
                 Ok(val) => {
                     self.sync_setlist_window();
@@ -16725,6 +16772,11 @@ impl DemoApp {
         let mut load_session: Option<String> = None;
         let mut overwrite_session: Option<String> = None;
         let mut delete_session: Option<String> = None;
+        let mut open_save_setlist = false;
+        let mut load_setlist: Option<String> = None;
+        let mut overwrite_setlist: Option<String> = None;
+        let mut delete_setlist: Option<String> = None;
+        let mut open_setlist_folder = false;
         let mut load_rig_preset: Option<(String, Option<usize>)> = None;
         let mut delete_rig_preset: Option<String> = None;
         let mut open_save_rig_preset = false;
@@ -16741,8 +16793,10 @@ impl DemoApp {
         let active_rig = self.active_rig;
         let active_rig_name = self.rig_name(active_rig);
         let sessions_dir = self.effective_sessions_dir();
+        let setlists_dir = self.effective_setlists_dir().to_path_buf();
         let presets_dir = self.rig_presets_dir.clone();
         let open_session = self.open_session.clone();
+        let open_setlist = self.open_setlist.clone();
         let autosave_enabled = self.autosave.enabled;
         let autosave_target = self.autosave_target();
         let session_msg = self.session_msg.clone();
@@ -17170,7 +17224,7 @@ impl DemoApp {
                                     });
                             }
                             RailTab::Library => {
-                                // Sub-tab switcher: SESSIONS | RIGS | TEMPLATES
+                                // Sub-tab switcher: SESSIONS | SETLISTS | RIGS | TEMPLATES
                                 egui::Frame::new()
                                     .fill(theme::PAPER_SINK)
                                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
@@ -17180,21 +17234,24 @@ impl DemoApp {
                                         let inner_w = ui.available_width().max(120.0);
                                         let segs = [
                                             ("SESSIONS", LibraryTab::Sessions),
+                                            ("SETLISTS", LibraryTab::Setlists),
                                             ("RIGS", LibraryTab::Rigs),
                                             ("TEMPLATES", LibraryTab::Templates),
                                         ];
-                                        let font = theme::medium_font(9.5);
+                                        let font = theme::medium_font(9.0);
+                                        let gap = 2.0;
+                                        let avail = (inner_w - gap * (segs.len() as f32 - 1.0)).max(80.0);
                                         let natural: Vec<f32> = segs.iter()
-                                            .map(|(lbl, _)| ui.painter().layout_no_wrap((*lbl).into(), font.clone(), theme::INK).size().x + 8.0)
+                                            .map(|(lbl, _)| ui.painter().layout_no_wrap((*lbl).into(), font.clone(), theme::INK).size().x + 6.0)
                                             .collect();
                                         let sum: f32 = natural.iter().sum();
-                                        let extra = ((inner_w - sum).max(0.0)) / segs.len() as f32;
-                                        let widths: Vec<f32> = natural.iter().map(|w| (w + extra).floor()).collect();
+                                        let scale = avail / sum.max(1.0);
+                                        let widths: Vec<f32> = natural.iter().map(|w| (w * scale).floor()).collect();
                                         ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 2.0;
+                                            ui.spacing_mut().item_spacing.x = gap;
                                             for ((lbl, lt), w) in segs.iter().zip(widths) {
                                                 let on = self.library_tab == *lt;
-                                                let (rect, resp) = ui.allocate_exact_size(egui::vec2((w - 1.5).max(24.0), 22.0), egui::Sense::click());
+                                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w.max(20.0), 22.0), egui::Sense::click());
                                                 let hov = resp.hovered();
                                                 let fill = if on { theme::ACCENT_DEEP } else if hov { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT };
                                                 let txt = if on { theme::ON_ACCENT } else if hov { theme::CREAM } else { theme::CREAM_MID };
@@ -17205,6 +17262,7 @@ impl DemoApp {
                                                 if resp.clicked() {
                                                     self.library_tab = *lt;
                                                     self.confirm_session = None;
+                                                    self.confirm_setlist = None;
                                                 }
                                             }
                                         });
@@ -17301,6 +17359,112 @@ impl DemoApp {
                                                                     if ui.button("Load").clicked() { load_session = Some(name.clone()); ui.close(); }
                                                                     if ui.button("Overwrite with current…").clicked() { self.confirm_session = Some(SessionConfirm::Overwrite(name.clone())); ui.close(); }
                                                                     if ui.button("Delete…").clicked() { self.confirm_session = Some(SessionConfirm::Delete(name.clone())); ui.close(); }
+                                                                });
+                                                            });
+                                                        });
+                                                    });
+                                                    ui.add_space(5.0);
+                                                }
+                                            });
+                                    }
+                                    LibraryTab::Setlists => {
+                                        egui::Frame::new()
+                                            .fill(theme::PAPER_SINK)
+                                            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                                            .corner_radius(3.0)
+                                            .inner_margin(egui::Margin::same(7))
+                                            .show(ui, |ui| {
+                                                ui.spacing_mut().item_spacing.y = 4.0;
+                                                let w = ui.available_width().max(80.0);
+                                                let (sr, sresp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+                                                let hov = sresp.hovered();
+                                                ui.painter().rect_filled(sr, 2.0, if hov { theme::alpha(theme::ACCENT, 0.16) } else { theme::DARK_PANEL_HI });
+                                                ui.painter().rect_stroke(sr, 2.0, Stroke::new(1.0, if hov { theme::ACCENT } else { theme::ACCENT_DEEP }), egui::StrokeKind::Inside);
+                                                let g = Self::ellipsized(ui.painter(), "Save setlist as…", theme::medium_font(11.0), theme::CREAM, (sr.width() - 10.0).max(16.0));
+                                                ui.painter().galley(sr.center() - g.size() * 0.5, g, theme::CREAM);
+                                                if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                                if sresp.clicked() { open_save_setlist = true; }
+                                                let folder_disp = crate::plugin_dirs::display(&setlists_dir);
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    let btn_w = theme::chip_button_width(ui, "Folder");
+                                                    let path_w = (ui.available_width() - btn_w - 6.0).max(40.0);
+                                                    let fg = Self::ellipsized(ui.painter(), &folder_disp, FontId::proportional(10.0), theme::INK_2, path_w);
+                                                    let (fr, fresp) = ui.allocate_exact_size(egui::vec2(path_w, 20.0), egui::Sense::hover());
+                                                    ui.painter().galley(Pos2::new(fr.left(), fr.center().y - fg.size().y * 0.5), fg, theme::INK_2);
+                                                    fresp.on_hover_text(setlists_dir.to_string_lossy());
+                                                    if theme::chip_button(ui, "Folder", false)
+                                                        .on_hover_text("Change setlists folder (Settings → Session)")
+                                                        .clicked()
+                                                    {
+                                                        open_setlist_folder = true;
+                                                    }
+                                                });
+                                            });
+                                        ui.add_space(4.0);
+                                        Self::stage_hairline(ui);
+                                        ui.add_space(2.0);
+
+                                        let names = crate::session::list_setlists(&setlists_dir);
+                                        let scroll_h = ui.available_height().max(1.0);
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("rail_setlists_scroll")
+                                            .min_scrolled_height(scroll_h)
+                                            .max_height(scroll_h)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                if names.is_empty() {
+                                                    ui.add_space(6.0);
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new("No saved setlists in this folder yet. Click Save setlist as… above.")
+                                                                .size(11.5)
+                                                                .color(theme::INK_2),
+                                                        )
+                                                        .wrap(),
+                                                    );
+                                                    return;
+                                                }
+                                                for (i, name) in names.iter().enumerate() {
+                                                    if i > 0 { Self::stage_hairline(ui); }
+                                                    ui.add_space(5.0);
+                                                    let is_open = open_setlist.as_deref() == Some(name.as_str());
+                                                    let confirm_match = self.confirm_setlist.clone();
+                                                    ui.horizontal(|ui| {
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                                            match confirm_match.as_ref() {
+                                                                Some(setlist_files::SetlistConfirm::Delete(n)) if n == name => {
+                                                                    if theme::chip_button(ui, "×", false).clicked() { self.confirm_setlist = None; }
+                                                                    if theme::danger_button(ui, "Delete", true).clicked() { delete_setlist = Some(name.clone()); }
+                                                                }
+                                                                Some(setlist_files::SetlistConfirm::Overwrite(n)) if n == name => {
+                                                                    if theme::chip_button(ui, "×", false).clicked() { self.confirm_setlist = None; }
+                                                                    if theme::danger_button(ui, "Replace", true).clicked() { overwrite_setlist = Some(name.clone()); }
+                                                                }
+                                                                _ => {
+                                                                    if theme::chip_button(ui, if is_open { "Open" } else { "Load" }, false)
+                                                                        .on_hover_text(format!("load setlist '{name}'"))
+                                                                        .clicked()
+                                                                    {
+                                                                        load_setlist = Some(name.clone());
+                                                                    }
+                                                                }
+                                                            }
+                                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                                let lbl = ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(name)
+                                                                            .font(theme::medium_font(12.0))
+                                                                            .color(if is_open { theme::LIVE_TEAL } else { theme::INK }),
+                                                                    )
+                                                                    .truncate()
+                                                                    .sense(egui::Sense::click()),
+                                                                );
+                                                                lbl.context_menu(|ui| {
+                                                                    if ui.button("Load").clicked() { load_setlist = Some(name.clone()); ui.close(); }
+                                                                    if ui.button("Overwrite with current…").clicked() { self.confirm_setlist = Some(setlist_files::SetlistConfirm::Overwrite(name.clone())); ui.close(); }
+                                                                    if ui.button("Delete…").clicked() { self.confirm_setlist = Some(setlist_files::SetlistConfirm::Delete(name.clone())); ui.close(); }
                                                                 });
                                                             });
                                                         });
@@ -17526,6 +17690,47 @@ impl DemoApp {
         if open_save_rig_preset {
             self.save_rig_dialog = Some((active_rig, active_rig_name));
         }
+        if open_save_setlist {
+            self.open_save_setlist_dialog();
+        }
+        if open_setlist_folder {
+            self.stage_view = StageView::Settings;
+            self.settings_page = SettingsPage::Session;
+            self.open_setlist_folder_edit();
+        }
+        if let Some(name) = load_setlist {
+            self.confirm_setlist = None;
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                self.push_user_undo();
+                let msg = match self.load_setlist_from_dir(&setlists_dir, &name) {
+                    Ok(()) => format!("Loaded setlist '{name}'"),
+                    Err(e) => format!("Load setlist failed: {e}"),
+                };
+                self.session_msg = msg.clone();
+                self.notify_patch(&msg);
+            }
+        }
+        if let Some(name) = overwrite_setlist {
+            self.confirm_setlist = None;
+            self.session_msg = match self.save_setlist_to_dir(&setlists_dir, &name) {
+                Ok(_) => format!("Overwrote setlist '{name}'"),
+                Err(e) => format!("Save setlist failed: {e}"),
+            };
+        }
+        if let Some(name) = delete_setlist {
+            self.confirm_setlist = None;
+            self.session_msg = match crate::session::delete_setlist(&setlists_dir, &name) {
+                Ok(()) => {
+                    if self.open_setlist.as_deref() == Some(name.as_str()) {
+                        self.open_setlist = None;
+                    }
+                    format!("Deleted setlist '{name}'")
+                }
+                Err(e) => format!("Delete setlist failed: {e}"),
+            };
+        }
         if let Some((name, target)) = load_rig_preset {
             if self.rack_locked {
                 self.notify_rack_locked();
@@ -17671,6 +17876,14 @@ impl DemoApp {
         let mut load_session: Option<String> = None;
         let mut overwrite_session: Option<String> = None;
         let mut delete_session: Option<String> = None;
+        let mut open_save_setlist = false;
+        let mut open_setlist_folder = false;
+        let mut load_setlist: Option<String> = None;
+        let mut overwrite_setlist: Option<String> = None;
+        let mut delete_setlist: Option<String> = None;
+        let setlists_dir = self.effective_setlists_dir().to_path_buf();
+        let setlists = crate::session::list_setlists(&setlists_dir);
+        let open_setlist = self.open_setlist.clone();
         let mut load_tpl: Option<Template> = None;
         let mut install_req: Option<&'static str> = None;
         let mut load_demo = false;
@@ -17706,7 +17919,7 @@ impl DemoApp {
                     let note_col = if autosave_note.contains("failed") { theme::CLIP_BRIGHT } else { theme::AGENT_TEXT };
                     ui.add(egui::Label::new(egui::RichText::new(&autosave_note).size(11.0).color(note_col)).truncate());
 
-                    // 2-tab bar: SESSIONS (N) | TEMPLATES
+                    // 3-tab bar: SESSIONS (N) | SETLISTS (M) | TEMPLATES
                     egui::Frame::new()
                         .fill(theme::PAPER_SINK)
                         .stroke(Stroke::new(1.0, theme::HAIRLINE))
@@ -17714,27 +17927,36 @@ impl DemoApp {
                         .inner_margin(egui::Margin::same(2))
                         .show(ui, |ui| {
                             let inner_w = ui.available_width().max(120.0);
-                            let half = ((inner_w - 2.0) * 0.5).floor();
                             let tabs = [
                                 (format!("SESSIONS ({})", names.len()), LibraryTab::Sessions),
+                                (format!("SETLISTS ({})", setlists.len()), LibraryTab::Setlists),
                                 ("TEMPLATES".to_string(), LibraryTab::Templates),
                             ];
-                            let font = theme::medium_font(10.0);
+                            let font = theme::medium_font(9.5);
+                            let gap = 2.0;
+                            let avail = (inner_w - gap * (tabs.len() as f32 - 1.0)).max(90.0);
+                            let natural: Vec<f32> = tabs.iter()
+                                .map(|(lbl, _)| ui.painter().layout_no_wrap(lbl.clone().into(), font.clone(), theme::INK).size().x + 8.0)
+                                .collect();
+                            let sum: f32 = natural.iter().sum();
+                            let scale = avail / sum.max(1.0);
+                            let widths: Vec<f32> = natural.iter().map(|w| (w * scale).floor()).collect();
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                for (lbl, tab) in tabs {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                for ((lbl, tab), w) in tabs.into_iter().zip(widths) {
                                     let on = self.session_popover_tab == tab;
-                                    let (r, resp) = ui.allocate_exact_size(egui::vec2(half, 22.0), egui::Sense::click());
+                                    let (r, resp) = ui.allocate_exact_size(egui::vec2(w.max(24.0), 22.0), egui::Sense::click());
                                     let hov = resp.hovered();
                                     let fill = if on { theme::ACCENT_DEEP } else if hov { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT };
                                     let txt = if on { theme::ON_ACCENT } else if hov { theme::CREAM } else { theme::CREAM_MID };
                                     ui.painter().rect_filled(r, 2.0, fill);
-                                    let g = Self::ellipsized(ui.painter(), &lbl, font.clone(), txt, (r.width() - 6.0).max(16.0));
+                                    let g = Self::ellipsized(ui.painter(), &lbl, font.clone(), txt, (r.width() - 6.0).max(12.0));
                                     ui.painter().galley(r.center() - g.size() * 0.5, g, txt);
                                     if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
                                     if resp.clicked() {
                                         self.session_popover_tab = tab;
                                         self.confirm_session = None;
+                                        self.confirm_setlist = None;
                                     }
                                 }
                             });
@@ -17748,6 +17970,74 @@ impl DemoApp {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             match self.session_popover_tab {
+                                LibraryTab::Setlists => {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        if theme::chip_button(ui, "Save setlist…", false).clicked() {
+                                            open_save_setlist = true;
+                                        }
+                                        if theme::chip_button(ui, "Folder…", false).clicked() {
+                                            open_setlist_folder = true;
+                                        }
+                                    });
+                                    let fdisp = crate::plugin_dirs::display(&setlists_dir);
+                                    let fw = ui.available_width().max(60.0);
+                                    let fg = Self::ellipsized(ui.painter(), &fdisp, FontId::proportional(10.5), theme::INK_2, fw);
+                                    let (fr, fresp) = ui.allocate_exact_size(egui::vec2(fw, 18.0), egui::Sense::hover());
+                                    ui.painter().galley(Pos2::new(fr.left(), fr.center().y - fg.size().y * 0.5), fg, theme::INK_2);
+                                    fresp.on_hover_text(setlists_dir.to_string_lossy());
+                                    Self::stage_hairline(ui);
+                                    if setlists.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.add(egui::Label::new(egui::RichText::new("No saved setlists in this folder yet.").size(12.0).color(theme::INK_2)).wrap());
+                                    }
+                                    for (i, name) in setlists.iter().enumerate() {
+                                        if i > 0 { Self::stage_hairline(ui); }
+                                        ui.add_space(5.0);
+                                        let is_open = open_setlist.as_deref() == Some(name.as_str());
+                                        let confirm = self.confirm_setlist.clone();
+                                        ui.horizontal(|ui| {
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                match confirm.as_ref() {
+                                                    Some(setlist_files::SetlistConfirm::Delete(n)) if n == name => {
+                                                        if theme::chip_button(ui, "Cancel", false).clicked() { self.confirm_setlist = None; }
+                                                        if theme::danger_button(ui, "Confirm", true).clicked() { delete_setlist = Some(name.clone()); }
+                                                    }
+                                                    Some(setlist_files::SetlistConfirm::Overwrite(n)) if n == name => {
+                                                        if theme::chip_button(ui, "Cancel", false).clicked() { self.confirm_setlist = None; }
+                                                        if theme::danger_button(ui, "Overwrite", true).clicked() { overwrite_setlist = Some(name.clone()); }
+                                                    }
+                                                    _ => {
+                                                        if theme::danger_button(ui, "×", false).on_hover_text(format!("delete '{name}'")).clicked() {
+                                                            self.confirm_setlist = Some(setlist_files::SetlistConfirm::Delete(name.clone()));
+                                                        }
+                                                        if theme::chip_button(ui, if is_open { "Open" } else { "Load" }, false).clicked() {
+                                                            load_setlist = Some(name.clone());
+                                                        }
+                                                    }
+                                                }
+                                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                    let lbl = ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(name)
+                                                                .font(theme::medium_font(12.5))
+                                                                .color(if is_open { theme::LIVE_TEAL } else { theme::INK }),
+                                                        )
+                                                        .truncate()
+                                                        .sense(egui::Sense::click()),
+                                                    );
+                                                    lbl.context_menu(|ui| {
+                                                        if ui.button("Overwrite with current…").clicked() { self.confirm_setlist = Some(setlist_files::SetlistConfirm::Overwrite(name.clone())); ui.close(); }
+                                                        if ui.button("Delete…").clicked() { self.confirm_setlist = Some(setlist_files::SetlistConfirm::Delete(name.clone())); ui.close(); }
+                                                    });
+                                                });
+                                            });
+                                        });
+                                        ui.add_space(5.0);
+                                    }
+                                }
                                 LibraryTab::Templates => {
                                     let mut tpl_row = |ui: &mut egui::Ui, title: &str, desc: &str| -> bool {
                                         let mut clicked = false;
@@ -17901,6 +18191,52 @@ impl DemoApp {
                 Err(e) => e,
             };
         }
+        if open_save_setlist {
+            self.session_popover_open = false;
+            self.open_save_setlist_dialog();
+        }
+        if open_setlist_folder {
+            self.session_popover_open = false;
+            self.stage_view = StageView::Settings;
+            self.settings_page = SettingsPage::Session;
+            self.open_setlist_folder_edit();
+        }
+        if let Some(name) = load_setlist {
+            self.confirm_setlist = None;
+            if self.rack_locked {
+                self.notify_rack_locked();
+            } else {
+                self.push_user_undo();
+                match self.load_setlist_from_dir(&setlists_dir, &name) {
+                    Ok(()) => {
+                        let msg = format!("Loaded setlist '{name}'");
+                        self.session_msg = msg.clone();
+                        self.notify_patch(&msg);
+                        self.session_popover_open = false;
+                    }
+                    Err(e) => self.session_msg = format!("Load setlist failed: {e}"),
+                }
+            }
+        }
+        if let Some(name) = overwrite_setlist {
+            self.confirm_setlist = None;
+            self.session_msg = match self.save_setlist_to_dir(&setlists_dir, &name) {
+                Ok(_) => format!("Overwrote setlist '{name}'"),
+                Err(e) => format!("Save setlist failed: {e}"),
+            };
+        }
+        if let Some(name) = delete_setlist {
+            self.confirm_setlist = None;
+            self.session_msg = match crate::session::delete_setlist(&setlists_dir, &name) {
+                Ok(()) => {
+                    if self.open_setlist.as_deref() == Some(name.as_str()) {
+                        self.open_setlist = None;
+                    }
+                    format!("Deleted setlist '{name}'")
+                }
+                Err(e) => format!("Delete setlist failed: {e}"),
+            };
+        }
         if load_tpl.is_some() || load_demo || load_multi {
             if self.rack_locked {
                 self.notify_rack_locked();
@@ -17924,6 +18260,7 @@ impl DemoApp {
         if pressed_outside {
             self.session_popover_open = false;
             self.confirm_session = None;
+            self.confirm_setlist = None;
         }
     }
 
@@ -19622,6 +19959,7 @@ impl DemoApp {
         self.apply_session(&s).map_err(|e| format!("Apply failed: {e}"))?;
         self.session_name = name.to_string();
         self.open_session = Some(name.to_string());
+        self.open_setlist = None;
         self.autosave_rebase();
         Ok(())
     }
@@ -19871,6 +20209,8 @@ impl DemoApp {
                         }
                     });
                 });
+                ui.add_space(6.0);
+                self.setlist_file_bar(ui);
                 ui.add_space(10.0);
                 Self::stage_hairline(ui);
                 ui.add_space(12.0);
@@ -23232,6 +23572,8 @@ impl DemoApp {
             },
         );
         Self::settings_gap(ui);
+        self.settings_setlist_folder_row(ui, actions);
+        Self::settings_gap(ui);
 
         let (enabled, bars) = (self.count_in_enabled, self.count_in_bars);
         let bars_label = |b: u8| if b == 1 { "1 bar".to_string() } else { format!("{b} bars") };
@@ -23603,6 +23945,7 @@ impl DemoApp {
                     (Ok(()), false) => "Autosave disabled".into(),
                 };
             }
+            SettingsAction::SetSetlistsDir(dir) => self.apply_setlists_dir_setting(dir),
             SettingsAction::SetCountIn(enabled, bars) => self.set_count_in(enabled, bars),
             SettingsAction::SetTimeSig(sig) => self.set_time_sig(sig),
             SettingsAction::SetAudioBackend(choice) => match self.set_audio_backend(choice) {
@@ -28375,6 +28718,8 @@ impl DemoApp {
         if self.confirm_delete_rig.is_some()
             || self.save_rig_dialog.is_some()
             || self.load_rig_dialog.is_some()
+            || self.save_setlist_dialog.is_some()
+            || self.load_setlist_dialog.is_some()
             || self.rename_rig_dialog.is_some()
             || self.strip_rename.is_some()
             // The quick-add picker owns keys and clicks while it is open (#307).
@@ -28553,7 +28898,9 @@ impl DemoApp {
             let modal_open = self.confirm_delete_rig.is_some()
                 || self.rename_rig_dialog.is_some()
                 || self.save_rig_dialog.is_some()
-                || self.load_rig_dialog.is_some();
+                || self.load_rig_dialog.is_some()
+                || self.save_setlist_dialog.is_some()
+                || self.load_setlist_dialog.is_some();
             if !(self.popup_open_at_start && !self.show_help)
                 && (!modal_open || self.confirm_delete_rig_preset.is_some())
                 && i.consume_key(Modifiers::NONE, Key::Escape)
@@ -28565,6 +28912,7 @@ impl DemoApp {
                 else if self.nav_rig_menu.is_some() { self.nav_rig_menu = None; }
                 else if self.session_popover_open {
                     if self.confirm_session.is_some() { self.confirm_session = None; }
+                    else if self.confirm_setlist.is_some() { self.confirm_setlist = None; }
                     else { self.session_popover_open = false; }
                 }
                 else if self.unit_menu.is_some() { self.unit_menu = None; }
@@ -28584,7 +28932,9 @@ impl DemoApp {
                 else if self.stage_view == StageView::Setlist && self.setlist_import_open { self.setlist_import_open = false; }
                 else if self.stage_view == StageView::Setlist && self.preshow.open { self.preshow.open = false; }
                 else if self.stage_view == StageView::Setlist && self.setlist_levels_open { self.setlist_levels_open = false; }
+                else if self.stage_view == StageView::Settings && self.setlist_folder_edit.is_some() { self.setlist_folder_edit = None; }
                 else if self.confirm_session.is_some() { self.confirm_session = None; }
+                else if self.confirm_setlist.is_some() { self.confirm_setlist = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
                 else if self.assistant_open() { self.dock = DockView::None; }
                 else { self.selected = None; self.selected_unit = None; }
@@ -36095,6 +36445,8 @@ impl DemoApp {
         self.rename_rig_modal(&ctx);
         self.save_rig_modal(&ctx);
         self.load_rig_modal(&ctx);
+        self.save_setlist_modal(&ctx);
+        self.load_setlist_modal(&ctx);
         self.param_editor_window(&ctx);
         self.tuner_panel(&ctx);
         self.draw_stage_toast(&ctx);

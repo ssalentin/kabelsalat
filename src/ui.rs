@@ -362,7 +362,10 @@ fn alsa_port_subscribed(seq_clients: &str, name: &str) -> Option<bool> {
 /// kernel's Midi Through port counts with KABELSALAT_MIDI_THROUGH=1, a
 /// hardware-path self-test feed (aseqsend -p 14:0).
 pub(crate) fn is_hw_midi_port(name: &str) -> bool {
-    let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
+    let through_ok = match std::env::var("KABELSALAT_MIDI_THROUGH") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => crate::config::midi_through(),
+    };
     !(name.contains("kabelsalat") || (name.contains("Midi Through") && !through_ok) || name == "System" || name == "Announce")
 }
 
@@ -3084,6 +3087,7 @@ enum StageView {
 enum SettingsPage {
     Audio,
     Session,
+    Show,
     Display,
     Plugins,
     Models,
@@ -3091,13 +3095,20 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const APP: [SettingsPage; 4] = [SettingsPage::Audio, SettingsPage::Session, SettingsPage::Display, SettingsPage::Plugins];
+    const APP: [SettingsPage; 5] = [
+        SettingsPage::Audio,
+        SettingsPage::Session,
+        SettingsPage::Show,
+        SettingsPage::Display,
+        SettingsPage::Plugins,
+    ];
     const AGENT: [SettingsPage; 2] = [SettingsPage::Models, SettingsPage::Keys];
 
     fn label(self) -> &'static str {
         match self {
             SettingsPage::Audio => "Audio",
             SettingsPage::Session => "Session",
+            SettingsPage::Show => "Show",
             SettingsPage::Display => "Display",
             SettingsPage::Plugins => "Plugins",
             SettingsPage::Models => "Models",
@@ -3113,6 +3124,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Audio => "Where kabelsalat plays and how much latency it adds.",
             SettingsPage::Session => "How your work is kept and how playback starts.",
+            SettingsPage::Show => "How Show mode behaves and which MIDI controls run your setlist across sessions.",
             SettingsPage::Display => "How the app moves and how large it is drawn.",
             SettingsPage::Plugins => "Where kabelsalat looks for plugins. Your own folders are searched after the standard ones, are remembered, and a change rescans in the background.",
             SettingsPage::Models => "The models the assistant works with. Nothing here changes the sound.",
@@ -3132,6 +3144,19 @@ enum SettingsAction {
     SetCableOpacity(f32),
     SetCableTension(f32),
     ToggleAutosave,
+    ToggleReopenLastSession,
+    ToggleRecordSync,
+    SetUiScale(Option<f32>),
+    ToggleCpuOverlay,
+    ToggleSystemIme,
+    TogglePluginSandbox,
+    ToggleMidiThrough,
+    SetShowLeaveHold(f32),
+    ToggleShowClock24h,
+    ToggleShowNotes,
+    ToggleShowRigMeters,
+    ToggleStartInShowMode,
+    ShowControl(show_controls::ShowControlAction),
     SetCountIn(bool, u8),
     SetTimeSig(crate::transport::TimeSig),
     SetAudioBackend(crate::audio_backend::AudioBackendChoice),
@@ -3633,9 +3658,10 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "save_setlist", "load_setlist", "list_setlists", "set_setlist_folder",
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
-    "record_save_last",
+    "record_save_last", "set_record_sync",
     "list_plugin_folders", "add_plugin_folder", "remove_plugin_folder",
     "list_takes", "soundcheck_start", "soundcheck_seek", "soundcheck_loop", "soundcheck_stop", "soundcheck_status", "export_take",
+    "get_config", "set_config",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3672,6 +3698,7 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "set_plugin_favorite"
             | "panic"
             | "record_save_last"
+            | "set_record_sync"
             | "add_plugin_folder"
             | "remove_plugin_folder"
             | "soundcheck_start"
@@ -3679,6 +3706,7 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "soundcheck_loop"
             | "soundcheck_stop"
             | "export_take"
+            | "set_config"
     )
 }
 
@@ -4312,6 +4340,20 @@ struct DemoApp {
     audio_doctor: audio_doctor::AudioDoctorState,
     /// Settings → Plugins: the open folder editor and which folders exist (#414).
     plugin_folders: plugin_folders::PluginFoldersState,
+    /// Permanent Show mode settings stored in `config.json` (#437).
+    show_mode_cfg: crate::config::ShowModeConfig,
+    /// Permanent port-keyed MIDI Show controls stored in `config.json` (#437).
+    config_show_controls: crate::config::ShowControlsConfig,
+    /// Inline manual Show-control binding editor in Settings → Show (#437).
+    show_control_edit: Option<show_controls::ShowControlEdit>,
+    /// Reopen the last saved/opened session at startup (`config.json`).
+    reopen_last_session: bool,
+    /// Explicit UI scale override from `config.json` (`None` = Auto).
+    ui_scale_pref: Option<f32>,
+    /// Process-wide plugin sandboxing preference (`config.json`).
+    plugin_sandbox_pref: bool,
+    /// Process-wide ALSA Midi Through visibility preference (`config.json`).
+    midi_through_pref: bool,
     /// The song and backing track the player was started with last (#278).
     setlist_backing_song: Option<(usize, String)>,
     /// The file-load id of that track (`PlayerControl::play`), the load the
@@ -4897,7 +4939,9 @@ impl DemoApp {
             mixer_fader_rects: Vec::new(),
             dock: DockView::None,
             focus_chat_request: false,
-            system_ime: system_ime_wanted(std::env::var_os("KABELSALAT_IME").as_deref()),
+            system_ime: std::env::var_os("KABELSALAT_IME")
+                .map(|v| system_ime_wanted(Some(v.as_os_str())))
+                .unwrap_or_else(crate::config::load_system_ime),
             demo_agent_hold: false,
             reduce_motion: crate::assistant::load_reduce_motion(),
             cable_opacity: crate::assistant::load_cable_opacity(),
@@ -5001,6 +5045,13 @@ impl DemoApp {
             preshow: Default::default(),
             audio_doctor: Default::default(),
             plugin_folders: Default::default(),
+            show_mode_cfg: crate::config::load_show_mode(),
+            config_show_controls: crate::config::load_show_controls(),
+            show_control_edit: None,
+            reopen_last_session: crate::config::load_reopen_last_session(),
+            ui_scale_pref: crate::config::load_ui_scale(),
+            plugin_sandbox_pref: crate::config::plugin_sandbox(),
+            midi_through_pref: crate::config::midi_through(),
             setlist_backing_song: None,
             track_load_id: 0,
             markers_imported: None,
@@ -5196,7 +5247,7 @@ impl DemoApp {
             player: crate::engine::PlayerPub::default(),
             last_player_rev: 0,
             recorder: None,
-            record_sync: false,
+            record_sync: crate::config::load_record_sync(),
             arm_master: true,
             arm_rigs: [false; crate::control::MAX_RIGS],
             ui_arm_grace: 0.0,
@@ -6311,6 +6362,9 @@ impl DemoApp {
                 enabled: self.count_in_enabled,
                 bars: self.count_in_bars,
             });
+        }
+        if self.record_sync {
+            let _ = bus.lock().unwrap().send(Command::SetRecordSync { on: true });
         }
         self.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, voice_retire_rx, bus);
         self.out_level = Some(level);
@@ -7487,6 +7541,8 @@ impl DemoApp {
             "audio_doctor" => "Run Audio Doctor".into(),
             "get_show_controls" => "Read show controls".into(),
             "set_part_sends" => "Part send scene".into(),
+            "get_config" => "Read config".into(),
+            "set_config" => "Update config".into(),
             "set_setlist_song" => match args.get("name").and_then(|v| v.as_str()) {
                 Some(n) if !n.trim().is_empty() => format!("Setlist · {n}"),
                 _ if args.get("remove").and_then(|v| v.as_bool()) == Some(true) => "Remove setlist song".into(),
@@ -10035,12 +10091,13 @@ impl DemoApp {
     }
 
     /// Send the engine what changed of the setlist's show controls, parts
-    /// and active part (#261).
+    /// and active part (#261, #437).
     fn publish_show(&mut self) {
         self.cues.publish(&self.setlist);
+        let controls = self.effective_show_controls();
         let Some(bus) = &self.bus else { return };
         let mut b = bus.lock().unwrap_or_else(|e| e.into_inner());
-        self.show_sent.publish(&self.setlist, |cmd| b.send(cmd));
+        self.show_sent.publish_with_controls(controls, &self.setlist, |cmd| b.send(cmd));
     }
 
     /// Recall the part the engine stepped to on a show control (#261). The
@@ -11809,10 +11866,9 @@ impl DemoApp {
             }
             "set_record_sync" => {
                 let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(!self.record_sync);
-                self.record_sync = on;
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetRecordSync { on });
-                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                self.set_record_sync(on);
+                if self.bus.is_some() && self.graph_pub.is_some() {
+                    self.pending_agent_origin = Some((origin, now + 1.0));
                 }
                 self.agent_activity.record(origin, format!("Record sync = {on}"), vec![], now);
                 serde_json::json!({"record_sync": self.record_sync}).to_string()
@@ -11969,11 +12025,64 @@ impl DemoApp {
                 }
             }
             "get_show_controls" => self.show_controls_json().to_string(),
-            "set_show_control" => match self.setlist.set_show_control(args) {
-                Ok(done) => {
-                    self.agent_activity.record(origin, "Show control", Vec::new(), now);
-                    let mut v = self.show_controls_json();
-                    v["changed"] = serde_json::json!(done);
+            "set_show_control" => {
+                let res = (|| -> Result<String, String> {
+                    let (parsed, global_scope) = crate::setlist::parse_show_control_args(args)?;
+                    if !global_scope {
+                        return self.setlist.set_show_control(args);
+                    }
+                    match parsed {
+                        crate::setlist::ParsedShowControl::SongOfProgram { device, device_port, on } => {
+                            if device.is_none() && device_port.is_none() {
+                                return Err("song_of_program needs 'device' or 'device_port'".into());
+                            }
+                            self.set_permanent_program_device(device, device_port.clone(), on)?;
+                            let who = device_port
+                                .or_else(|| device.map(|d| self.hw_device_label(d)))
+                                .unwrap_or_else(|| "device".into());
+                            Ok(format!(
+                                "{who} program change {} the song (saved to config.json)",
+                                if on { "now picks" } else { "no longer picks" }
+                            ))
+                        }
+                        crate::setlist::ParsedShowControl::Clear { action } => {
+                            self.clear_permanent_show_control(action);
+                            Ok(format!("Cleared {} (saved to config.json)", action.label()))
+                        }
+                        crate::setlist::ParsedShowControl::Bind { action, msg, device, device_port, channel } => {
+                            let displaced = self.persist_show_control(
+                                action,
+                                device,
+                                device_port.clone(),
+                                channel,
+                                msg,
+                            );
+                            let from = device_port
+                                .or_else(|| device.map(|d| self.hw_device_label(d)))
+                                .unwrap_or_else(|| "any device".into());
+                            let ch = channel.map_or(String::new(), |c| format!(" ch {}", c + 1));
+                            let lbl = crate::setlist::msg_label(msg);
+                            Ok(match displaced {
+                                Some(other) => format!("{lbl} from {from}{ch} now does {} (moved from {}; saved to config.json)", action.label(), other.label()),
+                                None => format!("{lbl} from {from}{ch} now does {} (saved to config.json)", action.label()),
+                            })
+                        }
+                    }
+                })();
+                match res {
+                    Ok(done) => {
+                        self.agent_activity.record(origin, "Show control", Vec::new(), now);
+                        let mut v = self.show_controls_json();
+                        v["changed"] = serde_json::json!(done);
+                        v.to_string()
+                    }
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            "get_config" => self.config_json().to_string(),
+            "set_config" => match self.exec_set_config(args) {
+                Ok(v) => {
+                    self.agent_activity.record(origin, "Update config", Vec::new(), now);
                     v.to_string()
                 }
                 Err(e) => format!("error: {e}"),
@@ -19860,11 +19969,7 @@ impl DemoApp {
                                     .on_hover_text("start/stop recording with the master transport (Space)")
                                     .clicked()
                                 {
-                                    self.record_sync = !sync;
-                                    self.ui_transport_grace = self.ui_time + 0.6;
-                                    if let Some(bus) = &self.bus {
-                                        let _ = bus.lock().unwrap().send(Command::SetRecordSync { on: self.record_sync });
-                                    }
+                                    self.set_record_sync(!sync);
                                 }
                             }
 
@@ -19876,11 +19981,7 @@ impl DemoApp {
                             rec_resp.context_menu(|ui| {
                                 let label = if self.record_sync { "✓ Sync with transport (Space)" } else { "Sync with transport (Space)" };
                                 if ui.button(label).clicked() {
-                                    self.record_sync = !self.record_sync;
-                                    self.ui_transport_grace = self.ui_time + 0.6;
-                                    if let Some(bus) = &self.bus {
-                                        let _ = bus.lock().unwrap().send(Command::SetRecordSync { on: self.record_sync });
-                                    }
+                                    self.set_record_sync(!self.record_sync);
                                     ui.close();
                                 }
                                 let (label, can) = retro_save_item(&snap.clone().unwrap_or_default());
@@ -20076,6 +20177,9 @@ impl DemoApp {
             .map_err(|e| format!("Save failed: {e}"))?;
         self.session_name = name.to_string();
         self.open_session = Some(name.to_string());
+        if name != AUTOSAVE_NAME {
+            let _ = crate::config::save_last_session(Some(name));
+        }
         self.autosave.saved = Some(s);
         Ok(path)
     }
@@ -20089,6 +20193,9 @@ impl DemoApp {
         self.session_name = name.to_string();
         self.open_session = Some(name.to_string());
         self.open_setlist = None;
+        if name != AUTOSAVE_NAME {
+            let _ = crate::config::save_last_session(Some(name));
+        }
         self.autosave_rebase();
         Ok(())
     }
@@ -20184,10 +20291,9 @@ impl DemoApp {
         let song_sets: Vec<Option<(String, bool)>> = (0..self.setlist.songs.len())
             .map(|si| self.setlist.set_of(si).map(|s| (s.name.clone(), s.skip)))
             .collect();
-        // Hardware devices whose program change can select the song (#208).
-        let program_rows: Vec<(u32, String, bool)> = (0..self.hw_devices.len() as u32)
-            .map(|d| (d, self.hw_device_label(d), self.hw_live.get(d as usize).copied().unwrap_or(true)))
-            .collect();
+        // Permanent/effective show controls and program-change devices (#208, #437).
+        let show_rows = self.show_control_rows_data();
+        let program_rows = self.show_program_rows_data();
         // Hosted instrument accounting (#275): real instance count, per-rig sharing
         // status, and each rig's audio effects for per-part effect-chain chips.
         let show_instances = self.show_instances();
@@ -20256,6 +20362,8 @@ impl DemoApp {
         let mut enter_show = false;
         let mut toggle_check = false;
         let mut close_subpanels = false;
+        let mut show_control_actions: Vec<show_controls::ShowControlAction> = Vec::new();
+        let mut open_show_settings = false;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
@@ -20355,7 +20463,9 @@ impl DemoApp {
                                  edit_song: &mut Option<usize>,
                                  new_song_name: &mut String,
                                  import_open: &mut bool,
-                                 learn: &mut Option<crate::show::ShowAction>,
+                                 learn: Option<crate::show::ShowAction>,
+                                 show_actions: &mut Vec<show_controls::ShowControlAction>,
+                                 open_settings: &mut bool,
                                  confirm_remove_song: &mut Option<usize>,
                                  add_song: &mut bool,
                                  import_session: &mut Option<String>,
@@ -20447,10 +20557,11 @@ impl DemoApp {
                     ui.add_space(10.0);
 
                     let program_h = 40.0 + PROGRAM_ROW_H * program_rows.len().clamp(1, PROGRAM_ROWS_SHOWN) as f32;
-                    let list_h = (avail_h - 210.0 - program_h).max(80.0);
+                    let min_list_h = if avail_h < 340.0 { 44.0 } else { 80.0 };
+                    let list_h = (avail_h - 210.0 - program_h).max(min_list_h);
                     egui::ScrollArea::vertical()
                         .id_salt("setlist_songs_scroll")
-                        .min_scrolled_height(list_h.min(80.0))
+                        .min_scrolled_height(list_h.min(min_list_h))
                         .max_height(list_h)
                         .show(ui, |ui| {
                             if setlist.songs.is_empty() {
@@ -20585,7 +20696,7 @@ impl DemoApp {
                         .show(ui, |ui| {
                             Self::stage_hairline(ui);
                             ui.add_space(8.0);
-                            Self::show_controls_rows(ui, setlist, learn, &program_rows);
+                            Self::show_controls_rows(ui, &show_rows, learn, &program_rows, show_actions, open_settings);
                         });
                 };
 
@@ -21106,7 +21217,9 @@ impl DemoApp {
                                 &mut self.setlist_edit_song,
                                 &mut self.setlist_new_song_name,
                                 &mut self.setlist_import_open,
-                                &mut self.show_learn,
+                                self.show_learn,
+                                &mut show_control_actions,
+                                &mut open_show_settings,
                                 &mut self.confirm_remove_song,
                                 &mut add_song,
                                 &mut import_session,
@@ -21161,7 +21274,9 @@ impl DemoApp {
                         &mut self.setlist_edit_song,
                         &mut self.setlist_new_song_name,
                         &mut self.setlist_import_open,
-                        &mut self.show_learn,
+                        self.show_learn,
+                        &mut show_control_actions,
+                        &mut open_show_settings,
                         &mut self.confirm_remove_song,
                         &mut add_song,
                         &mut import_session,
@@ -21210,6 +21325,13 @@ impl DemoApp {
         });
 
         // Apply deferred actions outside the UI borrows.
+        for act in show_control_actions {
+            self.apply_show_control_action(act);
+        }
+        if open_show_settings {
+            self.stage_view = StageView::Settings;
+            self.settings_page = SettingsPage::Show;
+        }
         if close_subpanels {
             self.preshow.open = false;
             self.setlist_levels_open = false;
@@ -23294,7 +23416,7 @@ impl DemoApp {
 
                 let avail_w = ui.available_width().max(200.0);
                 let body_h = ui.available_height().max(80.0);
-                if avail_w >= 620.0 && body_h >= 300.0 {
+                if avail_w >= 620.0 && body_h >= 410.0 {
                     let rail_w = (avail_w * 0.24).clamp(170.0, 220.0);
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(egui::vec2(rail_w, body_h), egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -23327,7 +23449,7 @@ impl DemoApp {
 
     /// One line per page for the rail: what is set there now, and a warning
     /// colour when the page holds something the user has to fix.
-    fn settings_summaries(&self, ppp: f32) -> [(String, Color32); 6] {
+    fn settings_summaries(&self, ppp: f32) -> [(String, Color32); 7] {
         use crate::llm::Role;
         let ok = theme::CREAM_DIM;
         let warn = theme::ACCENT_BRIGHT;
@@ -23342,6 +23464,25 @@ impl DemoApp {
                 .unwrap_or(raw),
         };
         let on_off = |on: bool| if on { "on" } else { "off" };
+        let show_controls_bound = crate::show::ShowAction::LEARNED
+            .iter()
+            .filter(|&&a| self.effective_show_control(a).is_some() || self.config_show_controls.binding_of(a).is_some())
+            .count()
+            + self.show_program_rows_data().iter().filter(|r| r.4).count();
+        let hold_s = self.show_mode_cfg.leave_hold_secs;
+        let hold_txt = if (hold_s - hold_s.round()).abs() < 0.05 {
+            format!("{hold_s:.1} s")
+        } else {
+            format!("{hold_s:.2} s")
+        };
+        let show_line = if show_controls_bound == 0 {
+            format!("hold {hold_txt} · no controls")
+        } else {
+            format!(
+                "{show_controls_bound} control{} · hold {hold_txt}",
+                if show_controls_bound == 1 { "" } else { "s" }
+            )
+        };
         let act = crate::assistant::short_model(&self.assistant.model_for(Role::Act)).to_string();
         let has_key = self.assistant.key_set;
         // A switched-off assistant needs nothing fixed: no warning colour.
@@ -23361,6 +23502,7 @@ impl DemoApp {
         [
             (format!("{shown_buf} frames · {out}"), ok),
             (format!("autosave {} · count-in {}", on_off(self.autosave.enabled), on_off(self.count_in_enabled)), ok),
+            (show_line, ok),
             (format!("{:.2}× · motion {}", ppp, if self.reduce_motion { "reduced" } else { "full" }), ok),
             (Self::plugin_folders_summary(), ok),
             models,
@@ -23380,7 +23522,7 @@ impl DemoApp {
 
     /// The vertical page list: App pages, then Agent pages under their own
     /// heading, each with a line of what is set there.
-    fn settings_rail(&mut self, ui: &mut egui::Ui, w: f32, summaries: &[(String, Color32); 6]) {
+    fn settings_rail(&mut self, ui: &mut egui::Ui, w: f32, summaries: &[(String, Color32); 7]) {
         for (gi, pages) in [&SettingsPage::APP[..], &SettingsPage::AGENT[..]].into_iter().enumerate() {
             if gi > 0 {
                 ui.add_space(12.0);
@@ -23512,6 +23654,7 @@ impl DemoApp {
                 match page {
                     SettingsPage::Audio => self.settings_audio_page(ui, actions),
                     SettingsPage::Session => self.settings_session_page(ui, actions),
+                    SettingsPage::Show => self.settings_show_page(ui, actions),
                     SettingsPage::Display => self.settings_display_page(ui, actions),
                     SettingsPage::Plugins => self.settings_plugins_page(ui, actions),
                     SettingsPage::Models => self.settings_models_page(ui, actions),
@@ -23708,6 +23851,32 @@ impl DemoApp {
         self.settings_setlist_folder_row(ui, actions);
         Self::settings_gap(ui);
 
+        let reopen_on = self.reopen_last_session;
+        Self::settings_row(
+            ui,
+            "Reopen last session",
+            "Loads the last saved or opened session automatically when kabelsalat starts (unless recovering from a crash).",
+            |ui| {
+                if theme::chip_button(ui, if reopen_on { "On" } else { "Off" }, reopen_on).clicked() {
+                    actions.push(SettingsAction::ToggleReopenLastSession);
+                }
+            },
+        );
+        Self::settings_gap(ui);
+
+        let sync_on = self.record_sync;
+        Self::settings_row(
+            ui,
+            "Sync recording with transport",
+            "Starts and stops recording automatically with master transport play/stop (Space). Remembered across restarts.",
+            |ui| {
+                if theme::chip_button(ui, if sync_on { "On" } else { "Off" }, sync_on).clicked() {
+                    actions.push(SettingsAction::ToggleRecordSync);
+                }
+            },
+        );
+        Self::settings_gap(ui);
+
         let (enabled, bars) = (self.count_in_enabled, self.count_in_bars);
         let bars_label = |b: u8| if b == 1 { "1 bar".to_string() } else { format!("{b} bars") };
         Self::settings_row(ui, "Count-in", "Plays metronome clicks before master playback starts.", |ui| {
@@ -23774,8 +23943,34 @@ impl DemoApp {
         });
         Self::settings_gap(ui);
         let scale = ui.ctx().pixels_per_point();
-        Self::settings_row(ui, "UI scale", "Follows the display the window is on; override with KABELSALAT_UI_SCALE.", |ui| {
-            ui.label(egui::RichText::new(format!("{scale:.2}×")).font(theme::medium_font(13.5)).color(theme::INK));
+        let pref = self.ui_scale_pref;
+        let scale_env = std::env::var_os("KABELSALAT_UI_SCALE").is_some();
+        let scale_label = match pref {
+            Some(s) => format!("{s:.2}×"),
+            None => format!("Auto ({scale:.2}×)"),
+        };
+        let scale_desc = if scale_env {
+            "Display magnification in pixels per point (overridden by KABELSALAT_UI_SCALE)."
+        } else {
+            "Display magnification in pixels per point. Auto follows the display scale."
+        };
+        Self::settings_row(ui, "UI scale", scale_desc, |ui| {
+            let dd_w = (ui.available_width() - 8.0).clamp(120.0, 180.0);
+            theme::Dropdown::new("dd_settings_ui_scale", &scale_label)
+                .width(dd_w)
+                .popup_min_width(140.0)
+                .text_size(12.0)
+                .show_ui(ui, |menu| {
+                    if menu.item(pref.is_none(), "Auto") {
+                        actions.push(SettingsAction::SetUiScale(None));
+                    }
+                    for &choice in crate::config::UI_SCALE_CHOICES {
+                        let sel = pref.is_some_and(|p| (p - choice).abs() < 0.01);
+                        if menu.item(sel, &format!("{choice:.2}×")) {
+                            actions.push(SettingsAction::SetUiScale(Some(choice)));
+                        }
+                    }
+                });
         });
         Self::settings_gap(ui);
         let mut opacity = self.cable_opacity;
@@ -23830,6 +24025,31 @@ impl DemoApp {
                 }
             },
         );
+        Self::settings_gap(ui);
+        let cpu_on = self.show_cpu_overlay;
+        Self::settings_row(
+            ui,
+            "Rack CPU overlay",
+            "Shows live per-unit CPU load badges on the rack (toggle anytime with F3).",
+            |ui| {
+                if theme::chip_button(ui, if cpu_on { "On" } else { "Off" }, cpu_on).clicked() {
+                    actions.push(SettingsAction::ToggleCpuOverlay);
+                }
+            },
+        );
+        Self::settings_gap(ui);
+        let ime_on = self.system_ime;
+        let ime_env = std::env::var_os("KABELSALAT_IME").is_some();
+        let ime_desc = if ime_env {
+            "Routes text input through the desktop IME (overridden by KABELSALAT_IME)."
+        } else {
+            "Routes text input through the desktop IME (useful for Chinese, Japanese, or Korean)."
+        };
+        Self::settings_row(ui, "System input method (IME)", ime_desc, |ui| {
+            if theme::chip_button(ui, if ime_on { "On" } else { "Off" }, ime_on).clicked() {
+                actions.push(SettingsAction::ToggleSystemIme);
+            }
+        });
     }
 
     fn settings_models_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
@@ -24079,6 +24299,118 @@ impl DemoApp {
                 };
             }
             SettingsAction::SetSetlistsDir(dir) => self.apply_setlists_dir_setting(dir),
+            SettingsAction::ToggleReopenLastSession => {
+                self.reopen_last_session = !self.reopen_last_session;
+                let saved = crate::config::save_reopen_last_session(self.reopen_last_session);
+                self.settings_msg = match (saved, self.reopen_last_session) {
+                    (Err(e), _) => format!("Saving startup session preference failed: {e}"),
+                    (Ok(()), true) => "Reopening last session on launch enabled".into(),
+                    (Ok(()), false) => "Reopening last session on launch disabled".into(),
+                };
+            }
+            SettingsAction::ToggleRecordSync => {
+                let next = !self.record_sync;
+                self.set_record_sync(next);
+                self.settings_msg = if next {
+                    "Recording synced with transport".into()
+                } else {
+                    "Recording transport sync disabled".into()
+                };
+            }
+            SettingsAction::SetUiScale(scale) => {
+                let norm = crate::config::normalize_ui_scale(scale);
+                self.ui_scale_pref = norm;
+                let saved = crate::config::save_ui_scale(norm);
+                self.settings_msg = match (saved, norm) {
+                    (Err(e), _) => format!("Saving UI scale failed: {e}"),
+                    (Ok(()), None) => "UI scale set to Auto".into(),
+                    (Ok(()), Some(s)) => format!("UI scale set to {s:.2}×"),
+                };
+            }
+            SettingsAction::ToggleCpuOverlay => {
+                let next = !self.show_cpu_overlay;
+                self.set_cpu_overlay(next);
+                self.settings_msg = if next {
+                    "Rack CPU overlay enabled".into()
+                } else {
+                    "Rack CPU overlay disabled".into()
+                };
+            }
+            SettingsAction::ToggleSystemIme => {
+                self.system_ime = !self.system_ime;
+                let saved = crate::config::save_system_ime(self.system_ime);
+                self.settings_msg = match (saved, self.system_ime) {
+                    (Err(e), _) => format!("Saving IME setting failed: {e}"),
+                    (Ok(()), true) => "System input method (IME) enabled".into(),
+                    (Ok(()), false) => "System input method (IME) disabled".into(),
+                };
+            }
+            SettingsAction::TogglePluginSandbox => {
+                let next = !self.plugin_sandbox_pref;
+                self.plugin_sandbox_pref = next;
+                let saved = crate::config::save_plugin_sandbox(next);
+                self.settings_msg = match (saved, next) {
+                    (Err(e), _) => format!("Saving plugin sandboxing failed: {e}"),
+                    (Ok(()), true) => "Plugin sandboxing enabled for newly loaded plugins".into(),
+                    (Ok(()), false) => "Plugin sandboxing disabled for newly loaded plugins".into(),
+                };
+            }
+            SettingsAction::ToggleMidiThrough => {
+                let next = !self.midi_through_pref;
+                self.midi_through_pref = next;
+                let saved = crate::config::save_midi_through(next);
+                self.settings_msg = match (saved, next) {
+                    (Err(e), _) => format!("Saving Midi Through setting failed: {e}"),
+                    (Ok(()), true) => "ALSA Midi Through port enabled".into(),
+                    (Ok(()), false) => "ALSA Midi Through port hidden".into(),
+                };
+            }
+            SettingsAction::SetShowLeaveHold(secs) => {
+                self.show_mode_cfg.leave_hold_secs = crate::config::clamp_leave_hold_secs(secs);
+                let hold = self.show_mode_cfg.leave_hold_secs;
+                let hold_txt = if (hold - hold.round()).abs() < 0.05 {
+                    format!("{hold:.1} s")
+                } else {
+                    format!("{hold:.2} s")
+                };
+                self.settings_msg = match crate::config::save_show_mode(&self.show_mode_cfg) {
+                    Err(e) => format!("Saving Show mode setting failed: {e}"),
+                    Ok(()) => format!("Show mode exit hold set to {hold_txt}"),
+                };
+            }
+            SettingsAction::ToggleShowClock24h => {
+                self.show_mode_cfg.clock_24h = !self.show_mode_cfg.clock_24h;
+                let is_24 = self.show_mode_cfg.clock_24h;
+                self.settings_msg = match crate::config::save_show_mode(&self.show_mode_cfg) {
+                    Err(e) => format!("Saving Show mode clock format failed: {e}"),
+                    Ok(()) => format!("Show mode clock set to {}", if is_24 { "24-hour" } else { "12-hour" }),
+                };
+            }
+            SettingsAction::ToggleShowNotes => {
+                self.show_mode_cfg.show_notes = !self.show_mode_cfg.show_notes;
+                let on = self.show_mode_cfg.show_notes;
+                self.settings_msg = match crate::config::save_show_mode(&self.show_mode_cfg) {
+                    Err(e) => format!("Saving Show mode notes setting failed: {e}"),
+                    Ok(()) => format!("Show mode song notes {}", if on { "shown" } else { "hidden" }),
+                };
+            }
+            SettingsAction::ToggleShowRigMeters => {
+                self.show_mode_cfg.show_rig_meters = !self.show_mode_cfg.show_rig_meters;
+                let on = self.show_mode_cfg.show_rig_meters;
+                self.settings_msg = match crate::config::save_show_mode(&self.show_mode_cfg) {
+                    Err(e) => format!("Saving Show mode rig meters failed: {e}"),
+                    Ok(()) => format!("Show mode rig meters {}", if on { "shown" } else { "hidden" }),
+                };
+            }
+            SettingsAction::ToggleStartInShowMode => {
+                self.show_mode_cfg.start_in_show_mode = !self.show_mode_cfg.start_in_show_mode;
+                let on = self.show_mode_cfg.start_in_show_mode;
+                self.settings_msg = match crate::config::save_show_mode(&self.show_mode_cfg) {
+                    Err(e) => format!("Saving startup Show mode failed: {e}"),
+                    Ok(()) => format!("Start in Show mode {}", if on { "enabled" } else { "disabled" }),
+                };
+            }
+            SettingsAction::ShowControl(action) => self.apply_show_control_action(action),
             SettingsAction::SetCountIn(enabled, bars) => self.set_count_in(enabled, bars),
             SettingsAction::SetTimeSig(sig) => self.set_time_sig(sig),
             SettingsAction::SetAudioBackend(choice) => match self.set_audio_backend(choice) {
@@ -32652,6 +32984,277 @@ impl DemoApp {
         }
     }
 
+    pub(super) fn set_record_sync(&mut self, on: bool) {
+        self.record_sync = on;
+        self.ui_transport_grace = self.ui_time + 0.6;
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetRecordSync { on });
+        }
+        let _ = crate::config::save_record_sync(on);
+    }
+
+    pub(super) fn apply_startup_preferences(&mut self) {
+        let last = crate::config::load_last_session();
+        self.apply_startup_preferences_from(&Self::sessions_dir(), last.as_deref());
+    }
+
+    pub(super) fn apply_startup_preferences_from(&mut self, sessions_dir: &std::path::Path, last_session: Option<&str>) {
+        if self.reopen_last_session {
+            if let Some(name) = last_session.map(str::trim).filter(|n| !n.is_empty() && *n != AUTOSAVE_NAME) {
+                let _ = self.open_saved_session(sessions_dir, name);
+            }
+        }
+        if self.show_mode_cfg.start_in_show_mode {
+            self.set_show_mode(true);
+        }
+    }
+
+    fn config_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "config_path": crate::plugin_dirs::display(&crate::assistant::config_path()),
+            "show_mode": self.show_mode_cfg.to_json(),
+            "show_controls": self.show_controls_json(),
+            "session": {
+                "autosave": self.autosave.enabled,
+                "reopen_last_session": self.reopen_last_session,
+                "last_session": self.open_session.clone().or_else(crate::config::load_last_session),
+                "count_in_enabled": self.count_in_enabled,
+                "count_in_bars": self.count_in_bars,
+                "record_sync": self.record_sync,
+                "retro_minutes": self.retro_minutes,
+            },
+            "display": {
+                "reduce_motion": self.reduce_motion,
+                "ui_scale": self.ui_scale_pref,
+                "cable_opacity": self.cable_opacity,
+                "cable_tension": self.cable_tension,
+                "cpu_overlay": self.show_cpu_overlay,
+                "system_ime": self.system_ime,
+            },
+            "plugins": {
+                "sandbox": self.plugin_sandbox_pref,
+            },
+            "midi": {
+                "midi_through": self.midi_through_pref,
+            },
+            "audio": {
+                "backend": self.audio_backend.as_str(),
+                "output": self.wanted_output.lock().ok().and_then(|w| w.clone()),
+                "buffer_frames": self.buffer_frames,
+            },
+        })
+    }
+
+    fn exec_set_config(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let obj = args.as_object().ok_or("set_config expects a JSON object")?;
+        let mut leave_hold: Option<f32> = None;
+        let mut clock_24h: Option<bool> = None;
+        let mut show_notes: Option<bool> = None;
+        let mut show_rig_meters: Option<bool> = None;
+        let mut start_in_show: Option<bool> = None;
+        let mut changed: Vec<&'static str> = Vec::new();
+
+        let parse_hold = |v: &serde_json::Value| -> Result<f32, String> {
+            let n = v.as_f64().filter(|n| n.is_finite()).ok_or("show_leave_hold_secs must be a number (0.25..=5.0)")?;
+            let secs = n as f32;
+            if !(crate::config::MIN_LEAVE_HOLD_SECS..=crate::config::MAX_LEAVE_HOLD_SECS).contains(&secs) {
+                return Err(format!(
+                    "show_leave_hold_secs must be between {} and {} seconds",
+                    crate::config::MIN_LEAVE_HOLD_SECS,
+                    crate::config::MAX_LEAVE_HOLD_SECS
+                ));
+            }
+            Ok(crate::config::clamp_leave_hold_secs(secs))
+        };
+        let parse_bool = |name: &str, v: &serde_json::Value| -> Result<bool, String> {
+            v.as_bool().ok_or_else(|| format!("{name} must be a boolean"))
+        };
+
+        if let Some(sm) = obj.get("show_mode") {
+            let sm_obj = sm.as_object().ok_or("show_mode must be an object")?;
+            if let Some(v) = sm_obj.get("leave_hold_secs") {
+                leave_hold = Some(parse_hold(v)?);
+            }
+            if let Some(v) = sm_obj.get("clock_24h") {
+                clock_24h = Some(parse_bool("show_mode.clock_24h", v)?);
+            }
+            if let Some(v) = sm_obj.get("show_notes") {
+                show_notes = Some(parse_bool("show_mode.show_notes", v)?);
+            }
+            if let Some(v) = sm_obj.get("show_rig_meters") {
+                show_rig_meters = Some(parse_bool("show_mode.show_rig_meters", v)?);
+            }
+            if let Some(v) = sm_obj.get("start_in_show_mode") {
+                start_in_show = Some(parse_bool("show_mode.start_in_show_mode", v)?);
+            }
+        }
+        if let Some(v) = obj.get("show_leave_hold_secs") {
+            leave_hold = Some(parse_hold(v)?);
+        }
+        if let Some(v) = obj.get("show_clock_24h") {
+            clock_24h = Some(parse_bool("show_clock_24h", v)?);
+        }
+        if let Some(v) = obj.get("show_notes") {
+            show_notes = Some(parse_bool("show_notes", v)?);
+        }
+        if let Some(v) = obj.get("show_rig_meters") {
+            show_rig_meters = Some(parse_bool("show_rig_meters", v)?);
+        }
+        if let Some(v) = obj.get("start_in_show_mode") {
+            start_in_show = Some(parse_bool("start_in_show_mode", v)?);
+        }
+
+        let autosave = obj.get("autosave").map(|v| parse_bool("autosave", v)).transpose()?;
+        let reopen_last = obj.get("reopen_last_session").map(|v| parse_bool("reopen_last_session", v)).transpose()?;
+        let record_sync = obj.get("record_sync").map(|v| parse_bool("record_sync", v)).transpose()?;
+        let retro_minutes = match obj.get("retro_minutes") {
+            None => None,
+            Some(v) => {
+                let m = v.as_u64().ok_or("retro_minutes must be one of 0, 1, 2, 5, 10")? as u32;
+                if !crate::retro::MINUTES_CHOICES.contains(&m) {
+                    return Err("retro_minutes must be one of 0, 1, 2, 5, 10".into());
+                }
+                Some(m)
+            }
+        };
+        let reduce_motion = obj.get("reduce_motion").map(|v| parse_bool("reduce_motion", v)).transpose()?;
+        let ui_scale: Option<Option<f32>> = match obj.get("ui_scale") {
+            None => None,
+            Some(serde_json::Value::Null) => Some(None),
+            Some(v) => {
+                let s = v.as_f64().filter(|n| n.is_finite()).ok_or("ui_scale must be a number in 1.0..=3.0, 0, or null")? as f32;
+                if s == 0.0 {
+                    Some(None)
+                } else if crate::config::valid_ui_scale(s) {
+                    Some(crate::config::normalize_ui_scale(Some(s)))
+                } else {
+                    return Err("ui_scale must be between 1.0 and 3.0 (or 0 / null for Auto)".into());
+                }
+            }
+        };
+        let cable_opacity = match obj.get("cable_opacity") {
+            None => None,
+            Some(v) => {
+                let x = v.as_f64().filter(|n| n.is_finite()).ok_or("cable_opacity must be between 0.3 and 1.0")? as f32;
+                if !(crate::assistant::MIN_CABLE_OPACITY..=crate::assistant::MAX_CABLE_OPACITY).contains(&x) {
+                    return Err("cable_opacity must be between 0.3 and 1.0".into());
+                }
+                Some(crate::assistant::clamp_cable_opacity(x))
+            }
+        };
+        let cable_tension = match obj.get("cable_tension") {
+            None => None,
+            Some(v) => {
+                let x = v.as_f64().filter(|n| n.is_finite()).ok_or("cable_tension must be between 0.0 and 1.0")? as f32;
+                if !(crate::assistant::MIN_CABLE_TENSION..=crate::assistant::MAX_CABLE_TENSION).contains(&x) {
+                    return Err("cable_tension must be between 0.0 and 1.0".into());
+                }
+                Some(crate::assistant::clamp_cable_tension(x))
+            }
+        };
+        let cpu_overlay = obj.get("cpu_overlay").map(|v| parse_bool("cpu_overlay", v)).transpose()?;
+        let system_ime = obj.get("system_ime").map(|v| parse_bool("system_ime", v)).transpose()?;
+        let plugin_sandbox = obj.get("plugin_sandbox").map(|v| parse_bool("plugin_sandbox", v)).transpose()?;
+        let midi_through = obj.get("midi_through").map(|v| parse_bool("midi_through", v)).transpose()?;
+
+        let mut show_mode_dirty = false;
+        if let Some(secs) = leave_hold {
+            self.show_mode_cfg.leave_hold_secs = secs;
+            show_mode_dirty = true;
+            changed.push("show_leave_hold_secs");
+        }
+        if let Some(b) = clock_24h {
+            self.show_mode_cfg.clock_24h = b;
+            show_mode_dirty = true;
+            changed.push("show_clock_24h");
+        }
+        if let Some(b) = show_notes {
+            self.show_mode_cfg.show_notes = b;
+            show_mode_dirty = true;
+            changed.push("show_notes");
+        }
+        if let Some(b) = show_rig_meters {
+            self.show_mode_cfg.show_rig_meters = b;
+            show_mode_dirty = true;
+            changed.push("show_rig_meters");
+        }
+        if let Some(b) = start_in_show {
+            self.show_mode_cfg.start_in_show_mode = b;
+            show_mode_dirty = true;
+            changed.push("start_in_show_mode");
+        }
+        if show_mode_dirty {
+            let _ = crate::config::save_show_mode(&self.show_mode_cfg);
+        }
+        if let Some(on) = autosave {
+            self.autosave.enabled = on;
+            self.autosave_rebase();
+            let _ = crate::assistant::save_session_autosave(on);
+            changed.push("autosave");
+        }
+        if let Some(on) = reopen_last {
+            self.reopen_last_session = on;
+            let _ = crate::config::save_reopen_last_session(on);
+            changed.push("reopen_last_session");
+        }
+        if let Some(on) = record_sync {
+            self.set_record_sync(on);
+            changed.push("record_sync");
+        }
+        if let Some(mins) = retro_minutes {
+            self.retro_minutes = mins;
+            if let Some(rec) = &self.recorder {
+                rec.set_retro_seconds(mins * 60);
+            }
+            let _ = crate::record::save_retro_minutes(mins);
+            changed.push("retro_minutes");
+        }
+        if let Some(on) = reduce_motion {
+            self.reduce_motion = on;
+            let _ = crate::assistant::save_reduce_motion(on);
+            changed.push("reduce_motion");
+        }
+        if let Some(scale) = ui_scale {
+            self.ui_scale_pref = scale;
+            let _ = crate::config::save_ui_scale(scale);
+            changed.push("ui_scale");
+        }
+        if let Some(op) = cable_opacity {
+            self.set_cable_opacity(op, true);
+            changed.push("cable_opacity");
+        }
+        if let Some(ten) = cable_tension {
+            self.set_cable_tension(ten, true);
+            changed.push("cable_tension");
+        }
+        if let Some(on) = cpu_overlay {
+            self.set_cpu_overlay(on);
+            changed.push("cpu_overlay");
+        }
+        if let Some(on) = system_ime {
+            self.system_ime = on;
+            let _ = crate::config::save_system_ime(on);
+            changed.push("system_ime");
+        }
+        if let Some(on) = plugin_sandbox {
+            self.plugin_sandbox_pref = on;
+            let _ = crate::config::save_plugin_sandbox(on);
+            changed.push("plugin_sandbox");
+        }
+        if let Some(on) = midi_through {
+            self.midi_through_pref = on;
+            let _ = crate::config::save_midi_through(on);
+            changed.push("midi_through");
+        }
+
+        if changed.is_empty() {
+            return Err("give at least one config option to update".into());
+        }
+        let mut out = self.config_json();
+        out["changed"] = serde_json::json!(changed);
+        Ok(out)
+    }
+
     /// Rack-local obstacle rects on `unit` for `side` so the per-unit CPU
     /// overlay badge never collides with titles, subtitles, LEDs, chips,
     /// knobs, jacks, or agent badges.
@@ -36402,7 +37005,7 @@ impl DemoApp {
         // eframe applies the window's scale after the app creator runs, so an
         // override lives here, on the frame path.
         let native = ctx.input(|i| i.viewport().native_pixels_per_point);
-        if let Some(target) = ui_scale_override(native) {
+        if let Some(target) = ui_scale_override(native, self.ui_scale_pref) {
             if (ctx.pixels_per_point() - target).abs() > 0.01 {
                 ctx.set_pixels_per_point(target);
                 eprintln!("ui scale: set to {target:.2} on frame path");
@@ -38086,17 +38689,18 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
 /// margin and a 1px stroke on each side.
 const RECESSED_INPUT_CHROME: f32 = 18.0;
 
-/// UI scale (egui pixels_per_point) when the compositor's is not used:
-/// KABELSALAT_UI_SCALE, or 1.6 (the design target, 1600x1000 points on a
-/// 2560x1600 panel) without a window (tests, headless renders). A window
-/// keeps the scale the compositor gives it (fractional on Wayland).
-fn ui_scale_override(native: Option<f32>) -> Option<f32> {
-    let valid = |s: f32| (1.0..=3.0).contains(&s);
+/// UI scale (egui pixels_per_point) when overriding the compositor's scale:
+/// KABELSALAT_UI_SCALE, then `configured` (from `config.json`), then 1.6
+/// (the design target) without a window (tests, headless renders).
+fn ui_scale_override(native: Option<f32>, configured: Option<f32>) -> Option<f32> {
+    let valid = crate::config::valid_ui_scale;
     std::env::var("KABELSALAT_UI_SCALE")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|s| valid(*s))
+        .or_else(|| configured.filter(|s| valid(*s)))
         .or((cfg!(test) || native.is_none()).then_some(1.6))
+        .or(native)
 }
 
 impl DemoApp {
@@ -38380,7 +38984,11 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                 }
             };
             let mut app = app;
-            app.start_recovery();
+            let recovered = app.start_recovery();
+            let demo_args = std::env::args().any(|a| a == "--demo-agent" || a == "--demo-agent-anim");
+            if !recovered && !demo_args {
+                app.apply_startup_preferences();
+            }
             Ok(Box::new(app))
         }),
     )
@@ -48390,7 +48998,7 @@ mod settings_and_dropdown_tests {
                         }
                     }
                     SettingsPage::Display => {
-                        assert!(texts.iter().any(|(t, _)| t == "1.60×"), "{size:?}: read-only UI scale shown: {texts:?}");
+                        assert!(texts.iter().any(|(t, _)| t == "Auto (1.60×)" || t == "1.60×"), "{size:?}: UI scale shown: {texts:?}");
                     }
                     _ => {}
                 }
@@ -48474,19 +49082,36 @@ mod settings_and_dropdown_tests {
             assert_eq!((fours.len(), slash.len()), (2, 1), "{size:?}: beats / note value: {texts:?}");
             assert!(fours[0].right() < slash[0].left() && slash[0].right() < fours[1].left(), "{size:?}: reads 4 / 4");
 
-            // Beats per bar: the left dropdown.
-            let (menu, _, _) = open_dropdown(&mut app, &ctx, size, fours[0].center());
-            let three = menu.iter().find(|(t, r)| t == "3" && r.top() > fours[0].bottom()).expect("3 in the beats menu").1.center();
-            assert!(menu.iter().any(|(t, _)| t == "5") && menu.iter().all(|(t, _)| t != "13" && t != "0"), "{size:?}: beats from 1: {menu:?}");
+            // Beats per bar: the left dropdown. Near the bottom of Settings → Session,
+            // egui::Popup flips the menu above the trigger so every option stays on screen.
+            let (menu, fg, _) = open_dropdown(&mut app, &ctx, size, fours[0].center());
+            let in_fg = |r: Rect| {
+                fg.iter().any(|(fr, _)| fr.expand(2.0).contains_rect(r))
+                    && (r.center().y - row_y).abs() > 16.0
+            };
+            let three = menu.iter().find(|(t, r)| t == "3" && in_fg(*r)).expect("3 in the beats menu").1.center();
+            assert!(
+                menu.iter().any(|(t, r)| t == "5" && in_fg(*r))
+                    && menu.iter().all(|(t, r)| !in_fg(*r) || (t != "13" && t != "0")),
+                "{size:?}: beats from 1: {menu:?}"
+            );
             click_at(&mut app, &ctx, size, three);
             assert_eq!(app.time_sig, TimeSig { num: 3, den: 4 }, "{size:?}");
 
             // Note value: the right dropdown.
             let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
             let den_dd = in_row(&texts, "4")[0].center();
-            let (menu, _, _) = open_dropdown(&mut app, &ctx, size, den_dd);
-            let eight = menu.iter().find(|(t, r)| t == "8" && r.top() > row_y).expect("8 in the note-value menu").1.center();
-            assert!(menu.iter().any(|(t, _)| t == "16") && menu.iter().all(|(t, _)| t != "32"), "{size:?}: 2, 4, 8, 16");
+            let (menu, fg, _) = open_dropdown(&mut app, &ctx, size, den_dd);
+            let in_fg = |r: Rect| {
+                fg.iter().any(|(fr, _)| fr.expand(2.0).contains_rect(r))
+                    && (r.center().y - row_y).abs() > 16.0
+            };
+            let eight = menu.iter().find(|(t, r)| t == "8" && in_fg(*r)).expect("8 in the note-value menu").1.center();
+            assert!(
+                menu.iter().any(|(t, r)| t == "16" && in_fg(*r))
+                    && menu.iter().all(|(t, r)| !in_fg(*r) || t != "32"),
+                "{size:?}: 2, 4, 8, 16"
+            );
             click_at(&mut app, &ctx, size, eight);
             assert_eq!(app.time_sig, TimeSig { num: 3, den: 8 }, "{size:?}");
             let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
@@ -48527,7 +49152,7 @@ mod settings_and_dropdown_tests {
     /// rail (1280x900) and under the tab row of a small sheet (781x468).
     #[test]
     fn agent_settings_have_their_own_pages_apart_from_the_app_settings() {
-        let app_only = ["Audio output", "Buffer size", "Autosave sessions", "Count-in", "Reduce motion", "UI scale"];
+        let app_only = ["Audio output", "Buffer size", "Autosave sessions", "Count-in", "Exit hold time", "Clock format", "Reduce motion", "UI scale"];
         let agent_only = ["Decisions (Jev)", "Chat model", "Listening model", "OpenRouter", "ASSISTANT ONLY"];
         for (size, rail) in [(Vec2::new(1280.0, 900.0), true), (Vec2::new(781.0, 468.0), false)] {
             let mut app = DemoApp::new_with_sink(None);
@@ -48556,10 +49181,10 @@ mod settings_and_dropdown_tests {
                 assert_eq!(teal, page.is_agent(), "{size:?}: teal selection on the {:?} page", page.label());
                 // Every Agent entry comes after every App entry, with a gap.
                 let entry = |label: &str| {
-                    texts.iter().filter(|(t, _)| t == label).map(|(_, r)| *r)
+                    texts.iter().filter(|(t, r)| t == label && inner.contains_rect(*r)).map(|(_, r)| *r)
                         .min_by(|a, b| a.left().total_cmp(&b.left())).expect("page entry")
                 };
-                let last_app = entry(SettingsPage::Display.label());
+                let last_app = entry(SettingsPage::APP.last().unwrap().label());
                 let first_agent = entry(SettingsPage::Models.label());
                 if rail {
                     assert!(first_agent.top() > last_app.bottom() + 40.0, "{size:?}: Agent group below the App group");
@@ -48980,6 +49605,78 @@ mod settings_and_dropdown_tests {
             let mut app = make();
             super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(name));
         }
+    }
+
+    #[test]
+    fn settings_persistent_preferences_and_ui_scale_dropdown_and_startup_prefs() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+
+        // Session page: Reopen last session & Sync recording with transport.
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, SettingsPage::Session.label());
+        assert_settings_text_layout(&app, &texts, size);
+        let chip_right_of = |texts: &[(String, Rect)], row_title: &str| {
+            let row_y = texts.iter().find(|(t, _)| t == row_title).expect(row_title).1.center().y;
+            texts
+                .iter()
+                .filter(|(t, r)| (t == "On" || t == "Off") && (r.center().y - row_y).abs() < 18.0)
+                .map(|(_, r)| r.center())
+                .next()
+                .expect("On/Off chip on row")
+        };
+        click_at(&mut app, &ctx, size, chip_right_of(&texts, "Reopen last session"));
+        assert!(app.reopen_last_session);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        click_at(&mut app, &ctx, size, chip_right_of(&texts, "Sync recording with transport"));
+        assert!(app.record_sync);
+
+        // Display page: UI scale dropdown, Rack CPU overlay, System IME.
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, SettingsPage::Display.label());
+        assert_settings_text_layout(&app, &texts, size);
+        let dd_trigger = texts
+            .iter()
+            .find(|(t, _)| t.starts_with("Auto ("))
+            .expect("UI scale Auto dropdown")
+            .1
+            .center();
+        let (dd_texts, _, _) = open_dropdown(&mut app, &ctx, size, dd_trigger);
+        let opt_150 = dd_texts.iter().find(|(t, _)| t == "1.50×").expect("1.50× choice").1.center();
+        click_at(&mut app, &ctx, size, opt_150);
+        assert_eq!(app.ui_scale_pref, Some(1.5));
+        assert_eq!(ui_scale_override(Some(1.0), app.ui_scale_pref), Some(1.5));
+
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let dd_trigger2 = texts.iter().find(|(t, _)| t == "1.50×").unwrap().1.center();
+        let (dd_texts2, _, _) = open_dropdown(&mut app, &ctx, size, dd_trigger2);
+        let opt_auto = dd_texts2.iter().find(|(t, _)| t == "Auto").expect("Auto choice").1.center();
+        click_at(&mut app, &ctx, size, opt_auto);
+        assert_eq!(app.ui_scale_pref, None);
+
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        click_at(&mut app, &ctx, size, chip_right_of(&texts, "Rack CPU overlay"));
+        assert!(app.show_cpu_overlay);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        click_at(&mut app, &ctx, size, chip_right_of(&texts, "System input method (IME)"));
+        assert!(app.system_ime);
+
+        // Startup preferences: reopen saved session and start in Show mode.
+        let tmp = std::env::temp_dir().join(format!("ksalat-startup-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        app.set_time_sig(crate::transport::TimeSig { num: 6, den: 8 });
+        app.set_rack_locked(true);
+        app.save_session_as(&tmp, "LiveSet").unwrap();
+        let mut fresh = DemoApp::new_with_sink(None);
+        fresh.reopen_last_session = true;
+        fresh.show_mode_cfg.start_in_show_mode = true;
+        fresh.apply_startup_preferences_from(&tmp, Some("LiveSet"));
+        assert_eq!(fresh.open_session.as_deref(), Some("LiveSet"));
+        assert_eq!(fresh.time_sig, crate::transport::TimeSig { num: 6, den: 8 });
+        assert!(fresh.rack_locked);
+        assert!(fresh.show_mode.is_some());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
@@ -52216,7 +52913,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 48] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 49] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -52329,6 +53026,7 @@ mod window_size_layout_tests {
             ("wind console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.rig_types = vec![Some(crate::keyboard::KeyboardType::Wind)] }),
             ("drums console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.rig_types = vec![Some(crate::keyboard::KeyboardType::Drums)] }),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
+            ("settings-show", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Show }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
             ("settings-plugins", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Plugins }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
@@ -53112,7 +53810,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 25] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 26] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -53171,6 +53869,7 @@ mod offline_shots {
                 a.audio_doctor = super::audio_doctor::tests::sample_state();
             }),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
+            ("settings-show", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Show }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
             ("settings-plugins", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Plugins }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
@@ -54233,7 +54932,7 @@ mod navigator_tests {
                 let texts = visible_texts(&mut app, &ctx, size, vec![]);
                 // A dock in a short window leaves the column no room below the
                 // songs list; the foot switches above these rows go first.
-                let Some(over) = texts.iter().find(|(t, _)| t == "Next part").map(|t| t.1.center()) else {
+                let Some(over) = texts.iter().find(|(t, _)| t == "Next song" || t == "Next part").map(|t| t.1.center()) else {
                     assert_ne!(dock, DockView::None, "{size:?}: the foot switches show");
                     continue;
                 };
@@ -54252,11 +54951,11 @@ mod navigator_tests {
                     assert_eq!(label, "Off");
                     assert!(chip.left() > name_rect.right() && chip.right() <= size.x, "{dock:?} {size:?}: the chip {chip:?} beside {name_rect:?}");
                     click_at(&mut app, &ctx, size, chip.center());
-                    assert!(app.setlist.program_selects_song(d as u32), "{dock:?} {size:?}: a click turns {name} on");
+                    assert!(app.effective_program_selects_song(d as u32), "{dock:?} {size:?}: a click turns {name} on");
                     let shown = program_row(&visible_texts(&mut app, &ctx, size, vec![]), name).map(|r| r.1);
                     assert_eq!(shown.as_deref(), Some("On"), "{dock:?} {size:?}");
                 }
-                let controls = app.setlist.show_controls();
+                let controls = app.effective_show_controls();
                 assert!((0..devices.len() as u32).all(|d| controls.iter().flatten().any(|c| c.device == Some(d) && c.action == crate::show::ShowAction::SongOfProgram)));
             }
         }
@@ -54380,7 +55079,7 @@ mod navigator_tests {
         let pedal = SourceId::Hardware(0);
         app.show_learn = Some(ShowAction::PrevPart);
         assert!(app.show_control_msg(pedal, 0, ShowMsg::Cc(67), true), "learn consumes CC");
-        assert_eq!(app.setlist.control_of(ShowAction::PrevPart).map(|c| (c.msg, c.device)), Some((ShowMsg::Cc(67), Some(0))));
+        assert_eq!(app.effective_show_control(ShowAction::PrevPart).map(|c| (c.msg, c.device)), Some((ShowMsg::Cc(67), Some(0))));
         assert!(app.show_control_msg(pedal, 0, ShowMsg::Cc(67), true), "a show control's CC moves no knob");
         assert!(!app.show_control_msg(pedal, 0, ShowMsg::Cc(1), true));
         assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));

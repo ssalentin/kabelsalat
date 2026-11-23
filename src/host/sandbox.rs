@@ -40,11 +40,11 @@ use crate::transport::{TimeSig, Transport};
 pub const SANDBOX_TEST_PLUGIN_ID: &str = "org.kabelsalat.sandbox-test-synth";
 
 /// Whether out-of-process sandboxing is enabled for hosted CLAP plugins in the
-/// app (`KABELSALAT_SANDBOX=0` disables it and falls back to in-process).
+/// app (`KABELSALAT_SANDBOX=0` overrides `config.json`).
 pub fn sandbox_enabled() -> bool {
     match std::env::var("KABELSALAT_SANDBOX") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+        Err(_) => crate::config::plugin_sandbox(),
     }
 }
 

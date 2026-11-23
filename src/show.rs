@@ -70,13 +70,15 @@ pub enum ShowAction {
     LoopSection,
     /// Stop the backing track at the end of its section playing, on and off.
     StopAtSection,
+    /// The app opens or leaves Show mode (#437).
+    ShowMode,
     /// Program change N selects the first part of song N+1 (#208), also of
     /// a song stepping skips. A program with no song, or a CC, selects nothing.
     SongOfProgram,
 }
 
 impl ShowAction {
-    pub const ALL: [ShowAction; 15] = [
+    pub const ALL: [ShowAction; 16] = [
         ShowAction::NextSong,
         ShowAction::PrevSong,
         ShowAction::NextPart,
@@ -91,12 +93,13 @@ impl ShowAction {
         ShowAction::PrevMarker,
         ShowAction::LoopSection,
         ShowAction::StopAtSection,
+        ShowAction::ShowMode,
         ShowAction::SongOfProgram,
     ];
 
     /// The actions one control each is learned for, in the order the app
     /// lists them. `SongOfProgram` is chosen per device instead.
-    pub const LEARNED: [ShowAction; 14] = [
+    pub const LEARNED: [ShowAction; 15] = [
         ShowAction::NextSong,
         ShowAction::PrevSong,
         ShowAction::NextPart,
@@ -111,6 +114,7 @@ impl ShowAction {
         ShowAction::PrevMarker,
         ShowAction::LoopSection,
         ShowAction::StopAtSection,
+        ShowAction::ShowMode,
     ];
 
     /// The name tools and sessions use.
@@ -130,6 +134,7 @@ impl ShowAction {
             ShowAction::PrevMarker => "prev_marker",
             ShowAction::LoopSection => "loop_section",
             ShowAction::StopAtSection => "stop_at_section",
+            ShowAction::ShowMode => "show_mode",
             ShowAction::SongOfProgram => "song_of_program",
         }
     }
@@ -154,6 +159,7 @@ impl ShowAction {
             ShowAction::PrevMarker => "Previous marker",
             ShowAction::LoopSection => "Loop section",
             ShowAction::StopAtSection => "Stop at section end",
+            ShowAction::ShowMode => "Show mode",
             ShowAction::SongOfProgram => "Program change picks the song",
         }
     }
@@ -484,8 +490,18 @@ pub struct ShowSent {
 impl ShowSent {
     /// Send what changed; a command `send` refuses (bus full) is sent again
     /// next time. A part table the engine let go of is freed here.
-    pub fn publish(&mut self, setlist: &crate::setlist::Setlist, mut send: impl FnMut(Command) -> bool) {
-        let controls = setlist.show_controls();
+    pub fn publish(&mut self, setlist: &crate::setlist::Setlist, send: impl FnMut(Command) -> bool) {
+        self.publish_with_controls(setlist.show_controls(), setlist, send);
+    }
+
+    /// Like [`Self::publish`], using an explicit [`ShowControls`] table
+    /// (merged global config + session overrides).
+    pub fn publish_with_controls(
+        &mut self,
+        controls: ShowControls,
+        setlist: &crate::setlist::Setlist,
+        mut send: impl FnMut(Command) -> bool,
+    ) {
         if controls != self.controls && send(Command::SetShowControls { controls }) {
             self.controls = controls;
         }
@@ -827,7 +843,7 @@ mod tests {
 
     #[test]
     fn every_other_action_is_handed_to_the_engine_once_per_press_and_counted() {
-        let others: Vec<ShowControl> = [ShowAction::Panic, ShowAction::TapTempo, ShowAction::Tuner, ShowAction::MasterMute, ShowAction::BackingTrack, ShowAction::Record, ShowAction::NextMarker, ShowAction::PrevMarker, ShowAction::LoopSection, ShowAction::StopAtSection]
+        let others: Vec<ShowControl> = [ShowAction::Panic, ShowAction::TapTempo, ShowAction::Tuner, ShowAction::MasterMute, ShowAction::BackingTrack, ShowAction::Record, ShowAction::NextMarker, ShowAction::PrevMarker, ShowAction::LoopSection, ShowAction::StopAtSection, ShowAction::ShowMode]
             .iter()
             .enumerate()
             .map(|(i, &action)| ShowControl { device: None, channel: None, msg: ShowMsg::Note(60 + i as u8), action })

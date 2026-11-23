@@ -5040,7 +5040,7 @@ impl GraphEngine {
             Take::Act(ShowAction::LoopSection) => self.player_marker(crate::markers::MarkerAction::Loop(None)),
             Take::Act(ShowAction::StopAtSection) => self.player_marker(crate::markers::MarkerAction::StopAtEnd(None)),
             // The app's own: done from the published presses.
-            Take::Act(ShowAction::Tuner | ShowAction::Record) => {}
+            Take::Act(ShowAction::Tuner | ShowAction::Record | ShowAction::ShowMode) => {}
             Take::Act(ShowAction::NextSong | ShowAction::PrevSong | ShowAction::NextPart | ShowAction::PrevPart | ShowAction::SongOfProgram) => {}
         }
         true

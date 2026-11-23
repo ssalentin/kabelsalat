@@ -834,7 +834,10 @@ fn deliver(seq: &mut SeqClient, port: u8, queue: u8, events: &[OutEvent], ctl: &
 /// subscriptions the wiring asks for.
 fn rescan_outs(ctl: &ClockControl, mut seq: Option<&mut SeqClient>, out_port: Option<u8>, wired: &[bool], subscriptions: &mut Vec<bool>) {
     let own = seq.as_deref().map(|s| s.client_id());
-    let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
+    let through_ok = match std::env::var("KABELSALAT_MIDI_THROUGH") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => crate::config::midi_through(),
+    };
     let listed: Vec<PortDesc> = seq.as_deref_mut().map(|s| s.list_ports()).unwrap_or_default();
     let candidates: Vec<&PortDesc> = listed.iter()
         .filter(|p| p.can_receive())

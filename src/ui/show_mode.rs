@@ -13,6 +13,7 @@
 use super::*;
 
 /// How long Esc is held before letting go of it leaves.
+#[cfg(test)]
 pub(super) const LEAVE_HOLD_SECS: f32 = 1.0;
 /// The floors of the master meter (`meter_db_pos`) and of a rig meter
 /// (`edge_display_level`), in dBFS.
@@ -92,11 +93,22 @@ fn regions(screen: Rect, meter_rows: usize) -> Regions {
     Regions { top, hero, next, meters, bottom }
 }
 
-/// The local wall-clock time, "21:47" (rule 54).
-fn clock_now() -> String {
+/// The local wall-clock time: `"21:47"` in 24-hour mode or `"9:47 PM"` in 12-hour mode (rule 54).
+fn clock_now(clock_24h: bool) -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let day = (secs + crate::record::local_utc_offset(secs)).rem_euclid(86_400);
-    format!("{:02}:{:02}", day / 3600, day % 3600 / 60)
+    let hour = day / 3600;
+    let min = day % 3600 / 60;
+    if clock_24h {
+        format!("{hour:02}:{min:02}")
+    } else {
+        let suffix = if hour < 12 { "AM" } else { "PM" };
+        let h12 = match hour % 12 {
+            0 => 12,
+            h => h,
+        };
+        format!("{h12}:{min:02} {suffix}")
+    }
 }
 
 /// `text` in the medium face, as large as fits `width` between `min` and
@@ -305,10 +317,11 @@ impl DemoApp {
         // tuner without leaving Show mode.
         let (esc, esc_released) = ctx.input(|i| (i.key_down(Key::Escape), i.key_released(Key::Escape)));
         let now = self.ui_time;
+        let hold_secs = self.show_mode_cfg.leave_hold_secs;
         let mut close_tuner = false;
         let leave = self.show_mode.as_mut().is_some_and(|show| {
             let was_down = show.esc_since.is_some();
-            let held_out = show.esc_since.is_some_and(|t| now - t >= LEAVE_HOLD_SECS);
+            let held_out = show.esc_since.is_some_and(|t| now - t >= hold_secs);
             show.esc_since = if esc { Some(show.esc_since.unwrap_or(now)) } else { None };
             if !esc && (was_down || esc_released) && !held_out && self.tuner_on {
                 close_tuner = true;
@@ -342,10 +355,14 @@ impl DemoApp {
             None if sl.songs.is_empty() => ("No setlist".into(), "Every rig plays".into(), None),
             None => ("Setlist not started · → or PageDown starts".into(), "Every rig plays".into(), None),
         };
-        let rigs = (0..self.rig_count())
-            .filter(|&r| self.rig_zones.get(r).is_none_or(|z| z.live))
-            .map(|r| (self.rig_name(r), self.rig_levels.get(r).copied().unwrap_or(0.0)))
-            .collect();
+        let rigs = if self.show_mode_cfg.show_rig_meters {
+            (0..self.rig_count())
+                .filter(|&r| self.rig_zones.get(r).is_none_or(|z| z.live))
+                .map(|r| (self.rig_name(r), self.rig_levels.get(r).copied().unwrap_or(0.0)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let next_part = sl.current().and_then(|(s, _, pos)| s.parts.get(pos.part + 1).map(|p| p.name.clone()));
         let mut indicators = Vec::new();
         if self.recorder.as_ref().is_some_and(|r| r.is_recording()) {
@@ -362,7 +379,12 @@ impl DemoApp {
         }
         indicators.extend(self.hotplug_indicators());
         let (song_idx, notes) = sl.current().map_or((None, None), |(s, _, pos)| {
-            (Some(pos.song), (!s.notes.trim().is_empty()).then(|| s.notes.clone()))
+            let notes = if self.show_mode_cfg.show_notes && !s.notes.trim().is_empty() {
+                Some(s.notes.clone())
+            } else {
+                None
+            };
+            (Some(pos.song), notes)
         });
         Board {
             song_idx,
@@ -405,7 +427,7 @@ impl DemoApp {
 
         // Top: what this screen is, live status indicators, and the clock.
         let top_cap = caption(&p, reg.top.left_center() - Vec2::new(0.0, 9.0), "Show mode · editing locked", 18.0, theme::INK_2);
-        let clock = p.layout_no_wrap(clock_now(), theme::medium_font(40.0), theme::INK);
+        let clock = p.layout_no_wrap(clock_now(self.show_mode_cfg.clock_24h), theme::medium_font(40.0), theme::INK);
         let clock_x = reg.top.right() - clock.size().x;
         p.galley(Pos2::new(clock_x, reg.top.center().y - clock.size().y / 2.0), clock, theme::INK);
         if !board.indicators.is_empty() {
@@ -653,9 +675,10 @@ impl DemoApp {
             self.panic();
         }
         let now = self.ui_time;
+        let hold_secs = self.show_mode_cfg.leave_hold_secs;
         let Some(show) = &mut self.show_mode else { return };
         show.panic_rect = Some(panic_rect);
-        let held_out = show.esc_since.is_some_and(|t| now - t >= LEAVE_HOLD_SECS);
+        let held_out = show.esc_since.is_some_and(|t| now - t >= hold_secs);
         let hint_str = if held_out { "Let go of Esc to leave" } else { "Hold Esc to leave" };
         let hint = p.layout_no_wrap(hint_str.into(), theme::medium_font(qsize(28.0)), theme::INK_2);
         let hint_w = hint.size().x;
@@ -671,7 +694,7 @@ impl DemoApp {
         p.galley(hint_pos, hint, theme::INK_2);
         p.rect_filled(track, 2.0, theme::METER_TRACK);
         if let Some(t) = show.esc_since {
-            let held = ((now - t) / LEAVE_HOLD_SECS).clamp(0.0, 1.0);
+            let held = ((now - t) / hold_secs).clamp(0.0, 1.0);
             p.rect_filled(Rect::from_min_size(track.min, Vec2::new(hint_w * held, 4.0)), 2.0, theme::CREAM);
         }
     }
@@ -1257,5 +1280,46 @@ pub(super) mod tests {
                 Vec::new()
             });
         }
+    }
+
+    #[test]
+    fn show_mode_config_customizes_hold_time_clock_notes_and_rig_meters() {
+        let ctx = egui::Context::default();
+        // 1. Custom hold time: 0.5 s leaves after ~0.55 s, while 2.0 s stays open at ~1.2 s.
+        let repeat = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: Modifiers::NONE,
+        };
+        for (hold_secs, elapsed, should_leave) in [(0.5_f32, 0.55_f64, true), (2.0_f32, 1.2_f64, false)] {
+            let mut app = gig();
+            app.show_mode_cfg.leave_hold_secs = hold_secs;
+            app.set_show_mode(true);
+            settle(&mut app, &ctx, WIDE);
+            frame(&mut app, &ctx, WIDE, vec![key(Key::Escape, true, Modifiers::NONE)]);
+            let frames = (elapsed * 60.0).round() as usize;
+            for _ in 0..frames {
+                frame(&mut app, &ctx, WIDE, vec![repeat.clone()]);
+            }
+            frame(&mut app, &ctx, WIDE, vec![key(Key::Escape, false, Modifiers::NONE)]);
+            assert_eq!(app.show_mode.is_none(), should_leave, "hold={hold_secs} elapsed={elapsed}");
+        }
+
+        // 2. 12-hour clock, hidden song notes, and hidden rig meters.
+        let mut app = gig();
+        app.setlist.songs[0].notes = "{c: Bridge}\n[G]Wait for cue".into();
+        app.show_mode_cfg.clock_24h = false;
+        app.show_mode_cfg.show_notes = false;
+        app.show_mode_cfg.show_rig_meters = false;
+        app.set_show_mode(true);
+        settle(&mut app, &ctx, WIDE);
+        let texts = frame(&mut app, &ctx, WIDE, vec![]);
+        let joined: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(joined.iter().any(|t| *t == "Master"), "Master meter stays visible: {joined:?}");
+        assert!(!joined.iter().any(|t| *t == "Organ" || *t == "Piano"), "per-rig meters hidden: {joined:?}");
+        assert!(!joined.iter().any(|t| t.contains("Bridge") || t.contains("Wait for cue")), "song notes hidden: {joined:?}");
+        assert!(joined.iter().any(|t| t.ends_with(" AM") || t.ends_with(" PM")), "12h clock formats AM/PM: {joined:?}");
     }
 }

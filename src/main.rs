@@ -25,6 +25,7 @@ mod capture;
 mod catalog;
 mod clocksend;
 mod clockin;
+mod config;
 mod control;
 mod cues;
 mod crash;
@@ -80,6 +81,7 @@ const MODES: &str = "app [--headless], crash-test, sandbox-test, preview, analys
 fn main() -> anyhow::Result<()> {
     plugin_window::ensure_x11_egl_platform();
     plugin_dirs::init();
+    config::init();
     // A process that loaded plugin code leaves without running the plugin
     // libraries' static destructors (#422).
     host::exit::leave(run())

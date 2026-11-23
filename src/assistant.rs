@@ -750,9 +750,15 @@ fn system_prompt() -> String {
      of them; save_setlist/load_setlist/list_setlists/set_setlist_folder save, load and manage \
      standalone setlists (.ksalat-setlist) in the user's configured setlists folder (default \
      ~/kabelsalat-setlists); get_show_controls lists and set_show_control binds or clears the pedal, key or button \
-     (a CC, a note or a program change from a device) for each show action: next/previous song or part, \
-     panic, tap tempo, tuner, master mute, backing track and record; it also chooses the devices whose \
+     (a CC, a note or a program change from a device, optionally filtered to a MIDI channel or device_port) \
+     for each show action: next/previous song or part, panic, tap tempo, tuner, master mute, backing track, \
+     record, next/previous marker, loop section, stop at section, and show_mode (toggles Show mode); by default bindings save permanently by MIDI port name in \
+     config.json (scope='session' overrides only the open session); it also chooses the devices whose \
      program change N picks song N+1; \
+     get_config and set_config read or permanently configure Show mode (leave_hold_secs, clock_24h, \
+     show_notes, show_rig_meters, start_in_show_mode), session startup (reopen_last_session, autosave, \
+     record_sync, retro_minutes), display (ui_scale, reduce_motion, cable_opacity, cable_tension, \
+     cpu_overlay, system_ime), plugin_sandbox and midi_through; \
      set_show_mode opens or leaves the locked stage screen (\"go on stage\", \"show mode\"). \
      set_rack_locked locks or unlocks the rack for editing (\"lock the rack\", \"unlock the rack\"); \
      while locked, playing and inspecting work but patching, unit/rig edits and rack knob changes are blocked. \
@@ -1418,13 +1424,23 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"get_show_controls",
-            "description":"List the show actions a pedal, key or button can trigger (next_song, prev_song, next_part, prev_part, panic, tap_tempo, tuner, master_mute, backing_track, record), the control learned for each (a CC, a note or a program change, and from which hardware device), and every hardware device with whether its program change N picks song N+1 (song_of_program). Show controls work in every song: they are at show level.",
+            "description":"List the show actions a pedal, key or button can trigger (next_song, prev_song, next_part, prev_part, panic, tap_tempo, tuner, master_mute, backing_track, record, next_marker, prev_marker, loop_section, stop_at_section, show_mode), the control configured for each (a CC, note or program change, optional channel, hardware device index and port name, connected status, and scope global|session), and every hardware or saved device with whether its program change N picks song N+1 (song_of_program).",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_show_control",
-            "description":"Bind a hardware control to a show action, clear it, or choose whether a device's program change picks the song. Give one of cc (0..127, acts when it rises to 64 or above), note (0..127 or a name like \"C2\", acts on its note-on) or program (0..127), and optionally device (hardware device index from get_show_controls; omitted = any device); or clear: true. A message another action had moves to this one. song_of_program takes device and on (default true): program N from that device then selects song N+1. What a control takes never reaches an instrument.",
-            "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["next_song","prev_song","next_part","prev_part","panic","tap_tempo","tuner","master_mute","backing_track","record","song_of_program"]},"cc":{"type":"integer"},"note":{"type":["integer","string"]},"program":{"type":"integer"},"device":{"type":"integer"},"clear":{"type":"boolean"},"on":{"type":"boolean"}},"required":["action"]}
+            "description":"Bind a hardware control to a show action, clear it, or choose whether a device's program change picks the song. action: next_song | prev_song | next_part | prev_part | panic | tap_tempo | tuner | master_mute | backing_track | record | next_marker | prev_marker | loop_section | stop_at_section | show_mode | song_of_program. Give one of cc (0..127, acts when it rises to 64 or above), note (0..127 or a name like \"C2\", acts on its note-on) or program (0..127), optionally channel (0..15; omitted = any channel), and device (hardware device index from get_show_controls) or device_port (stable port name; omitted = any device); or clear: true. By default scope='global' saves permanently to ~/.config/kabelsalat/config.json by MIDI port name; pass scope='session' to store only on the current session. song_of_program takes device or device_port and on (default true): program N from that device then selects song N+1.",
+            "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["next_song","prev_song","next_part","prev_part","panic","tap_tempo","tuner","master_mute","backing_track","record","next_marker","prev_marker","loop_section","stop_at_section","show_mode","song_of_program"]},"cc":{"type":"integer"},"note":{"type":["integer","string"]},"program":{"type":"integer"},"channel":{"type":"integer"},"device":{"type":"integer"},"device_port":{"type":"string"},"clear":{"type":"boolean"},"on":{"type":"boolean"},"scope":{"type":"string","enum":["global","session"]}},"required":["action"]}
+        }},
+        {"type":"function","function":{
+            "name":"get_config",
+            "description":"Read kabelsalat's permanent configuration (~/.config/kabelsalat/config.json) and live settings: Show mode (leave_hold_secs, clock_24h, show_notes, show_rig_meters, start_in_show_mode), MIDI Show controls, session prefs (autosave, reopen_last_session, last_session, count_in, record_sync, retro_minutes), display prefs (reduce_motion, ui_scale, cable_opacity, cable_tension, cpu_overlay, system_ime), plugins (sandbox), midi (midi_through), and audio prefs.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_config",
+            "description":"Update one or more permanent configuration options in ~/.config/kabelsalat/config.json and apply them immediately: show_leave_hold_secs (0.25..=5.0), show_clock_24h, show_notes, show_rig_meters, start_in_show_mode, autosave, reopen_last_session, record_sync, retro_minutes (0|1|2|5|10), reduce_motion, ui_scale (1.0..=3.0, or 0 / null for Auto), cable_opacity (0.3..=1.0), cable_tension (0.0..=1.0), cpu_overlay, system_ime, plugin_sandbox, midi_through.",
+            "parameters":{"type":"object","properties":{"show_leave_hold_secs":{"type":"number"},"show_clock_24h":{"type":"boolean"},"show_notes":{"type":"boolean"},"show_rig_meters":{"type":"boolean"},"start_in_show_mode":{"type":"boolean"},"autosave":{"type":"boolean"},"reopen_last_session":{"type":"boolean"},"record_sync":{"type":"boolean"},"retro_minutes":{"type":"integer"},"reduce_motion":{"type":"boolean"},"ui_scale":{"type":["number","null"]},"cable_opacity":{"type":"number"},"cable_tension":{"type":"number"},"cpu_overlay":{"type":"boolean"},"system_ime":{"type":"boolean"},"plugin_sandbox":{"type":"boolean"},"midi_through":{"type":"boolean"}}}
         }},
         {"type":"function","function":{
             "name":"get_cues",
@@ -3504,5 +3520,19 @@ mod tests {
             .expect("add_rig tool exists");
         let desc = add_rig["function"]["description"].as_str().unwrap();
         assert!(desc.contains("Say Again."), "add_rig description should warn about Dexed's default patch: {desc}");
+    }
+
+    #[test]
+    fn config_and_scoped_show_control_tools_parse_cleanly() {
+        let all = tools();
+        assert_eq!(parse_tool_call(&all, "get_config", "").unwrap(), json!({}));
+        assert_eq!(
+            parse_tool_call(&all, "set_config", r#"{"show_clock_24h":false,"ui_scale":0,"reopen_last_session":true}"#).unwrap(),
+            json!({"show_clock_24h": false, "ui_scale": 0, "reopen_last_session": true})
+        );
+        assert_eq!(
+            parse_tool_call(&all, "set_show_control", r#"{"action":"show_mode","cc":86,"channel":2,"device_port":"FCB1010","scope":"global"}"#).unwrap(),
+            json!({"action": "show_mode", "cc": 86, "channel": 2, "device_port": "FCB1010", "scope": "global"})
+        );
     }
 }

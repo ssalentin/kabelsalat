@@ -105,6 +105,19 @@ struct State {
     rig_types: Vec<Option<crate::keyboard::KeyboardType>>,
     /// Headless setlist mirror (#204); in Remote mode the GUI app owns it.
     setlist: crate::setlist::Setlist,
+    /// Permanent Show mode preferences (#437).
+    show_mode_cfg: crate::config::ShowModeConfig,
+    /// Permanent MIDI show controls (#437).
+    show_controls_cfg: crate::config::ShowControlsConfig,
+    reopen_last_session: bool,
+    ui_scale: Option<f32>,
+    system_ime: bool,
+    reduce_motion: bool,
+    autosave: bool,
+    retro_minutes: u32,
+    cable_opacity: f32,
+    cable_tension: f32,
+    cpu_overlay: bool,
 }
 
 impl State {
@@ -448,16 +461,381 @@ fn setlist_json(st: &State) -> Value {
         "load_ahead": sl.load_ahead,
         "window_songs": sl.window_songs(),
         "hosted_instances": hosted_instances,
-        "show_controls": headless_show_controls(sl),
+        "show_controls": headless_show_controls(st),
         "sets": show["sets"],
         "levels": show["levels"],
         "instances": instances,
     })
 }
 
-/// Headless MCP knows no hardware devices: it names them by index.
-fn headless_show_controls(sl: &crate::setlist::Setlist) -> Value {
-    sl.show_controls_json(&[], &|d| format!("hw:{d}"))
+/// Headless MCP knows no hardware devices by live ALSA scan: it resolves
+/// indexed bindings and keeps saved port-keyed config rows as offline/port-named.
+fn headless_show_controls(st: &State) -> Value {
+    let hw: Vec<String> = Vec::new();
+    let table = st
+        .show_controls_cfg
+        .merge_with_session(&st.setlist.controls, &hw, crate::clocksend::midi_port_key);
+    let dev_name = |d: u32| format!("hw:{d}");
+    let actions: Vec<Value> = crate::show::ShowAction::LEARNED
+        .iter()
+        .map(|&a| {
+            let session_ov = st.setlist.control_of(a);
+            let eff = table.iter().flatten().find(|c| c.action == a).copied();
+            let saved = st.show_controls_cfg.binding_of(a);
+            let ctrl_json = if let Some(c) = eff {
+                let mut v = crate::setlist::control_json(c, &dev_name);
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("connected".into(), json!(true));
+                    if session_ov.is_none() {
+                        if let Some(port) = saved.and_then(|b| b.device.as_deref()) {
+                            m.insert("device_port".into(), json!(port));
+                        }
+                    }
+                }
+                Some(v)
+            } else if let Some(b) = saved {
+                let mut v = crate::setlist::control_json(
+                    crate::show::ShowControl {
+                        device: b.device_index,
+                        channel: b.channel,
+                        msg: b.msg,
+                        action: a,
+                    },
+                    &dev_name,
+                );
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("connected".into(), json!(false));
+                    if let Some(port) = &b.device {
+                        m.insert("device_name".into(), json!(port));
+                        m.insert("device_port".into(), json!(port));
+                    }
+                }
+                Some(v)
+            } else {
+                None
+            };
+            let scope = if session_ov.is_some() {
+                Some("session")
+            } else if saved.is_some() {
+                Some("global")
+            } else {
+                None
+            };
+            json!({
+                "action": a.id(),
+                "label": a.label(),
+                "scope": scope,
+                "control": ctrl_json,
+            })
+        })
+        .collect();
+    let mut listed: Vec<u32> = st
+        .show_controls_cfg
+        .program_device_indices
+        .iter()
+        .copied()
+        .chain(st.setlist.program_devices())
+        .collect();
+    listed.sort_unstable();
+    listed.dedup();
+    let mut programs: Vec<Value> = listed
+        .into_iter()
+        .map(|d| {
+            json!({
+                "device": d,
+                "name": dev_name(d),
+                "connected": true,
+                "on": st.show_controls_cfg.program_selects_index(d) || st.setlist.program_selects_song(d),
+            })
+        })
+        .collect();
+    for port in &st.show_controls_cfg.program_devices {
+        programs.push(json!({
+            "device": Value::Null,
+            "device_port": port,
+            "name": port,
+            "connected": false,
+            "on": true,
+        }));
+    }
+    json!({
+        "actions": actions,
+        "song_of_program": programs,
+        "slots": {
+            "used": table.iter().flatten().count(),
+            "max": crate::show::MAX_SHOW_CONTROLS,
+        },
+        "session_overrides": !st.setlist.controls.is_empty(),
+    })
+}
+
+fn headless_config_json(st: &State) -> Value {
+    json!({
+        "config_path": crate::plugin_dirs::display(&crate::assistant::config_path()),
+        "show_mode": st.show_mode_cfg.to_json(),
+        "show_controls": headless_show_controls(st),
+        "session": {
+            "autosave": st.autosave,
+            "reopen_last_session": st.reopen_last_session,
+            "last_session": crate::config::load_last_session(),
+            "count_in_enabled": st.count_in_enabled,
+            "count_in_bars": st.count_in_bars,
+            "record_sync": st.record_sync,
+            "retro_minutes": st.retro_minutes,
+        },
+        "display": {
+            "reduce_motion": st.reduce_motion,
+            "ui_scale": st.ui_scale,
+            "cable_opacity": st.cable_opacity,
+            "cable_tension": st.cable_tension,
+            "cpu_overlay": st.cpu_overlay,
+            "system_ime": st.system_ime,
+        },
+        "plugins": {
+            "sandbox": crate::config::plugin_sandbox(),
+        },
+        "midi": {
+            "midi_through": crate::config::midi_through(),
+        },
+        "audio": {
+            "backend": crate::assistant::load_audio_backend().as_str(),
+            "output": crate::assistant::load_config_str("audio_output"),
+            "buffer_frames": crate::assistant::load_buffer_frames(),
+        },
+    })
+}
+
+fn headless_set_config(st: &mut State, args: &Value) -> Result<Value, String> {
+    let obj = args.as_object().ok_or("set_config expects a JSON object")?;
+    let mut leave_hold: Option<f32> = None;
+    let mut clock_24h: Option<bool> = None;
+    let mut show_notes: Option<bool> = None;
+    let mut show_rig_meters: Option<bool> = None;
+    let mut start_in_show: Option<bool> = None;
+
+    let parse_hold = |v: &Value| -> Result<f32, String> {
+        let n = v
+            .as_f64()
+            .filter(|n| n.is_finite())
+            .ok_or("show_leave_hold_secs must be a number (0.25..=5.0)")?;
+        let secs = n as f32;
+        if !(crate::config::MIN_LEAVE_HOLD_SECS..=crate::config::MAX_LEAVE_HOLD_SECS).contains(&secs) {
+            return Err(format!(
+                "show_leave_hold_secs must be between {} and {} seconds",
+                crate::config::MIN_LEAVE_HOLD_SECS,
+                crate::config::MAX_LEAVE_HOLD_SECS
+            ));
+        }
+        Ok(crate::config::clamp_leave_hold_secs(secs))
+    };
+    let parse_bool = |name: &str, v: &Value| -> Result<bool, String> {
+        v.as_bool().ok_or_else(|| format!("{name} must be a boolean"))
+    };
+
+    if let Some(sm) = obj.get("show_mode") {
+        let sm_obj = sm.as_object().ok_or("show_mode must be an object")?;
+        if let Some(v) = sm_obj.get("leave_hold_secs") {
+            leave_hold = Some(parse_hold(v)?);
+        }
+        if let Some(v) = sm_obj.get("clock_24h") {
+            clock_24h = Some(parse_bool("show_mode.clock_24h", v)?);
+        }
+        if let Some(v) = sm_obj.get("show_notes") {
+            show_notes = Some(parse_bool("show_mode.show_notes", v)?);
+        }
+        if let Some(v) = sm_obj.get("show_rig_meters") {
+            show_rig_meters = Some(parse_bool("show_mode.show_rig_meters", v)?);
+        }
+        if let Some(v) = sm_obj.get("start_in_show_mode") {
+            start_in_show = Some(parse_bool("show_mode.start_in_show_mode", v)?);
+        }
+    }
+    if let Some(v) = obj.get("show_leave_hold_secs") {
+        leave_hold = Some(parse_hold(v)?);
+    }
+    if let Some(v) = obj.get("show_clock_24h") {
+        clock_24h = Some(parse_bool("show_clock_24h", v)?);
+    }
+    if let Some(v) = obj.get("show_notes") {
+        show_notes = Some(parse_bool("show_notes", v)?);
+    }
+    if let Some(v) = obj.get("show_rig_meters") {
+        show_rig_meters = Some(parse_bool("show_rig_meters", v)?);
+    }
+    if let Some(v) = obj.get("start_in_show_mode") {
+        start_in_show = Some(parse_bool("start_in_show_mode", v)?);
+    }
+
+    let autosave = obj.get("autosave").map(|v| parse_bool("autosave", v)).transpose()?;
+    let reopen_last = obj
+        .get("reopen_last_session")
+        .map(|v| parse_bool("reopen_last_session", v))
+        .transpose()?;
+    let record_sync = obj.get("record_sync").map(|v| parse_bool("record_sync", v)).transpose()?;
+    let retro_minutes = match obj.get("retro_minutes") {
+        None => None,
+        Some(v) => {
+            let m = v.as_u64().ok_or("retro_minutes must be one of 0, 1, 2, 5, 10")? as u32;
+            if !crate::retro::MINUTES_CHOICES.contains(&m) {
+                return Err("retro_minutes must be one of 0, 1, 2, 5, 10".into());
+            }
+            Some(m)
+        }
+    };
+    let reduce_motion = obj.get("reduce_motion").map(|v| parse_bool("reduce_motion", v)).transpose()?;
+    let ui_scale: Option<Option<f32>> = match obj.get("ui_scale") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(v) => {
+            let s = v
+                .as_f64()
+                .filter(|n| n.is_finite())
+                .ok_or("ui_scale must be a number in 1.0..=3.0, 0, or null")? as f32;
+            if s == 0.0 {
+                Some(None)
+            } else if crate::config::valid_ui_scale(s) {
+                Some(crate::config::normalize_ui_scale(Some(s)))
+            } else {
+                return Err("ui_scale must be between 1.0 and 3.0 (or 0 / null for Auto)".into());
+            }
+        }
+    };
+    let cable_opacity = match obj.get("cable_opacity") {
+        None => None,
+        Some(v) => {
+            let x = v
+                .as_f64()
+                .filter(|n| n.is_finite())
+                .ok_or("cable_opacity must be between 0.3 and 1.0")? as f32;
+            if !(crate::assistant::MIN_CABLE_OPACITY..=crate::assistant::MAX_CABLE_OPACITY).contains(&x) {
+                return Err("cable_opacity must be between 0.3 and 1.0".into());
+            }
+            Some(crate::assistant::clamp_cable_opacity(x))
+        }
+    };
+    let cable_tension = match obj.get("cable_tension") {
+        None => None,
+        Some(v) => {
+            let x = v
+                .as_f64()
+                .filter(|n| n.is_finite())
+                .ok_or("cable_tension must be between 0.0 and 1.0")? as f32;
+            if !(crate::assistant::MIN_CABLE_TENSION..=crate::assistant::MAX_CABLE_TENSION).contains(&x) {
+                return Err("cable_tension must be between 0.0 and 1.0".into());
+            }
+            Some(crate::assistant::clamp_cable_tension(x))
+        }
+    };
+    let cpu_overlay = obj.get("cpu_overlay").map(|v| parse_bool("cpu_overlay", v)).transpose()?;
+    let system_ime = obj.get("system_ime").map(|v| parse_bool("system_ime", v)).transpose()?;
+    let plugin_sandbox = obj
+        .get("plugin_sandbox")
+        .map(|v| parse_bool("plugin_sandbox", v))
+        .transpose()?;
+    let midi_through = obj
+        .get("midi_through")
+        .map(|v| parse_bool("midi_through", v))
+        .transpose()?;
+
+    if let Some(on) = record_sync {
+        send_cmd(st, Command::SetRecordSync { on })?;
+        st.record_sync = on;
+        let _ = crate::config::save_record_sync(on);
+    }
+
+    let mut changed: Vec<&'static str> = Vec::new();
+    let mut show_mode_dirty = false;
+    if let Some(secs) = leave_hold {
+        st.show_mode_cfg.leave_hold_secs = secs;
+        show_mode_dirty = true;
+        changed.push("show_leave_hold_secs");
+    }
+    if let Some(b) = clock_24h {
+        st.show_mode_cfg.clock_24h = b;
+        show_mode_dirty = true;
+        changed.push("show_clock_24h");
+    }
+    if let Some(b) = show_notes {
+        st.show_mode_cfg.show_notes = b;
+        show_mode_dirty = true;
+        changed.push("show_notes");
+    }
+    if let Some(b) = show_rig_meters {
+        st.show_mode_cfg.show_rig_meters = b;
+        show_mode_dirty = true;
+        changed.push("show_rig_meters");
+    }
+    if let Some(b) = start_in_show {
+        st.show_mode_cfg.start_in_show_mode = b;
+        show_mode_dirty = true;
+        changed.push("start_in_show_mode");
+    }
+    if show_mode_dirty {
+        let _ = crate::config::save_show_mode(&st.show_mode_cfg);
+    }
+    if let Some(on) = autosave {
+        st.autosave = on;
+        let _ = crate::assistant::save_session_autosave(on);
+        changed.push("autosave");
+    }
+    if let Some(on) = reopen_last {
+        st.reopen_last_session = on;
+        let _ = crate::config::save_reopen_last_session(on);
+        changed.push("reopen_last_session");
+    }
+    if record_sync.is_some() {
+        changed.push("record_sync");
+    }
+    if let Some(mins) = retro_minutes {
+        st.retro_minutes = mins;
+        let _ = crate::record::save_retro_minutes(mins);
+        changed.push("retro_minutes");
+    }
+    if let Some(on) = reduce_motion {
+        st.reduce_motion = on;
+        let _ = crate::assistant::save_reduce_motion(on);
+        changed.push("reduce_motion");
+    }
+    if let Some(scale) = ui_scale {
+        st.ui_scale = scale;
+        let _ = crate::config::save_ui_scale(scale);
+        changed.push("ui_scale");
+    }
+    if let Some(op) = cable_opacity {
+        st.cable_opacity = op;
+        let _ = crate::assistant::save_cable_opacity(op);
+        changed.push("cable_opacity");
+    }
+    if let Some(ten) = cable_tension {
+        st.cable_tension = ten;
+        let _ = crate::assistant::save_cable_tension(ten);
+        changed.push("cable_tension");
+    }
+    if let Some(on) = cpu_overlay {
+        st.cpu_overlay = on;
+        let _ = crate::assistant::save_config_value("ui_cpu_overlay", Value::Bool(on));
+        changed.push("cpu_overlay");
+    }
+    if let Some(on) = system_ime {
+        st.system_ime = on;
+        let _ = crate::config::save_system_ime(on);
+        changed.push("system_ime");
+    }
+    if let Some(on) = plugin_sandbox {
+        let _ = crate::config::save_plugin_sandbox(on);
+        changed.push("plugin_sandbox");
+    }
+    if let Some(on) = midi_through {
+        let _ = crate::config::save_midi_through(on);
+        changed.push("midi_through");
+    }
+
+    if changed.is_empty() {
+        return Err("give at least one config option to update".into());
+    }
+    let mut out = headless_config_json(st);
+    out["changed"] = json!(changed);
+    Ok(out)
 }
 
 fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Result<(), String> {
@@ -1124,7 +1502,8 @@ struct SetCuesArgs {
 #[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 struct SetShowControlArgs {
     /// next_song | prev_song | next_part | prev_part | panic | tap_tempo |
-    /// tuner | master_mute | backing_track | record | song_of_program.
+    /// tuner | master_mute | backing_track | record | next_marker | prev_marker |
+    /// loop_section | stop_at_section | show_mode | song_of_program.
     action: String,
     /// A CC (0..127): acts when it rises to 64 or above.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1135,16 +1514,88 @@ struct SetShowControlArgs {
     /// A program change (0..127): every one acts.
     #[serde(skip_serializing_if = "Option::is_none")]
     program: Option<u8>,
+    /// Optional MIDI channel (0..=15; omitted = any channel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<u8>,
     /// Hardware device index (get_show_controls); omit for any device.
-    /// Required for song_of_program.
+    /// Required (or `device_port`) for song_of_program.
     #[serde(skip_serializing_if = "Option::is_none")]
     device: Option<u32>,
+    /// Stable hardware MIDI port name (from `get_show_controls` `device_port`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_port: Option<String>,
+    /// Where to store the binding: "global" (default, saved permanently in config.json) or "session" (override on the open session only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
     /// true removes the action's control.
     #[serde(skip_serializing_if = "Option::is_none")]
     clear: Option<bool>,
     /// song_of_program: whether the device's program change picks the song (default true).
     #[serde(skip_serializing_if = "Option::is_none")]
     on: Option<bool>,
+}
+
+fn de_present_value<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// Arguments for `set_config` (#437).
+#[derive(Debug, Default, Deserialize, serde::Serialize, JsonSchema)]
+struct SetConfigArgs {
+    /// Show mode settings object (alternative to flat keys: leave_hold_secs, clock_24h, show_notes, show_rig_meters, start_in_show_mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show_mode: Option<Value>,
+    /// Seconds Esc must be held before releasing leaves Show mode (0.25..=5.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show_leave_hold_secs: Option<f32>,
+    /// Show stage clock in 24-hour format (true) or 12-hour format (false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show_clock_24h: Option<bool>,
+    /// Show song notes and ChordPro chart panel in Show mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show_notes: Option<bool>,
+    /// Show per-rig meters beside the Master meter in Show mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    show_rig_meters: Option<bool>,
+    /// Open Show mode automatically when kabelsalat launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_in_show_mode: Option<bool>,
+    /// Save changes to the open session automatically every 20 s and on quit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    autosave: Option<bool>,
+    /// Reopen the last saved/opened session automatically on launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reopen_last_session: Option<bool>,
+    /// Sync recording start/stop with master transport play/stop (Space).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_sync: Option<bool>,
+    /// Retrospective recording ring buffer length in minutes (0, 1, 2, 5, or 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retro_minutes: Option<u32>,
+    /// Snap rack animations and stop pulsing indicators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reduce_motion: Option<bool>,
+    /// UI scale in pixels per point (1.0..=3.0), or null for Auto (monitor native).
+    #[serde(default, deserialize_with = "de_present_value", skip_serializing_if = "Option::is_none")]
+    ui_scale: Option<Value>,
+    /// Patch cable opacity on the back of the rack (0.3..=1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cable_opacity: Option<f32>,
+    /// Patch cable tension on the back of the rack (0.0..=1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cable_tension: Option<f32>,
+    /// Show live per-unit CPU load overlay badges on rack units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_overlay: Option<bool>,
+    /// Route text input through the desktop IME (useful for CJK scripts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_ime: Option<bool>,
+    /// Isolate plugins in out-of-process sandboxes (applies to newly loaded plugins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plugin_sandbox: Option<bool>,
+    /// Expose ALSA's kernel Midi Through port alongside hardware controllers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    midi_through: Option<bool>,
 }
 
 /// Arguments for `set_show_mode`.
@@ -5605,19 +6056,19 @@ impl McpServer {
         }
     }
 
-    /// Every show action and its control (#277).
-    #[tool(name = "get_show_controls", description = "List the show actions a pedal, key or button can trigger (next_song, prev_song, next_part, prev_part, panic, tap_tempo, tuner, master_mute, backing_track, record), the control learned for each (a CC, a note or a program change, and from which hardware device), and every hardware device with whether its program change N picks song N+1 (song_of_program). Show controls work in every song: they are at show level.")]
+    /// Every show action and its control (#277, #437).
+    #[tool(name = "get_show_controls", description = "List the show actions a pedal, key or button can trigger (next_song, prev_song, next_part, prev_part, panic, tap_tempo, tuner, master_mute, backing_track, record, next_marker, prev_marker, loop_section, stop_at_section, show_mode), the control configured for each (CC, note or program change, optional channel, device index and port name, connected state, and scope global|session), and every hardware or saved device with whether its program change N picks song N+1 (song_of_program).")]
     fn get_show_controls(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
             drop(st);
             return Self::ui_bridge_tool("get_show_controls", json!({}));
         }
-        ok_json(headless_show_controls(&st.setlist))
+        ok_json(headless_show_controls(&st))
     }
 
-    /// Bind or clear one show action's control, or choose a program-change device (#277, #208).
-    #[tool(name = "set_show_control", description = "Bind a hardware control to a show action, clear it, or choose whether a device's program change picks the song. action: next_song | prev_song | next_part | prev_part | panic | tap_tempo | tuner | master_mute | backing_track | record | song_of_program. Give one of cc (0..127, acts when it rises to 64 or above), note (0..127 or a name like \"C2\", acts on its note-on) or program (0..127), and optionally device (hardware device index from get_show_controls; omitted = any device); or clear: true. A message another action had moves to this one. song_of_program takes device and on (default true): program N from that device then selects song N+1. What a control takes never reaches an instrument.")]
+    /// Bind or clear one show action's control, or choose a program-change device (#277, #208, #437).
+    #[tool(name = "set_show_control", description = "Bind a hardware control to a show action, clear it, or choose whether a device's program change picks the song. action: next_song | prev_song | next_part | prev_part | panic | tap_tempo | tuner | master_mute | backing_track | record | next_marker | prev_marker | loop_section | stop_at_section | show_mode | song_of_program. Give one of cc (0..127, acts when it rises to 64 or above), note (0..127 or a name like \"C2\", acts on its note-on) or program (0..127), optionally channel (0..15; omitted = any channel), and device (hardware device index from get_show_controls) or device_port (stable port name; omitted = any device); or clear: true. By default scope='global' saves permanently in ~/.config/kabelsalat/config.json by MIDI port name; pass scope='session' to store only on the current session. song_of_program takes device or device_port and on (default true).")]
     fn set_show_control(&self, Parameters(args): Parameters<SetShowControlArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
@@ -5625,12 +6076,100 @@ impl McpServer {
             drop(st);
             return Self::ui_bridge_tool("set_show_control", v);
         }
-        match st.setlist.set_show_control(&v) {
-            Ok(done) => {
-                let mut out = headless_show_controls(&st.setlist);
-                out["changed"] = json!(done);
-                ok_json(out)
+        let (parsed, global_scope) = match crate::setlist::parse_show_control_args(&v) {
+            Ok(p) => p,
+            Err(e) => return tool_err(e),
+        };
+        if !global_scope {
+            return match st.setlist.set_show_control(&v) {
+                Ok(done) => {
+                    let mut out = headless_show_controls(&st);
+                    out["changed"] = json!(done);
+                    ok_json(out)
+                }
+                Err(e) => tool_err(e),
+            };
+        }
+        let done = match parsed {
+            crate::setlist::ParsedShowControl::SongOfProgram { device, device_port, on } => {
+                if let Some(port) = device_port {
+                    let already = st.show_controls_cfg.program_selects_port(&port);
+                    let used = st.show_controls_cfg.program_devices.len()
+                        + st.show_controls_cfg.program_device_indices.len();
+                    if on && !already && used >= crate::setlist::MAX_PROGRAM_DEVICES {
+                        return tool_err(format!("at most {} devices pick songs: turn one off first", crate::setlist::MAX_PROGRAM_DEVICES));
+                    }
+                    st.show_controls_cfg.set_program_port(port.clone(), on);
+                    if let Some(idx) = device {
+                        st.setlist.set_program_selects_song(idx, false);
+                    }
+                    let _ = crate::config::save_show_controls(&st.show_controls_cfg);
+                    format!("{port}'s program change {} the song (saved to config.json)", if on { "now picks" } else { "no longer picks" })
+                } else if let Some(d) = device {
+                    let already = st.show_controls_cfg.program_selects_index(d);
+                    let used = st.show_controls_cfg.program_devices.len()
+                        + st.show_controls_cfg.program_device_indices.len();
+                    if on && !already && used >= crate::setlist::MAX_PROGRAM_DEVICES {
+                        return tool_err(format!("at most {} devices pick songs: turn one off first", crate::setlist::MAX_PROGRAM_DEVICES));
+                    }
+                    st.show_controls_cfg.set_program_index(d, on);
+                    st.setlist.set_program_selects_song(d, false);
+                    let _ = crate::config::save_show_controls(&st.show_controls_cfg);
+                    format!("device {d}'s program change {} the song (saved to config.json)", if on { "now picks" } else { "no longer picks" })
+                } else {
+                    return tool_err("song_of_program needs 'device' or 'device_port'");
+                }
             }
+            crate::setlist::ParsedShowControl::Clear { action } => {
+                st.show_controls_cfg.clear_binding(action);
+                st.setlist.forget(action);
+                let _ = crate::config::save_show_controls(&st.show_controls_cfg);
+                format!("{} cleared (saved to config.json)", action.label())
+            }
+            crate::setlist::ParsedShowControl::Bind { action, msg, device, device_port, channel } => {
+                let port = device_port.filter(|s| !s.trim().is_empty());
+                let idx = if port.is_some() { None } else { device };
+                st.setlist.controls.retain(|c| c.action != action);
+                let displaced = st.show_controls_cfg.set_binding(action, msg, port.clone(), idx, channel);
+                let _ = crate::config::save_show_controls(&st.show_controls_cfg);
+                let from = port
+                    .or_else(|| device.map(|d| format!("device {d}")))
+                    .unwrap_or_else(|| "any device".into());
+                let ch = channel.map_or(String::new(), |c| format!(" ch {}", c + 1));
+                let lbl = crate::setlist::msg_label(msg);
+                match displaced {
+                    Some(other) => format!("{lbl} from {from}{ch} now does {} (moved from {}; saved to config.json)", action.label(), other.label()),
+                    None => format!("{lbl} from {from}{ch} now does {} (saved to config.json)", action.label()),
+                }
+            }
+        };
+        let mut out = headless_show_controls(&st);
+        out["changed"] = json!(done);
+        ok_json(out)
+    }
+
+    /// Read permanent configuration in `~/.config/kabelsalat/config.json` (#437).
+    #[tool(name = "get_config", description = "Read kabelsalat's permanent configuration (~/.config/kabelsalat/config.json) and live settings: Show mode prefs (leave_hold_secs, clock_24h, show_notes, show_rig_meters, start_in_show_mode), MIDI Show controls, session prefs (autosave, reopen_last_session, last_session, count_in, record_sync, retro_minutes), display prefs (reduce_motion, ui_scale, cable_opacity, cable_tension, cpu_overlay, system_ime), plugins (sandbox), midi (midi_through), and audio prefs.")]
+    fn get_config(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("get_config", json!({}));
+        }
+        ok_json(headless_config_json(&st))
+    }
+
+    /// Update permanent configuration in `~/.config/kabelsalat/config.json` (#437).
+    #[tool(name = "set_config", description = "Update one or more permanent configuration options in ~/.config/kabelsalat/config.json and apply them immediately: show_leave_hold_secs (0.25..=5.0), show_clock_24h, show_notes, show_rig_meters, start_in_show_mode (or nested show_mode object), autosave, reopen_last_session, record_sync, retro_minutes (0|1|2|5|10), reduce_motion, ui_scale (1.0..=3.0 or null for Auto), cable_opacity (0.3..=1.0), cable_tension (0.0..=1.0), cpu_overlay, system_ime, plugin_sandbox, midi_through.")]
+    fn set_config(&self, Parameters(args): Parameters<SetConfigArgs>) -> Result<CallToolResult, McpError> {
+        let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_config", v);
+        }
+        match headless_set_config(&mut st, &v) {
+            Ok(out) => ok_json(out),
             Err(e) => tool_err(e),
         }
     }
@@ -6037,14 +6576,19 @@ impl McpServer {
     }
 
     /// Toggle sync-to-transport recording.
-    #[tool(name = "set_record_sync", description = "Toggle 'sync to transport' (Command::SetRecordSync): while on, master transport play starts a recording and stop stops it. The take begins at song beat 0 (after any count-in).")]
+    #[tool(name = "set_record_sync", description = "Toggle 'sync to transport' (Command::SetRecordSync): while on, master transport play starts a recording and stop stops it. The take begins at song beat 0 (after any count-in). Remembered in config.json.")]
     fn set_record_sync(&self, Parameters(args): Parameters<RecordSyncArgs>) -> Result<CallToolResult, McpError> {
-        let mut st = self.state.lock().unwrap();
         let on = args.on;
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_record_sync", json!({"on": on}));
+        }
         if let Err(e) = send_cmd(&mut st, Command::SetRecordSync { on }) {
             return tool_err(e);
         }
         st.record_sync = on;
+        let _ = crate::config::save_record_sync(on);
         ok_json(json!({"record_sync": on}))
     }
 }
@@ -6304,14 +6848,28 @@ pub fn run() -> anyhow::Result<()> {
         device_instruments: Default::default(),
         instrument_bound: Vec::new(),
         record: audio.record,
-        record_sync: false,
+        record_sync: crate::config::load_record_sync(),
         rig_presets_dir: crate::session::rig_presets_dir(),
         setlists_dir_default: crate::session::default_setlists_dir(),
         setlists_dir_custom: crate::session::setlists_dir_configured(),
         open_setlist: None,
         rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
+        show_mode_cfg: crate::config::load_show_mode(),
+        show_controls_cfg: crate::config::load_show_controls(),
+        reopen_last_session: crate::config::load_reopen_last_session(),
+        ui_scale: crate::config::load_ui_scale(),
+        system_ime: crate::config::load_system_ime(),
+        reduce_motion: crate::assistant::load_reduce_motion(),
+        autosave: crate::assistant::load_session_autosave(),
+        retro_minutes: crate::record::retro_minutes_setting(),
+        cable_opacity: crate::assistant::load_cable_opacity(),
+        cable_tension: crate::assistant::load_cable_tension(),
+        cpu_overlay: crate::assistant::load_config_value("ui_cpu_overlay").and_then(|v| v.as_bool()).unwrap_or(false),
     }));
+    if state.lock().unwrap().record_sync {
+        let _ = send_cmd(&mut state.lock().unwrap(), Command::SetRecordSync { on: true });
+    }
     let server = McpServer { state, tool_router: McpServer::tool_router() };
     let result = serve_stdio(server, rpc_stdout, &mut audio.mains);
 
@@ -6346,13 +6904,24 @@ pub fn run_attach() -> anyhow::Result<()> {
         device_instruments: Default::default(),
         instrument_bound: Vec::new(),
         record: Arc::new(crate::record::RecorderShared::new()),
-        record_sync: false,
+        record_sync: crate::config::load_record_sync(),
         rig_presets_dir: crate::session::rig_presets_dir(),
         setlists_dir_default: crate::session::default_setlists_dir(),
         setlists_dir_custom: crate::session::setlists_dir_configured(),
         open_setlist: None,
         rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
+        show_mode_cfg: crate::config::load_show_mode(),
+        show_controls_cfg: crate::config::load_show_controls(),
+        reopen_last_session: crate::config::load_reopen_last_session(),
+        ui_scale: crate::config::load_ui_scale(),
+        system_ime: crate::config::load_system_ime(),
+        reduce_motion: crate::assistant::load_reduce_motion(),
+        autosave: crate::assistant::load_session_autosave(),
+        retro_minutes: crate::record::retro_minutes_setting(),
+        cable_opacity: crate::assistant::load_cable_opacity(),
+        cable_tension: crate::assistant::load_cable_tension(),
+        cpu_overlay: crate::assistant::load_config_value("ui_cpu_overlay").and_then(|v| v.as_bool()).unwrap_or(false),
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
     // here as an actionable error ("start the app"), not mid-tool-call.
@@ -6492,7 +7061,7 @@ mod tests {
         device_instruments: Default::default(),
         instrument_bound: Vec::new(),
             record: Arc::new(crate::record::RecorderShared::new()),
-            record_sync: false,
+            record_sync: crate::config::load_record_sync(),
             rig_presets_dir: std::env::var_os("CARGO_TARGET_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir)
@@ -6511,6 +7080,17 @@ mod tests {
             open_setlist: None,
             rig_types: Vec::new(),
         setlist: crate::setlist::Setlist::default(),
+            show_mode_cfg: crate::config::load_show_mode(),
+            show_controls_cfg: crate::config::load_show_controls(),
+            reopen_last_session: crate::config::load_reopen_last_session(),
+            ui_scale: crate::config::load_ui_scale(),
+            system_ime: crate::config::load_system_ime(),
+            reduce_motion: crate::assistant::load_reduce_motion(),
+            autosave: crate::assistant::load_session_autosave(),
+            retro_minutes: crate::record::retro_minutes_setting(),
+            cable_opacity: crate::assistant::load_cable_opacity(),
+            cable_tension: crate::assistant::load_cable_tension(),
+            cpu_overlay: false,
         };
         let server = McpServer {
             state: Arc::new(Mutex::new(state)),
@@ -7186,7 +7766,10 @@ mod tests {
             cc: Some(64),
             note: None,
             program: None,
+            channel: None,
             device: None,
+            device_port: None,
+            scope: None,
             clear: None,
             on: None,
         })));
@@ -7196,7 +7779,10 @@ mod tests {
             cc: None,
             note: Some(json!("C1")),
             program: None,
+            channel: None,
             device: Some(2),
+            device_port: None,
+            scope: None,
             clear: None,
             on: None,
         })));
@@ -7631,5 +8217,86 @@ mod tests {
         let default_dir = server.state.lock().unwrap().setlists_dir_default.clone();
         let _ = std::fs::remove_dir_all(&custom);
         let _ = std::fs::remove_dir_all(&default_dir);
+    }
+
+    #[test]
+    fn get_config_set_config_and_scoped_show_controls_work_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+
+        let initial = tool_json(&server.get_config());
+        assert_eq!(initial["show_mode"]["clock_24h"], json!(true));
+        assert_eq!(initial["display"]["ui_scale"], Value::Null);
+
+        let updated = tool_json(&server.set_config(Parameters(SetConfigArgs {
+            show_leave_hold_secs: Some(2.5),
+            show_clock_24h: Some(false),
+            show_notes: Some(false),
+            show_rig_meters: Some(false),
+            start_in_show_mode: Some(true),
+            reopen_last_session: Some(true),
+            record_sync: Some(true),
+            ui_scale: Some(json!(1.75)),
+            plugin_sandbox: Some(false),
+            midi_through: Some(true),
+            ..Default::default()
+        })));
+        assert_eq!(updated["show_mode"]["leave_hold_secs"], json!(2.5));
+        assert_eq!(updated["show_mode"]["clock_24h"], json!(false));
+        assert_eq!(updated["display"]["ui_scale"], json!(1.75));
+        assert_eq!(updated["plugins"]["sandbox"], json!(false));
+        assert_eq!(updated["midi"]["midi_through"], json!(true));
+        engine.render(&mut buf, 2);
+        assert!(engine.transport_pub().record_sync);
+
+        // Explicit `ui_scale: null` resets back to Auto (null).
+        let reset = tool_json(&server.set_config(Parameters(SetConfigArgs {
+            ui_scale: Some(Value::Null),
+            ..Default::default()
+        })));
+        assert_eq!(reset["display"]["ui_scale"], Value::Null);
+
+        assert!(is_err(server.set_config(Parameters(SetConfigArgs::default()))));
+        assert!(is_err(server.set_config(Parameters(SetConfigArgs {
+            ui_scale: Some(json!(8.0)),
+            ..Default::default()
+        }))));
+
+        // Scoped show control: global port-named ShowMode + channel, and session override.
+        let global = tool_json(&server.set_show_control(Parameters(SetShowControlArgs {
+            action: "show_mode".into(),
+            cc: Some(86),
+            note: None,
+            program: None,
+            channel: Some(3),
+            device: None,
+            device_port: Some("FCB1010:FCB1010 MIDI 1".into()),
+            scope: None,
+            clear: None,
+            on: None,
+        })));
+        let sm_row = global["actions"].as_array().unwrap().iter().find(|r| r["action"] == "show_mode").unwrap();
+        assert_eq!(sm_row["scope"], json!("global"));
+        assert_eq!(sm_row["control"]["cc"], json!(86));
+        assert_eq!(sm_row["control"]["channel"], json!(3));
+        assert_eq!(sm_row["control"]["device_port"], json!("FCB1010:FCB1010 MIDI 1"));
+
+        let sess = tool_json(&server.set_show_control(Parameters(SetShowControlArgs {
+            action: "panic".into(),
+            cc: None,
+            note: Some(json!("C2")),
+            program: None,
+            channel: None,
+            device: Some(0),
+            device_port: None,
+            scope: Some("session".into()),
+            clear: None,
+            on: None,
+        })));
+        assert_eq!(sess["session_overrides"], json!(true));
     }
 }

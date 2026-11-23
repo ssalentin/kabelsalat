@@ -1,2 +1,0 @@
-### Fixed
-- **CLAP plugin GUI opening reliability:** set `DISPLAY` (probing for the first reachable X11/XWayland socket) and `EGL_PLATFORM=x11` before `gui.create`, sync the host X11 window with the X server before `set_parent`, resize to post-attach plugin dimensions, fall back to floating X11/Wayland CLAP GUIs when embedded X11 is unsupported, allow double-clicking parameter-less CLAP plugins with native GUIs, and prevent sandboxed plugin workers from starving editor `pump()` callbacks or timing out slow GUI initialization.

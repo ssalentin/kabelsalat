@@ -210,13 +210,13 @@ instruments built by the community. Fast, professional, easy to use.**
 | Version | Theme |
 |---|---|
 | **0.3** | **The MainStage for Linux: a whole gig from one setlist (plus VST3 & LV2 GUIs)** |
-| 0.4 | Trust it on stage: a plugin crash never stops the show |
+| 0.4 | Trust it on stage: a plugin crash never stops the show, FOH/IEM/click outputs, hot-plug recovery, the assistant on a local model |
 | 0.5 | Instruments by the community: SFZ instruments and an open catalog |
 | 0.6 | Runs everywhere, plays everything: packages for your distribution |
 | 0.7 | Controllers and remote |
 | 0.8 | Practise and create: looper, practice tools, multi-take recording |
-| 0.9 | The assistant, on your terms: local models |
-| 1.0 | A promise of stability: old sessions keep loading |
+| 0.9 | The assistant, hands-free: voice, foot switch, recorded recipes |
+| 1.0 | A promise of stability: old sessions keep loading, Virtual Soundcheck, show sync |
 
 The [roadmap to v1.0](https://github.com/ssalentin/kabelsalat/issues/272)
 lists the issues behind each version; what changed is in

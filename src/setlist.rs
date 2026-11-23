@@ -260,6 +260,10 @@ pub struct Song {
     /// starts when the song is selected (#278).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backing: Option<String>,
+    /// The backing track's markers (#291), in file order: read from the
+    /// file's cue points when the track first loads, and edited in the app.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<crate::markers::Marker>,
     /// Optional lyrics, cues, or ChordPro chart shown in Show mode.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
@@ -274,7 +278,19 @@ impl Song {
             parts,
             set: None,
             backing: None,
+            markers: Vec::new(),
             notes: String::new(),
+        }
+    }
+}
+
+impl Song {
+    /// Renumber the parts the markers select after the parts moved: `map`
+    /// answers a part's new index, or `None` when it is gone (its markers
+    /// then select no part).
+    pub fn remap_marker_parts(&mut self, map: impl Fn(usize) -> Option<usize>) {
+        for m in &mut self.markers {
+            m.part = m.part.and_then(&map);
         }
     }
 }
@@ -725,6 +741,18 @@ impl Setlist {
         }
         let part = s.parts.remove(from);
         s.parts.insert(to, part);
+        // A marker keeps the part it selects, wherever that part moved.
+        s.remap_marker_parts(|p| {
+            Some(if p == from {
+                to
+            } else if from < to && p > from && p <= to {
+                p - 1
+            } else if to < from && p >= to && p < from {
+                p + 1
+            } else {
+                p
+            })
+        });
         if let Some(pos) = &mut self.active {
             if pos.song == song {
                 if pos.part == from {
@@ -746,6 +774,7 @@ impl Setlist {
         copy.name = format!("{} copy", copy.name);
         let at = index + 1;
         s.parts.insert(at, copy);
+        s.remap_marker_parts(|p| Some(if p > index { p + 1 } else { p }));
         if let Some(pos) = &mut self.active {
             if pos.song == song && pos.part > index {
                 pos.part += 1;

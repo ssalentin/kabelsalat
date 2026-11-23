@@ -154,6 +154,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   song and read them in Show mode. → [Song notes & chord charts](docs/GUIDE.md#song-notes-and-chord-charts)
 - **Check the show** before the first song: devices, plugins, sound, power, with
   one-click quick-fix links. → [Check show](docs/GUIDE.md#check-the-show-before-the-first-song)
+- **Backing-track markers:** jump to the chorus, loop the solo or stop at the
+  end of a section, on the bar; a marker can switch the song's part.
+  → [Markers](docs/GUIDE.md#markers-jump-to-a-section-loop-a-section)
 - **Step songs from a foot switch**, attach WAV backing tracks directly to songs,
   record the set or save the last two minutes with **Retro**, and restart by
   itself after a crash. → [Pedals](docs/GUIDE.md#run-the-show-from-a-pedal),

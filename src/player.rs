@@ -31,20 +31,45 @@ use rtrb::{Producer, PushError};
 pub const DEFAULT_BPM: f32 = 120.0;
 
 enum PlayerMsg {
-    Play(std::path::PathBuf),
+    Play(std::path::PathBuf, u64),
+}
+
+/// What the decode thread found in the file it loaded last, beside the
+/// audio (#291): the frontend reads it, the engine never does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileInfo {
+    /// The load this is (`PlayerControl::play`'s answer, `PlayerPub::file`).
+    pub id: u64,
+    pub path: std::path::PathBuf,
+    pub duration: f64,
+    /// The file's own cue points.
+    pub cues: Vec<crate::markers::Marker>,
+    /// The waveform overview (`markers::peaks`).
+    pub peaks: Vec<f32>,
 }
 
 /// UI-side handle: tell the decode thread what to play.
 #[derive(Clone)]
 pub struct PlayerControl {
     tx: Sender<PlayerMsg>,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+    info: Arc<std::sync::Mutex<Option<Arc<FileInfo>>>>,
 }
 
 impl PlayerControl {
     /// Load `path` and start playback (the engine arms the file at the next
     /// bar line when sync is on and the transport rolls; see `load_player`).
-    pub fn play(&self, path: impl Into<std::path::PathBuf>) {
-        let _ = self.tx.send(PlayerMsg::Play(path.into()));
+    /// Answers the load's id: markers are sent for it
+    /// (`Command::SetPlayerMarkers`), and the engine says which load plays.
+    pub fn play(&self, path: impl Into<std::path::PathBuf>) -> u64 {
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let _ = self.tx.send(PlayerMsg::Play(path.into(), id));
+        id
+    }
+
+    /// The file loaded last, once the decode thread has read it.
+    pub fn info(&self) -> Option<Arc<FileInfo>> {
+        self.info.lock().ok()?.clone()
     }
 }
 
@@ -58,6 +83,9 @@ pub struct PlayerData {
     pub sample_rate: u32,
     /// "nnn bpm" in the filename (AUM's default for the original tempo).
     pub bpm: Option<f32>,
+    /// Which load this is (`PlayerControl::play`); 0 for a buffer made in
+    /// place. The engine follows only the markers sent for this id.
+    pub id: u64,
 }
 
 impl PlayerData {
@@ -78,12 +106,12 @@ impl PlayerData {
             samples.push(sample_at(&w.data, f, 0, file_ch));
             samples.push(sample_at(&w.data, f, file_ch - 1, file_ch));
         }
-        Self { samples: samples.into(), sample_rate: w.sample_rate, bpm: None }
+        Self { samples: samples.into(), sample_rate: w.sample_rate, bpm: None, id: 0 }
     }
 
     /// Interleaved stereo at `sample_rate`, for tests and self-tests.
     pub fn from_samples(samples: Vec<f32>, sample_rate: u32) -> Self {
-        Self { samples: samples.into(), sample_rate, bpm: None }
+        Self { samples: samples.into(), sample_rate, bpm: None, id: 0 }
     }
 }
 
@@ -201,27 +229,43 @@ pub fn read_frame(data: &[f32], frames: usize, pos: f64, wrap: bool) -> [f32; 2]
 /// channel between loads and exits when the app drops the engine's ring.
 pub fn start(mut loader: Producer<PlayerData>) -> PlayerControl {
     let (tx, rx) = mpsc::channel();
+    let info: Arc<std::sync::Mutex<Option<Arc<FileInfo>>>> = Default::default();
+    let found = info.clone();
     std::thread::Builder::new()
         .name("file-player".into())
         .spawn(move || {
-            while let Ok(PlayerMsg::Play(path)) = rx.recv() {
-                match load_file(&path) {
-                    Ok(data) => push_loaded(&mut loader, data),
+            while let Ok(PlayerMsg::Play(path, id)) = rx.recv() {
+                match load_file_info(&path) {
+                    Ok((mut data, cues)) => {
+                        data.id = id;
+                        let file = FileInfo { id, path, duration: data.duration(), cues, peaks: crate::markers::peaks(&data.samples) };
+                        // The info first: when the engine says this load
+                        // plays, the frontend already finds its markers.
+                        if let Ok(mut slot) = found.lock() {
+                            *slot = Some(Arc::new(file));
+                        }
+                        push_loaded(&mut loader, data);
+                    }
                     Err(e) => eprintln!("file-player: cannot open {}: {e:#}", path.display()),
                 }
             }
         })
         .expect("spawn file-player thread");
-    PlayerControl { tx }
+    PlayerControl { tx, next_id: Default::default(), info }
 }
 
 /// Decode a WAV file into a `PlayerData` (parse, upmix, filename BPM).
 pub fn load_file(path: &Path) -> anyhow::Result<PlayerData> {
-    let mut file = std::fs::File::open(path)?;
-    let wav = parse_wav(&mut file)?;
-    let mut data = PlayerData::from_wav(wav);
+    load_file_info(path).map(|(data, _)| data)
+}
+
+/// `load_file`, and the file's cue points as markers (#291).
+pub fn load_file_info(path: &Path) -> anyhow::Result<(PlayerData, Vec<crate::markers::Marker>)> {
+    let bytes = std::fs::read(path)?;
+    let cues = crate::markers::wav_cues(&bytes);
+    let mut data = PlayerData::from_wav(parse_wav_bytes(&bytes)?);
     data.bpm = filename_bpm(path);
-    Ok(data)
+    Ok((data, cues))
 }
 
 /// Hand one decoded buffer to the engine. The ring holds a handful of
@@ -252,6 +296,10 @@ pub(crate) fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
     use std::io::Read;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    parse_wav_bytes(&bytes)
+}
+
+fn parse_wav_bytes(bytes: &[u8]) -> anyhow::Result<Wav> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         anyhow::bail!("not a RIFF/WAVE file");
     }
@@ -690,6 +738,103 @@ pub mod selftest {
     }
 }
 
+/// Marker fixtures and measurements (#291), shared by the unit tests and
+/// `player-test`.
+pub mod marker_test {
+    use super::selftest::*;
+    use crate::control::Command;
+    use crate::markers::{Marker, MarkerAction, MarkerTable};
+
+    /// A 16-beat file at 100 BPM with a burst every 4 beats, markers on the
+    /// bar lines at file beats 4, 8 and 12.
+    pub fn bar_file() -> (super::PlayerData, MarkerTable) {
+        let frames = (16.0 * 0.6 * FILE_SR as f64) as usize;
+        let marks: Vec<Marker> = [4.0, 8.0, 12.0].iter().enumerate().map(|(i, b)| Marker::new(format!("Bar {}", i + 1), b * 0.6)).collect();
+        (burst_file(frames, 16, 4), MarkerTable::new(&marks))
+    }
+
+    /// Jump next/prev of a synced track under a rolling transport: the
+    /// burst at each marker must sound ON a bar line. Returns the song
+    /// beats of every burst: expected 0, 4, 8, 12.
+    pub fn bar_jumps() -> Vec<f64> {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 100.0 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(false), sync: Some(true), beats: None, offset: None, bpm: Some(100.0) });
+        let (mut data, table) = bar_file();
+        data.id = 7;
+        r.send(Command::SetPlayerMarkers { file: 7, markers: table });
+        r.load(data);
+        r.run(512, 512, |_, _, _| {});
+        r.send(Command::TransportPlay);
+        let beat = 28_800usize; // frames per beat at 100 BPM
+        let mut on = r.onsets(beat * 5 + beat * 3 / 10, 512); // to beat 5.3
+        r.send(Command::PlayerMarker { action: MarkerAction::Next });
+        on.extend(r.onsets(beat * 4 + beat * 2 / 10, 512)); // to beat 9.5: Next from section 1 → marker 1 at the bar, beat 8
+        r.send(Command::PlayerMarker { action: MarkerAction::Prev });
+        on.extend(r.onsets(beat * 4 + beat / 2, 512));
+        on
+    }
+
+    /// A sine file with markers on whole cycles (441 Hz at 44.1 kHz is 100
+    /// frames a cycle; 20000 and 40000 are whole cycles).
+    pub fn sine_sections() -> (super::PlayerData, MarkerTable) {
+        let marks = [20_000.0, 40_000.0].iter().enumerate().map(|(i, f)| Marker::new(format!("S{i}"), f / FILE_SR as f64)).collect::<Vec<_>>();
+        (sine_loop(), MarkerTable::new(&marks))
+    }
+
+    fn started() -> Rig {
+        let mut r = Rig::new();
+        r.send(Command::SetPlayerCfg { loop_on: Some(false), sync: Some(false), beats: None, offset: None, bpm: None });
+        let (mut d, t) = sine_sections();
+        d.id = 3;
+        r.send(Command::SetPlayerMarkers { file: 3, markers: t });
+        r.load(d);
+        r.run(512, 512, |_, _, _| {});
+        r
+    }
+
+    /// Loop section 1 (marker 0 to marker 1) for `secs`: the worst second
+    /// difference of the sine (a click is far above 2·(1−cos ω) ≈ 0.0033),
+    /// its peak, and the section still playing.
+    pub fn section_loop(secs: f64) -> (f32, f32, u8) {
+        let mut r = started();
+        r.send(Command::PlayerMarker { action: MarkerAction::Jump(0) });
+        r.run(1, 1, |_, _, _| {});
+        r.send(Command::PlayerMarker { action: MarkerAction::Loop(Some(true)) });
+        let (mut worst, mut peak, mut hist) = (0.0f32, 0.0f32, Vec::<f32>::new());
+        r.run((secs * OUT_SR) as usize, 61, |p, _, _| hist.extend(p.chunks(2).map(|s| s[0])));
+        // Skip the jump's own crossfade: judge from 10 ms on.
+        for w in hist[480..].windows(3) {
+            worst = worst.max((w[2] - 2.0 * w[1] + w[0]).abs());
+            peak = peak.max(w[1].abs());
+        }
+        (worst, peak, r.state().section)
+    }
+
+    /// Stop at the end of section 0 from the start: (samples sounding after
+    /// the stop's fade, the position it stopped at in seconds, the peak
+    /// once started again, where that start began).
+    pub fn stop_at_end() -> (f32, f32, f32, f32) {
+        let mut r = started();
+        r.send(Command::PlayerMarker { action: MarkerAction::StopAtEnd(Some(true)) });
+        // Section 0 ends at 20000 file frames = 21333 output frames.
+        r.run(21_333 + 400, 61, |_, _, _| {});
+        let st = r.state();
+        let mut tail = 0.0f32;
+        r.run(4800, 61, |p, _, _| tail = p.iter().fold(tail, |m, s| m.max(s.abs())));
+        let stopped_at = r.state().pos;
+        r.send(Command::SetPlayerEnable { on: true });
+        let mut first = None;
+        let mut peak = 0.0f32;
+        r.run(2000, 61, |p, _, _| {
+            peak = p.iter().fold(peak, |m, s| m.max(s.abs()));
+            first.get_or_insert(p[0]);
+        });
+        assert!(!st.playing && st.at_end == crate::markers::AtEnd::Continue, "{st:?}");
+        (tail, stopped_at, peak, r.state().pos)
+    }
+}
+
 /// `kabelsalat player-test`: the real decode thread feeding a real engine,
 /// then the loop seam, the beat lock over five minutes, and a tempo change
 /// (issue #84). Every number printed is measured, not asserted from a model.
@@ -743,6 +888,30 @@ pub fn run_test() -> anyhow::Result<()> {
     println!(
         "player-test: (c) tempo change 120→90 BPM mid-beat followed — worst off-grid {before:.5} before / {after:.5} after, beat gap {gap_b:.4} s → {gap_a:.4} s"
     );
+
+    // 5. Markers (#291): cue points from a real file, bar-exact jumps,
+    // a seamless section loop and a stop at the section's end.
+    let pcm = vec![0i16; 44_100 * 2 * 2];
+    let cued = std::env::temp_dir().join(format!("ksalat-player-test-{}.wav", std::process::id()));
+    std::fs::write(&cued, crate::markers::wav_with_cues(44_100, 2, &pcm, &[(0, "Intro"), (44_100, "Chorus")]))?;
+    let (_, cues) = load_file_info(&cued)?;
+    let _ = std::fs::remove_file(&cued);
+    anyhow::ensure!(cues.len() == 2 && cues[1].name == "Chorus" && cues[1].at == 1.0, "cue points: {cues:?}");
+    println!("player-test: (d) a WAV's cue points read as markers: {}", cues.iter().map(|m| format!("{} @ {:.1} s", m.name, m.at)).collect::<Vec<_>>().join(", "));
+    let on = marker_test::bar_jumps();
+    let tol = frames_to_beats(3.0, 100.0);
+    anyhow::ensure!(on.len() == 4 && [0.0, 4.0, 8.0, 12.0].iter().zip(&on).all(|(w, b)| (w - b).abs() < tol), "bar jumps: onsets at beats {on:?}");
+    println!(
+        "player-test: (d) synced jumps (next, then previous marker) land on the bar — bursts at song beats {} (tolerance {:.1} frames)",
+        on.iter().map(|b| format!("{b:.4}")).collect::<Vec<_>>().join(", "),
+        tol / frames_to_beats(1.0, 100.0)
+    );
+    let (worst, peak, section) = marker_test::section_loop(6.0);
+    anyhow::ensure!(worst < 0.0034 && peak > 0.99 && peak < 1.001 && section == 1, "section loop: second difference {worst}, peak {peak}, section {section}");
+    println!("player-test: (d) a section loops 13 times with no gap or click — worst second difference {worst:.5} (a clean 441 Hz sine is 0.0033), peak {peak:.4}");
+    let (tail, at, peak, restarted) = marker_test::stop_at_end();
+    anyhow::ensure!(tail == 0.0 && (at - 20_000.0 / 44_100.0).abs() < 0.002 && peak > 0.9 && restarted > at, "stop at end: tail {tail}, at {at}, peak {peak}, restarted {restarted}");
+    println!("player-test: (d) stop at the section's end — silent after {at:.4} s, and the next start sounds on from there");
     println!("player-test: OK");
     Ok(())
 }
@@ -929,6 +1098,52 @@ mod engine_tests {
         let back = r.back.pop().expect("old buffer handed back");
         assert_eq!(back.len(), FILE_SR as usize * 2);
         assert_eq!(r.state().bpm, 87.5, "filename BPM adopted");
+    }
+
+    /// #291: next/previous marker of a synced track land on the bar line.
+    #[test]
+    fn synced_marker_jumps_land_on_the_bar() {
+        use super::selftest::*;
+        let on = super::marker_test::bar_jumps();
+        assert_eq!(on.len(), 4, "{on:?}");
+        for (want, got) in [0.0, 4.0, 8.0, 12.0].iter().zip(&on) {
+            assert!((want - got).abs() < frames_to_beats(3.0, 100.0), "burst at beat {got}, wanted {want}: {on:?}");
+        }
+    }
+
+    /// #291: a looped section repeats with no gap or click at the seam.
+    #[test]
+    fn a_looped_section_repeats_without_a_click() {
+        let (worst, peak, section) = super::marker_test::section_loop(3.0);
+        assert!(worst < 0.0034, "second difference {worst}");
+        assert!(peak > 0.99 && peak < 1.001, "peak {peak}");
+        assert_eq!(section, 1);
+    }
+
+    /// #291: stop at the section end, silent, and the next start goes on.
+    #[test]
+    fn stop_at_the_sections_end_resumes_from_the_next_section() {
+        let (tail, at, peak, restarted) = super::marker_test::stop_at_end();
+        assert_eq!(tail, 0.0);
+        assert!((at - 20_000.0 / 44_100.0).abs() < 0.002, "stopped at {at}");
+        assert!(peak > 0.9 && restarted > at, "restart peak {peak}, pos {restarted}");
+    }
+
+    /// Markers sent for another load do not apply to this one.
+    #[test]
+    fn markers_of_another_file_are_ignored() {
+        use super::selftest::*;
+        let mut r = Rig::new();
+        let (_, table) = super::marker_test::sine_sections();
+        r.send(Command::SetPlayerMarkers { file: 99, markers: table });
+        let mut d = sine_loop();
+        d.id = 1;
+        r.load(d);
+        r.run(512, 512, |_, _, _| {});
+        assert_eq!(r.state().markers, 0);
+        r.send(Command::PlayerMarker { action: crate::markers::MarkerAction::Jump(0) });
+        r.run(512, 512, |_, _, _| {});
+        assert!(r.state().pos < 0.05, "no jump: {}", r.state().pos);
     }
 
     /// Backing tracks default to stop-at-end (`loop_on == false`): loading a

@@ -695,6 +695,24 @@ struct SetPlayerArgs {
     bpm: Option<f32>,
 }
 
+/// Arguments for `backing_markers`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct BackingMarkersArgs {
+    /// list (default), add, remove, rename, move, set_part, jump, next, prev, loop_section, stop_at_section.
+    action: Option<String>,
+    /// Setlist song index, 0-based (default: the active song).
+    song: Option<u32>,
+    /// Marker index in file order, 0-based.
+    index: Option<u32>,
+    name: Option<String>,
+    /// Seconds from the file's start.
+    at: Option<f64>,
+    /// The part of the song the marker selects, 0-based; null clears.
+    part: Option<u32>,
+    /// loop_section / stop_at_section: true or false; omitted toggles.
+    on: Option<bool>,
+}
+
 /// Arguments for `play_file`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PlayFileArgs {
@@ -2986,6 +3004,16 @@ impl McpServer {
             }
         }
         Self::ui_bridge_tool("play_file", a)
+    }
+
+    /// Markers of a song's backing track.
+    #[tool(name = "backing_markers", description = "Markers of a song's backing track: named points (read from the WAV's cue points when the track first loads, or added here) that bound sections. action: list (default), add (name, at seconds or the playhead, optional part), remove, rename, move (index, at), set_part (index, part: the song's part, 0-based, the sound switches to when playback reaches the marker; null clears it), jump (index), next, prev, loop_section (on: optional, toggles), stop_at_section. song is a 0-based setlist index (default: the active song). index is 0-based in file order. A jump of a synced track lands on the next bar line. Needs the running app (kabelsalat mcp --attach).")]
+    fn backing_markers(&self, Parameters(args): Parameters<BackingMarkersArgs>) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if !remote {
+            return tool_err("backing_markers needs the running app (kabelsalat mcp --attach)");
+        }
+        Self::ui_bridge_tool("backing_markers", serde_json::to_value(&args).unwrap_or_else(|_| json!({})))
     }
 
     /// Stop the backing track.

@@ -41,6 +41,7 @@ mod listen;
 mod llm;
 mod lv2;
 mod main_controls;
+mod markers;
 mod matrix;
 mod mcp;
 mod organ;

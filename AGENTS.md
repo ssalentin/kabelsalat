@@ -2050,3 +2050,13 @@ Learned so far (2026-11-15, UI polish pass):
     xrun. Check with `kabelsalat hotplug-test`
     (`an_unplugged_keyboard_lets_go_of_its_held_keys_and_pedal_and_of_nothing_else`,
     `audio_recover::tests`).
+
+231. **A marker seam is a crossfade on the engine's own clock, and a synced loop
+    moves the song-clock anchor, not the position:** `fill_player` keeps the
+    outgoing side playing for `markers::FADE_SECS` while the incoming side fades
+    in (equal-gain, so a seam inside one waveform stays at unity), a synced
+    jump anchors at the bar line itself (`jump_at`), and a section loop shifts
+    `anchor_file_beats` back by the section's length so a section of whole bars
+    stays on the bar. Markers are followed only for the load they were sent
+    for (`SetPlayerMarkers.file`, `PlayerData::id`). Check with
+    `kabelsalat player-test` (d) and `player::engine_tests`.

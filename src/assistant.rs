@@ -1027,6 +1027,11 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
+            "name":"backing_markers",
+            "description":"Markers of a song's backing track: named points (read from the WAV's cue points when the track first loads, or added here) that bound sections. action: list (default), add (name, at seconds or the playhead, optional part), remove, rename, move (index, at), set_part (index, part: the song's part, 0-based, the sound switches to when playback reaches the marker; null clears it), jump (index), next, prev, loop_section (on: optional, toggles), stop_at_section. song is a 0-based setlist index (default: the active song). index is 0-based in file order. A jump of a synced track lands on the next bar line.",
+            "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","add","remove","rename","move","set_part","jump","next","prev","loop_section","stop_at_section"]},"song":{"type":"integer"},"index":{"type":"integer"},"name":{"type":"string"},"at":{"type":"number"},"part":{"type":["integer","null"]},"on":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
             "name":"set_player",
             "description":"Change the file player without restarting it: mix gain (0..1, 0 mutes) and/or the AUM FilePlayer options loop, sync, beats, offset, bpm. Give at least one.",
             "parameters":{"type":"object","properties":{"gain":{"type":"number"},"loop":{"type":"boolean","description":"restart the file seamlessly at its end"},"sync":{"type":"boolean","description":"playback rate follows the transport tempo (AUM varispeed from the file's original BPM, not time-stretch); with the transport rolling, play starts at the next bar"},"beats":{"type":"number","description":"Number of Beats: the loop length in beats (loop+sync derive the tempo from it, so an aligned loop never drifts)"},"offset":{"type":"number","description":"Beat Offset (+/-): start point in beats"},"bpm":{"type":"number","description":"the file's original BPM (a \"120 bpm\" in the file name is adopted automatically)"}}}

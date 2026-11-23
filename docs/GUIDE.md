@@ -42,6 +42,7 @@ every keyboard shortcut.
   - [Check the show before the first song](#check-the-show-before-the-first-song)
   - [Run the show from a pedal](#run-the-show-from-a-pedal)
   - [Play along with a backing track](#play-along-with-a-backing-track)
+  - [Markers: jump to a section, loop a section](#markers-jump-to-a-section-loop-a-section)
   - [Running backing tracks for a band](#running-backing-tracks-for-a-band)
   - [Record your set](#record-your-set)
   - [Get back on stage after a crash](#get-back-on-stage-after-a-crash)
@@ -722,6 +723,36 @@ or drop a `.wav` file onto the app), or name one via `set_setlist_song` with
 `backing`: selecting the song starts it, a song's backing track stops cleanly at
 the end of the song rather than looping unexpectedly (unless **loop** is
 explicitly enabled), and switching to a song without one stops playback.
+
+### Markers: jump to a section, loop a section
+
+A song's backing track can carry **markers**: named points that cut it into
+sections. The WAV's own cue points (with their labels) become markers when the
+track first loads; under **Markers** in the Setlist song editor you add more
+(**+ Marker** puts one at the spot you clicked on the waveform, or at the
+playhead), rename, remove or move them, and each marker can pick a **part** of
+the song: when playback reaches or jumps to the marker the sound switches to
+that part, in the engine, like a foot-switch step.
+
+The actions work on the section playing:
+
+| Action | What it does |
+|---|---|
+| **Go** / `jump` | jump to that marker |
+| **Next ▸** / **◂ Prev** | the marker after / before the section playing |
+| **Loop** | repeat the section playing until switched off (no gap, no click) |
+| **Stop at end** | play to the end of the section, stop once; the next start goes on from the next section |
+
+With **sync** on and the transport rolling, a jump waits for the next bar line
+and the marker lands on it (a section of whole bars stays on the bar through
+its loop). Without sync, or with the transport stopped, it goes at once or
+sets where the next start begins. Every seam is a 5 ms crossfade.
+
+Learn the four actions on pedals like the other show controls (**Setlist →
+Show controls**: Next marker, Previous marker, Loop section, Stop at section
+end). The assistant and MCP agents use the `backing_markers` tool. Markers are
+saved with the song. In Show mode the waveform, its markers, the playhead and
+the section name sit under the song title.
 
 ### Running backing tracks for a band
 

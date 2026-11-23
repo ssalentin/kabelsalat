@@ -1468,6 +1468,14 @@ pub enum Command {
     /// master transport rolling (or counting in), sounding starts at the
     /// next bar boundary; otherwise it starts now. `on: false` stops.
     SetPlayerEnable { on: bool },
+    /// The markers of the file load `file` (`PlayerControl::play`'s id;
+    /// #291): the engine follows them only while that load plays, so a
+    /// song's markers never apply to the track before it.
+    SetPlayerMarkers { file: u64, markers: crate::markers::MarkerTable },
+    /// Jump to a marker, or loop or stop at the end of the section playing.
+    /// A jump of a synced track under a rolling transport lands on the next
+    /// bar line; a stopped player takes it as where its next start begins.
+    PlayerMarker { action: crate::markers::MarkerAction },
     /// Master transport: start EVERY transport-capable node (sets
     /// `Node::playing` on all of them) and run the song clock hosted CLAP
     /// plugins follow, from beat 0. Per-node SetNodePlaying overrides
@@ -1644,6 +1652,8 @@ impl Command {
             | Command::SetPlayer { .. }
             | Command::SetPlayerCfg { .. }
             | Command::SetPlayerEnable { .. }
+            | Command::SetPlayerMarkers { .. }
+            | Command::PlayerMarker { .. }
             | Command::TransportPlay
             | Command::TransportStop
             | Command::SetNodePlaying { .. }
@@ -1815,6 +1825,9 @@ mod tests {
             Command::SetNodeSplit { node: 0, point: Some(60) },
             Command::SetNodeSplit { node: 0, point: None },
             Command::SetSystemAudio { gain: 0.5 },
+            Command::SetPlayerMarkers { file: 3, markers: crate::markers::MarkerTable::new(&[crate::markers::Marker { name: "Chorus".into(), at: 12.5, part: Some(1) }]) },
+            Command::PlayerMarker { action: crate::markers::MarkerAction::Jump(2) },
+            Command::PlayerMarker { action: crate::markers::MarkerAction::Loop(None) },
             Command::TransportPlay,
             Command::TransportStop,
             Command::SetNodePlaying { node: 7, playing: true },

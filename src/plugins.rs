@@ -914,6 +914,42 @@ impl Entry<'_> {
         }
     }
 
+    /// Whether the app has an add action for it: hostable, and not a CLAP or
+    /// VST3 MIDI effect (only built-in and LV2 MIDI strips exist).
+    pub fn addable(&self) -> bool {
+        self.hostable()
+            && !(self.ty() == PluginType::MidiFx && matches!(self.source, Source::Clap(_) | Source::Vst3(_)))
+    }
+
+    /// The format tag and the plugin's own id: together its identity.
+    fn key_parts(&self) -> (&'static str, &str) {
+        match self.source {
+            Source::Builtin(b) => ("builtin", b.id),
+            Source::Clap(p) => ("clap", &p.id),
+            Source::Vst3(p) => ("vst3", &p.cid),
+            Source::Lv2(p) => ("lv2", &p.uri),
+        }
+    }
+
+    /// The plugin's own id: `builtin.delay`, a CLAP id, a VST3 CID or an LV2 URI.
+    pub fn id(&self) -> &str {
+        self.key_parts().1
+    }
+
+    /// One identity across formats (`clap:<id>`, `lv2:<uri>`, …): what
+    /// favorites and recents store (#307).
+    pub fn key(&self) -> String {
+        let (tag, id) = self.key_parts();
+        format!("{tag}:{id}")
+    }
+
+    /// Whether `key` (as `key()` writes it) names this plugin, without
+    /// building a string per entry.
+    pub fn has_key(&self, key: &str) -> bool {
+        let (tag, id) = self.key_parts();
+        key.split_once(':').is_some_and(|(t, i)| t == tag && i == id)
+    }
+
     fn matches_query(&self, query: &str) -> bool {
         let (ty, sub) = (self.ty().label(), self.sub.label());
         match self.source {
@@ -964,6 +1000,10 @@ pub struct PluginListFilter {
     pub format: Option<PluginFormat>,
     pub query: String,
     pub limit: Option<usize>,
+    /// Only the user's favorites or recently added plugins (#307). The keys
+    /// come from the shelf: `on_shelf` fills them.
+    pub shelf: Option<ShelfView>,
+    pub shelf_keys: Vec<String>,
 }
 
 impl PluginListFilter {
@@ -997,23 +1037,41 @@ impl PluginListFilter {
                     .ok_or_else(|| format!("unknown format '{raw}' (use builtin | clap | vst3 | lv2 | all)"))
             })
             .transpose()?;
+        let shelf = arg(&["shelf"])
+            .map(|raw| ShelfView::parse(raw).ok_or_else(|| format!("unknown shelf '{raw}' (use favorites | recent | all)")))
+            .transpose()?;
         Ok(Self {
             plugin_type,
             subtype,
             format,
             query: args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
             limit: args.get("limit").and_then(|v| v.as_u64()).map(|n| (n as usize).clamp(1, 300)),
+            shelf,
+            shelf_keys: Vec::new(),
         })
     }
 
+    /// Fill the keys of the shelf view this filter asks for, if any.
+    pub fn on_shelf(mut self, shelf: &Shelf) -> Self {
+        if let Some(view) = self.shelf {
+            self.shelf_keys = shelf.keys(view).to_vec();
+        }
+        self
+    }
+
     fn is_filtered(&self) -> bool {
-        self.plugin_type.is_some() || self.subtype.is_some() || self.format.is_some() || !self.query.is_empty()
+        self.plugin_type.is_some()
+            || self.subtype.is_some()
+            || self.format.is_some()
+            || self.shelf.is_some()
+            || !self.query.is_empty()
     }
 
     pub fn matches(&self, e: &Entry<'_>) -> bool {
         self.plugin_type.is_none_or(|t| t == e.ty())
             && self.subtype.is_none_or(|s| s == e.sub)
             && self.format.is_none_or(|f| f == e.format())
+            && (self.shelf.is_none() || self.shelf_keys.iter().any(|k| e.has_key(k)))
             && e.matches_query(&self.query)
     }
 
@@ -1023,8 +1081,253 @@ impl PluginListFilter {
         lv2: &'a [Lv2PluginInfo],
         vst3: &'a [Vst3PluginInfo],
     ) -> Vec<Entry<'a>> {
-        entries(clap, lv2, vst3).into_iter().filter(|e| self.matches(e)).collect()
+        let mut hits: Vec<Entry<'a>> = entries(clap, lv2, vst3).into_iter().filter(|e| self.matches(e)).collect();
+        if self.shelf == Some(ShelfView::Recent) {
+            sort_by_recency(&mut hits, &self.shelf_keys);
+        }
+        hits
     }
+}
+
+/// A view of the shelf: the starred plugins, or the ones added last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShelfView {
+    Favorites,
+    Recent,
+}
+
+impl ShelfView {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "favorites" | "favorite" | "favourites" | "favourite" | "starred" => Some(Self::Favorites),
+            "recent" | "recents" | "recently_used" => Some(Self::Recent),
+            _ => None,
+        }
+    }
+}
+
+/// Newest first, in the order of `recents`; a stable sort, so equal ranks
+/// keep the order they came in.
+pub fn sort_by_recency(entries: &mut [Entry<'_>], recents: &[String]) {
+    entries.sort_by_cached_key(|e| recents.iter().position(|k| e.has_key(k)).unwrap_or(usize::MAX));
+}
+
+/// The user's starred plugins and the ones they added last (#307), kept in
+/// the config file. Favorites are in the order they were starred (lists sort
+/// them for browsing); recents are newest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shelf {
+    favorites: Vec<String>,
+    recents: Vec<String>,
+}
+
+impl Shelf {
+    pub const MAX_RECENT: usize = 12;
+    pub const FAVORITES_FIELD: &'static str = "plugin_favorites";
+    pub const RECENTS_FIELD: &'static str = "plugin_recents";
+
+    /// The shelf of this user's config file (empty in tests, rule 37).
+    pub fn load() -> Self {
+        if cfg!(test) {
+            return Self::default();
+        }
+        Self::load_from(&crate::assistant::config_path())
+    }
+
+    /// Read a config file's shelf. Anything that is not a list of strings
+    /// reads as empty; doubles are dropped and recents capped, so a
+    /// hand-edited file cannot break the order.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        let v: serde_json::Value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let list = |field: &str| {
+            let mut out: Vec<String> = Vec::new();
+            for k in v.get(field).and_then(|l| l.as_array()).into_iter().flatten().filter_map(|k| k.as_str()) {
+                if k.contains(':') && !out.iter().any(|o| o == k) {
+                    out.push(k.to_string());
+                }
+            }
+            out
+        };
+        let mut recents = list(Self::RECENTS_FIELD);
+        recents.truncate(Self::MAX_RECENT);
+        Self { favorites: list(Self::FAVORITES_FIELD), recents }
+    }
+
+    /// Write the shelf into this user's config file (no-op in tests, rule 37).
+    pub fn save(&self) -> std::io::Result<()> {
+        if cfg!(test) {
+            return Ok(());
+        }
+        self.save_to(&crate::assistant::config_path())
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        crate::assistant::save_config_values_to(
+            path,
+            &[
+                (Self::FAVORITES_FIELD, serde_json::json!(self.favorites)),
+                (Self::RECENTS_FIELD, serde_json::json!(self.recents)),
+            ],
+        )
+    }
+
+    pub fn keys(&self, view: ShelfView) -> &[String] {
+        match view {
+            ShelfView::Favorites => &self.favorites,
+            ShelfView::Recent => &self.recents,
+        }
+    }
+
+    pub fn is_favorite(&self, e: &Entry<'_>) -> bool {
+        self.favorites.iter().any(|k| e.has_key(k))
+    }
+
+    /// Where `e` stands among the recents (0 = added last).
+    pub fn recent_rank(&self, e: &Entry<'_>) -> Option<usize> {
+        self.recents.iter().position(|k| e.has_key(k))
+    }
+
+    /// Star or unstar a plugin; false when nothing changed.
+    pub fn set_favorite(&mut self, key: &str, on: bool) -> bool {
+        let at = self.favorites.iter().position(|k| k == key);
+        match (at, on) {
+            (None, true) => self.favorites.push(key.to_string()),
+            (Some(i), false) => {
+                self.favorites.remove(i);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// A plugin was added to the rack: it is the newest recent now.
+    pub fn note_used(&mut self, key: &str) {
+        self.recents.retain(|k| k != key);
+        self.recents.insert(0, key.to_string());
+        self.recents.truncate(Self::MAX_RECENT);
+    }
+}
+
+/// The plugin an agent names: its shelf key (`clap:<id>`), its own id (a
+/// built-in id, CLAP id, VST3 CID or LV2 URI) or, when only one plugin has
+/// it, its name. An unknown one is an error that says where to look (rule 77).
+pub fn find_plugin<'a, 'b>(all: &'b [Entry<'a>], wanted: &str) -> Result<&'b Entry<'a>, String> {
+    let wanted = wanted.trim();
+    if let Some(e) = all.iter().find(|e| e.has_key(wanted)).or_else(|| all.iter().find(|e| e.id() == wanted)) {
+        return Ok(e);
+    }
+    let named: Vec<&Entry> = all.iter().filter(|e| e.name().eq_ignore_ascii_case(wanted)).collect();
+    match named.as_slice() {
+        [e] => Ok(e),
+        [] => Err(format!(
+            "no plugin '{wanted}' is installed (give the id, cid or uri that list_plugins shows, e.g. builtin.delay)"
+        )),
+        many => Err(format!(
+            "{} plugins are named '{wanted}': give one of {}",
+            many.len(),
+            many.iter().map(|e| e.key()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// How well `query` fits `text` as a fuzzy match: every character of the
+/// query appears in order (case-insensitive). Higher is better: a match at
+/// the start, at a word start and runs of adjacent characters count most,
+/// so "sxt" finds "Surge XT" and "rev" ranks "Reverb" over "Drive Reverse".
+pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    let q: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let t: Vec<char> = text.chars().collect();
+    let same = |c: char, want: char| c.to_lowercase().eq(std::iter::once(want));
+    // Greedy from every place the first letter stands, best start wins: from
+    // the first place alone, "rev" would take the r of "Drive" in "Drive
+    // Reverse" and miss the word that starts with it.
+    let from = |start: usize| -> Option<i32> {
+        let mut score = 0i32;
+        let mut qi = 0usize;
+        let mut last: Option<usize> = None;
+        for (ti, &c) in t.iter().enumerate().skip(start) {
+            if qi == q.len() {
+                break;
+            }
+            if !same(c, q[qi]) {
+                continue;
+            }
+            let word_start = ti == 0 || !t[ti - 1].is_alphanumeric() || (c.is_uppercase() && t[ti - 1].is_lowercase());
+            score += 10;
+            if ti == 0 {
+                score += 15;
+            }
+            if word_start {
+                score += 10;
+            }
+            match last {
+                Some(l) if l + 1 == ti => score += 12,
+                Some(l) => score -= ((ti - l - 1) as i32).min(6),
+                None => score -= (ti as i32).min(6),
+            }
+            last = Some(ti);
+            qi += 1;
+        }
+        (qi == q.len()).then_some(score)
+    };
+    (0..t.len())
+        .filter(|&i| same(t[i], q[0]))
+        .filter_map(from)
+        .max()
+        .map(|score| score - (t.len() as i32 / 8).min(5))
+}
+
+/// The quick-add list (#307): what can be added, best match first. Without
+/// a query: favorites (by name), then recents (newest first), then the rest
+/// in browsing order. With one: fuzzy matches on the name by score, then
+/// plugins whose vendor, id, category or format hold every word. Ties keep
+/// favorites, then recents, then names in front, so the order never jumps.
+pub fn quick_search<'a>(
+    all: &[Entry<'a>],
+    query: &str,
+    shelf: &Shelf,
+    view: Option<ShelfView>,
+    ty: Option<PluginType>,
+) -> Vec<Entry<'a>> {
+    let query = query.trim();
+    let mut hits: Vec<(i32, Entry<'a>)> = all
+        .iter()
+        .filter(|e| e.addable() && ty.is_none_or(|t| t == e.ty()))
+        .filter(|e| match view {
+            Some(v) => shelf.keys(v).iter().any(|k| e.has_key(k)),
+            None => true,
+        })
+        .filter_map(|e| {
+            if query.is_empty() {
+                return Some((0, *e));
+            }
+            // A scattered match (letters far apart, mid-word) is noise:
+            // it counts only when the letters sit together or on word starts.
+            let floor = 12 * query.chars().filter(|c| !c.is_whitespace()).count() as i32;
+            match fuzzy_score(query, e.name()) {
+                Some(s) if s >= floor => Some((s.max(1), *e)),
+                _ => e.matches_query(query).then_some((0, *e)),
+            }
+        })
+        .collect();
+    hits.sort_by_cached_key(|(score, e)| {
+        (
+            -*score,
+            !shelf.is_favorite(e),
+            shelf.recent_rank(e).unwrap_or(usize::MAX),
+            e.sub,
+            e.name().to_lowercase(),
+            e.format(),
+            e.id().to_string(),
+        )
+    });
+    hits.into_iter().map(|(_, e)| e).collect()
 }
 
 /// The in-app assistant's `list_plugins` answer: plugins grouped by type,
@@ -1226,6 +1529,224 @@ mod tests {
             bundle_path: std::path::PathBuf::from("/tmp/test.vst3"),
             is_yabridge,
         }
+    }
+
+    /// A scratch config file under the build's temp dir, never the user's (rule 37).
+    fn scratch_config(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ksalat-shelf-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.json")
+    }
+
+    fn shelf_fixture() -> (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>, Vec<Vst3PluginInfo>) {
+        (
+            vec![
+                clap("org.surge-synth-team.surge-xt", "Surge XT", &["instrument", "synthesizer"]),
+                clap("com.digital-suburban.dexed", "Dexed", &["instrument", "synthesizer"]),
+                clap("org.example.midi", "Note Shaper", &["note-effect"]),
+            ],
+            vec![
+                lv2("http://example.org/roomverb", "Room Reverb", "ReverbPlugin", false, false),
+                lv2("http://example.org/drive-reverse", "Drive Reverse", "DistortionPlugin", false, false),
+            ],
+            vec![vst3("0123456789ABCDEF0123456789ABCDEF", "Plate", &["Fx", "Reverb"], false)],
+        )
+    }
+
+    fn names(hits: &[Entry]) -> Vec<String> {
+        hits.iter().map(|e| e.name().to_string()).collect()
+    }
+
+    #[test]
+    fn every_plugin_has_one_shelf_key_that_only_it_answers_to() {
+        let (c, l, v) = shelf_fixture();
+        let all = entries(&c, &l, &v);
+        let keys: Vec<String> = all.iter().map(Entry::key).collect();
+        assert!(keys.contains(&"builtin:builtin.delay".to_string()), "{keys:?}");
+        assert!(keys.contains(&"clap:com.digital-suburban.dexed".to_string()), "{keys:?}");
+        assert!(keys.contains(&"vst3:0123456789ABCDEF0123456789ABCDEF".to_string()), "{keys:?}");
+        // An LV2 URI holds colons of its own: the key still splits at the first.
+        assert!(keys.contains(&"lv2:http://example.org/roomverb".to_string()), "{keys:?}");
+        for (i, e) in all.iter().enumerate() {
+            let hits: Vec<usize> = keys.iter().enumerate().filter(|(_, k)| e.has_key(k)).map(|(j, _)| j).collect();
+            assert_eq!(hits, vec![i], "{} answers to exactly its own key", e.name());
+        }
+        // The same id in another format is another plugin.
+        assert!(!all[0].has_key("clap:builtin.delay"));
+    }
+
+    #[test]
+    fn the_shelf_survives_a_restart_and_keeps_the_rest_of_the_config() {
+        let path = scratch_config("roundtrip");
+        std::fs::write(&path, r#"{"openrouter_key":"keep-me","audio_buffer_frames":256}"#).unwrap();
+        let mut shelf = Shelf::load_from(&path);
+        assert_eq!(shelf, Shelf::default(), "a config without the fields is an empty shelf");
+        assert!(shelf.set_favorite("clap:com.digital-suburban.dexed", true));
+        assert!(shelf.set_favorite("builtin:builtin.delay", true));
+        assert!(!shelf.set_favorite("builtin:builtin.delay", true), "starring twice changes nothing");
+        shelf.note_used("builtin:builtin.reverb");
+        shelf.note_used("lv2:http://example.org/roomverb");
+        shelf.save_to(&path).unwrap();
+
+        // "Restart": a new shelf read from the file is the one that was saved.
+        let again = Shelf::load_from(&path);
+        assert_eq!(again, shelf);
+        assert_eq!(again.keys(ShelfView::Favorites), ["clap:com.digital-suburban.dexed", "builtin:builtin.delay"]);
+        assert_eq!(again.keys(ShelfView::Recent), ["lv2:http://example.org/roomverb", "builtin:builtin.reverb"]);
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["openrouter_key"], "keep-me", "other fields stay: {raw}");
+        assert_eq!(raw["audio_buffer_frames"], 256, "{raw}");
+
+        // Unstar, save, restart: gone.
+        let mut again = again;
+        assert!(again.set_favorite("clap:com.digital-suburban.dexed", false));
+        again.save_to(&path).unwrap();
+        assert_eq!(Shelf::load_from(&path).keys(ShelfView::Favorites), ["builtin:builtin.delay"]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn recents_are_newest_first_without_doubles_and_capped() {
+        let mut shelf = Shelf::default();
+        for i in 0..20 {
+            shelf.note_used(&format!("clap:p{i}"));
+        }
+        assert_eq!(shelf.keys(ShelfView::Recent).len(), Shelf::MAX_RECENT);
+        assert_eq!(shelf.keys(ShelfView::Recent)[0], "clap:p19");
+        // Using an older one again moves it to the front, once.
+        shelf.note_used("clap:p15");
+        assert_eq!(&shelf.keys(ShelfView::Recent)[..2], ["clap:p15", "clap:p19"]);
+        assert_eq!(shelf.keys(ShelfView::Recent).iter().filter(|k| *k == "clap:p15").count(), 1);
+        assert_eq!(shelf.keys(ShelfView::Recent).len(), Shelf::MAX_RECENT);
+    }
+
+    #[test]
+    fn a_hand_edited_shelf_reads_without_doubles_or_garbage() {
+        let path = scratch_config("garbage");
+        std::fs::write(
+            &path,
+            r#"{"plugin_favorites":["clap:a","clap:a",7,"no-colon",null,"lv2:http://x/y"],"plugin_recents":"oops"}"#,
+        )
+        .unwrap();
+        let shelf = Shelf::load_from(&path);
+        assert_eq!(shelf.keys(ShelfView::Favorites), ["clap:a", "lv2:http://x/y"]);
+        assert!(shelf.keys(ShelfView::Recent).is_empty());
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(Shelf::load_from(&path), Shelf::default());
+        let long: Vec<String> = (0..40).map(|i| format!("clap:p{i}")).collect();
+        std::fs::write(&path, serde_json::json!({"plugin_recents": long}).to_string()).unwrap();
+        assert_eq!(Shelf::load_from(&path).keys(ShelfView::Recent).len(), Shelf::MAX_RECENT);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn quick_add_lists_favorites_then_recents_then_the_rest_whatever_the_scan_order() {
+        let (c, l, v) = shelf_fixture();
+        let mut shelf = Shelf::default();
+        // Starred in this order; the list sorts favorites by name.
+        shelf.set_favorite("lv2:http://example.org/roomverb", true);
+        shelf.set_favorite("clap:com.digital-suburban.dexed", true);
+        shelf.note_used("builtin:builtin.gain");
+        shelf.note_used("builtin:builtin.reverb"); // newest
+        let all = entries(&c, &l, &v);
+        let order = names(&quick_search(&all, "", &shelf, None, None));
+        assert_eq!(&order[..4], ["Dexed", "Room Reverb", "Reverb", "Gain"], "{order:?}");
+        assert!(!order.contains(&"Note Shaper".to_string()), "a CLAP MIDI effect cannot be added: {order:?}");
+        // Every other addable plugin follows, each once.
+        let addable = all.iter().filter(|e| e.addable()).count();
+        assert_eq!(order.len(), addable);
+
+        // The same shelf over a scan that came back in another order.
+        let (mut c2, mut l2, v2) = shelf_fixture();
+        c2.reverse();
+        l2.reverse();
+        let all2 = entries(&c2, &l2, &v2);
+        assert_eq!(names(&quick_search(&all2, "", &shelf, None, None)), order, "the order does not follow the scan");
+
+        // The shelf views and the type filter narrow it.
+        assert_eq!(names(&quick_search(&all, "", &shelf, Some(ShelfView::Favorites), None)), ["Dexed", "Room Reverb"]);
+        assert_eq!(names(&quick_search(&all, "", &shelf, Some(ShelfView::Recent), None)), ["Reverb", "Gain"]);
+        assert_eq!(
+            names(&quick_search(&all, "", &shelf, Some(ShelfView::Favorites), Some(PluginType::Instrument))),
+            ["Dexed"]
+        );
+    }
+
+    #[test]
+    fn fuzzy_search_finds_abbreviations_and_ranks_the_closest_name_first() {
+        assert!(fuzzy_score("sxt", "Surge XT").is_some());
+        assert!(fuzzy_score("dxd", "Dexed").is_some());
+        assert!(fuzzy_score("xyz", "Surge XT").is_none());
+        assert!(fuzzy_score("rev", "Reverb") > fuzzy_score("rev", "Drive Reverse"));
+        assert!(fuzzy_score("rev", "Drive Reverse") > fuzzy_score("rev", "Parametric Equalizer Vintage"));
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+
+        let (c, l, v) = shelf_fixture();
+        let all = entries(&c, &l, &v);
+        let shelf = Shelf::default();
+        let hits = names(&quick_search(&all, "rev", &shelf, None, None));
+        assert_eq!(hits[0], "Reverb", "{hits:?}");
+        assert!(hits.contains(&"Room Reverb".to_string()) && hits.contains(&"Drive Reverse".to_string()), "{hits:?}");
+        // "Plate" is a reverb by category: found by the word, after the names.
+        let hits = names(&quick_search(&all, "reverb", &shelf, None, None));
+        assert_eq!(&hits[..2], ["Reverb", "Room Reverb"], "{hits:?}");
+        assert!(hits.contains(&"Plate".to_string()), "{hits:?}");
+        assert_eq!(names(&quick_search(&all, "sxt", &shelf, None, None)), ["Surge XT"]);
+        assert!(quick_search(&all, "zzzz", &shelf, None, None).is_empty());
+
+        // A favorite wins a tie, never a better match.
+        let mut starred = Shelf::default();
+        starred.set_favorite("lv2:http://example.org/drive-reverse", true);
+        assert_eq!(names(&quick_search(&all, "rev", &starred, None, None))[0], "Reverb");
+        let both = names(&quick_search(&all, "", &starred, None, Some(PluginType::Effect)));
+        assert_eq!(both[0], "Drive Reverse", "{both:?}");
+    }
+
+    #[test]
+    fn list_plugins_narrows_to_a_shelf_and_refuses_an_unknown_one() {
+        let (c, l, v) = shelf_fixture();
+        let mut shelf = Shelf::default();
+        shelf.set_favorite("clap:com.digital-suburban.dexed", true);
+        shelf.note_used("builtin:builtin.delay");
+        shelf.note_used("lv2:http://example.org/roomverb");
+
+        let fav = PluginListFilter::from_args(&serde_json::json!({"shelf": "favorites"})).unwrap().on_shelf(&shelf);
+        let json = list_plugins_json(&c, &l, &v, &fav);
+        assert_eq!(json["clap"].as_array().unwrap().len(), 1, "{json}");
+        assert_eq!(json["clap"][0]["id"], "com.digital-suburban.dexed");
+        assert_eq!(json["builtin"].as_array().unwrap().len(), 0, "{json}");
+        assert_eq!(json["lv2_count"], 0, "{json}");
+
+        let recent = PluginListFilter::from_args(&serde_json::json!({"shelf": "recent"})).unwrap().on_shelf(&shelf);
+        let txt = format_list_plugins(&c, &l, &v, &recent);
+        assert!(txt.contains("Room Reverb") && txt.contains("Delay"), "{txt}");
+        assert!(!txt.contains("Dexed"), "{txt}");
+        let hits = recent.apply(&c, &l, &v);
+        assert_eq!(names(&hits), ["Room Reverb", "Delay"], "newest first");
+
+        // "all" is no narrowing; an unknown shelf names the accepted ones.
+        let all = PluginListFilter::from_args(&serde_json::json!({"shelf": "all"})).unwrap();
+        assert!(all.shelf.is_none());
+        let err = PluginListFilter::from_args(&serde_json::json!({"shelf": "loved"})).unwrap_err();
+        assert!(err.contains("favorites | recent"), "{err}");
+        // An empty shelf lists nothing, not everything.
+        let none = PluginListFilter::from_args(&serde_json::json!({"shelf": "favorites"})).unwrap().on_shelf(&Shelf::default());
+        assert!(none.apply(&c, &l, &v).is_empty());
+    }
+
+    #[test]
+    fn an_agent_names_a_plugin_by_key_id_or_unique_name() {
+        let (mut c, l, v) = shelf_fixture();
+        c.push(clap("org.other.dexed", "Dexed", &["instrument"]));
+        let all = entries(&c, &l, &v);
+        assert_eq!(find_plugin(&all, "builtin.delay").unwrap().key(), "builtin:builtin.delay");
+        assert_eq!(find_plugin(&all, "lv2:http://example.org/roomverb").unwrap().name(), "Room Reverb");
+        assert_eq!(find_plugin(&all, "http://example.org/roomverb").unwrap().name(), "Room Reverb");
+        assert_eq!(find_plugin(&all, " surge xt ").unwrap().key(), "clap:org.surge-synth-team.surge-xt");
+        let two = find_plugin(&all, "Dexed").unwrap_err();
+        assert!(two.contains("clap:com.digital-suburban.dexed") && two.contains("clap:org.other.dexed"), "{two}");
+        let none = find_plugin(&all, "Nonesuch").unwrap_err();
+        assert!(none.contains("list_plugins"), "{none}");
     }
 
     #[test]

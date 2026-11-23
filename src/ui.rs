@@ -191,6 +191,7 @@ mod window_load;
 mod hotplug;
 mod firstrun;
 pub(crate) use hotplug::midi_selftest as hotplug_midi_selftest;
+mod quick_add;
 use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -3233,6 +3234,8 @@ enum BrowserAction {
     AddMidiFx(Option<String>, String),
     Install(String),
     ShowType(PluginType),
+    /// Star or unstar the plugin with this shelf key (#307).
+    ToggleFavorite(String),
 }
 
 /// What a Plugins-browser card shows for one plugin: its subtitle, the id or
@@ -3591,7 +3594,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_keyboard_state", "set_keyboard_mode",
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
-    "play_demo", "stop_demo", "set_show_mode", "set_rack_locked", "panic",
+    "play_demo", "stop_demo", "set_show_mode", "set_rack_locked", "panic", "set_plugin_favorite",
     "get_setlist", "set_setlist_song", "set_part_sends", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check", "audio_doctor",
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
@@ -3627,6 +3630,7 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "stop_demo"
             | "set_show_mode"
             | "set_rack_locked"
+            | "set_plugin_favorite"
             | "panic"
             | "record_save_last"
             | "add_plugin_folder"
@@ -3918,6 +3922,12 @@ struct DemoApp {
     plugin_category: PluginCategory,
     plugin_subtype: Option<PluginSubtype>,
     plugin_format: Option<PluginFormat>,
+    /// Starred and recently added plugins (#307), kept in the config file.
+    plugin_shelf: crate::plugins::Shelf,
+    /// The Plugins view's Favorites / Recent filter.
+    plugin_shelf_view: Option<crate::plugins::ShelfView>,
+    /// The quick-add picker over the rack (#307); None = closed.
+    quick_add: Option<quick_add::QuickAdd>,
     /// The Install view's instrument / effect filter.
     plugin_catalog_type: Option<PluginType>,
     plugin_msg: String,
@@ -4728,6 +4738,9 @@ impl DemoApp {
             plugin_category: PluginCategory::All,
             plugin_subtype: None,
             plugin_format: None,
+            plugin_shelf: crate::plugins::Shelf::load(),
+            plugin_shelf_view: None,
+            quick_add: None,
             plugin_catalog_type: None,
             plugin_msg: String::new(),
             install: None,
@@ -5627,6 +5640,7 @@ impl DemoApp {
                 (&["click"], "a cable to select its path"),
                 (&["Del"], "remove the selected cable"),
                 (&["B", "F9"], "plugin browser"),
+                (&["Enter", "right-click"], "empty rack space: quick-add a plugin"),
                 (&["M", "F10"], "mixer view (sources → rig bus → master)"),
                 (&["N", "F11"], "MIDI matrix view"),
                 (&["F12"], "setlist view"),
@@ -7222,6 +7236,10 @@ impl DemoApp {
             "set_rack_locked" => match args.get("locked").and_then(|v| v.as_bool()) {
                 Some(false) => "Unlock rack".into(),
                 _ => "Lock rack".into(),
+            },
+            "set_plugin_favorite" => match args.get("favorite").and_then(|v| v.as_bool()) {
+                Some(false) => "Unstar plugin".into(),
+                _ => "Star plugin".into(),
             },
             "panic" => "Panic: all notes off".into(),
             "set_octave" => {
@@ -11459,12 +11477,18 @@ impl DemoApp {
                 self.agent_activity.record(origin, format!("Quick knob {} → {label}", self.unit_display_name(node)), vec![node], now);
                 format!("{} (node {node}): quick knob set to {label} — saved with the session", self.unit_display_name(node))
             }
+            "set_plugin_favorite" => self.plugin_favorite_tool(args),
             "list_plugins" => {
                 if !self.plugin_lists_ready() {
                     return "scanning installed plugins in the background (first run) — ask again in a few seconds".into();
                 }
                 match PluginListFilter::from_args(args) {
-                    Ok(filter) => format_list_plugins(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3, &filter),
+                    Ok(filter) => format_list_plugins(
+                        &self.plugins_clap,
+                        &self.plugins_lv2,
+                        &self.plugins_vst3,
+                        &filter.on_shelf(&self.plugin_shelf),
+                    ),
                     Err(e) => format!("list_plugins: {e}"),
                 }
             }
@@ -21932,8 +21956,13 @@ impl DemoApp {
 
                 // Counts on the chips follow the format filter; the
                 // subcategory chips belong to the type in view.
-                let (type_counts, sub_counts) = {
+                use crate::plugins::ShelfView;
+                let (type_counts, sub_counts, shelf_counts) = {
                     let all = crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3);
+                    // What is on a shelf and installed (a starred plugin
+                    // that was removed from disk is not counted).
+                    let shelf_counts = [ShelfView::Favorites, ShelfView::Recent]
+                        .map(|v| all.iter().filter(|e| self.plugin_shelf.keys(v).iter().any(|k| e.has_key(k))).count());
                     let shown: Vec<&crate::plugins::Entry> =
                         all.iter().filter(|e| self.plugin_format.is_none_or(|f| f == e.format())).collect();
                     let type_counts = PluginType::ALL.map(|ty| shown.iter().filter(|e| e.ty() == ty).count());
@@ -21946,7 +21975,7 @@ impl DemoApp {
                         .map(|&sub| (sub, shown.iter().filter(|e| e.sub == sub).count()))
                         .filter(|&(_, n)| n > 0)
                         .collect();
-                    (type_counts, sub_counts)
+                    (type_counts, sub_counts, shelf_counts)
                 };
 
                 // A chip that does not fit moves to the next line whole,
@@ -21974,6 +22003,22 @@ impl DemoApp {
                         if theme::wrapped_chip_button(ui, &label, self.plugin_category == cat).clicked() && self.plugin_category != cat {
                             self.plugin_category = cat;
                             self.plugin_subtype = None;
+                            if cat == PluginCategory::Install {
+                                self.plugin_shelf_view = None;
+                            }
+                        }
+                    }
+                    // Favorites and Recent narrow whatever type is in view (#307).
+                    for (view, label, tip) in [
+                        (ShelfView::Favorites, format!("★ Favorites ({})", shelf_counts[0]), "only the plugins you starred"),
+                        (ShelfView::Recent, format!("Recent ({})", shelf_counts[1]), "the plugins you added last, newest first"),
+                    ] {
+                        let on = self.plugin_shelf_view == Some(view);
+                        if theme::wrapped_chip_button(ui, &label, on).on_hover_text(tip).clicked() {
+                            self.plugin_shelf_view = if on { None } else { Some(view) };
+                            if self.plugin_category == PluginCategory::Install {
+                                self.plugin_category = PluginCategory::All;
+                            }
                         }
                     }
                     if theme::wrapped_chip_button(ui, "Refresh", false)
@@ -22041,7 +22086,7 @@ impl DemoApp {
 
                 let filter = self.plugin_filter.trim().to_string();
                 let list_h = ui.available_height().max(1.0);
-                let mut action: Option<BrowserAction> = None;
+                let mut action: Option<(BrowserAction, Option<String>)> = None;
 
                 egui::ScrollArea::vertical()
                     .id_salt("plugins_scroll")
@@ -22384,7 +22429,7 @@ impl DemoApp {
                                                                     }
                                                                     CatalogAction::Install { id, hover } => {
                                                                         if theme::primary_button(ui, "Install").on_hover_text(&hover).clicked() {
-                                                                            action = Some(BrowserAction::Install(id.to_string()));
+                                                                            action = Some((BrowserAction::Install(id.to_string()), None));
                                                                         }
                                                                     }
                                                                     CatalogAction::ShowType { ty } => {
@@ -22392,7 +22437,7 @@ impl DemoApp {
                                                                             .on_hover_text("switch to the installed plugins tab filtered to this plugin")
                                                                             .clicked()
                                                                         {
-                                                                            action = Some(BrowserAction::ShowType(ty));
+                                                                            action = Some((BrowserAction::ShowType(ty), None));
                                                                         }
                                                                     }
                                                                     CatalogAction::OpenUrl { label, url } => {
@@ -22419,20 +22464,32 @@ impl DemoApp {
                             format: self.plugin_format,
                             query: filter.clone(),
                             limit: None,
-                        };
+                            shelf: self.plugin_shelf_view,
+                            shelf_keys: Vec::new(),
+                        }
+                        .on_shelf(&self.plugin_shelf);
                         let mut entries: Vec<crate::plugins::Entry> =
                             crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3)
                                 .into_iter()
                                 .filter(|e| wanted.matches(e))
                                 .collect();
                         crate::plugins::sort_for_browsing(&mut entries);
+                        let shelf_view = self.plugin_shelf_view;
+                        if shelf_view == Some(ShelfView::Recent) {
+                            crate::plugins::sort_by_recency(&mut entries, self.plugin_shelf.keys(ShelfView::Recent));
+                        }
 
                         if entries.is_empty() {
                             ui.add_space(12.0);
-                            let empty = if filter.is_empty() {
-                                "No plugins found in this category.".to_string()
-                            } else {
-                                format!("No plugins match '{filter}'.")
+                            let empty = match (filter.is_empty(), shelf_view) {
+                                (true, Some(ShelfView::Favorites)) => {
+                                    "No favorites here yet. Click the ☆ on a plugin card to keep it on this shelf.".to_string()
+                                }
+                                (true, Some(ShelfView::Recent)) => {
+                                    "Nothing added yet. Plugins you add to the rack show up here, newest first.".to_string()
+                                }
+                                (true, None) => "No plugins found in this category.".to_string(),
+                                (false, _) => format!("No plugins match '{filter}'."),
                             };
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
@@ -22447,10 +22504,14 @@ impl DemoApp {
                             return;
                         }
 
-                        let card_header = |ui: &mut egui::Ui, title: &str, badge: &str, badge_col: Color32, inner_w: f32| {
+                        // Returns whether the star was clicked. The star is
+                        // drawn first, at the right edge, so a long title
+                        // truncates before it (rule 196).
+                        let card_header = |ui: &mut egui::Ui, title: &str, badge: &str, badge_col: Color32, inner_w: f32, starred: bool| -> bool {
                             ui.horizontal(|ui| {
                                 ui.set_width(inner_w);
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let star = Self::favorite_star(ui, starred);
                                     theme::tracked_label(ui, badge, 9.5, 0.12, badge_col);
                                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                         ui.add(
@@ -22462,14 +22523,18 @@ impl DemoApp {
                                             .truncate(),
                                         );
                                     });
-                                });
-                            });
+                                    star
+                                })
+                                .inner
+                            })
+                            .inner
                         };
 
                         // In the overview a badge names the subcategory too;
                         // a type view already heads each group with it.
                         let show_sub_badge = self.plugin_category == PluginCategory::All;
-                        let draw_entry_grid = |ui: &mut egui::Ui, items: &[&crate::plugins::Entry], action: &mut Option<BrowserAction>| {
+                        let shelf = &self.plugin_shelf;
+                        let draw_entry_grid = |ui: &mut egui::Ui, items: &[&crate::plugins::Entry], action: &mut Option<(BrowserAction, Option<String>)>| {
                             for row in items.chunks(cols) {
                                 ui.horizontal_top(|ui| {
                                     ui.spacing_mut().item_spacing.x = gap;
@@ -22491,7 +22556,9 @@ impl DemoApp {
                                                 PluginType::MidiFx => theme::MIDI_BLUE,
                                                 PluginType::Utility => theme::CREAM_META,
                                             };
-                                            card_header(ui, e.name(), &badge, badge_col, iw);
+                                            if card_header(ui, e.name(), &badge, badge_col, iw, shelf.is_favorite(e)) {
+                                                *action = Some((BrowserAction::ToggleFavorite(e.key()), None));
+                                            }
                                             ui.add_space(4.0);
                                             ui.add(
                                                 egui::Label::new(egui::RichText::new(&card.subtitle).size(12.0).color(theme::INK_2))
@@ -22508,7 +22575,7 @@ impl DemoApp {
                                                 for (i, (label, hint, act)) in card.actions.into_iter().enumerate() {
                                                     let resp = if i == 0 { theme::primary_button(ui, label) } else { theme::chip_button(ui, label, false) };
                                                     if resp.on_hover_text(hint).clicked() {
-                                                        *action = Some(act);
+                                                        *action = Some((act, Some(e.key())));
                                                     }
                                                 }
                                             });
@@ -22529,6 +22596,13 @@ impl DemoApp {
                             need_divider = true;
                         };
                         match self.plugin_category.plugin_type() {
+                            // Recent: one list, newest first, whatever the type.
+                            _ if shelf_view == Some(ShelfView::Recent) => {
+                                let group: Vec<&crate::plugins::Entry> = entries.iter().collect();
+                                theme::section_label(ui, &format!("Recently added ({})", group.len()));
+                                ui.add_space(8.0);
+                                draw_entry_grid(ui, &group, &mut action);
+                            }
                             // The overview: one row per type, with a jump into
                             // the full type view when the row cut some off.
                             None => {
@@ -22538,14 +22612,14 @@ impl DemoApp {
                                         continue;
                                     }
                                     divider(ui);
-                                    let truncated = filter.is_empty() && group.len() > cols;
+                                    let truncated = filter.is_empty() && shelf_view.is_none() && group.len() > cols;
                                     ui.horizontal(|ui| {
                                         ui.set_min_height(26.0);
                                         theme::section_label(ui, &format!("{} ({})", ty.label(), group.len()));
                                         if truncated {
                                             ui.add_space(10.0);
                                             if theme::chip_button(ui, &format!("See all {}", group.len()), false).clicked() {
-                                                action = Some(BrowserAction::ShowType(ty));
+                                                action = Some((BrowserAction::ShowType(ty), None));
                                             }
                                         }
                                     });
@@ -22569,33 +22643,8 @@ impl DemoApp {
                         }
                     });
 
-                if let Some(act) = action {
-                    let is_edit = !matches!(act, BrowserAction::Install(_) | BrowserAction::ShowType(_));
-                    if self.rack_locked && is_edit {
-                        self.plugin_msg = "Rack is locked for editing — unlock (Ctrl+L) to add plugins".into();
-                        self.notify_rack_locked();
-                    } else {
-                        match act {
-                            BrowserAction::NewClapRig(id, name) => self.add_clap_rig(&id, &name),
-                            BrowserAction::NewVst3Rig(cid, name) => self.add_vst3_rig(&cid, &name),
-                            BrowserAction::NewLv2Rig(uri, name) => self.add_lv2_instrument_rig(&uri, &name),
-                            BrowserAction::AddInstrument(kind, name) => self.add_instrument_to_active_rig(kind, &name),
-                            BrowserAction::AddEffect(kind, name) => self.add_effect_to_active_rig(kind, &name),
-                            BrowserAction::AddMasterEffect(kind, name) => self.add_effect_to_master(kind, &name),
-                            BrowserAction::AddArp => self.add_arp_to_active_rig(),
-                            BrowserAction::AddMetronome => self.add_metronome_to_active_rig(),
-                            BrowserAction::AddMidiFx(uri, name) => self.add_midi_fx_to_active_rig(uri.as_deref(), &name),
-                            BrowserAction::Install(id) => {
-                                if let Err(e) = self.start_install(&id) {
-                                    self.plugin_msg = format!("Install: {e}");
-                                }
-                            }
-                            BrowserAction::ShowType(ty) => {
-                                self.plugin_category = PluginCategory::of_type(ty);
-                                self.plugin_subtype = None;
-                            }
-                        }
-                    }
+                if let Some((act, key)) = action {
+                    self.run_browser_action(act, key);
                 }
             });
         });
@@ -28207,6 +28256,8 @@ impl DemoApp {
             || self.load_rig_dialog.is_some()
             || self.rename_rig_dialog.is_some()
             || self.strip_rename.is_some()
+            // The quick-add picker owns keys and clicks while it is open (#307).
+            || self.quick_add.is_some()
         {
             return;
         }
@@ -28244,6 +28295,7 @@ impl DemoApp {
             }
         }
         let mut quick_save = false;
+        let mut open_quick_add: Option<Option<Pos2>> = None;
         let mut unit_shortcut: Option<&'static str> = None;
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) { toggle_play = true; }
@@ -28368,6 +28420,14 @@ impl DemoApp {
                 && i.consume_key(Modifiers::NONE, Key::Enter)
             {
                 self.cc_learn = None;
+            }
+            // Quick-add (#307): Enter on the rack opens the plugin picker.
+            if self.stage_view == StageView::Rack
+                && !self.show_help
+                && !self.popup_open_at_start
+                && i.consume_key(Modifiers::NONE, Key::Enter)
+            {
+                open_quick_add = Some(None);
             }
             let modal_open = self.confirm_delete_rig.is_some()
                 || self.rename_rig_dialog.is_some()
@@ -28522,6 +28582,12 @@ impl DemoApp {
             }
         }
 
+        // Enter needs no pointer over the window.
+        if open_quick_add.take().is_some() {
+            self.open_quick_add(None);
+            return;
+        }
+
         let (pointer, pressed, down, released, double_clicked, right_clicked, ctrl, shift) = ctx.input(|i| {
             (i.pointer.hover_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(),
              i.pointer.primary_released(), i.pointer.button_double_clicked(egui::PointerButton::Primary),
@@ -28600,6 +28666,8 @@ impl DemoApp {
                     Hit::Knob { .. } | Hit::Unit(_) | Hit::Cable(..) | Hit::Jack { .. } => {
                         self.notify_rack_locked();
                     }
+                    // Quick-add would open here on an unlocked rack (#307).
+                    Hit::Background if rect.contains(s) && !self.show_help => self.notify_rack_locked(),
                     _ => {}
                 }
             } else if self.pending.is_some() {
@@ -28632,10 +28700,16 @@ impl DemoApp {
                             self.unit_menu = Some(UnitMenu { node: node_id, pos: s, side: self.side });
                         }
                     }
-                    _ => {
+                    hit => {
+                        // Empty rack space: the quick-add picker (#307),
+                        // unless this click only dismisses an open menu.
+                        let menu_open = self.knob_menu.is_some() || self.unit_menu.is_some() || self.cc_learn.is_some();
                         self.knob_menu = None;
                         self.unit_menu = None;
                         self.cc_learn = None;
+                        if matches!(hit, Hit::Background) && !menu_open && rect.contains(s) && !self.show_help {
+                            open_quick_add = Some(Some(s));
+                        }
                     }
                 }
             } else {
@@ -28662,12 +28736,21 @@ impl DemoApp {
                         self.selected_unit = Some(node_id);
                         self.unit_menu = Some(UnitMenu { node: node_id, pos: s, side: self.side });
                     }
-                    _ => {
+                    hit => {
+                        let menu_open = self.cable_menu.is_some() || self.unit_menu.is_some();
                         self.cable_menu = None;
                         self.unit_menu = None;
+                        if matches!(hit, Hit::Background) && !menu_open && rect.contains(s) && !self.show_help {
+                            open_quick_add = Some(Some(s));
+                        }
                     }
                 }
             }
+        }
+        if let Some(pos) = open_quick_add {
+            self.open_quick_add(pos);
+            self.hover = Some(Hit::Background);
+            return;
         }
 
         if self.unit_menu.is_some() && self.unit_menu_rect.contains(s) {
@@ -35825,6 +35908,7 @@ impl DemoApp {
         self.scale_menu_ui(&ctx);
         self.cable_menu_ui(&ctx);
         self.unit_menu_ui(&ctx);
+        self.quick_add_ui(&ctx);
         self.jack_tooltip_ui(&ctx);
         self.engine_info_ui(&ctx);
         self.session_popover_ui(&ctx);

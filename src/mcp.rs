@@ -1393,6 +1393,18 @@ struct ListPluginsArgs {
     query: Option<String>,
     /// Maximum CLAP / VST3 / LV2 entries returned (default 60, max 300).
     limit: Option<u64>,
+    /// "favorites" = only the plugins the user starred, "recent" = the ones
+    /// added last, newest first (default "all").
+    shelf: Option<String>,
+}
+
+/// Arguments for `set_plugin_favorite` (#307).
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetPluginFavoriteArgs {
+    /// The plugin: its id, cid or uri from list_plugins (e.g. "builtin.delay"), or its exact name.
+    plugin: String,
+    /// true stars the plugin, false unstars it.
+    favorite: bool,
 }
 
 /// Arguments for `add_insert` (#74).
@@ -4771,7 +4783,7 @@ impl McpServer {
     }
 
     /// List built-in units and installed CLAP, VST3, and LV2 plugins, organized by type.
-    #[tool(name = "list_plugins", description = "List built-in units and installed CLAP/VST3/LV2 plugins organized by type (instrument, effect, midi_fx, utility) and subcategory (delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, analyzer, synth, organ, sampler, …). Optional filters: type, category, format, query, limit.")]
+    #[tool(name = "list_plugins", description = "List built-in units and installed CLAP/VST3/LV2 plugins organized by type (instrument, effect, midi_fx, utility) and subcategory (delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, analyzer, synth, organ, sampler, …). Optional filters: type, category, format, query, limit, and shelf (favorites = the plugins the user starred, recent = the ones added last, newest first).")]
     fn list_plugins(&self, Parameters(args): Parameters<ListPluginsArgs>) -> Result<CallToolResult, McpError> {
         let filter_args = json!({
             "type": args.plugin_type,
@@ -4779,9 +4791,11 @@ impl McpServer {
             "format": args.format,
             "query": args.query,
             "limit": args.limit,
+            "shelf": args.shelf,
         });
+        // The shelf is the config file's, which the app and headless MCP share.
         let filter = match crate::plugins::PluginListFilter::from_args(&filter_args) {
-            Ok(f) => f,
+            Ok(f) => f.on_shelf(&crate::plugins::Shelf::load()),
             Err(e) => return tool_err(e),
         };
         let clap = crate::host::list_clap_plugins();
@@ -5067,6 +5081,36 @@ impl McpServer {
             return Self::ui_bridge_tool("set_rack_locked", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
         }
         tool_err("Rack edit lock is a state of the running app (connect with --attach)")
+    }
+
+    /// Star or unstar a plugin (#307).
+    #[tool(name = "set_plugin_favorite", description = "Star (favorite=true) or unstar (favorite=false) an installed plugin or built-in unit, as the star on its card in the Plugins view does. plugin = its id, cid or uri from list_plugins (e.g. builtin.delay), or its exact name. Favorites are kept in the config file, head the app's quick-add picker (Enter on the rack) and are what list_plugins shelf=favorites lists. Changes no patch. Returns {plugin, name, favorite, favorites}.")]
+    fn set_plugin_favorite(&self, Parameters(args): Parameters<SetPluginFavoriteArgs>) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("set_plugin_favorite", serde_json::to_value(&args).unwrap_or_else(|_| json!({})));
+        }
+        // Headless: the same config file the app reads at start.
+        let clap = crate::host::list_clap_plugins();
+        let lv2 = crate::lv2::discover();
+        let vst3 = crate::vst3::list_vst3_plugins();
+        let all = crate::plugins::entries(&clap, &lv2, &vst3);
+        let e = match crate::plugins::find_plugin(&all, &args.plugin) {
+            Ok(e) => e,
+            Err(e) => return tool_err(e),
+        };
+        let mut shelf = crate::plugins::Shelf::load();
+        if shelf.set_favorite(&e.key(), args.favorite) {
+            if let Err(err) = shelf.save() {
+                return tool_err(format!("favorites not saved: {err}"));
+            }
+        }
+        ok_json(json!({
+            "plugin": e.key(),
+            "name": e.name(),
+            "favorite": args.favorite,
+            "favorites": shelf.keys(crate::plugins::ShelfView::Favorites),
+        }))
     }
 
     /// All notes off on every rig (#210).

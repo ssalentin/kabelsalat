@@ -755,6 +755,8 @@ fn system_prompt() -> String {
      set_rack_locked locks or unlocks the rack for editing (\"lock the rack\", \"unlock the rack\"); \
      while locked, playing and inspecting work but patching, unit/rig edits and rack knob changes are blocked. \
      panic: all notes off on every rig when notes hang. \
+     set_plugin_favorite stars or unstars a plugin (\"add the delay to my favorites\"); \
+     list_plugins(shelf=\"favorites\" | \"recent\") shows the starred and the last added ones. \
      Levels: every rig, aux bus and CC binding lives at show level (no song switch touches it: \
      a vocal mic, a master reverb, a volume pedal), at the level of a set (a named group of songs, \
      set_setlist_set makes, fills, skips or moves one) or at song level (only where the parts use \
@@ -941,6 +943,11 @@ pub(crate) fn tools() -> Value {
             "name":"set_rack_locked",
             "description":"Lock (locked=true) or unlock (locked=false) the rack for editing. While locked, playing, transport, rig switching, flipping front/back to inspect cables and read-only views keep working, while patching, unplugging, reordering, adding/deleting units or rigs and rack knob/control edits are blocked. Saved with the session.",
             "parameters":{"type":"object","properties":{"locked":{"type":"boolean"}},"required":["locked"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_plugin_favorite",
+            "description":"Star (favorite=true) or unstar (favorite=false) an installed plugin or built-in unit, as the star on its card in the Plugins view does. plugin = its id, cid or uri from list_plugins (e.g. builtin.delay) or its exact name. Favorites are kept in the config file, head the quick-add picker (Enter on the rack) and are listed by list_plugins with shelf=favorites. Changes no patch.",
+            "parameters":{"type":"object","properties":{"plugin":{"type":"string","description":"Plugin id, cid, uri or exact name (list_plugins)"},"favorite":{"type":"boolean"}},"required":["plugin","favorite"]}
         }},
         {"type":"function","function":{
             "name":"panic",
@@ -1229,8 +1236,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_plugins",
-            "description":"List built-in units and installed CLAP/VST3/LV2 plugins organized by type (Instruments, Effects, MIDI FX, Utilities) and effect subcategory (Delay & Reverb, EQ & Filter, Dynamics, Drive & Amp, Modulation, Pitch & Spatial, Multi-FX, Analyzers, …). Pass optional type, category, format, or query to narrow large lists.",
-            "parameters":{"type":"object","properties":{"type":{"type":"string","enum":["all","instrument","effect","midi_fx","utility"],"description":"Filter by plugin type (default all)"},"category":{"type":"string","description":"Filter by subcategory (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"},"format":{"type":"string","enum":["all","builtin","clap","vst3","lv2"],"description":"Filter by plugin format (default all)"},"query":{"type":"string","description":"Optional search words matching name, author/vendor, cid/uri/id, or category"},"limit":{"type":"integer","description":"Max items per section (default 24 unfiltered, 60 filtered)"}}}
+            "description":"List built-in units and installed CLAP/VST3/LV2 plugins organized by type (Instruments, Effects, MIDI FX, Utilities) and effect subcategory (Delay & Reverb, EQ & Filter, Dynamics, Drive & Amp, Modulation, Pitch & Spatial, Multi-FX, Analyzers, …). Pass optional type, category, format, or query to narrow large lists; shelf=favorites lists only the plugins the user starred, shelf=recent the ones they added last (newest first).",
+            "parameters":{"type":"object","properties":{"type":{"type":"string","enum":["all","instrument","effect","midi_fx","utility"],"description":"Filter by plugin type (default all)"},"category":{"type":"string","description":"Filter by subcategory (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"},"format":{"type":"string","enum":["all","builtin","clap","vst3","lv2"],"description":"Filter by plugin format (default all)"},"query":{"type":"string","description":"Optional search words matching name, author/vendor, cid/uri/id, or category"},"shelf":{"type":"string","enum":["all","favorites","recent"],"description":"Only the user's starred plugins, or the ones added last (default all)"},"limit":{"type":"integer","description":"Max items per section (default 24 unfiltered, 60 filtered)"}}}
         }},
         {"type":"function","function":{
             "name":"list_plugin_folders",

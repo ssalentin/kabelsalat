@@ -730,9 +730,12 @@ and part in large type, the upcoming part and next song, top status pills (`REC`
 `TRACK`, `CLICK`), tempo and time signature, the master
 meter, one meter per rig that plays in this part, and a clock. Editing is
 locked while it is open: no click or key moves a cable, a fader or a song.
-PageUp / PageDown (Shift for songs) and a foot switch still step the setlist,
-**Panic** sends all notes off on every rig (agents: `panic`), and to leave
-you hold **Esc** until its line fills (a second), then let go.
+Use **← / →** or **PageUp / PageDown** (**Shift** for songs) and foot switches
+to step the setlist, **↑ / ↓** to scroll song notes, **Space** to start/stop the
+click and transport, **Shift+T** for tap tempo, and **Ctrl+T** for the tuner
+(short **Esc** closes it). **Panic** sends all notes off on every rig (agents:
+`panic`), and to leave you hold **Esc** until its line fills (a second), then
+let go.
 
 <p align="center"><img src="shots/show-mode.png" width="85%" alt="Show mode: the song Moonlight Drive in large type with its part Chorus and 118 BPM 4/4, the next song Riders on the Storm, meters for the master and the organ, a clock, the Panic button and the hint to hold Esc to leave"/></p>
 

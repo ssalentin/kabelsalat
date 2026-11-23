@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 use crate::bridge;
 use crate::control::{
     self, merge_rigs, name_bytes, name_str, Command, CommandBus, DspKind, EdgeId, Graph, NodeId,
-    NodeKind, PortKind, PortRef, Rig, RigSnapshot, SendSource, SinkName,
+    NodeKind, OutSource, PortKind, PortRef, Rig, RigSnapshot, SendSource, SinkName,
 };
 use crate::engine::{GraphEngine, GraphPub};
 use crate::host::{ClapVoice, ClapVoiceMain};
@@ -1260,6 +1260,31 @@ struct SetBusOutputArgs {
 /// Arguments for `get_bus_outputs` (#147).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct GetBusOutputsArgs {}
+
+/// Arguments for `set_output_route` (#399).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetOutputRouteArgs {
+    /// "master", "click" (every metronome and the count-in) or "player"
+    /// (the backing track). Omit when giving `rig` or `bus`.
+    source: Option<String>,
+    /// The rig whose bus to place (0-based), instead of `source`.
+    rig: Option<u8>,
+    /// An aux bus's node id, instead of `source`.
+    bus: Option<u32>,
+    /// First output channel, 1-based: 3 = outputs 3-4, or output 3 alone
+    /// with `mono`. Omit or null = no assignment.
+    output: Option<u32>,
+    /// One output channel instead of a stereo pair.
+    mono: Option<bool>,
+    /// Level on these outputs in dB (default 0, at most 6).
+    level_db: Option<f32>,
+    /// Balance of the pair, -1..1 (default 0).
+    pan: Option<f32>,
+}
+
+/// Arguments for `get_output_routes` (#399).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetOutputRoutesArgs {}
 
 /// Arguments for `get_sends` (issue #5).
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -4056,6 +4081,65 @@ impl McpServer {
         buses.extend(st.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus)))
             .map(|n| json!({"bus": n.id, "name": name_str(&n.name), "output": out(SendSource::Node(n.id))})));
         ok_json(json!({"buses": buses, "max_outputs": crate::engine::MAX_OUTS}))
+    }
+
+    /// Place a source on output channels of the audio interface (#399).
+    #[tool(name = "set_output_route", description = "Stage output matrix (#399): play one source on its own output channels of the audio interface, e.g. the click on outputs 3-4 for the in-ear monitors while the master plays on 1-2 for the PA. Name ONE source: source = master, click (every metronome and the count-in) or player (the backing track), OR rig (0-based index, that rig's bus), OR bus (an aux bus's node id). output = the first output channel, 1-based: 3 = outputs 3-4, or output 3 alone with mono=true; omit or null = no assignment (the master on 1-2; click, player and buses in the master mix). A click, player or bus on outputs of its own has left the master mix and passes no master limiter. level_db (default 0, at most 6) and pan (-1..1) set its level there. While the stream has fewer channels (a 2-channel output; the headless engine always renders 2) the assignment is kept and the source plays where it would without one. Resets on graph loads (the running app saves it with the session and re-sends it).")]
+    fn set_output_route(&self, Parameters(args): Parameters<SetOutputRouteArgs>) -> Result<CallToolResult, McpError> {
+        let raw = json!({"source": args.source, "rig": args.rig, "bus": args.bus, "output": args.output, "mono": args.mono, "level_db": args.level_db, "pan": args.pan});
+        // Absent fields stay absent for the shared argument reader.
+        let raw = Value::Object(raw.as_object().into_iter().flatten().filter(|(k, v)| !v.is_null() || k.as_str() == "output").map(|(k, v)| (k.clone(), v.clone())).collect());
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_output_route", raw);
+        }
+        let source = match crate::out_routes::parse_source(&raw) {
+            Ok(s) => s,
+            Err(e) => return tool_err(e),
+        };
+        match source {
+            OutSource::Bus(SendSource::Rig(r)) if !st.graph.nodes.iter().any(|n| n.rig == r) => return tool_err(format!("no rig {r} (see get_rigs)")),
+            OutSource::Bus(SendSource::Node(n)) if !st.graph.is_bus(n) => return tool_err(format!("node {n} is not an aux bus (get_output_routes lists the buses; a rig bus is rig=)")),
+            _ => {}
+        }
+        let to = match crate::out_routes::parse_target(&raw) {
+            Ok(t) => t,
+            Err(e) => return tool_err(e),
+        };
+        if to.is_some() {
+            let held = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| g.out_routes));
+            let n = held.iter().flatten().flatten().filter(|r| r.source != source).count();
+            if n >= crate::engine::MAX_OUT_ROUTES {
+                return tool_err(format!("{} sources already have outputs of their own, the most kabelsalat serves at once", crate::engine::MAX_OUT_ROUTES));
+            }
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetOutRoute { source, to }) {
+            return tool_err(e);
+        }
+        let channels = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| g.out_channels as usize)).unwrap_or(2);
+        ok_json(crate::out_routes::route_json(source, "", to, channels))
+    }
+
+    /// List the stage output matrix (#399).
+    #[tool(name = "get_output_routes", description = "List the stage output matrix (#399), as the engine holds it: how many output channels the open stream has, and for master, click, player, every rig bus and every aux bus the outputs it is assigned to (null = none) and where it plays right now.")]
+    fn get_output_routes(&self, Parameters(_args): Parameters<GetOutputRoutesArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("get_output_routes", json!({}));
+        }
+        let (held, channels) = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| (g.out_routes, g.out_channels as usize)))
+            .unwrap_or(([None; crate::engine::MAX_OUT_ROUTES], 2));
+        let one = |s: OutSource, name: &str| crate::out_routes::route_json(s, name, held.iter().flatten().find(|r| r.source == s).map(|r| r.to), channels);
+        let mut sources = vec![one(OutSource::Master, "Master"), one(OutSource::Click, "Click"), one(OutSource::Player, "Backing track")];
+        let mut rigs: Vec<u8> = st.graph.nodes.iter().map(|n| n.rig).collect();
+        rigs.sort();
+        rigs.dedup();
+        sources.extend(rigs.iter().map(|&r| one(OutSource::Bus(SendSource::Rig(r)), &format!("rig {r}"))));
+        sources.extend(st.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus)))
+            .map(|n| one(OutSource::Bus(SendSource::Node(n.id)), name_str(&n.name))));
+        ok_json(json!({"output_channels": channels, "sources": sources, "max_assignments": crate::engine::MAX_OUT_ROUTES}))
     }
 
     /// Remove an aux bus (issue #5).

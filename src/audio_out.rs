@@ -155,6 +155,8 @@ pub enum StreamCmd {
 pub struct OutputState {
     pub outputs: Vec<OutputDevice>,
     pub current: Option<String>,
+    /// How many channels `current` has (#399); `None` = not known.
+    pub current_channels: Option<usize>,
     pub streams: Vec<AppStream>,
     /// The `streams` the system-audio capture may record (sink-input
     /// indices): those known to belong to another process.
@@ -216,6 +218,39 @@ pub fn parse_sinks(json: &str, default: &str) -> Vec<OutputDevice> {
     }).collect();
     out.sort_by(|a, b| b.default.cmp(&a.default).then_with(|| a.name.cmp(&b.name)));
     out
+}
+
+/// How many channels the sink `name` has, from `pactl -f json list sinks`
+/// (#399): the length of its channel map.
+pub fn sink_channel_count(sinks_json: &str, name: &str) -> Option<usize> {
+    let v: Value = serde_json::from_str(sinks_json).ok()?;
+    let sink = v.as_array()?.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(name))?;
+    let n = sink.get("channel_map")?.as_str()?.split(',').filter(|c| !c.trim().is_empty()).count();
+    (n > 0).then_some(n)
+}
+
+/// Channels the output stream opens with on a sink of `sink_channels`
+/// (#399): every channel of an interface with more than two (up to
+/// `engine::MAX_OUT_CH`), and plain stereo otherwise, which PipeWire remixes
+/// for a mono or surround sink as it always did.
+pub fn stream_channels(sink_channels: Option<usize>) -> usize {
+    match sink_channels {
+        Some(n) if n > 2 => n.min(crate::engine::MAX_OUT_CH),
+        _ => 2,
+    }
+}
+
+/// Channels to open the output stream with: those of the sink it will play
+/// to, which is `target`, else the output chosen in Settings while it is
+/// connected, else PipeWire's default. Blocking `pactl` calls: never on the
+/// audio thread, and only where the stream is opened.
+pub fn wanted_stream_channels(target: Option<&str>) -> usize {
+    let Some(sinks_json) = pactl(&["-f", "json", "list", "sinks"]) else { return 2 };
+    let chosen = crate::assistant::load_config_str("audio_output").filter(|s| !s.is_empty());
+    let known = |n: &&str| sink_channel_count(&sinks_json, n).is_some();
+    let default = pactl(&["get-default-sink"]).unwrap_or_default().trim().to_string();
+    let sink = target.filter(known).or(chosen.as_deref().filter(known)).unwrap_or(default.as_str());
+    stream_channels(sink_channel_count(&sinks_json, sink))
 }
 
 /// Our playback stream in `pactl -f json list sink-inputs`, matched through
@@ -353,7 +388,8 @@ pub fn scan_and_apply(target: Target) -> OutputState {
             if ok { eprintln!("audio out: asked PipeWire to move the stream to {w}"); }
         }
     }
-    OutputState { outputs, current, streams, capturable }
+    let current_channels = current.as_deref().and_then(|c| sink_channel_count(&sinks_json, c));
+    OutputState { outputs, current, current_channels, streams, capturable }
 }
 
 /// What the self-tests against a real PipeWire share (`audio-out-test`,
@@ -431,15 +467,20 @@ pub(crate) mod selftest {
             Self { modules: Vec::new(), app: None, saved_default, default_changed: false, run }
         }
         pub(crate) fn null_sink(&mut self, name: &str, label: &str) -> anyhow::Result<String> {
-            let id = (self.run)(
-                "pactl",
-                &[
-                    "load-module",
-                    "module-null-sink",
-                    &format!("sink_name={name}"),
-                    &format!("sink_properties='device.description={label} state.restore-props=false'"),
-                ],
-            )
+            self.null_sink_with(name, label, &[])
+        }
+        /// A null sink with extra module arguments (`channels=4`,
+        /// `channel_map=…`, #399).
+        pub(crate) fn null_sink_with(&mut self, name: &str, label: &str, extra: &[&str]) -> anyhow::Result<String> {
+            let mut args = vec![
+                "load-module".to_string(),
+                "module-null-sink".to_string(),
+                format!("sink_name={name}"),
+                format!("sink_properties='device.description={label} state.restore-props=false'"),
+            ];
+            args.extend(extra.iter().map(|e| e.to_string()));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let id = (self.run)("pactl", &args)
             .ok_or_else(|| anyhow::anyhow!("could not load a null sink"))?;
             let id = id.trim().to_string();
             anyhow::ensure!(!id.is_empty(), "empty module id from load-module for {name}");
@@ -1136,6 +1177,7 @@ mod tests {
                 OutputDevice { raw: "m2".into(), name: "M2".into(), default: false },
             ],
             current: Some(current.into()),
+            current_channels: None,
             streams: Vec::new(),
             capturable: Vec::new(),
         };

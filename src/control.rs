@@ -203,6 +203,92 @@ pub struct BusOut {
     pub sink: SinkName,
 }
 
+/// What the stage output matrix can place on the interface's channels
+/// (#399): the master mix, the click (every metronome and the count-in), the
+/// file player (cue or backing track), or one rig bus or aux bus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutSource {
+    Master,
+    Click,
+    Player,
+    Bus(SendSource),
+}
+
+/// Channels of the audio interface a source plays on (#399): the stereo pair
+/// that starts at `first` (0-based, so 2 = outputs 3-4), or the one channel
+/// `first` for `mono`, at `level` (linear gain, 0..=2). `pan` (-1..=1) is
+/// the balance of a pair and unused for a mono output.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OutChannels {
+    pub first: u8,
+    #[serde(default)]
+    pub mono: bool,
+    #[serde(default = "unity_level")]
+    pub level: f32,
+    #[serde(default)]
+    pub pan: f32,
+}
+
+fn unity_level() -> f32 {
+    1.0
+}
+
+impl OutChannels {
+    /// Outputs 1-2 at unity: where the master plays without an assignment.
+    pub const MAIN: Self = Self { first: 0, mono: false, level: 1.0, pan: 0.0 };
+    /// Loudest level an assignment takes (+6 dB).
+    pub const MAX_LEVEL: f32 = 2.0;
+
+    pub fn pair(first: u8) -> Self {
+        Self { first, ..Self::MAIN }
+    }
+
+    /// How many channels it plays on.
+    pub fn width(&self) -> usize {
+        if self.mono { 1 } else { 2 }
+    }
+
+    /// Whether a device with `channels` outputs has these.
+    pub fn fits(&self, channels: usize) -> bool {
+        self.first as usize + self.width() <= channels
+    }
+
+    /// The same assignment with level and pan inside their ranges (a value
+    /// that is no number becomes the default).
+    pub fn clamped(self) -> Self {
+        let num = |v: f32, d: f32| if v.is_finite() { v } else { d };
+        Self { level: num(self.level, 1.0).clamp(0.0, Self::MAX_LEVEL), pan: num(self.pan, 0.0).clamp(-1.0, 1.0), ..self }
+    }
+
+    /// Gains for the left and right of the source's stereo signal: a pair
+    /// is balanced like a rig bus (unity in the centre), a mono output sums
+    /// both halves.
+    pub fn gains(&self) -> (f32, f32) {
+        if self.mono {
+            (self.level * 0.5, self.level * 0.5)
+        } else {
+            (self.level * (1.0 - self.pan).max(0.0).sqrt(), self.level * (1.0 + self.pan).max(0.0).sqrt())
+        }
+    }
+
+    /// "3–4" or "3", 1-based as the interface numbers its outputs.
+    pub fn label(&self) -> String {
+        let a = self.first as usize + 1;
+        if self.mono { format!("{a}") } else { format!("{a}–{}", a + 1) }
+    }
+}
+
+/// One assignment of the stage output matrix (#399): `source` plays on the
+/// channels `to` of the audio interface. A click, player or bus with an
+/// assignment leaves the master mix; while the interface has no such
+/// channels (a 2-channel laptop) it plays where it would without one.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OutRoute {
+    pub source: OutSource,
+    pub to: OutChannels,
+}
+
 /// Which device channels an `AudioIn` node turns into its stereo OUT. A guitar
 /// or vocal mic is usually mono on one input of a stereo interface, so the
 /// node picks the left or right channel (centered to both); `Stereo` passes the
@@ -1247,6 +1333,11 @@ pub enum Command {
     /// master's. The engine serves `engine::MAX_OUTS` such outputs at once;
     /// one more distinct sink is refused. Resets on graph loads.
     SetBusOutput { bus: SendSource, sink: Option<SinkName> },
+    /// Play `source` on channels of the audio interface (#399), or where
+    /// it plays by default for `None` (the master on outputs 1-2; click,
+    /// player and buses in the master mix). A bus takes either this or
+    /// `SetBusOutput`: the later one wins. Resets on graph loads.
+    SetOutRoute { source: OutSource, to: Option<OutChannels> },
     /// Bypass one effect node (#74): a bypassed FX passes its input through
     /// unchanged (its knob values are kept). Resets on graph loads.
     SetStripBypass { node: NodeId, bypass: bool },
@@ -1483,7 +1574,7 @@ impl Command {
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
-            | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::SetBusOutput { .. } | Command::RenameNode { .. }
+            | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::SetBusOutput { .. } | Command::SetOutRoute { .. } | Command::RenameNode { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. }
             | Command::SetKeysScale { .. } | Command::SetMasterMute { .. })
@@ -1540,6 +1631,7 @@ impl Command {
             | Command::SetStripMix { .. }
             | Command::SetSend { .. }
             | Command::SetBusOutput { .. }
+            | Command::SetOutRoute { .. }
             | Command::SetStripBypass { .. }
             | Command::RenameNode { .. }
             | Command::Cc { .. }

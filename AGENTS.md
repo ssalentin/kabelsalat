@@ -248,6 +248,8 @@ and never passed off as tested.**
   the 50 ms budget at three block sizes; app path and foot switch),
   `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
   temporary null sinks, so nothing is heard),
+  `stage-out-test` (the stage output matrix, #399: click on 3–4 of a 4-channel
+  PipeWire null sink with no bleed into 1–2, then the 2-channel fallback),
   `state-race-test [seconds] [patch.fxp...]`,
   `main-controls-test`, `engine-bench [render|session|routing|units|shared|idle] [--reps N] [--json]` (offline render timing
   and output hashes: the demo rack, a full rack of 4 rigs and 20 effects, the

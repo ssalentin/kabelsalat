@@ -449,6 +449,32 @@ do the same (`set_bus_output`, `get_bus_outputs`). This needs PipeWire
 
 <p align="center"><img src="shots/bus-outputs.png" width="85%" alt="The mixer with rig B's bus sent to the headphones and an aux bus called Mon sent to a second sound card, each naming its output under the strip name"/></p>
 
+### Stage outputs: FOH, in-ears and click on one interface
+
+On an audio interface with more than two outputs, kabelsalat opens every one
+of them (up to 32), and the Mixer shows **Stage outputs** under **Master
+out**: where the **Master**, the **Click** (every metronome and the count-in)
+and the **Track** (the backing track or cue file) play. Pick **Outputs 3–4**
+for the click and the drummer's in-ears get it on 3–4 while Front of House
+gets the master on 1–2 without it. Each assignment has its own level and
+balance; a single output (**Output 5 (mono)**) sums left and right for a
+wedge. The output menu of every rig bus and aux bus lists the interface's
+outputs too, next to the other sound cards. A click, track or bus on outputs
+of its own leaves the master mix and passes no master limiter (a soft knee
+still keeps it below full scale). Outputs 1–2 belong to the master; move it
+with its own menu.
+
+The assignments are saved with the session. On an output with fewer channels
+(rehearsing on a 2-channel laptop) they are kept: each source plays where it
+would without one (the master on 1–2, the rest in the master mix), its menu
+is outlined in amber, and the pre-show check warns, e.g. "The click is
+assigned to outputs 3–4, but this output has 2 channels: it plays in the
+master mix, so the audience hears it". Connect the stage interface and they
+apply again. The assistant and MCP agents do the same (`set_output_route`,
+`get_output_routes`). This needs the PipeWire backend; on JACK, route the
+ports in the patchbay. `kabelsalat stage-out-test` checks it on two
+temporary PipeWire null sinks (4 and 2 channels), so nothing is heard.
+
 ## Controllers and tempo
 
 ### Control knobs and the mixer from your controller

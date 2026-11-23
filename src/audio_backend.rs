@@ -424,6 +424,42 @@ impl SpaAudioFormatPod {
     }
 }
 
+/// The same `SPA_PARAM_EnumFormat` pod for `channels` f32 channels at
+/// `rate` Hz, with a position per channel: AUX0, AUX1, … (#399). With
+/// `stream.dont-remix` PipeWire then links channel n of the stream to
+/// channel n of the sink, whatever the sink calls its channels, and leaves
+/// a channel the sink lacks unconnected instead of mixing it into others.
+/// Returned as `u64` words for the pod's 8-byte alignment.
+fn multichannel_f32_pod(rate: u32, channels: u32) -> Vec<u64> {
+    const SPA_TYPE_ARRAY: u32 = 13;
+    const SPA_FORMAT_AUDIO_POSITION: u32 = 0x10005;
+    const SPA_AUDIO_CHANNEL_AUX0: u32 = 0x1000;
+    let mut w: Vec<u32> = vec![0, SPA_TYPE_OBJECT, SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT];
+    for (key, ty, val) in [
+        (SPA_FORMAT_MEDIA_TYPE, SPA_TYPE_ID, SPA_MEDIA_TYPE_AUDIO),
+        (SPA_FORMAT_MEDIA_SUBTYPE, SPA_TYPE_ID, SPA_MEDIA_SUBTYPE_RAW),
+        (SPA_FORMAT_AUDIO_FORMAT, SPA_TYPE_ID, SPA_AUDIO_FORMAT_F32),
+        (SPA_FORMAT_AUDIO_RATE, SPA_TYPE_INT, rate),
+        (SPA_FORMAT_AUDIO_CHANNELS, SPA_TYPE_INT, channels),
+    ] {
+        w.extend([key, 0, 4, ty, val, 0]);
+    }
+    // The position array: prop header, pod header (body = child header +
+    // one id per channel), child header, the ids, padded to 8 bytes.
+    w.extend([SPA_FORMAT_AUDIO_POSITION, 0, 8 + 4 * channels, SPA_TYPE_ARRAY, 4, SPA_TYPE_ID]);
+    w.extend((0..channels).map(|c| SPA_AUDIO_CHANNEL_AUX0 + c));
+    if w.len() % 2 == 1 {
+        w.push(0);
+    }
+    w[0] = (w.len() as u32 - 2) * 4;
+    w.chunks_exact(2).map(|p| u64::from_ne_bytes({
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&p[0].to_ne_bytes());
+        b[4..].copy_from_slice(&p[1].to_ne_bytes());
+        b
+    })).collect()
+}
+
 struct PwApi {
     pw_init: unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char),
     pw_thread_loop_new: unsafe extern "C" fn(*const c_char, *const c_void) -> *mut c_void,
@@ -507,6 +543,8 @@ struct PwState {
     state: Arc<AtomicI32>,
     last_err: Arc<Mutex<Option<String>>>,
     pinned: bool,
+    /// Channels of the stream's format (#399).
+    channels: usize,
 }
 
 unsafe impl Send for PwState {}
@@ -579,18 +617,18 @@ extern "C" fn pw_process_cb(data: *mut c_void) {
         if !spa_buf.is_null() && (*spa_buf).n_datas > 0 && !(*spa_buf).datas.is_null() {
             let d = &mut *(*spa_buf).datas;
             if !d.data.is_null() && !d.chunk.is_null() {
-                const CH: usize = 2;
-                const STRIDE: usize = CH * std::mem::size_of::<f32>();
-                let max_frames = (d.maxsize as usize) / STRIDE;
+                let ch = st.channels.max(1);
+                let stride = ch * std::mem::size_of::<f32>();
+                let max_frames = (d.maxsize as usize) / stride;
                 let req = (*pw_buf).requested as usize;
                 let frames = pw_callback_frames(req, st.default_frames, max_frames);
                 if frames > 0 {
-                    let out = std::slice::from_raw_parts_mut(d.data as *mut f32, frames * CH);
+                    let out = std::slice::from_raw_parts_mut(d.data as *mut f32, frames * ch);
                     let lat_ns = ((frames as f64 / st.sample_rate.max(1.0)) * 1e9) as u64;
-                    (st.render)(out, CH, Some(lat_ns));
+                    (st.render)(out, ch, Some(lat_ns));
                     (*d.chunk).offset = 0;
-                    (*d.chunk).stride = STRIDE as i32;
-                    (*d.chunk).size = (frames * STRIDE) as u32;
+                    (*d.chunk).stride = stride as i32;
+                    (*d.chunk).size = (frames * stride) as u32;
                 }
             }
         }
@@ -649,6 +687,10 @@ fn open_pipewire(
     let sample_rate = expected_rate.unwrap_or(48000.0).max(8000.0);
     let rate_u32 = sample_rate.round() as u32;
     let buf_frames = buffer_frames.max(64);
+    // Every channel of an interface with more than two (#399): asked here,
+    // before the stream exists, never on the audio thread.
+    let pw_target = target_device.filter(|s| !s.is_empty() && !looks_like_alsa_pcm(s));
+    let channels = crate::audio_out::wanted_stream_channels(pw_target);
 
     unsafe {
         let tloop = (api.pw_thread_loop_new)(c"kabelsalat-pw".as_ptr(), std::ptr::null());
@@ -673,8 +715,13 @@ fn open_pipewire(
         set_prop(c"node.name", "kabelsalat");
         set_prop(c"node.description", "Kabelsalat");
         set_prop(c"node.latency", &format!("{buf_frames}/{rate_u32}"));
-        if let Some(sink) = target_device.filter(|s| !s.is_empty() && !looks_like_alsa_pcm(s)) {
+        if let Some(sink) = pw_target {
             set_prop(c"target.object", sink);
+        }
+        if channels > 2 {
+            // Channel n plays on output n and nowhere else: no up- or
+            // downmix, also after the stream moved to another sink.
+            set_prop(c"stream.dont-remix", "true");
         }
 
         let events = Box::new(PwStreamEvents {
@@ -704,6 +751,7 @@ fn open_pipewire(
             state: state_flag.clone(),
             last_err: last_err.clone(),
             pinned: false,
+            channels,
         }));
 
         let stream = (api.pw_stream_new_simple)(
@@ -721,7 +769,12 @@ fn open_pipewire(
         (*state_ptr).stream = stream;
 
         let pod = SpaAudioFormatPod::stereo_f32(rate_u32);
-        let mut param_ptr: *const c_void = &pod as *const SpaAudioFormatPod as *const c_void;
+        let wide_pod = multichannel_f32_pod(rate_u32, channels as u32);
+        let mut param_ptr: *const c_void = if channels > 2 {
+            wide_pod.as_ptr() as *const c_void
+        } else {
+            &pod as *const SpaAudioFormatPod as *const c_void
+        };
         let flags = PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS;
         let rc = (api.pw_stream_connect)(
             stream,
@@ -777,7 +830,7 @@ fn open_pipewire(
         }
 
         eprintln!(
-            "audio: host=PipeWire node=kabelsalat rate={} ch=2 buffer={} frames ({:.1} ms)",
+            "audio: host=PipeWire node=kabelsalat rate={} ch={channels} buffer={} frames ({:.1} ms)",
             sample_rate,
             buf_frames,
             buf_frames as f64 / sample_rate * 1000.0,
@@ -788,7 +841,7 @@ fn open_pipewire(
             backend: ActiveBackend::PipeWire,
             sample_rate,
             buffer_frames: buf_frames,
-            channels: 2,
+            channels,
             device_label: target_device
                 .filter(|s| !s.is_empty() && !looks_like_alsa_pcm(s))
                 .unwrap_or("PipeWire default")

@@ -45,6 +45,7 @@ mod mcp;
 mod organ;
 mod instruments;
 mod meter;
+mod out_routes;
 mod midi;
 mod player;
 mod preshow;
@@ -199,6 +200,7 @@ fn main() -> anyhow::Result<()> {
         "audio-in-test" => audio_in::run_test(),
         "audio-out-test" => audio_out::run_test(),
         "hotplug-test" => audio_recover::run_test(),
+        "stage-out-test" => out_routes::run_stage_test(),
         "monitor-latency-test" => audio_in::run_monitor_latency_test(),
         "guitar-rig-test" => engine::guitar_rig_test(),
         "analysis-test" => {

@@ -488,6 +488,24 @@ agents are in [AGENTS.md](../AGENTS.md).
   separate clocks when the sinks are separate cards: the feeder cuts a
   backlog above 40 ms, and `audio-out-test` prints how far apart the two
   arrive.
+- **2026-11-23** — **Stage output matrix (#399)**: one output stream with
+  every channel of the interface, not a stream per destination, so FOH,
+  in-ears and click share one clock. `open_pipewire` asks `pactl` for the
+  target sink's channel map before the stream exists and, above two
+  channels, connects with an AUX0..AUXn position array and
+  `stream.dont-remix`: channel n lands on output n, and a channel the sink
+  lacks stays unlinked instead of being mixed into others. The engine keeps
+  `out_routes` (fixed capacity `MAX_OUT_ROUTES`, each with its own
+  `out_mix` span and `GainRamp`): the click, the player and a routed bus sum
+  into their span instead of the master, and after the master stage (whose
+  meter, recorder and listen taps still see channels 1-2) the spans are
+  written to their channels, soft-kneed like the master's last stage. The
+  assignment is checked against the block's `ch` every block, so a
+  2-channel stream plays each source where it would without one, and the
+  app reopens the stream when the scan sees it on a sink with another
+  channel count (`follow_output_channels`). A bus takes either channels
+  (`SetOutRoute`) or a sound card of its own (`SetBusOutput`, #147): the
+  later wins in engine and mirror alike.
 - **2026-11-19** — **Sends and aux buses (#5)**: an aux bus is a node
   (`DspKind::Bus`) with an OUT jack and no input. What feeds it is the send
   table (`Command::SetSend`: a rig or a node, a level, pre or post fader),

@@ -2060,3 +2060,18 @@ Learned so far (2026-11-15, UI polish pass):
     stays on the bar. Markers are followed only for the load they were sent
     for (`SetPlayerMarkers.file`, `PlayerData::id`). Check with
     `kabelsalat player-test` (d) and `player::engine_tests`.
+233. **A process that loaded plugin code leaves with `_exit`, never by returning from `main`:**
+    a plugin library's static/thread-local destructors run at `exit()`; Six Sines'
+    VST3 destroys a joinable `std::thread` there (`std::terminate`, exit 134) after
+    `vst3-test`/`editor-test` already printed PASS (#422). Every place that opens a
+    plugin binary calls `host::exit::plugin_code_loaded()`, `main` ends in
+    `host::exit::leave(..)`, and `vst3-test` runs a child against a fixture whose
+    destructor aborts (`KABELSALAT_VST3_PROBE_ABORT_AT_EXIT`). A new loader of
+    plugin code calls `plugin_code_loaded()`.
+234. **Re-assert `EGL_PLATFORM=x11` before every X11 editor, not only at startup (#421):**
+    `main` sets it once, but a plugin loaded earlier in the same `editor-test`
+    process can change the environment, and Unsampled Piano (baseview) then
+    crashed in `wl_proxy_create_wrapper`. Editor-opening paths call
+    `plugin_window::force_x11_egl_platform()` (sets it whenever it is not `x11`
+    under Wayland), and `run_editor_test` calls it first. Not reproduced on the
+    aarch64 CI-less server (no Wayland GPU session): the bench test checks it.

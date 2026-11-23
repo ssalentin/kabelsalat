@@ -351,6 +351,7 @@ pub fn scan_vst3_bundle(bundle: &Path) -> Result<Vec<Vst3PluginInfo>> {
     let c_so = CString::new(resolved.so_path.to_string_lossy().as_bytes())
         .context("invalid VST3 binary path")?;
 
+    crate::host::exit::plugin_code_loaded();
     let dl = unsafe { libc::dlopen(c_so.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
     if dl.is_null() {
         let err = unsafe {

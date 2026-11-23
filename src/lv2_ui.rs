@@ -358,6 +358,7 @@ impl Lv2UiHandle {
             .map_err(|reason| anyhow!("{reason}"))?;
 
         let c_binary = CString::new(info.binary_path.as_str()).context("invalid LV2 UI path")?;
+        crate::host::exit::plugin_code_loaded();
         let dl_handle = unsafe { libc::dlopen(c_binary.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if dl_handle.is_null() {
             let err = unsafe {
@@ -464,7 +465,7 @@ impl Lv2UiHandle {
 
         let mut window = if info.is_x11 {
             crate::plugin_window::ensure_display();
-            crate::plugin_window::ensure_x11_egl_platform();
+            crate::plugin_window::force_x11_egl_platform();
             Some(PluginWindow::open(title, 640, 480, info.resizable)?)
         } else {
             None

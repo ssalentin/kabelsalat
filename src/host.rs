@@ -60,6 +60,7 @@ use crate::main_controls::{self, Candidate, MainControls, RemotePage};
 use crate::plugin_window::PluginWindow;
 use crate::transport::Transport;
 
+pub mod exit;
 mod loader;
 pub mod sandbox;
 pub use loader::{ClapLoader, ClapLoaderResp, HostedClapMain};
@@ -1972,6 +1973,8 @@ fn ready_fds(fds: &[(i32, FdFlags)]) -> Vec<(i32, FdFlags)> {
 /// for a while, and check that the editor attached to the host window. Hold
 /// each open longer with `KABELSALAT_EDITOR_HOLD=<seconds>` (for screenshots).
 pub fn run_editor_test(ids: &[String]) -> Result<()> {
+    // Before any plugin library is loaded (#421).
+    crate::plugin_window::force_x11_egl_platform();
     let mut lv2_uris = Vec::new();
     let mut voice_ids = Vec::new();
     if ids.is_empty() {
@@ -2238,7 +2241,7 @@ impl ClapMainInner {
         // their X11/EGL connection inside `create`, before `set_parent`.
         if cfg.api_type == GuiApiType::X11 {
             crate::plugin_window::ensure_display();
-            crate::plugin_window::ensure_x11_egl_platform();
+            crate::plugin_window::force_x11_egl_platform();
         }
         self.instance.access_shared_handler(|h| {
             h.gui_closed.store(false, Ordering::SeqCst);
@@ -3307,6 +3310,7 @@ fn open_bundle(path: &std::path::Path) -> Result<PluginEntry> {
     // SAFETY: loading a CLAP bundle executes its init code. The app loads
     // only the bundle the out-of-process scan found a plugin in; the scan
     // itself runs this inside the isolated `scan-clap` child process.
+    exit::plugin_code_loaded();
     unsafe { PluginEntry::load(path) }.with_context(|| format!("failed to load CLAP bundle {}", path.display()))
 }
 

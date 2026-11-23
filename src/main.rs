@@ -75,6 +75,12 @@ const MODES: &str = "app [--headless], crash-test, sandbox-test, preview, analys
 fn main() -> anyhow::Result<()> {
     plugin_window::ensure_x11_egl_platform();
     plugin_dirs::init();
+    // A process that loaded plugin code leaves without running the plugin
+    // libraries' static destructors (#422).
+    host::exit::leave(run())
+}
+
+fn run() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
     match mode.as_str() {
         "app" => watchdog::run_app(std::env::args().any(|a| a == "--headless")),

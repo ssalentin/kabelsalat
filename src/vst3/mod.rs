@@ -125,6 +125,7 @@ fn load_module_factory(so_path: &Path) -> Result<ComPtr<IPluginFactory>> {
     }
 
     let c_so = CString::new(canon.to_string_lossy().as_bytes()).context("invalid VST3 path")?;
+    crate::host::exit::plugin_code_loaded();
     let dl = unsafe { libc::dlopen(c_so.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if dl.is_null() {
         let err = unsafe {
@@ -966,7 +967,7 @@ impl Vst3VoiceMain {
         let resizable = can_res == kResultOk || can_res == kResultTrue;
 
         crate::plugin_window::ensure_display();
-        crate::plugin_window::ensure_x11_egl_platform();
+        crate::plugin_window::force_x11_egl_platform();
         let mut window = PluginWindow::open(title, w, h, resizable)?;
 
         let frame = ComWrapper::new(HostPlugFrame::new());
@@ -1372,6 +1373,9 @@ fn peak_of(buf: &[f32]) -> f32 {
 /// parameter edits, state save/restore, `IMidiMapping`, `IPlugView` + `IRunLoop`,
 /// and any named installed VST3 CIDs.
 pub fn run_vst3_test(args: &[String]) -> Result<()> {
+    if args.first().map(String::as_str) == Some(EXIT_PROBE_ARG) {
+        return exit_probe_child();
+    }
     let (bundle, synth_cid, gain_cid) = build_fixture_bundle("cli")?;
     let res = (|| -> Result<()> {
         let scanned = scan::scan_vst3_bundle(&bundle)?;
@@ -1444,11 +1448,71 @@ pub fn run_vst3_test(args: &[String]) -> Result<()> {
             println!("vst3-test {}: PASS (effect={}, params={})", m.info().name, v.is_effect(), m.params.len());
             m.retire();
         }
+        // The test binary is not `kabelsalat`, so only the CLI runs this step.
+        #[cfg(not(test))]
+        exit_probe()?;
         println!("=== vst3-test PASS ===");
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
     res
+}
+
+/// `vst3-test`'s argument for the child of [`exit_probe`].
+const EXIT_PROBE_ARG: &str = "--exit-probe";
+/// Makes the fixture's static destructor abort (see `vst3_probe.c`).
+const EXIT_PROBE_ENV: &str = "KABELSALAT_VST3_PROBE_ABORT_AT_EXIT";
+
+/// The child of [`exit_probe`]: host the fixture synth for one block, retire
+/// it and return to `main` like any self-test that passed.
+fn exit_probe_child() -> Result<()> {
+    let (bundle, synth_cid, _) = build_fixture_bundle("exit")?;
+    let res = (|| -> Result<()> {
+        let (mut v, m) = Vst3VoiceMain::load(&synth_cid, 48_000.0)?;
+        let mut out = vec![0.0f32; BLOCK * 2];
+        v.render_block(BLOCK, None, &mut out, &Transport::default(), &[VoiceCmd::NoteOn(69, 1.0)]);
+        anyhow::ensure!(peak_of(&out) > 0.25, "the exit probe's synth is silent");
+        m.retire();
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
+    println!("vst3-test exit probe child: hosted and retired, leaving");
+    res
+}
+
+/// A plugin whose static destructor aborts must not turn a passed run into
+/// `SIGABRT` (#422): run this binary again with a fixture that aborts when
+/// its library's destructors run, and ask for a clean exit.
+#[cfg(not(test))]
+fn exit_probe() -> Result<()> {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(["vst3-test", EXIT_PROBE_ARG]).env(EXIT_PROBE_ENV, "1");
+    // No core file for the abort this step exists to catch.
+    unsafe {
+        cmd.pre_exec(|| {
+            let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            libc::setrlimit(libc::RLIMIT_CORE, &none);
+            Ok(())
+        });
+    }
+    let out = cmd.output().context("starting the exit probe child")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    anyhow::ensure!(
+        stdout.contains("exit probe child: hosted and retired"),
+        "the exit probe child did not get to its end: {stdout} {stderr}"
+    );
+    anyhow::ensure!(
+        out.status.success(),
+        "a plugin's static destructor ran at process exit and killed a passed run \
+         (code {:?}, signal {:?}): {}",
+        out.status.code(),
+        out.status.signal(),
+        stderr.trim()
+    );
+    println!("vst3-test exit with an aborting plugin destructor: PASS (exit 0)");
+    Ok(())
 }
 
 #[cfg(test)]

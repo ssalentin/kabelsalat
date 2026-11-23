@@ -1658,6 +1658,7 @@ pub fn host_test() -> anyhow::Result<()> {
             if p.is_null() {
                 continue;
             }
+            crate::host::exit::plugin_code_loaded();
             let inst = lilv_plugin_instantiate(p, 48000.0, features.as_ptr());
             if !inst.is_null() {
                 plugin = p;
@@ -2092,6 +2093,7 @@ impl Lv2Plugin {
             if let Some(reason) = foreign_binary(plugin) {
                 anyhow::bail!("{uri}: {reason}");
             }
+            crate::host::exit::plugin_code_loaded();
             let instance = lilv_plugin_instantiate(plugin, sample_rate, features.as_ptr());
             anyhow::ensure!(!instance.is_null(), "instantiate failed for {uri}");
             pin_plugin_library(plugin);

@@ -49,7 +49,7 @@ impl PluginWindow {
     /// size, so tiling window managers float it at the plugin's own size.
     pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Result<Self> {
         ensure_display();
-        ensure_x11_egl_platform();
+        force_x11_egl_platform();
         let display_desc = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".into());
         let (conn, screen_num) = x11rb::connect(None).with_context(|| {
             format!("no X server for plugin windows (DISPLAY={display_desc}; is XWayland running?)")
@@ -366,6 +366,28 @@ pub fn ensure_x11_egl_platform() {
     }
 }
 
+/// Whether an X11 editor is about to open under Wayland with an EGL platform
+/// other than `x11` (#421): a plugin loaded earlier in the same process can
+/// change it (`setenv`/`unsetenv` in its own init), after `main` set it.
+fn should_force_x11_egl_platform(
+    wayland_display: Option<&std::ffi::OsStr>,
+    egl_platform: Option<&std::ffi::OsStr>,
+) -> bool {
+    wayland_display.is_some_and(|v| !v.is_empty()) && egl_platform != Some(std::ffi::OsStr::new("x11"))
+}
+
+/// Re-assert `EGL_PLATFORM=x11` right before a plugin's X11 editor is created,
+/// whatever an earlier plugin did to the environment (#421). Runs on the main
+/// thread that owns editors, like [`ensure_x11_egl_platform`].
+pub fn force_x11_egl_platform() {
+    if should_force_x11_egl_platform(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("EGL_PLATFORM").as_deref(),
+    ) {
+        std::env::set_var("EGL_PLATFORM", "x11");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +397,17 @@ mod tests {
             MonitorRect { name: "eDP-1".into(), x: 0, y: 0, w: 2560, h: 1600, primary: false },
             MonitorRect { name: "DP-1".into(), x: 2560, y: 0, w: 1920, h: 1080, primary: false },
         ]
+    }
+
+    #[test]
+    fn x11_egl_platform_is_reasserted_when_an_earlier_plugin_changed_it() {
+        use std::ffi::OsStr;
+        let wl = Some(OsStr::new("wayland-1"));
+        assert!(should_force_x11_egl_platform(wl, None));
+        assert!(should_force_x11_egl_platform(wl, Some(OsStr::new(""))));
+        assert!(should_force_x11_egl_platform(wl, Some(OsStr::new("wayland"))));
+        assert!(!should_force_x11_egl_platform(wl, Some(OsStr::new("x11"))));
+        assert!(!should_force_x11_egl_platform(None, None));
     }
 
     #[test]

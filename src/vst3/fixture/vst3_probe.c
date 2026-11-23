@@ -3,6 +3,7 @@
  * Zero external headers: matches Steinberg VST3 C COM ABI on Linux LP64. */
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -889,4 +890,16 @@ __attribute__((visibility("default")))
 void *GetPluginFactory(void) {
     G_FACTORY.refcnt++;
     return &G_FACTORY;
+}
+
+/* What a C++ plugin's static destructor can do at `exit()` (#422): Six Sines
+ * destroys a still joinable std::thread there, which is std::terminate. With
+ * KABELSALAT_VST3_PROBE_ABORT_AT_EXIT set, this library aborts the same way
+ * when the host process runs the destructors of its loaded libraries. */
+__attribute__((destructor)) static void probe_static_destructor(void) {
+    const char *v = getenv("KABELSALAT_VST3_PROBE_ABORT_AT_EXIT");
+    if (v && v[0]) {
+        fputs("vst3 probe: static destructor ran at exit, aborting (terminate called without an active exception)\n", stderr);
+        abort();
+    }
 }

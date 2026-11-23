@@ -2024,6 +2024,15 @@ Learned so far (2026-11-15, UI polish pass):
     `LilvWorld` and crashes `liblilv` in `lilv_world_get_unique`; suffix both
     path and URI with a monotonic counter, call `lv2::remove_bundle(&dir)` before
     deletion, and skip non-existent dirs in `EXTRA_BUNDLES`.
+231. **A viewport zoom scales the painted shapes, and text is re-laid at a
+    quantized size (#309):** the rack draws at 100 % and `zoom_shapes` maps
+    the shapes it added through `Xform::view()` afterwards; every pointer
+    position goes through `Xform::inv` / `screen` (never `p` alone) and a
+    pan is in screen points. Text galleys are laid out again at
+    `zoom_font_size` (floored on a ladder: 0.5/1/2/4 px steps), never at
+    `size * zoom`, or each zoom value adds glyphs to the font atlas (rule 17);
+    pixel-snapped rects are snapped again after the transform (rule 167)
+    (`zoom_tests::continuous_zoom_never_grows_the_font_atlas_after_a_warm_up`).
 
 231. **A device that goes away has its held state released, and a stream that
     dies is reopened by its own watcher (#402):** an unplugged MIDI keyboard

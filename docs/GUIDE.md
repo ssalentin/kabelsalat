@@ -13,6 +13,7 @@ every keyboard shortcut.
   - [Play your guitar](#play-your-guitar)
 - [Build rigs](#build-rigs)
   - [Patch with real cables](#patch-with-real-cables)
+  - [Zoom the rack](#zoom-the-rack)
   - [Run several rigs at once](#run-several-rigs-at-once)
   - [Route MIDI anywhere](#route-midi-anywhere)
   - [Put MIDI effects in front of an instrument](#put-midi-effects-in-front-of-an-instrument)
@@ -186,6 +187,21 @@ Click the **padlock** button next to the view tabs (or press **Ctrl+L**) to **lo
 <p align="center"><img src="shots/rack-locked.png" width="85%" alt="The rack locked for editing: the top-bar padlock button is engaged, a LOCKED · CTRL+L TO UNLOCK badge sits above the rack, and the rack stays playable and inspectable without accidental edits"/></p>
 
 <p align="center"><img src="shots/back.png" width="85%" alt="The back of the rack: hovering Surge A OUT traces its audio cables while dimming unrelated routes, shows a live dBFS port tooltip, and exposes opacity and tension sliders"/></p>
+
+### Zoom the rack
+
+Zoom the rack to see all of a big rig or to tweak one unit, on the front and
+on the back; knobs, jacks, cables and Ctrl-dragging a unit work at any zoom.
+
+| Keys | What it does |
+|---|---|
+| **Ctrl+scroll** (or a trackpad pinch) | zoom about the pointer, 25 % to 300 % |
+| **Ctrl+=** / **Ctrl+-** | step up / down: 25, 33, 50, 67, 80, 100, 125, 150, 200, 250, 300 % |
+| **Ctrl+0** | back to 100 %; at 100 % a rack larger than the window zooms out until all of it shows |
+| **Ctrl+Shift+F** | fill the view with the selected (or pointed-at) unit; again to zoom back |
+
+The wheel pans a zoomed rack, and the hint line shows the zoom level while it
+is not 100 %. **F4** (multi-rig demo) is unchanged.
 
 ### Run several rigs at once
 

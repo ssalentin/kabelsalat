@@ -155,9 +155,22 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct HttpTransport(reqwest::blocking::Client);
 
+/// The one way to start an HTTP client: reqwest is built without a TLS
+/// crypto provider of its own (`rustls-no-provider`, so the binary carries
+/// ring instead of aws-lc), and panics on the first HTTPS request unless one
+/// is installed. Installing it here, once per process, covers every client.
+pub fn client_builder() -> reqwest::blocking::ClientBuilder {
+    static TLS: std::sync::Once = std::sync::Once::new();
+    TLS.call_once(|| {
+        // Err only when another provider was installed first; that one serves.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    reqwest::blocking::Client::builder()
+}
+
 impl HttpTransport {
     pub fn new() -> Result<Self, String> {
-        reqwest::blocking::Client::builder()
+        client_builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(10))
             .build()
@@ -389,6 +402,14 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_https_client_builds_with_the_ring_provider() {
+        // Without `client_builder` installing ring, reqwest panics here
+        // ("No provider set"); no request is sent (rule 37).
+        assert!(client_builder().build().is_ok());
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
     use super::fake::*;
     use super::*;
     use serde_json::json;

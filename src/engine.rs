@@ -1234,7 +1234,18 @@ impl Default for EdgeLevels {
 }
 
 fn block_peak(buf: &[f32]) -> f32 {
-    buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    // Eight running maxima the compiler keeps in vector lanes: one chain
+    // through every sample cannot be vectorized. A maximum does not depend on
+    // the order it is taken in, so the result is the same to the bit.
+    let mut lanes = [0.0f32; 8];
+    let mut chunks = buf.chunks_exact(8);
+    for c in &mut chunks {
+        for k in 0..8 {
+            lanes[k] = lanes[k].max(c[k].abs());
+        }
+    }
+    let tail = chunks.remainder().iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    lanes.iter().fold(tail, |m, &x| m.max(x))
 }
 
 /// One source node's strip output gains (L, R), or None when the node has no
@@ -1444,6 +1455,46 @@ fn add_routed(graph: &Graph, pdc: &mut pdc::Pdc, node: NodeId, dest: NodeId, src
     if !graph.has_route(node, dest, PortKind::Audio) { return; }
     let mono = graph.has_route_port(node, dest, 2, PortKind::Audio);
     pdc.mix(node, dest, src, mono, (1.0, 1.0), out);
+}
+
+/// The sources with an audio cable into one node, from one pass over the
+/// cables: a summing loop asks it per source instead of walking every cable
+/// for each one (`Graph::has_route`). Past its fixed table it falls back to
+/// asking the graph. Allocation-free.
+struct WiredInto {
+    dest: NodeId,
+    nodes: [NodeId; 16],
+    n: usize,
+}
+
+impl WiredInto {
+    fn of(graph: &Graph, dest: NodeId) -> Self {
+        let mut w = Self { dest, nodes: [NodeId::MAX; 16], n: 0 };
+        for e in &graph.edges {
+            if e.kind == PortKind::Audio && e.to.node == dest {
+                if w.n < w.nodes.len() {
+                    w.nodes[w.n] = e.from.node;
+                }
+                w.n += 1;
+            }
+        }
+        w
+    }
+
+    fn has(&self, graph: &Graph, src: NodeId) -> bool {
+        if self.n <= self.nodes.len() {
+            self.nodes[..self.n].contains(&src)
+        } else {
+            graph.has_route(src, self.dest, PortKind::Audio)
+        }
+    }
+
+    /// `add_routed` into this destination.
+    fn add(&self, graph: &Graph, pdc: &mut pdc::Pdc, node: NodeId, src: &[f32], out: &mut [f32]) {
+        if !self.has(graph, node) { return; }
+        let mono = graph.has_route_port(node, self.dest, 2, PortKind::Audio);
+        pdc.mix(node, self.dest, src, mono, (1.0, 1.0), out);
+    }
 }
 
 /// The published send table (`GraphPub::sends`): empty slots have
@@ -4243,6 +4294,10 @@ impl GraphEngine {
     /// post-gain). Block rate, allocation-free: linear scans over reserved
     /// graph storage, like the rest of the render path.
     fn publish_edge_levels(&self, n2: usize, sys: bool) {
+        // A source's cables follow one another (L and R, or one per unit it
+        // feeds): its peak is taken once for the run, not once per cable.
+        // Keyed by output port too: a splitter's two outputs differ (#308).
+        let mut last: Option<(NodeId, u8, f32)> = None;
         for e in &self.graph.edges {
             if e.kind != PortKind::Audio {
                 continue;
@@ -4263,6 +4318,12 @@ impl GraphEngine {
                 self.edge_levels.store(e.id, 0.0);
                 continue;
             }
+            if let Some((n, port, p)) = last {
+                if n == src && port == e.from.port {
+                    self.edge_levels.store(e.id, p);
+                    continue;
+                }
+            }
             let peak = if let Some(v) = self.voices.iter().find(|v| v.node == src) {
                 block_peak(&v.scratch[..n2])
             } else if let Some(d) = self.dsp.iter().find(|d| d.node == src) {
@@ -4278,6 +4339,7 @@ impl GraphEngine {
             } else {
                 0.0
             };
+            last = Some((src, e.from.port, peak));
             self.edge_levels.store(e.id, peak);
         }
     }
@@ -4336,11 +4398,15 @@ impl GraphEngine {
                 if self.fx_after_bus[f] || self.fx_is_bus(f) { continue; }
                 let to = self.fx_node(f);
                 if to == NodeId::MAX { continue; }
-                let fed = (0..n_fx).any(|g| {
-                    let from = self.fx_node(g);
-                    g != f && from != NodeId::MAX
-                        && (self.fx_after_bus[g] || self.fx_is_bus(g))
-                        && self.graph.has_route(from, to, PortKind::Audio)
+                // One pass over the cables into `to`, then the few effects
+                // they come from: asking `has_route` per effect pair walked
+                // every cable for each of them, every block.
+                let fed = self.graph.edges.iter().any(|e| {
+                    e.kind == PortKind::Audio && e.to.node == to
+                        && (0..n_fx).any(|g| {
+                            g != f && self.fx_node(g) == e.from.node
+                                && (self.fx_after_bus[g] || self.fx_is_bus(g))
+                        })
                 });
                 if fed {
                     self.fx_after_bus[f] = true;
@@ -4590,21 +4656,9 @@ impl GraphEngine {
         let (graph, pdc) = (&self.graph, &mut self.pdc);
         // Who is wired into `dest`, from one pass over the cables: asking
         // the graph per source walked all of them for every unit.
-        let mut wired = [NodeId::MAX; 16];
-        let mut n_wired = 0;
-        for e in &graph.edges {
-            if e.kind == PortKind::Audio && e.to.node == dest {
-                if n_wired < wired.len() {
-                    wired[n_wired] = e.from.node;
-                }
-                n_wired += 1;
-            }
-        }
-        let routed = |src: NodeId| {
-            if n_wired <= wired.len() { wired[..n_wired].contains(&src) } else { graph.has_route(src, dest, PortKind::Audio) }
-        };
+        let wired = WiredInto::of(graph, dest);
         let mut add = |src: NodeId, buf: &[f32]| {
-            if src == dest || !routed(src) {
+            if src == dest || !wired.has(graph, src) {
                 return;
             }
             let Some(b) = second.as_deref_mut() else {
@@ -7458,26 +7512,33 @@ impl GraphEngine {
                 // No capture opened for this node yet: silent, no level.
                 continue;
             }
+            // One chunk read for the block: popping sample by sample cost two
+            // atomics per sample. What the ring lacks reads as starved, the
+            // way a failed pop did: past `k`, each channel repeats its last.
+            let chunk = consumer.as_mut().map(|c| {
+                let k = c.slots().min(n2);
+                c.read_chunk(k).expect("k <= slots")
+            });
+            let k = chunk.as_ref().map_or(0, |c| c.len());
+            let (head, tail) = chunk.as_ref().map_or((&[][..], &[][..]), |c| c.as_slices());
+            let at = |j: usize| if j < head.len() { head[j] } else { tail[j - head.len()] };
             for i in 0..frames {
-                let (l, r) = match consumer.as_mut() {
-                    None => (s.raw[i * 2], s.raw[i * 2 + 1]),
-                    Some(consumer) => {
-                        let l = match consumer.pop() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                s.starved += 1;
-                                s.last[0]
-                            }
-                        };
-                        let r = match consumer.pop() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                s.starved += 1;
-                                s.last[1]
-                            }
-                        };
-                        (l, r)
-                    }
+                let (l, r) = if chunk.is_none() {
+                    (s.raw[i * 2], s.raw[i * 2 + 1])
+                } else {
+                    let l = if 2 * i < k {
+                        at(2 * i)
+                    } else {
+                        s.starved += 1;
+                        s.last[0]
+                    };
+                    let r = if 2 * i + 1 < k {
+                        at(2 * i + 1)
+                    } else {
+                        s.starved += 1;
+                        s.last[1]
+                    };
+                    (l, r)
                 };
                 s.last = [l, r];
                 s.raw[i * 2] = l;
@@ -7491,6 +7552,9 @@ impl GraphEngine {
                 s.buf[i * 2] = ol * g;
                 s.buf[i * 2 + 1] = or * g;
             }
+            if let Some(c) = chunk {
+                c.commit_all();
+            }
             let Some(consumer) = consumer else {
                 self.audio_in_levels.store(s.node, block_peak(&s.raw[..n2]));
                 continue;
@@ -7501,8 +7565,9 @@ impl GraphEngine {
             s.drift = crate::audio_in::Drift::new(n2.max(2));
             let backlog = s.drift.catch_up(consumer.slots());
             if backlog > 0 {
-                for _ in 0..backlog {
-                    let _ = consumer.pop();
+                // `catch_up` never asks for more than the ring holds.
+                if let Ok(c) = consumer.read_chunk(backlog.min(consumer.slots())) {
+                    c.commit_all();
                 }
                 s.dropped += (backlog / 2) as u64;
             }
@@ -8029,27 +8094,28 @@ impl GraphEngine {
                     // master except the buses and their chains (the returns),
                     // each through its compensation delay when the plan has
                     // one.
+                    let wired = WiredInto::of(&self.graph, master);
                     for (i, v) in self.voices.iter().enumerate() {
                         if v.node != NodeId::MAX && !self.fx_after_bus[n_dsp + n_lv2 + i] {
-                            add_routed(&self.graph, &mut self.pdc, v.node, master, &v.scratch[..n2], rig_buf);
+                            wired.add(&self.graph, &mut self.pdc, v.node, &v.scratch[..n2], rig_buf);
                         }
                     }
                     for (i, d) in self.dsp.iter().enumerate() {
                         // A click on channels of its own is in no rig.
                         if click_out.is_some() && d.kind == DspKind::Metronome { continue; }
                         if d.kind != DspKind::Bus && !self.fx_after_bus[i] {
-                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.out_to(&self.graph, master)[..n2], rig_buf);
+                            wired.add(&self.graph, &mut self.pdc, d.node, &d.out_to(&self.graph, master)[..n2], rig_buf);
                         }
                     }
                     for (i, slot) in self.lv2.iter().enumerate() {
                         if !self.fx_after_bus[n_dsp + i] {
-                            add_routed(&self.graph, &mut self.pdc, slot.node, master, &slot.buf[..n2], rig_buf);
+                            wired.add(&self.graph, &mut self.pdc, slot.node, &slot.buf[..n2], rig_buf);
                         }
                     }
                     // Audio In wired into this master (OUT jack → graph
                     // routing) always sums stereo.
                     for a in &self.audio_in {
-                        if self.graph.has_route(a.node, master, PortKind::Audio) {
+                        if wired.has(&self.graph, a.node) {
                             self.pdc.mix(a.node, master, &a.buf[..n2], false, (1.0, 1.0), rig_buf);
                         }
                     }

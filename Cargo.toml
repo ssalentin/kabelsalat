@@ -37,7 +37,12 @@ png = "0.18.1"
 base64 = "0.23.1"
 rmcp = { version = "3.10", features = ["server", "transport-io", "macros"] }
 schemars = "1"
-reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
+# TLS through rustls on ring, not reqwest's default aws-lc: aws-lc is a large
+# C library (about 0.6 MB of the release binary, a 33 MB static archive built
+# from C for every fresh target dir), and the app only makes a few HTTPS calls
+# to model APIs and GitHub. `llm::client_builder` installs ring.
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rtrb = "0.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

@@ -31,6 +31,7 @@ mod dsp;
 mod engine;
 mod engine_info;
 mod factory;
+mod firstrun;
 mod guitar;
 mod host;
 mod juce;
@@ -79,6 +80,7 @@ fn main() -> anyhow::Result<()> {
         "preview" => preview::run(),
         "audio-test" => audio::run_test(),
         "factory-test" => factory::run_test(),
+        "first-run-test" => firstrun::run_test(),
         "audio-doctor" => audio_doctor::run_cli(&std::env::args().skip(2).collect::<Vec<_>>()),
         "audio-backend-test" => audio_backend::run_test(),
         "midi-test" => midi::run_test(),

@@ -87,6 +87,10 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   and Leslie, pipe organ stops, synth wheels and X/Y pad, bass neck, wind
   breath, drum pads. **Shift+V** fills the window with it.
   → [Instruments and the on-screen keyboard](docs/GUIDE.md#instruments-and-the-on-screen-keyboard)
+- **Sound within a minute:** the first start finds your output, plays one
+  quiet note and opens the keyboard; if the output is missing, the buffer is
+  large or realtime rights are, it says so in one sentence and points to the
+  Audio Doctor. → [First start](docs/GUIDE.md#first-start)
 - **Factory sounds, no plugin needed:** a piano, an electric piano and a drum
   kit are built in, so the first key press sounds even on a bare machine.
   → [Factory sounds](docs/GUIDE.md#factory-sounds)

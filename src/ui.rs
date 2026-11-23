@@ -187,6 +187,7 @@ mod plugin_folders;
 mod shared;
 mod window_load;
 mod hotplug;
+mod firstrun;
 pub(crate) use hotplug::midi_selftest as hotplug_midi_selftest;
 use levels::LevelItem;
 
@@ -3864,6 +3865,7 @@ struct DemoApp {
     recovery: recovery::Recovery,
     /// Device loss and return (#402): notices, Show-mode flags, input retries.
     hotplug: hotplug::Hotplug,
+    first_run: firstrun::FirstRun,
     session_msg: String,
     confirm_session: Option<SessionConfirm>,
     /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
@@ -4675,6 +4677,7 @@ impl DemoApp {
             },
             recovery: Default::default(),
             hotplug: Default::default(),
+            first_run: Default::default(),
             session_msg: String::new(),
             confirm_session: None,
             patch_notice: None,
@@ -35723,6 +35726,7 @@ impl DemoApp {
         self.crash_notice(&ctx);
         self.track_recovery();
         self.track_hotplug();
+        self.track_first_run();
 
         // Full frame rate while focused (the cables are the show) or while an
         // animation / agent run is active; ~30 fps when unfocused and idle.
@@ -37186,6 +37190,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
 
             let mut sink = sink;
             let mut audio = None;
+            let mut no_output: Option<String> = None;
             if with_audio {
                 match build_audio() {
                     Ok(ba) => {
@@ -37265,10 +37270,14 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             audio_in_levels,
                         ));
                     }
-                    Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
+                    Err(e) => {
+                        eprintln!("audio unavailable, running silent: {e}");
+                        no_output = Some(format!("{e}").lines().next().unwrap_or("").to_string());
+                    }
                 }
             }
             let mut app = DemoApp::new_with_sink(sink);
+            app.first_run.no_output = no_output;
             // Scan plugins in the background from the start, so the browser
             // opens instantly.
             app.start_plugin_scan(false);

@@ -10,6 +10,7 @@ every keyboard shortcut.
   - [Navigate rigs, sessions and plugins](#navigate-rigs-sessions-and-plugins)
 - [Play](#play)
   - [Instruments and the on-screen keyboard](#instruments-and-the-on-screen-keyboard)
+  - [First start](#first-start)
   - [Factory sounds](#factory-sounds)
   - [Play your guitar](#play-your-guitar)
 - [Build rigs](#build-rigs)
@@ -143,6 +144,19 @@ rack (Esc or DOCK brings it back), and the instrument moves as you play:
   (harder in the middle), next to a 4×4 pad bank.
 
 <p align="center"><img src="shots/keyboard-consoles-2.png" width="85%" alt="Four more full-window consoles: E-Piano with a tine per key, Bass with a four-string neck showing the held notes, Wind with breath control and air column, Drums with an overhead kit and sixteen pads"/></p>
+
+### First start
+
+On the very first start kabelsalat opens your sound output, plays one quiet
+note and puts the keyboard up, with no dialog to answer; the laptop keys play
+at once. If there is no synth plugin, the [factory sounds](#factory-sounds)
+play. If something is wrong, one plain sentence appears for 25 seconds: no
+output was found, the audio buffer is large (keys answer late), or the audio
+thread has no realtime priority. Each sentence names the Audio Doctor
+(Settings → Audio), which can fix the last two. A MIDI keyboard you plug in
+later is announced the moment it appears. `kabelsalat first-run-test` runs a
+scripted first start in an isolated home and fails if no sound comes within a
+minute.
 
 ### Factory sounds
 

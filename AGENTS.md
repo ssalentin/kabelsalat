@@ -67,6 +67,17 @@
   conflicting PRs read-only and labels them `merge-conflict` for the
   session to rebase with `scripts/sync-branch.sh --push`, so a
   `git pull` is never needed.
+- **The least expensive model that can do the job (user, 2026-11-23):**
+  before you start a session, a subagent or a delegate, choose its model on
+  purpose and never let it inherit the most expensive one by default. Small
+  and well-specified work (a bug with a reproduction, a docs or test change,
+  a search) goes to the cheapest tier, an ordinary feature to the middle
+  tier, and only work that is hard to get right (audio-thread, routing or
+  cross-cutting engine changes) to a top tier. Say in the brief to read only
+  what the task needs. When you start several at once, add up what they
+  cost first: fourteen sessions started on the top model used up the user's
+  whole five-hour budget in twelve minutes, and every one of them stopped
+  mid-build.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

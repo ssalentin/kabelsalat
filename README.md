@@ -103,15 +103,16 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 **Plugins**
 - **Browse by what a plugin does**, not by its format: instruments, effects,
   MIDI FX across CLAP, VST3 (native Linux and Windows plugins via yabridge), and
-  LV2, with native plugin GUI windows for all three formats.
+  LV2, with native plugin GUI windows and live bidirectional parameter sync for
+  all three formats.
   → [Browse plugins](docs/GUIDE.md#browse-and-install-plugins-by-type),
   [VST3 & plugin GUIs](docs/GUIDE.md#vst3-plugins-and-native-plugin-guis)
 - **Install 23 tested plugins with one click** (Surge XT, Dexed, Vitalium,
   setBfree, Aeolus, Guitarix, …). → [Catalog](docs/GUIDE.md#install-instruments-from-the-catalog),
   [tested plugins](docs/PLUGINS.md)
-- **Out-of-process plugin sandboxing:** each CLAP and VST3 plugin runs in its
-  own helper process over shared memory — a crash silences only that strip and
-  restarts it with its last saved state while every other rig keeps playing.
+- **Out-of-process plugin sandboxing:** each CLAP, VST3 and LV2 plugin runs in
+  its own helper process over shared memory — a crash silences only that strip
+  and restarts it with its last saved state while every other rig keeps playing.
   → [Plugin crash isolation](docs/GUIDE.md#plugin-crash-isolation)
 
 **Mix**
@@ -236,10 +237,10 @@ How it is built: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   realtime thread; 256-frame buffer by default (≈ 5.3 ms at 48 kHz).
   Hardware MIDI reaches the engine from its own thread, so sound never waits
   for the screen.
-- **Plugins:** CLAP via [clack](https://github.com/prokopyl/clack) and VST3
-  (including yabridge-bridged Windows `.vst3` bundles), scanned out of process
-  and hosted in isolated per-plugin worker sandboxes; LV2 via lilv on a loader
-  thread with native `ui:X11UI` / `ui:showInterface` GUIs. A plugin's own
+- **Plugins:** CLAP via [clack](https://github.com/prokopyl/clack), VST3
+  (including yabridge-bridged Windows `.vst3` bundles, scanned out of process),
+  and LV2 via lilv on a loader thread — all hosted in isolated per-plugin worker
+  sandboxes with native X11 / LV2 GUIs and live parameter sync. A plugin's own
   editor opens in its own window.
 - **Rigs:** every rig is a graph of units and cables; the rigs are merged into
   one engine graph and mixed per rig. A routing change releases held notes

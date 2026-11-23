@@ -779,16 +779,24 @@ impl Drop for Lv2UiHandle {
     }
 }
 
+static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Compile the pure-C LV2 UI test fixture into a temporary `.lv2` bundle and
 /// register it with [`super::add_bundle`].
 pub fn build_fixture_bundle(tag: &str) -> Result<(std::path::PathBuf, String)> {
-    let dir = std::env::temp_dir().join(format!("kabelsalat-lv2-ui-fixture-{tag}-{}", std::process::id()));
+    let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("kabelsalat-lv2-ui-fixture-{tag}-{pid}-{seq}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
 
+    let plugin_uri = format!("urn:kabelsalat:fixture:ui_gain:{tag}:{pid}:{seq}");
+    let ui_uri = format!("{plugin_uri}#ui");
+
     let c_path = dir.join("fixture.c");
     let so_path = dir.join("fixture.so");
-    std::fs::write(&c_path, include_str!("lv2_ui_fixture.c"))?;
+    let c_src = include_str!("lv2_ui_fixture.c").replace("urn:kabelsalat:fixture:ui_gain", &plugin_uri);
+    std::fs::write(&c_path, c_src)?;
 
     let status = std::process::Command::new("cc")
         .args(["-shared", "-fPIC", "-O2", "-o"])
@@ -798,8 +806,6 @@ pub fn build_fixture_bundle(tag: &str) -> Result<(std::path::PathBuf, String)> {
         .context("invoking cc to compile LV2 UI fixture")?;
     anyhow::ensure!(status.success(), "cc failed compiling LV2 UI fixture");
 
-    let plugin_uri = "urn:kabelsalat:fixture:ui_gain".to_string();
-    let ui_uri = "urn:kabelsalat:fixture:ui_gain#ui";
     std::fs::write(
         dir.join("manifest.ttl"),
         format!(
@@ -913,6 +919,7 @@ pub fn run_lv2_ui_test(uris: &[String]) -> Result<()> {
         println!("=== lv2-ui-test PASS ===");
         Ok(())
     })();
+    super::remove_bundle(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     res
 }

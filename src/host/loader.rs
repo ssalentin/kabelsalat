@@ -535,6 +535,29 @@ impl HostedClapMain {
         }
     }
 
+    pub fn has_pending_param_edits(&self) -> bool {
+        match self {
+            HostedClapMain::Local(_) => true,
+            HostedClapMain::Bg(bg) => !bg.busy.load(Ordering::Acquire) && bg.editor_open,
+            HostedClapMain::Sandbox(sb) => sb.editor_open() || sb.has_pending_param_edits(),
+        }
+    }
+
+    pub fn drain_param_edits(&mut self) -> Vec<(u32, f64)> {
+        match self {
+            HostedClapMain::Local(m) => m.drain_param_edits(),
+            HostedClapMain::Bg(bg) => {
+                if bg.busy.load(Ordering::Acquire) {
+                    Vec::new()
+                } else {
+                    bg.try_call(UI_POLL_TIMEOUT, |m| m.drain_param_edits())
+                        .unwrap_or_default()
+                }
+            }
+            HostedClapMain::Sandbox(sb) => sb.drain_param_edits(),
+        }
+    }
+
     pub fn poll_latency(&mut self) -> u32 {
         match self {
             HostedClapMain::Local(m) => m.poll_latency(),

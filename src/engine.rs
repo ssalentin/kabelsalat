@@ -610,7 +610,7 @@ fn sync_wet(wet: &mut gain_ramp::GainRamp, init: &mut bool, bypassed: bool, ramp
 
 struct Lv2Slot {
     node: NodeId,
-    plugin: crate::lv2::Lv2Plugin,
+    plugin: crate::host::HostedLv2,
     buf: Vec<f32>,
     /// The latency the plugin last reported, in frames: what the delay
     /// plan counts for this unit.
@@ -813,9 +813,63 @@ fn build_arp_slots(graph: &Graph) -> Vec<crate::arp::ArpState> {
     v
 }
 
+/// Maximum simultaneous LV2 crash/recovery strip badges published to the UI.
+pub const MAX_LV2_NOTICES: usize = 16;
+
+fn copy_trunc_utf8<const N: usize>(s: &str) -> (u8, [u8; N]) {
+    let mut text = [0u8; N];
+    let mut n = s.len().min(N);
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    text[..n].copy_from_slice(&s.as_bytes()[..n]);
+    (n as u8, text)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lv2NoticePub {
+    pub node: NodeId,
+    pub len: u8,
+    pub text: [u8; 48],
+}
+
+impl Lv2NoticePub {
+    pub const EMPTY: Self = Self { node: u32::MAX, len: 0, text: [0; 48] };
+
+    pub fn new(node: NodeId, s: &str) -> Self {
+        let (len, text) = copy_trunc_utf8(s);
+        Self { node, len, text }
+    }
+
+    pub fn as_str(&self) -> &str {
+        let n = (self.len as usize).min(self.text.len());
+        std::str::from_utf8(&self.text[..n]).unwrap_or("")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lv2CrashMsgPub {
+    pub len: u8,
+    pub text: [u8; 160],
+}
+
+impl Lv2CrashMsgPub {
+    pub const EMPTY: Self = Self { len: 0, text: [0; 160] };
+
+    pub fn new(s: &str) -> Self {
+        let (len, text) = copy_trunc_utf8(s);
+        Self { len, text }
+    }
+
+    pub fn as_str(&self) -> &str {
+        let n = (self.len as usize).min(self.text.len());
+        std::str::from_utf8(&self.text[..n]).unwrap_or("")
+    }
+}
+
 /// Work the audio thread hands to the LV2 loader thread: instantiating a
-/// plugin (~200 ms for Vitalium), parsing its presets and freeing an
-/// instance all block far longer than one audio buffer.
+/// plugin (~200 ms for Vitalium), parsing its presets, saving state and
+/// freeing an instance all block far longer than one audio buffer.
 enum Lv2Request {
     Load { node: NodeId, uri: crate::control::Lv2Uri, gen: u64 },
     Preset { node: NodeId, uri: crate::control::Lv2Uri, preset_uri: String },
@@ -823,6 +877,11 @@ enum Lv2Request {
     State { node: NodeId, uri: crate::control::Lv2Uri, gen: u64, state: Vec<u8> },
     Retire(Lv2Slot),
     RetirePreset(crate::lv2::Lv2Preset),
+    SaveState {
+        slot_id: u64,
+        key: String,
+        reply: std::sync::mpsc::SyncSender<anyhow::Result<Vec<u8>>>,
+    },
 }
 
 /// What the loader hands back; attached at the next block boundary.
@@ -834,6 +893,7 @@ enum Lv2Response {
     Restored { node: NodeId, gen: u64, slot: Lv2Slot },
     /// The plugin could not take a state (`State`): the node keeps its own.
     Refused { node: NodeId, gen: u64 },
+    Notice { node: NodeId, notice: Lv2NoticePub, crash_msg: Lv2CrashMsgPub },
 }
 
 /// LV2 instances the engine hosts at once: two per rig (an organ and an
@@ -841,9 +901,52 @@ enum Lv2Response {
 const LV2_SLOT_CAP: usize = 2 * MAX_RIGS;
 const LV2_RING: usize = 2 * LV2_SLOT_CAP;
 
-fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
+fn load_lv2_slot_hosted(
+    node: NodeId,
+    uri: &str,
+    sample_rate: f64,
+    initial_state: Option<(String, String, Vec<u8>)>,
+) -> Option<(Lv2Slot, Option<crate::host::SandboxLv2Main>)> {
+    if crate::host::sandbox_enabled() {
+        match crate::host::spawn_sandboxed_lv2(uri, sample_rate, 8192, initial_state) {
+            Ok((audio, main)) => {
+                let slot = Lv2Slot {
+                    node,
+                    plugin: crate::host::HostedLv2::Sandbox(audio),
+                    buf: vec![0.0; 8192 * 2],
+                    latency: 0,
+                    wet: gain_ramp::GainRamp::UNITY,
+                    wet_init: false,
+                    held_notes: [0; 16],
+                };
+                return Some((slot, Some(main)));
+            }
+            Err(e) => {
+                eprintln!("lv2 sandbox node {node}: {e}");
+                return None;
+            }
+        }
+    }
     match crate::lv2::Lv2Plugin::load(uri, sample_rate, 8192) {
-        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false, held_notes: [0; 16] }),
+        Ok(mut plugin) => {
+            if let Some((key, kind, state)) = initial_state {
+                if let Err(e) = plugin.restore_state(&[(key.as_str(), kind.as_str(), state.as_slice())]) {
+                    eprintln!("lv2 node {node}: {e}");
+                    crate::lv2::retire(plugin);
+                    return None;
+                }
+            }
+            let slot = Lv2Slot {
+                node,
+                plugin: crate::host::HostedLv2::InProcess(plugin),
+                buf: vec![0.0; 8192 * 2],
+                latency: 0,
+                wet: gain_ramp::GainRamp::UNITY,
+                wet_init: false,
+                held_notes: [0; 16],
+            };
+            Some((slot, None))
+        }
         Err(e) => {
             eprintln!("lv2 node {node}: {e}");
             None
@@ -854,7 +957,12 @@ fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
 /// A new instance of `uri` with `state` restored: checked first, because a
 /// state the plugin cannot read can hang the thread restoring it
 /// (`vital::check_patch`).
-fn restored_lv2_slot(node: NodeId, uri: &str, state: &[u8], sample_rate: f64) -> Option<Lv2Slot> {
+fn restored_lv2_slot_hosted(
+    node: NodeId,
+    uri: &str,
+    state: &[u8],
+    sample_rate: f64,
+) -> Option<(Lv2Slot, Option<crate::host::SandboxLv2Main>)> {
     let Some(format) = crate::lv2::state_format(uri) else {
         eprintln!("lv2 node {node}: no known state format for {uri}");
         return None;
@@ -863,22 +971,89 @@ fn restored_lv2_slot(node: NodeId, uri: &str, state: &[u8], sample_rate: f64) ->
         eprintln!("lv2 node {node}: {e}");
         return None;
     }
-    let mut slot = load_lv2_slot(node, uri, sample_rate)?;
-    match slot.plugin.restore_state(&[(format.key, format.kind, state)]) {
-        Ok(()) => Some(slot),
-        Err(e) => {
-            eprintln!("lv2 node {node}: {e}");
-            crate::lv2::retire(slot.plugin);
-            None
+    load_lv2_slot_hosted(
+        node,
+        uri,
+        sample_rate,
+        Some((format.key.to_string(), format.kind.to_string(), state.to_vec())),
+    )
+}
+
+fn retire_lv2_slot_off_rt(
+    slot: Lv2Slot,
+    mains: &mut Vec<(u64, NodeId, crate::host::SandboxLv2Main)>,
+) {
+    match slot.plugin {
+        crate::host::HostedLv2::InProcess(p) => {
+            crate::lv2::retire(p); // parks never-free plugins (#14)
+        }
+        crate::host::HostedLv2::Sandbox(audio) => {
+            let sid = audio.slot_id();
+            drop(audio);
+            if let Some(pos) = mains.iter().position(|(id, _, _)| *id == sid) {
+                let (_, _, mut main) = mains.swap_remove(pos);
+                main.shutdown();
+            }
         }
     }
 }
 
-/// The LV2 loader thread: serves requests until the engine drops its end.
-fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer<Lv2Response>, sample_rate: f64) {
+fn push_lv2_resp(resp: &mut rtrb::Producer<Lv2Response>, msg: Lv2Response) -> bool {
+    let mut pending = Some(msg);
+    while let Some(m) = pending.take() {
+        match resp.push(m) {
+            Ok(()) => return true,
+            Err(rtrb::PushError::Full(m)) => {
+                if resp.is_abandoned() {
+                    return false;
+                }
+                pending = Some(m);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    true
+}
+
+/// The LV2 loader thread: serves requests and supervises sandboxed LV2
+/// workers until the engine drops its end.
+fn lv2_loader_loop(
+    mut req: rtrb::Consumer<Lv2Request>,
+    mut resp: rtrb::Producer<Lv2Response>,
+    sample_rate: f64,
+    mut mains: Vec<(u64, NodeId, crate::host::SandboxLv2Main)>,
+) {
+    let mut last_recovery_poll = std::time::Instant::now();
     loop {
+        if !mains.is_empty()
+            && (mains.iter().any(|(_, _, m)| m.is_crashed())
+                || last_recovery_poll.elapsed() >= std::time::Duration::from_millis(20))
+        {
+            for (_, node, main) in &mut mains {
+                if let Some((badge, msg)) = main.poll_recovery() {
+                    if !push_lv2_resp(
+                        &mut resp,
+                        Lv2Response::Notice {
+                            node: *node,
+                            notice: Lv2NoticePub::new(*node, &badge),
+                            crash_msg: Lv2CrashMsgPub::new(&msg),
+                        },
+                    ) {
+                        for (_, _, mut m) in mains {
+                            m.shutdown();
+                        }
+                        return;
+                    }
+                }
+            }
+            last_recovery_poll = std::time::Instant::now();
+        }
+
         let Ok(r) = req.pop() else {
             if req.is_abandoned() {
+                for (_, _, mut m) in mains {
+                    m.shutdown();
+                }
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -886,19 +1061,33 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
         };
         let out = match r {
             Lv2Request::Load { node, uri, gen } => Some(
-                load_lv2_slot(node, uri.as_str(), sample_rate)
-                    .map_or(Lv2Response::LoadFailed { node, gen }, |slot| Lv2Response::Loaded { node, gen, slot }),
+                match load_lv2_slot_hosted(node, uri.as_str(), sample_rate, None) {
+                    Some((slot, main)) => {
+                        if let Some(m) = main {
+                            mains.push((m.slot_id(), node, m));
+                        }
+                        Lv2Response::Loaded { node, gen, slot }
+                    }
+                    None => Lv2Response::LoadFailed { node, gen },
+                },
             ),
             Lv2Request::Preset { node, uri, preset_uri } => crate::lv2::discover_presets(uri.as_str())
                 .into_iter()
                 .find(|p| p.uri == preset_uri)
                 .map(|preset| Lv2Response::Preset { node, preset }),
             Lv2Request::State { node, uri, gen, state } => Some(
-                restored_lv2_slot(node, uri.as_str(), &state, sample_rate)
-                    .map_or(Lv2Response::Refused { node, gen }, |slot| Lv2Response::Restored { node, gen, slot }),
+                match restored_lv2_slot_hosted(node, uri.as_str(), &state, sample_rate) {
+                    Some((slot, main)) => {
+                        if let Some(m) = main {
+                            mains.push((m.slot_id(), node, m));
+                        }
+                        Lv2Response::Restored { node, gen, slot }
+                    }
+                    None => Lv2Response::Refused { node, gen },
+                },
             ),
             Lv2Request::Retire(slot) => {
-                crate::lv2::retire(slot.plugin); // parks never-free plugins (#14)
+                retire_lv2_slot_off_rt(slot, &mut mains);
                 crate::host::trim_heap();
                 None
             }
@@ -906,39 +1095,44 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
                 drop(p);
                 None
             }
+            Lv2Request::SaveState { slot_id, key, reply } => {
+                let res = match mains.iter_mut().find(|(id, _, _)| *id == slot_id) {
+                    Some((_, _, main)) => main.save_state(&key),
+                    None => Err(anyhow::anyhow!("LV2 sandbox supervisor {slot_id} unavailable")),
+                };
+                let _ = reply.send(res);
+                None
+            }
         };
-        let mut pending = out;
-        while let Some(msg) = pending.take() {
-            match resp.push(msg) {
-                Ok(()) => {}
-                Err(rtrb::PushError::Full(m)) => {
-                    if resp.is_abandoned() {
-                        return;
-                    }
-                    pending = Some(m);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+        if let Some(msg) = out {
+            if !push_lv2_resp(&mut resp, msg) {
+                for (_, _, mut m) in mains {
+                    m.shutdown();
                 }
+                return;
             }
         }
     }
 }
 
 /// Load an LV2 plugin instance for every Lv2 node (rare structural op).
-fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
-    graph
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.kind {
-            NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sample_rate, 8192) {
-                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false, held_notes: [0; 16] }),
-                Err(e) => {
-                    eprintln!("lv2 node {}: {e}", n.id);
-                    None
+fn build_lv2_slots(
+    graph: &Graph,
+    sample_rate: f64,
+) -> (Vec<Lv2Slot>, Vec<(u64, NodeId, crate::host::SandboxLv2Main)>) {
+    let mut slots = Vec::new();
+    let mut mains = Vec::new();
+    for n in &graph.nodes {
+        if let NodeKind::Lv2 { uri } = &n.kind {
+            if let Some((slot, main)) = load_lv2_slot_hosted(n.id, uri.as_str(), sample_rate, None) {
+                if let Some(m) = main {
+                    mains.push((m.slot_id(), n.id, m));
                 }
-            },
-            _ => None,
-        })
-        .collect()
+                slots.push(slot);
+            }
+        }
+    }
+    (slots, mains)
 }
 
 /// Number of lock-free per-edge level slots (`EdgeLevels`): sixteen cables
@@ -1283,6 +1477,10 @@ impl Default for GraphPub {
             lv2_loaded: Vec::new(),
             lv2_loading: Vec::new(),
             lv2_rev: 0,
+            lv2_notices: [Lv2NoticePub::EMPTY; MAX_LV2_NOTICES],
+            lv2_notice_rev: 0,
+            lv2_crash_msg: Lv2CrashMsgPub::EMPTY,
+            lv2_crash_rev: 0,
             rig_busy_mask: 0,
             rig_held_mask: 0,
         }
@@ -1424,6 +1622,13 @@ pub struct GraphPub {
     pub lv2_loaded: Vec<NodeId>,
     pub lv2_loading: Vec<NodeId>,
     pub lv2_rev: u64,
+    /// Per-node LV2 sandbox status badges (`RESTARTED (...)` / `CRASHED (...)`),
+    /// allocation-free fixed table bumped by `lv2_notice_rev` (#413).
+    pub lv2_notices: [Lv2NoticePub; MAX_LV2_NOTICES],
+    pub lv2_notice_rev: u64,
+    /// Most recent human-readable LV2 crash/recovery message for status bar.
+    pub lv2_crash_msg: Lv2CrashMsgPub,
+    pub lv2_crash_rev: u64,
     /// Per-rig activity bitmask (#207): bit `r` is 1 while rig `r` has pre-fader
     /// audio > -100 dBFS, held notes, or sustain pedal down (updated every block).
     pub rig_busy_mask: u64,
@@ -1743,6 +1948,10 @@ pub struct GraphEngine {
     /// (tests, offline self-tests).
     lv2_req: Option<rtrb::Producer<Lv2Request>>,
     lv2_resp: Option<rtrb::Consumer<Lv2Response>>,
+    lv2_loader_handle: Option<std::thread::JoinHandle<()>>,
+    /// Supervisors for sandboxed LV2 slots created before `spawn_lv2_loader()`
+    /// (or when no loader thread runs); transferred to the loader thread on spawn.
+    initial_lv2_mains: Vec<(u64, NodeId, crate::host::SandboxLv2Main)>,
     /// Bumped by every graph load: a plugin the loader finishes for an
     /// older graph is retired, not attached.
     lv2_gen: u64,
@@ -1767,6 +1976,10 @@ pub struct GraphEngine {
     lv2_in_flight: Vec<NodeId>,
     /// LV2 attachment / loading set changed since last publication.
     lv2_dirty: bool,
+    lv2_notices: [Lv2NoticePub; MAX_LV2_NOTICES],
+    lv2_notice_dirty: bool,
+    lv2_crash_msg: Lv2CrashMsgPub,
+    lv2_crash_dirty: bool,
     /// Per-rig held note bitsets and sustain-pedal mask for outgoing-rig drain
     /// tracking (#207, allocation-free).
     rig_notes_down: [u128; MAX_RIGS],
@@ -1834,7 +2047,7 @@ impl GraphEngine {
                 _ => None,
             })
             .collect();
-        let lv2 = build_lv2_slots(&graph, sample_rate);
+        let (lv2, initial_lv2_mains) = build_lv2_slots(&graph, sample_rate);
         let audio_in = build_audio_in_slots(&graph);
         let arp = build_arp_slots(&graph);
         // Default routing: every source class feeds every rig (full range).
@@ -1960,6 +2173,8 @@ impl GraphEngine {
             voices_dirty: true,
             lv2_req: None,
             lv2_resp: None,
+            lv2_loader_handle: None,
+            initial_lv2_mains,
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
             hosted_rigs: None,
@@ -1968,6 +2183,10 @@ impl GraphEngine {
             always_hosted_nodes: Vec::with_capacity(64),
             lv2_in_flight: Vec::with_capacity(LV2_SLOT_CAP),
             lv2_dirty: true,
+            lv2_notices: [Lv2NoticePub::EMPTY; MAX_LV2_NOTICES],
+            lv2_notice_dirty: false,
+            lv2_crash_msg: Lv2CrashMsgPub::EMPTY,
+            lv2_crash_dirty: false,
             rig_notes_down: [0u128; MAX_RIGS],
             rig_sustain_mask: 0,
             rig_busy_mask: 0,
@@ -2101,12 +2320,14 @@ impl GraphEngine {
         let (req_tx, req_rx) = rtrb::RingBuffer::new(LV2_RING);
         let (resp_tx, resp_rx) = rtrb::RingBuffer::new(LV2_RING);
         let sr = self.sample_rate;
-        std::thread::Builder::new()
+        let initial_mains = std::mem::take(&mut self.initial_lv2_mains);
+        let handle = std::thread::Builder::new()
             .name("kabelsalat-lv2-loader".into())
-            .spawn(move || lv2_loader_loop(req_rx, resp_tx, sr))
+            .spawn(move || lv2_loader_loop(req_rx, resp_tx, sr, initial_mains))
             .expect("spawn lv2 loader");
         self.lv2_req = Some(req_tx);
         self.lv2_resp = Some(resp_rx);
+        self.lv2_loader_handle = Some(handle);
         self.lv2.reserve(LV2_SLOT_CAP);
         self.lv2_retire_backlog.reserve(LV2_SLOT_CAP);
     }
@@ -2127,7 +2348,10 @@ impl GraphEngine {
             // silently dead node.
             eprintln!("lv2 loader queue full: loading node {node} inline");
         }
-        if let Some(slot) = load_lv2_slot(node, uri.as_str(), self.sample_rate) {
+        if let Some((slot, main)) = load_lv2_slot_hosted(node, uri.as_str(), self.sample_rate, None) {
+            if let Some(m) = main {
+                self.initial_lv2_mains.push((m.slot_id(), node, m));
+            }
             self.attach_lv2(slot);
             self.lv2_dirty = true;
         }
@@ -2214,6 +2438,26 @@ impl GraphEngine {
         }
     }
 
+    fn set_lv2_notice(&mut self, node: NodeId, notice: Lv2NoticePub) {
+        if let Some(slot) = self.lv2_notices.iter_mut().find(|n| n.node == node) {
+            *slot = notice;
+        } else if let Some(slot) = self.lv2_notices.iter_mut().find(|n| n.node == u32::MAX) {
+            *slot = notice;
+        } else {
+            self.lv2_notices[0] = notice;
+        }
+        self.lv2_notice_dirty = true;
+    }
+
+    fn clear_lv2_notice(&mut self, node: NodeId) {
+        for slot in &mut self.lv2_notices {
+            if slot.node == node {
+                *slot = Lv2NoticePub::EMPTY;
+                self.lv2_notice_dirty = true;
+            }
+        }
+    }
+
     /// Free an LV2 slot off the audio thread when the loader runs.
     fn retire_lv2(&mut self, slot: Lv2Slot) {
         if let Some(tx) = self.lv2_req.as_mut() {
@@ -2224,6 +2468,8 @@ impl GraphEngine {
                     drop(slot); // last resort: never leak
                 }
             }
+        } else {
+            retire_lv2_slot_off_rt(slot, &mut self.initial_lv2_mains);
         }
     }
 
@@ -2291,6 +2537,14 @@ impl GraphEngine {
                     if let Some(tx) = self.lv2_req.as_mut() {
                         let _ = tx.push(Lv2Request::RetirePreset(preset));
                     }
+                }
+                Lv2Response::Notice { node, notice, crash_msg } => {
+                    if self.graph.node(node).is_some() {
+                        self.set_lv2_notice(node, notice);
+                    }
+                    self.lv2_crash_msg = crash_msg;
+                    self.lv2_crash_dirty = true;
+                    self.wake_node(node);
                 }
             }
         }
@@ -2451,16 +2705,30 @@ impl GraphEngine {
     }
 
     fn publish_lv2(&mut self) {
-        if !self.lv2_dirty {
+        if !self.lv2_dirty && !self.lv2_notice_dirty && !self.lv2_crash_dirty {
             return;
         }
         let Some(p) = &self.graph_pub else {
             self.lv2_dirty = false;
+            self.lv2_notice_dirty = false;
+            self.lv2_crash_dirty = false;
             return;
         };
         if let Ok(mut g) = p.try_lock() {
-            write_lv2_status(&mut g, &self.lv2, &self.midi_fx, &self.lv2_in_flight);
-            self.lv2_dirty = false;
+            if self.lv2_dirty {
+                write_lv2_status(&mut g, &self.lv2, &self.midi_fx, &self.lv2_in_flight);
+                self.lv2_dirty = false;
+            }
+            if self.lv2_notice_dirty {
+                g.lv2_notices = self.lv2_notices;
+                g.lv2_notice_rev = g.lv2_notice_rev.wrapping_add(1);
+                self.lv2_notice_dirty = false;
+            }
+            if self.lv2_crash_dirty {
+                g.lv2_crash_msg = self.lv2_crash_msg;
+                g.lv2_crash_rev = g.lv2_crash_rev.wrapping_add(1);
+                self.lv2_crash_dirty = false;
+            }
         }
     }
 
@@ -3050,6 +3318,16 @@ impl GraphEngine {
                 g.reserve_lv2(LV2_SLOT_CAP);
                 write_lv2_status(&mut g, &self.lv2, &self.midi_fx, &self.lv2_in_flight);
                 self.lv2_dirty = false;
+                if g.lv2_notices != self.lv2_notices || self.lv2_notice_dirty {
+                    g.lv2_notices = self.lv2_notices;
+                    g.lv2_notice_rev = g.lv2_notice_rev.wrapping_add(1);
+                }
+                self.lv2_notice_dirty = false;
+                if self.lv2_crash_dirty {
+                    g.lv2_crash_msg = self.lv2_crash_msg;
+                    g.lv2_crash_rev = g.lv2_crash_rev.wrapping_add(1);
+                    self.lv2_crash_dirty = false;
+                }
             }
         }
     }
@@ -3895,6 +4173,52 @@ impl GraphEngine {
     pub fn lv2_control_value(&self, node: NodeId, nth: usize) -> Option<f32> {
         let slot = self.lv2.iter().find(|s| s.node == node)?;
         slot.plugin.control_descs().get(nth).map(|c| c.value)
+    }
+
+    /// Read saved LV2 plugin state under `key` (supports both sandboxed workers
+    /// and in-process fallback).
+    pub(crate) fn lv2_saved_state(&mut self, node: NodeId, key: &str) -> anyhow::Result<Vec<u8>> {
+        let slot = self
+            .lv2
+            .iter_mut()
+            .find(|s| s.node == node)
+            .ok_or_else(|| anyhow::anyhow!("LV2 slot gone"))?;
+        match &mut slot.plugin {
+            crate::host::HostedLv2::InProcess(p) => p.saved_state(key),
+            crate::host::HostedLv2::Sandbox(s) => {
+                let slot_id = s.slot_id();
+                if let Some((_, _, main)) = self.initial_lv2_mains.iter_mut().find(|(id, _, _)| *id == slot_id) {
+                    return main.save_state(key);
+                }
+                if let Some(tx) = self.lv2_req.as_mut() {
+                    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                    tx.push(Lv2Request::SaveState {
+                        slot_id,
+                        key: key.to_string(),
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| anyhow::anyhow!("lv2 loader queue full"))?;
+                    return reply_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .map_err(|e| anyhow::anyhow!("lv2 SaveState timeout: {e}"))?;
+                }
+                anyhow::bail!("LV2 sandbox supervisor unavailable for slot {slot_id}")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lv2_worker_pid_for_test(&self, node: NodeId) -> Option<u32> {
+        self.lv2
+            .iter()
+            .find(|s| s.node == node)
+            .and_then(|s| s.plugin.worker_pid())
+            .or_else(|| {
+                self.midi_fx.iter().find(|s| s.node == node).and_then(|s| match &s.proc {
+                    Some(MidiFxProc::Lv2(l)) => l.plugin.worker_pid(),
+                    None => None,
+                })
+            })
     }
 
     /// Arp verification hook (self-test): the notes this arp node has
@@ -5301,6 +5625,7 @@ impl GraphEngine {
                     let slot = self.lv2.remove(i);
                     self.retire_lv2(slot);
                 }
+                self.clear_lv2_notice(id);
                 self.lv2_in_flight.retain(|&n| n != id);
                 self.lv2_dirty = true;
                 for s in &mut self.voices {
@@ -5389,7 +5714,10 @@ impl GraphEngine {
                     }
                     return;
                 }
-                if let Some(slot) = restored_lv2_slot(node, uri.as_str(), &state, self.sample_rate) {
+                if let Some((slot, main)) = restored_lv2_slot_hosted(node, uri.as_str(), &state, self.sample_rate) {
+                    if let Some(m) = main {
+                        self.initial_lv2_mains.push((m.slot_id(), node, m));
+                    }
                     self.adopt_restored_lv2(node, gen, slot);
                 }
             }
@@ -5451,6 +5779,8 @@ impl GraphEngine {
                 }
                 self.lv2_gen = self.lv2_gen.wrapping_add(1);
                 self.lv2_in_flight.clear();
+                self.lv2_notices = [Lv2NoticePub::EMPTY; MAX_LV2_NOTICES];
+                self.lv2_notice_dirty = true;
                 self.lv2_dirty = true;
                 self.hosted_lv2_dirty = false;
                 self.rig_notes_down = [0u128; MAX_RIGS];
@@ -7193,6 +7523,19 @@ impl GraphEngine {
         self.publish_meter();
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
+    }
+}
+
+impl Drop for GraphEngine {
+    fn drop(&mut self) {
+        self.lv2_req.take();
+        self.lv2_resp.take();
+        if let Some(handle) = self.lv2_loader_handle.take() {
+            let _ = handle.join();
+        }
+        for (_, _, mut main) in self.initial_lv2_mains.drain(..) {
+            main.shutdown();
+        }
     }
 }
 
@@ -11002,8 +11345,7 @@ fn vital_patch_readback(engine: &mut GraphEngine, node: NodeId, path: &std::path
         Ok(serde_json::from_str(String::from_utf8_lossy(bytes).trim_end_matches('\0'))?)
     };
     let patch = parse(&std::fs::read(path)?)?;
-    let slot = engine.lv2.iter_mut().find(|s| s.node == node).ok_or_else(|| anyhow::anyhow!("LV2 slot gone"))?;
-    let saved = parse(&slot.plugin.saved_state("urn:juce:stateBinary")?)?;
+    let saved = parse(&engine.lv2_saved_state(node, "urn:juce:stateBinary")?)?;
     let (want, have) = (&patch["settings"], &saved["settings"]);
     let numbers: Vec<(&String, f64)> = want.as_object().into_iter().flatten().filter(|(k, _)| *k != "beats_per_minute").filter_map(|(k, v)| Some((k, v.as_f64()?))).collect();
     let same = numbers.iter().filter(|(k, v)| have[k.as_str()].as_f64().is_some_and(|h| (h - v).abs() <= 1e-4 * v.abs().max(1.0))).count();
@@ -14140,5 +14482,101 @@ mod idle_sleep_tests {
             corr.lag_frames == 0 && corr.r > 0.98,
             "woken rig 1 dry PDC path must stay phase-aligned with latent wet path: {corr:?}"
         );
+    }
+
+    #[test]
+    fn engine_sandboxed_lv2_recovers_from_segv_and_publishes_notice() {
+        use crate::control::{
+            command_bus, name_bytes, AudioInChannel, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef,
+        };
+        let (dir, uri) = crate::lv2::ui::build_fixture_bundle("engine-lv2").unwrap();
+
+        let (mut bus, drain) = command_bus();
+        let mut g = Graph::default();
+        let ain = g.add_node(
+            NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo },
+            name_bytes("IN"),
+        );
+        let lv2 = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(&uri) }, name_bytes("LV2 GAIN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: ain, port: 0 }, PortRef { node: lv2, port: 0 }, PortKind::Audio);
+        g.connect_with_id(2, PortRef { node: lv2, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(GraphPub::default()));
+        let mut engine = super::GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
+        engine.set_graph_pub(pub_.clone());
+        engine.spawn_lv2_loader();
+
+        let (mut side_tx, side_rx) = rtrb::RingBuffer::<(u32, rtrb::Consumer<f32>)>::new(8);
+        engine.set_audio_in_channel(side_rx);
+        let (mut data_tx, data_rx) = rtrb::RingBuffer::<f32>::new(65536);
+
+        bus.send(Command::LoadGraph { graph: g });
+        let mut buf = vec![0.0f32; 256 * 2];
+        let mut pid1 = None;
+        for _ in 0..200 {
+            engine.render(&mut buf, 2);
+            if let Some(p) = engine.lv2_worker_pid_for_test(lv2) {
+                pid1 = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid1 = pid1.expect("LV2 fixture should attach in sandboxed GraphEngine");
+
+        let _ = side_tx.push((ain, data_rx));
+        let feed = |tx: &mut rtrb::Producer<f32>| {
+            while tx.slots() >= 512 {
+                for _ in 0..256 {
+                    let _ = tx.push(0.5);
+                    let _ = tx.push(0.5);
+                }
+            }
+        };
+        feed(&mut data_tx);
+        // Range is 0..=2.0 -> 0.8 normalized sets native gain = 1.6 (different from default 1.0).
+        bus.send(Command::SetParam { node: lv2, param: 0, value: 0.8 });
+        let mut peak_before = 0.0f32;
+        for _ in 0..4 {
+            feed(&mut data_tx);
+            engine.render(&mut buf, 2);
+            peak_before = peak_before.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+        }
+        assert!(peak_before > 0.2, "LV2 fixture must pass audio before crash: {peak_before}");
+
+        unsafe { libc::kill(pid1 as libc::pid_t, libc::SIGSEGV); }
+
+        let mut pid2 = None;
+        let mut badge = String::new();
+        for _ in 0..100 {
+            feed(&mut data_tx);
+            engine.render(&mut buf, 2);
+            if let Ok(gp) = pub_.try_lock() {
+                if let Some(entry) = gp.lv2_notices.iter().find(|n| n.node == lv2 && n.len > 0) {
+                    badge = entry.as_str().to_string();
+                }
+            }
+            if let Some(p) = engine.lv2_worker_pid_for_test(lv2) {
+                if p != pid1 && !badge.is_empty() {
+                    pid2 = Some(p);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid2 = pid2.expect("LV2 worker must restart with a new PID after SIGSEGV");
+        assert_ne!(pid2, pid1);
+        assert_eq!(badge, "RESTARTED (SIGSEGV)");
+
+        feed(&mut data_tx);
+        engine.render(&mut buf, 2);
+        let peak_after = buf.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak_after > 0.2, "recovered LV2 fixture must emit audio: {peak_after}");
+        let ctrl = engine.lv2_control_value(lv2, 0).expect("control value readable");
+        assert!((ctrl - 1.6).abs() < 1e-4, "live control value preserved across recovery: {ctrl}");
+
+        drop(engine);
+        crate::lv2::remove_bundle(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

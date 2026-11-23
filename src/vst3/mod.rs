@@ -224,6 +224,7 @@ pub struct Vst3Voice {
     program_change_param: Option<(u32, i32)>,
     main_to_audio_rx: rtrb::Consumer<(u32, f64, u64)>,
     audio_to_main_tx: rtrb::Producer<(u32, f64, u64)>,
+    out_param_dirty: bool,
     last_main_seq: u64,
     wake_flag: Arc<AtomicBool>,
     last_tail: u32,
@@ -250,6 +251,10 @@ impl Vst3Voice {
 
     pub fn take_wake_request(&mut self) -> bool {
         self.wake_flag.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_out_param_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.out_param_dirty)
     }
 
     pub fn param_range(&self, id: u32) -> Option<(f64, f64)> {
@@ -526,6 +531,7 @@ impl Vst3Voice {
             let seq = self.last_main_seq;
             self.out_params.drain_last_points(|id, val| {
                 let _ = self.audio_to_main_tx.push((id, val, seq));
+                self.out_param_dirty = true;
             });
         }
 
@@ -885,6 +891,7 @@ impl Vst3VoiceMain {
             program_change_param,
             main_to_audio_rx,
             audio_to_main_tx,
+            out_param_dirty: false,
             last_main_seq: 0,
             wake_flag: Arc::new(AtomicBool::new(false)),
             last_tail: 0,
@@ -1025,12 +1032,7 @@ impl Vst3VoiceMain {
         }
     }
 
-    /// Poll X11 events, Linux run loop, parameter edits from the plugin GUI,
-    /// and resize/restart flags.
-    pub fn pump(&mut self) -> Vst3PumpResult {
-        let mut res = Vst3PumpResult::default();
-        self.drain_audio_params();
-
+    fn drain_handler(&mut self, mut out_edits: Option<&mut Vec<(u32, f64)>>) -> i32 {
         let (edits, restart_flags) = self.handler.take();
         for (id, val) in edits {
             if let Some(m) = self.params.iter_mut().find(|p| p.id == id) {
@@ -1038,16 +1040,32 @@ impl Vst3VoiceMain {
             }
             self.push_main_param(id, val);
             self.pending_param_edits.push((id, val));
-            res.param_edits.push((id, val));
+            if let Some(out) = out_edits.as_deref_mut() {
+                out.push((id, val));
+            }
         }
         if restart_flags != 0 {
-            res.restarted = true;
             if restart_flags & vst3::Steinberg::Vst::RestartFlags_::kLatencyChanged != 0 {
                 self.pending_latency_poll = true;
-                res.latency_changed = true;
             }
             if restart_flags & vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged != 0 {
                 self.refresh_param_values();
+            }
+        }
+        restart_flags
+    }
+
+    /// Poll X11 events, Linux run loop, parameter edits from the plugin GUI,
+    /// and resize/restart flags.
+    pub fn pump(&mut self) -> Vst3PumpResult {
+        let mut res = Vst3PumpResult::default();
+        self.drain_audio_params();
+
+        let restart_flags = self.drain_handler(Some(&mut res.param_edits));
+        if restart_flags != 0 {
+            res.restarted = true;
+            if restart_flags & vst3::Steinberg::Vst::RestartFlags_::kLatencyChanged != 0 {
+                res.latency_changed = true;
             }
         }
 
@@ -1078,6 +1096,7 @@ impl Vst3VoiceMain {
     /// or processor `outputParameterChanges` since the last call (GigChain #60).
     pub fn drain_param_edits(&mut self) -> Vec<(u32, f64)> {
         self.drain_audio_params();
+        let _ = self.drain_handler(None);
         std::mem::take(&mut self.pending_param_edits)
     }
 
@@ -1494,6 +1513,46 @@ mod tests {
         let val3 = m.param_value(2).unwrap();
         assert!((val3 - 1.0).abs() < 1e-4, "expected program 3 -> 1.0, got {val3}");
         assert_eq!(m.param_text(2, val3), "Lead");
+
+        m.retire();
+        let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
+    }
+
+    #[test]
+    fn vst3_probe_perform_edit_and_output_param_changes_drain() {
+        let (bundle, synth_cid, _) = build_fixture_bundle("drain-edits").unwrap();
+        let (mut v, mut m) = Vst3VoiceMain::load(&synth_cid, 48_000.0).unwrap();
+
+        // 1. Editor-initiated performEdit via IRunLoop timer
+        let raw_view = unsafe { m.controller.createView(ViewType::kEditor) };
+        let view = unsafe { ComPtr::<IPlugView>::from_raw(raw_view) }.unwrap();
+        let frame = ComWrapper::new(HostPlugFrame::new());
+        unsafe { view.setFrame(frame.as_com_ref::<IPlugFrame>().unwrap().as_ptr()) };
+        std::thread::sleep(Duration::from_millis(25));
+        frame.pump_run_loop();
+
+        let edits = m.drain_param_edits();
+        assert!(
+            edits.iter().any(|&(id, val)| id == 0 && (val - 0.75).abs() < 1e-4),
+            "drain_param_edits must capture VST3 performEdit: {edits:?}"
+        );
+        assert!(m.drain_param_edits().is_empty(), "drain clears pending edits");
+
+        unsafe { view.removed() };
+        unsafe { view.setFrame(std::ptr::null_mut()) };
+        frame.clear_handlers();
+        drop(view);
+
+        // 2. Processor-initiated outputParameterChanges
+        let mut out = vec![0.0f32; BLOCK * 2];
+        v.render_block(BLOCK, None, &mut out, &Transport::default(), &[VoiceCmd::Param(0.into(), 0.421875)]);
+        assert!(v.take_out_param_dirty(), "outputParameterChanges sets out_param_dirty");
+        assert!(!v.take_out_param_dirty(), "take_out_param_dirty clears flag");
+        let proc_edits = m.drain_param_edits();
+        assert!(
+            proc_edits.iter().any(|&(id, val)| id == 0 && (val - 0.625).abs() < 1e-4),
+            "drain_param_edits must capture outputParameterChanges: {proc_edits:?}"
+        );
 
         m.retire();
         let _ = std::fs::remove_dir_all(bundle.parent().unwrap());

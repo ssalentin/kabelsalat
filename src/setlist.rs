@@ -475,6 +475,14 @@ impl Setlist {
         Some((song, part, pos))
     }
 
+    /// Mutable access to the currently active `(part, pos)` if any.
+    pub fn current_part_mut(&mut self) -> Option<(&mut Part, SetlistPos)> {
+        let pos = self.active?;
+        let song = self.songs.get_mut(pos.song)?;
+        let part = song.parts.get_mut(pos.part)?;
+        Some((part, pos))
+    }
+
     /// Every part in setlist order as the engine steps through it on a foot
     /// switch (#261): its song, whether stepping passes over that song, and
     /// its level-aware zones. Songs without parts add nothing.

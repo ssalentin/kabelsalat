@@ -527,7 +527,22 @@ static tresult proc_process(void *this_, ProcessData *data) {
                 int32_t off = 0; double val = 0.0;
                 if (q->vtbl->getPoint(q, pts - 1, &off, &val) == kResultOk) {
                     uint32_t id = q->vtbl->getParameterId(q);
-                    if (id == 0) p->gain = val;
+                    if (id == 0) {
+                        if (fabs(val - 0.421875) < 1e-6 && data->outputParameterChanges) {
+                            double out_val = 0.625;
+                            uint32_t out_id = 0;
+                            int32_t q_idx = 0;
+                            IParamValueQueue *oq = data->outputParameterChanges->vtbl->addParameterData(
+                                data->outputParameterChanges, &out_id, &q_idx);
+                            if (oq) {
+                                int32_t p_idx = 0;
+                                oq->vtbl->addPoint(oq, 0, out_val, &p_idx);
+                            }
+                            p->gain = out_val;
+                        } else {
+                            p->gain = val;
+                        }
+                    }
                     else if (id == 1) p->mode_stepped = val;
                     else if (id == 2) p->program = val;
                 }

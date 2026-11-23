@@ -427,7 +427,7 @@ pub struct Lv2UiInfo {
     pub resizable: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Lv2ControlDesc {
     pub index: usize,
     pub symbol: String,
@@ -1303,11 +1303,7 @@ unsafe fn new_world_with_extras() -> *mut LilvWorld {
         return std::ptr::null_mut();
     }
     lilv_world_load_all(world);
-    for dir in EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        let bundle = lilv_new_file_uri(world, std::ptr::null(), dir.as_ptr());
-        lilv_world_load_bundle(world, bundle);
-        lilv_node_free(bundle);
-    }
+    load_extra_bundles(world);
     world
 }
 
@@ -1902,18 +1898,77 @@ pub struct Lv2Plugin {
 /// Bundles `Lv2Plugin::load` reads beside the LV2 search path.
 static EXTRA_BUNDLES: std::sync::Mutex<Vec<std::ffi::CString>> = std::sync::Mutex::new(Vec::new());
 
-/// Let `Lv2Plugin::load` find the plugins of the bundle folder `dir`,
-/// wherever it lies (rule 116: a test loads its own bundle by path, and
-/// `LV2_PATH` is the whole process's).
-pub fn add_bundle(dir: &std::path::Path) {
+fn bundle_cstring(dir: &std::path::Path) -> Option<std::ffi::CString> {
     let mut path = dir.to_string_lossy().into_owned();
     if !path.ends_with('/') {
         path.push('/');
     }
-    let Ok(path) = std::ffi::CString::new(path) else { return };
+    std::ffi::CString::new(path).ok()
+}
+
+fn extra_bundle_cstrings() -> Vec<std::ffi::CString> {
+    EXTRA_BUNDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|p| p.to_str().is_ok_and(|s| std::path::Path::new(s).is_dir()))
+        .cloned()
+        .collect()
+}
+
+unsafe fn load_extra_bundles(world: *mut LilvWorld) {
+    for dir in extra_bundle_cstrings() {
+        let bundle = lilv_new_file_uri(world, std::ptr::null(), dir.as_ptr());
+        lilv_world_load_bundle(world, bundle);
+        lilv_node_free(bundle);
+    }
+}
+
+/// Let `Lv2Plugin::load` find the plugins of the bundle folder `dir`,
+/// wherever it lies (rule 116: a test loads its own bundle by path, and
+/// `LV2_PATH` is the whole process's).
+pub fn add_bundle(dir: &std::path::Path) {
+    let Some(path) = bundle_cstring(dir) else { return };
     let mut extra = EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
     if !extra.contains(&path) {
         extra.push(path);
+    }
+}
+
+/// Remove a bundle folder registered via [`add_bundle`] before deleting it on disk.
+pub fn remove_bundle(dir: &std::path::Path) {
+    let Some(path) = bundle_cstring(dir) else { return };
+    let mut extra = EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner());
+    extra.retain(|p| p != &path);
+}
+
+/// Colon-separated extra LV2 bundle paths for child workers (`plugin-worker`).
+pub fn extra_bundles_env() -> Option<String> {
+    let mut list: Vec<String> = extra_bundle_cstrings()
+        .into_iter()
+        .filter_map(|p| p.into_string().ok())
+        .collect();
+    if let Ok(env_val) = std::env::var("KABELSALAT_EXTRA_LV2_BUNDLES") {
+        for part in env_val.split(':').filter(|s| !s.is_empty()) {
+            let s = part.to_string();
+            if std::path::Path::new(&s).is_dir() && !list.contains(&s) {
+                list.push(s);
+            }
+        }
+    }
+    if list.is_empty() {
+        None
+    } else {
+        Some(list.join(":"))
+    }
+}
+
+/// Register any extra LV2 bundles passed down via `KABELSALAT_EXTRA_LV2_BUNDLES`.
+pub fn load_extra_bundles_from_env() {
+    if let Ok(env_val) = std::env::var("KABELSALAT_EXTRA_LV2_BUNDLES") {
+        for part in env_val.split(':').filter(|s| !s.is_empty()) {
+            add_bundle(std::path::Path::new(part));
+        }
     }
 }
 
@@ -1972,11 +2027,7 @@ impl Lv2Plugin {
             let world = lilv_world_new();
             anyhow::ensure!(!world.is_null(), "lilv_world_new failed");
             lilv_world_load_all(world);
-            for dir in EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                let bundle = lilv_new_file_uri(world, std::ptr::null(), dir.as_ptr());
-                lilv_world_load_bundle(world, bundle);
-                lilv_node_free(bundle);
-            }
+            load_extra_bundles(world);
             let plugin = find_plugin(world, needle);
             anyhow::ensure!(!plugin.is_null(), "LV2 plugin not found: {needle}");
             let uri = node_borrowed(lilv_plugin_get_uri(plugin));
@@ -2230,6 +2281,13 @@ impl Lv2Plugin {
         Some(if hi > lo { ((v - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.0 })
     }
 
+    /// Set the nth control input to a native port value. Allocation-free.
+    pub fn set_control_native(&mut self, nth: usize, value: f32) {
+        if let Some(&port) = self.control_in.get(nth) {
+            self.buffers[port][0] = value;
+        }
+    }
+
     /// Describe all control-input ports with their current buffer values.
     pub fn control_descs(&self) -> Vec<Lv2ControlDesc> {
         self.control_meta
@@ -2264,6 +2322,11 @@ impl Lv2Plugin {
     /// True for a MIDI-only unit (MIDI in, MIDI out, no audio port).
     pub fn is_midi_fx(&self) -> bool {
         self.is_midi_fx
+    }
+
+    /// True when the plugin declares an atom/MIDI input port.
+    pub fn has_midi_in(&self) -> bool {
+        self.atom_in.is_some()
     }
 
     /// Queue one raw 3-byte channel-voice message (channel kept) for the

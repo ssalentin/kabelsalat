@@ -125,7 +125,8 @@ pub fn extra_bundles_env() -> Option<String> {
     }
 }
 
-/// Standard Linux VST3 search directories plus `$VST3_PATH` entries, deduplicated in order.
+/// Standard Linux VST3 search directories, `$VST3_PATH` entries, then the
+/// custom folders of Settings → Plugins (#414), deduplicated in order.
 pub fn vst3_search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut push_unique = |p: PathBuf| {
@@ -148,6 +149,9 @@ pub fn vst3_search_dirs() -> Vec<PathBuf> {
                 push_unique(PathBuf::from(part));
             }
         }
+    }
+    for dir in crate::plugin_dirs::custom(crate::plugin_dirs::Format::Vst3) {
+        push_unique(dir);
     }
     dirs
 }

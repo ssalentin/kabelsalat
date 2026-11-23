@@ -196,6 +196,15 @@ struct LoadRigArgs {
     rig: Option<usize>,
 }
 
+/// Arguments for `add_plugin_folder` and `remove_plugin_folder`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PluginFolderArgs {
+    /// Plugin format the folder holds: clap, vst3 or lv2.
+    format: String,
+    /// The folder: a full path, or one starting with ~.
+    path: String,
+}
+
 /// Arguments for `install_instrument`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct InstallInstrumentArgs {
@@ -3009,6 +3018,29 @@ impl McpServer {
         }
     }
 
+    /// `add_plugin_folder` / `remove_plugin_folder`: the app's own tool when
+    /// attached; headless, the same edit on this process's folders and the
+    /// config file (plugin lists are scanned per call here, so the next
+    /// `list_plugins` sees it).
+    fn edit_plugin_folders(&self, tool: &str, args: PluginFolderArgs) -> Result<CallToolResult, McpError> {
+        let args = json!({"format": args.format, "path": args.path});
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool(tool, args);
+        }
+        let mut dirs = crate::plugin_dirs::current();
+        match crate::plugin_dirs::tool_edit(&mut dirs, tool, &args) {
+            Ok(what) => {
+                let saved = crate::plugin_dirs::save(&dirs);
+                crate::plugin_dirs::set(dirs);
+                match saved {
+                    Ok(()) => ok_json(json!({"ok": what, "folders": crate::plugin_dirs::describe(&crate::plugin_dirs::current(), |p| Some(p.is_dir()))})),
+                    Err(e) => tool_err(format!("{what} for this run, but NOT saved to the config file: {e}")),
+                }
+            }
+            Err(e) => tool_err(e),
+        }
+    }
+
     fn ui_bridge_tool(tool: &str, args: Value) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool_within(tool, args, std::time::Duration::from_secs(5))
     }
@@ -4622,6 +4654,27 @@ impl McpServer {
             "lv2": lv2,
             "clap_not_hostable_yet": clap,
         }))
+    }
+
+    /// Where plugins are searched (#414).
+    #[tool(name = "list_plugin_folders", description = "List where plugins are searched, per format (clap, vst3, lv2): the user's custom folders (Settings → Plugins; each with whether it exists), the folders named by CLAP_PATH / VST3_PATH / LV2_PATH, and the standard folders. Attached mode adds 'scanning': true while the app's background rescan runs.")]
+    fn list_plugin_folders(&self) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("list_plugin_folders", json!({}));
+        }
+        ok_json(crate::plugin_dirs::describe(&crate::plugin_dirs::current(), |p| Some(p.is_dir())))
+    }
+
+    /// Add a custom plugin search folder (#414).
+    #[tool(name = "add_plugin_folder", description = "Add a custom plugin search folder for one format (clap, vst3 or lv2; the same list as Settings → Plugins). It is remembered in kabelsalat's config file. Attached mode rescans the app's plugins in the background (call list_plugins a few seconds later); headless, the next list_plugins searches it.")]
+    fn add_plugin_folder(&self, Parameters(args): Parameters<PluginFolderArgs>) -> Result<CallToolResult, McpError> {
+        self.edit_plugin_folders("add_plugin_folder", args)
+    }
+
+    /// Remove a custom plugin search folder (#414).
+    #[tool(name = "remove_plugin_folder", description = "Take a custom plugin search folder (from list_plugin_folders) off the list of one format. Nothing on disk is deleted. Standard folders and the *_PATH environment variables cannot be removed. Attached mode rescans the app's plugins in the background.")]
+    fn remove_plugin_folder(&self, Parameters(args): Parameters<PluginFolderArgs>) -> Result<CallToolResult, McpError> {
+        self.edit_plugin_folders("remove_plugin_folder", args)
     }
 
     /// List the built-in instrument catalog with installed/running state.

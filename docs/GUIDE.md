@@ -18,6 +18,7 @@ every keyboard shortcut.
   - [Put MIDI effects in front of an instrument](#put-midi-effects-in-front-of-an-instrument)
 - [Plugins](#plugins)
   - [Browse and install plugins by type](#browse-and-install-plugins-by-type)
+  - [Search your own plugin folders](#search-your-own-plugin-folders)
   - [VST3 plugins and native plugin GUIs](#vst3-plugins-and-native-plugin-guis)
   - [Install instruments from the catalog](#install-instruments-from-the-catalog)
   - [Plugin crash isolation](#plugin-crash-isolation)
@@ -235,6 +236,33 @@ active rig or straight onto the **Master FX** bus, and filter the mixer's
 search the same taxonomy with `list_plugins`.
 
 <p align="center"><img src="shots/plugins.png" width="85%" alt="The Plugins view organized by type (Instruments, Effects, MIDI FX, Utilities) with effect subcategory and format filters"/></p>
+
+### Search your own plugin folders
+
+kabelsalat always searches the standard folders of each format (`~/.clap`,
+`~/.vst3`, `~/.lv2`, and the same names under `/usr/lib` and
+`/usr/local/lib`) and whatever `CLAP_PATH`, `VST3_PATH` and `LV2_PATH` name.
+Plugins that live somewhere else, on a second drive or in a studio folder,
+need no environment variable: open **Settings → Plugins** and use **Add
+folder** under **CLAP folders**, **VST3 folders** or **LV2 folders**. Type the
+folder (a full path, or one that starts with `~`) and press **Enter** or
+**Save**. **Edit** points an entry at another folder, **Remove** takes it off
+the list; nothing on disk is touched.
+
+Every change rescans the installed plugins in the background, so playing goes
+on and the **Plugins** view fills in when the scan is done; **Rescan** does the
+same on request (after you copied a plugin into a folder). Custom folders are
+searched after the standard ones. A folder that is not there right now, such
+as an unplugged drive, is marked **not found** and stays on the list until you
+remove it.
+
+The folders are kept in `~/.config/kabelsalat/config.json` under
+`plugin_dirs`, so sandboxed plugin workers, `kabelsalat mcp` and the
+self-tests search them too. The assistant and MCP agents read and change the
+same lists with `list_plugin_folders`, `add_plugin_folder` and
+`remove_plugin_folder`.
+
+<p align="center"><img src="shots/plugin-folders.png" width="85%" alt="Settings → Plugins with custom CLAP, VST3 and LV2 search folders, one of them marked not found"/></p>
 
 ### VST3 plugins and native plugin GUIs
 

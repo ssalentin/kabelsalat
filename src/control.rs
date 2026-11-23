@@ -796,15 +796,17 @@ impl Graph {
         let mut g = Self::default();
         g.reserve(64, 256);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let (id_a, name_a) = crate::factory::starter_synth(0);
         let surge_a = g.add_node(
-            NodeKind::Clap { plugin_id: ClapId::new("org.surge-synth-team.surge-xt") },
-            name_bytes("SURGE A"),
+            NodeKind::Clap { plugin_id: ClapId::new(id_a) },
+            name_bytes(if id_a == SURGE_PLUGIN_ID { "SURGE A" } else { name_a }),
         );
         let delay_a = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY A"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+        let (id_b, name_b) = crate::factory::starter_synth(1);
         let surge_b = g.add_node(
-            NodeKind::Clap { plugin_id: ClapId::new("org.surge-synth-team.surge-xt") },
-            name_bytes("SURGE B"),
+            NodeKind::Clap { plugin_id: ClapId::new(id_b) },
+            name_bytes(if id_b == SURGE_PLUGIN_ID { "SURGE B" } else { name_b }),
         );
         let delay_b = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY B"));
         g.next_edge = 1;
@@ -976,10 +978,9 @@ pub fn standard_rig_graph(with_synth: bool) -> Graph {
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     if with_synth {
-        let synth = g.add_node(
-            NodeKind::Clap { plugin_id: ClapId::new(SURGE_PLUGIN_ID) },
-            name_bytes("SURGE"),
-        );
+        // Surge XT, or the factory piano while Surge XT is missing (#221).
+        let (id, name) = crate::factory::starter_synth(0);
+        let synth = g.add_node(NodeKind::Clap { plugin_id: ClapId::new(id) }, name_bytes(name));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
         g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
         g.connect_with_id(3, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);

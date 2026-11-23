@@ -10,6 +10,7 @@ every keyboard shortcut.
   - [Navigate rigs, sessions and plugins](#navigate-rigs-sessions-and-plugins)
 - [Play](#play)
   - [Instruments and the on-screen keyboard](#instruments-and-the-on-screen-keyboard)
+  - [Factory sounds](#factory-sounds)
   - [Play your guitar](#play-your-guitar)
 - [Build rigs](#build-rigs)
   - [Patch with real cables](#patch-with-real-cables)
@@ -142,6 +143,20 @@ rack (Esc or DOCK brings it back), and the instrument moves as you play:
   (harder in the middle), next to a 4×4 pad bank.
 
 <p align="center"><img src="shots/keyboard-consoles-2.png" width="85%" alt="Four more full-window consoles: E-Piano with a tine per key, Bass with a four-string neck showing the held notes, Wind with breath control and air column, Drums with an overhead kit and sixteen pads"/></p>
+
+### Factory sounds
+
+kabelsalat carries three instruments of its own: a **piano** (an upright), an
+**electric piano** (FM) and a **drum kit** (synthesized hits on the General MIDI
+notes the drum pads play). They play with no CLAP or LV2 plugin installed. When
+Surge XT is not found at start, the starter rigs use the piano and the electric
+piano in its place, so the first key press makes a sound. Add one to a rig like
+any instrument (`add_node` with the plugin id `kabelsalat.factory.piano`,
+`kabelsalat.factory.epiano` or `kabelsalat.factory.drums`); each has one sound
+(`list_sounds`) and the sustain pedal works. The samples are reduced copies of
+CC0 FreePats banks, rebuilt by `scripts/factory-sounds.sh`; their licences are
+in `assets/factory/*/LICENSE`. `kabelsalat factory-test` checks the first note
+of each without any plugin.
 
 ### Play your guitar
 

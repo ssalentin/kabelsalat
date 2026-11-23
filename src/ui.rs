@@ -8999,7 +8999,8 @@ impl DemoApp {
     /// its audio half to the engine. The engine binds it to a voiceless Clap
     /// node of that plugin. Returns the hosted index.
     fn host_voice(&mut self, plugin_id: &str) -> Result<usize, String> {
-        let (voice, main): (ClapVoice, HostedClapMain) = if crate::host::sandbox_enabled() {
+        // A factory instrument has no plugin to isolate (#221).
+        let (voice, main): (ClapVoice, HostedClapMain) = if crate::host::sandbox_enabled() && crate::factory::kind_of(plugin_id).is_none() {
             let (v, m) = crate::host::spawn_sandboxed_clap(self.sample_rate, plugin_id, None)
                 .map_err(|e| format!("Load {plugin_id} failed: {e}"))?;
             (v, HostedClapMain::from(m))
@@ -25973,6 +25974,9 @@ impl DemoApp {
         if let Some(p) = self.plugins_vst3.iter().find(|p| p.cid.eq_ignore_ascii_case(target)) {
             return Some(p.name.clone());
         }
+        if let Some(kind) = crate::factory::kind_of(plugin_id) {
+            return Some(kind.name().to_string());
+        }
         (plugin_id == SURGE_ID || plugin_id == "Surge XT").then(|| "Surge XT".to_string())
     }
 
@@ -36660,8 +36664,16 @@ pub(crate) fn preferred_host() -> cpal::Host {
 fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Vec<ClapVoiceMain>)> {
     let mut voices = Vec::new();
     let mut mains = Vec::new();
+    // No Surge XT on this machine: the starter setups play the factory
+    // sounds instead, and the app still starts with sound (#221).
+    if !crate::host::surge_available() {
+        crate::factory::set_fallback(true);
+    }
     for n in Graph::demo_patch().nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })) {
-        let (v, m) = ClapVoice::new(sample_rate)?;
+        let (v, m) = match n.kind.voice_plugin_key() {
+            Some(id) if crate::factory::kind_of(&id).is_some() => ClapVoice::new_plugin(sample_rate, &id)?,
+            _ => ClapVoice::new(sample_rate)?,
+        };
         voices.push((n.id, v));
         mains.push(m);
     }

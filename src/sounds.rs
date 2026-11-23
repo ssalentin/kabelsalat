@@ -75,6 +75,8 @@ pub enum Load {
     ParamValue { param: u32, value: f64 },
     /// An Aeolus registration, written as the plugin's CLAP state.
     AeolusRegistration(&'static crate::aeolus::Registration),
+    /// A factory instrument's own sound: nothing to load.
+    Factory,
     /// An Unsampled Piano CPU/room profile, applied to its CLAP state.
     UnsampledPianoProfile(&'static crate::unsampled_piano::Profile),
 }
@@ -121,6 +123,8 @@ pub enum Source {
     /// CPU / room profiles for Unsampled Piano (`unsampled_piano::PROFILES`),
     /// applied to its CLAP state.
     UnsampledPianoProfiles,
+    /// The built-in factory instruments' own sound (`factory::Kind::sound`).
+    FactorySounds,
     /// `pset:Preset` files in the LV2 bundles, plus the programmes the
     /// plugin names in its MIDNAM document.
     Lv2Bundles,
@@ -140,6 +144,7 @@ impl Instrument {
 
     pub fn source(&self) -> Source {
         match self {
+            Instrument::Clap(id) if crate::factory::kind_of(id).is_some() => Source::FactorySounds,
             Instrument::Clap(id) if id == SURGE_ID => Source::SurgePatches,
             Instrument::Clap(id) if id == DEXED_ID => Source::DexedCartridges,
             Instrument::Clap(id) if id == ODIN_ID => Source::OdinSoundbanks,
@@ -156,6 +161,7 @@ impl Instrument {
 /// parsing, an LV2 instantiation): `Libraries` runs it off the UI thread.
 pub fn scan(instrument: &Instrument) -> Library {
     match instrument.source() {
+        Source::FactorySounds => factory_library(instrument.id()),
         Source::SurgePatches => surge_library(),
         Source::DexedCartridges => dexed_library(),
         Source::OdinSoundbanks => odin_library(&odin_soundbanks_dir()),
@@ -219,6 +225,16 @@ pub fn dirs_stamp(root: &std::path::Path) -> Stamp {
     // Deeper than any bank is laid out (`<bank>/Presets/<folder>/…`).
     walk(root, 8, &mut hasher);
     hasher.finish()
+}
+
+/// The factory instrument's one sound: it needs no loading, it is what the
+/// instrument plays (#221).
+fn factory_library(id: &str) -> Library {
+    let sounds = crate::factory::kind_of(id).map(|k| {
+        let (category, name) = k.sound();
+        Sound { category: category.into(), name: name.into(), preferred: true, load: Load::Factory }
+    });
+    Library { kind: "factory sounds".into(), sounds: sounds.into_iter().collect(), params: Vec::new() }
 }
 
 fn surge_library() -> Library {
@@ -448,6 +464,7 @@ pub fn load(sound: &Sound, to: Target) -> Result<(), String> {
             let state = crate::juce::value_tree_to_state(&data).map_err(|e| format!("{}: {e}", path.display()))?;
             plugin()?.0.load_state(&state).map_err(|e| e.to_string())
         }
+        Load::Factory => Ok(()),
         Load::AeolusRegistration(reg) => plugin()?.0.load_state(&crate::aeolus::state(reg)).map_err(|e| e.to_string()),
         Load::UnsampledPianoProfile(profile) => {
             let main = plugin()?.0;

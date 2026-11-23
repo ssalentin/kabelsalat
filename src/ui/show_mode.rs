@@ -356,7 +356,15 @@ impl DemoApp {
             .chain(board.rigs.iter().map(|(n, l)| (n.clone(), *l, None)))
             .take(cols * fit_rows)
             .collect();
-        let reg = regions(screen, meters.len().div_ceil(cols));
+        let mut reg = regions(screen, meters.len().div_ceil(cols));
+        // The backing track's waveform with its markers (#291): a strip
+        // under the hero while the song's track plays.
+        let track = self.track_view().filter(|_| reg.hero.height() > 260.0);
+        let track_strip = track.as_ref().map(|_| {
+            let strip = Rect::from_min_max(Pos2::new(reg.hero.left(), reg.hero.bottom() - 64.0), reg.hero.max);
+            reg.hero.max.y -= 64.0 + 12.0;
+            strip
+        });
 
         // Top: what this screen is, live status indicators, and the clock.
         let top_cap = caption(&p, reg.top.left_center() - Vec2::new(0.0, 9.0), "Show mode · editing locked", 18.0, theme::INK_2);
@@ -376,6 +384,24 @@ impl DemoApp {
                 p.galley(pill.center() - g.size() / 2.0, g, col);
                 ix = pill.right() + 8.0;
             }
+        }
+
+        if let (Some(view), Some(strip)) = (&track, track_strip) {
+            let markers = self.setlist.current().map(|(s, _, _)| s.markers.clone()).unwrap_or_default();
+            super::markers_ui::paint_waveform(&p, strip, view, &markers, true);
+            let (name, mode) = {
+                let sec = view.section.checked_sub(1).and_then(|i| markers.get(i)).map(|m| m.name.clone());
+                (sec.unwrap_or_else(|| "Start".into()), view.at_end)
+            };
+            let tag = match mode {
+                crate::markers::AtEnd::Loop => format!("{name} · LOOP"),
+                crate::markers::AtEnd::Stop => format!("{name} · STOPS AT END"),
+                crate::markers::AtEnd::Continue => name,
+            };
+            let g = p.layout_no_wrap(tag, theme::medium_font(14.0), theme::CREAM);
+            let r = Rect::from_min_size(Pos2::new(strip.right() - g.size().x - 14.0, strip.bottom() - g.size().y - 8.0), g.size() + Vec2::new(10.0, 4.0));
+            p.rect_filled(r, 4.0, theme::DARK_PANEL);
+            p.galley(r.min + Vec2::new(5.0, 2.0), g, theme::CREAM);
         }
 
         // The hero: song, part and tempo, as large as the panel allows,
@@ -632,7 +658,7 @@ impl DemoApp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::control::{name_bytes, Graph, NodeKind, PortRef};
 
@@ -642,7 +668,7 @@ mod tests {
 
     /// Piano and Organ, and three songs: a verse on the piano, a chorus on
     /// the organ, then two songs of one part each.
-    pub(super) fn gig() -> DemoApp {
+    pub(in crate::ui) fn gig() -> DemoApp {
         let synth = |name: &str| {
             let mut g = Graph::default();
             g.reserve(8, 8);

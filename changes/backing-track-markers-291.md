@@ -1,0 +1,2 @@
+### Added
+- **Backing-track markers (#291):** a song's backing track can carry markers, read from the WAV's cue points or set in the app. Jump to a marker, step to the next or previous one, loop a section or stop at its end, each landing on the bar when the track is synced; a marker can switch the song's part. Learnable on a foot switch, available to the assistant and MCP agents (`backing_markers`), drawn on the waveform and in Show mode.

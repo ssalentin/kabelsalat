@@ -62,13 +62,21 @@ pub enum ShowAction {
     BackingTrack,
     /// The app starts or stops recording, as its REC button does.
     Record,
+    /// The backing track jumps to its next marker (#291), on the bar line
+    /// when it is synced.
+    NextMarker,
+    PrevMarker,
+    /// Loop the backing track's section playing, on and off.
+    LoopSection,
+    /// Stop the backing track at the end of its section playing, on and off.
+    StopAtSection,
     /// Program change N selects the first part of song N+1 (#208), also of
     /// a song stepping skips. A program with no song, or a CC, selects nothing.
     SongOfProgram,
 }
 
 impl ShowAction {
-    pub const ALL: [ShowAction; 11] = [
+    pub const ALL: [ShowAction; 15] = [
         ShowAction::NextSong,
         ShowAction::PrevSong,
         ShowAction::NextPart,
@@ -79,12 +87,16 @@ impl ShowAction {
         ShowAction::MasterMute,
         ShowAction::BackingTrack,
         ShowAction::Record,
+        ShowAction::NextMarker,
+        ShowAction::PrevMarker,
+        ShowAction::LoopSection,
+        ShowAction::StopAtSection,
         ShowAction::SongOfProgram,
     ];
 
     /// The actions one control each is learned for, in the order the app
     /// lists them. `SongOfProgram` is chosen per device instead.
-    pub const LEARNED: [ShowAction; 10] = [
+    pub const LEARNED: [ShowAction; 14] = [
         ShowAction::NextSong,
         ShowAction::PrevSong,
         ShowAction::NextPart,
@@ -95,6 +107,10 @@ impl ShowAction {
         ShowAction::MasterMute,
         ShowAction::BackingTrack,
         ShowAction::Record,
+        ShowAction::NextMarker,
+        ShowAction::PrevMarker,
+        ShowAction::LoopSection,
+        ShowAction::StopAtSection,
     ];
 
     /// The name tools and sessions use.
@@ -110,6 +126,10 @@ impl ShowAction {
             ShowAction::MasterMute => "master_mute",
             ShowAction::BackingTrack => "backing_track",
             ShowAction::Record => "record",
+            ShowAction::NextMarker => "next_marker",
+            ShowAction::PrevMarker => "prev_marker",
+            ShowAction::LoopSection => "loop_section",
+            ShowAction::StopAtSection => "stop_at_section",
             ShowAction::SongOfProgram => "song_of_program",
         }
     }
@@ -130,6 +150,10 @@ impl ShowAction {
             ShowAction::MasterMute => "Master mute",
             ShowAction::BackingTrack => "Backing track",
             ShowAction::Record => "Record",
+            ShowAction::NextMarker => "Next marker",
+            ShowAction::PrevMarker => "Previous marker",
+            ShowAction::LoopSection => "Loop section",
+            ShowAction::StopAtSection => "Stop at section end",
             ShowAction::SongOfProgram => "Program change picks the song",
         }
     }
@@ -369,6 +393,24 @@ impl Show {
         self.part = Some(to);
         self.steps += 1;
         Take::Part(part.zones)
+    }
+
+    /// Part `n` of the song the active part belongs to, as a backing-track
+    /// marker selects it (#291). `None` when nothing moves: no part active,
+    /// the song has no such part, or it is the part already playing.
+    pub fn go_song_part(&mut self, n: usize) -> Option<[RigZone; MAX_RIGS]> {
+        let parts = self.parts.as_ref().map_or(&[][..], |p| &p.0[..]);
+        let now = self.part.filter(|&p| p < parts.len())?;
+        let song = parts[now].song;
+        let first = parts.iter().position(|p| p.song == song)?;
+        let to = first + n;
+        if to == now || parts.get(to).is_none_or(|p| p.song != song) {
+            return None;
+        }
+        match self.go(to) {
+            Take::Part(zones) => Some(zones),
+            _ => None,
+        }
     }
 
     /// To the first part of the next (or previous) song, as
@@ -685,6 +727,25 @@ mod tests {
         cc(&mut s, 80, 0);
         assert_eq!(cc(&mut s, 80, 127), Take::Part(part(RigZone::OPEN, OFF)), "a part the table no longer has counts as none");
     }
+
+    #[test]
+    fn a_marker_selects_a_part_of_the_song_playing_and_no_other() {
+        let mut s = show(&[]);
+        // Song 0: parts 0, 1, 2; song 1: parts 3, 4.
+        s.set_parts(songs_of(&[(0, false), (0, false), (0, false), (1, false), (1, false)]));
+        assert_eq!(s.go_song_part(1), None, "no part active: a marker moves nothing");
+        s.set_part(Some(4));
+        let zones = |i: usize| part(RigZone { transpose: i as i8, ..RigZone::OPEN }, OFF);
+        assert_eq!(s.go_song_part(0), Some(zones(3)), "part 1 of the second song");
+        assert_eq!((s.part(), s.steps()), (Some(3), 1));
+        assert_eq!(s.go_song_part(0), None, "already there: no second step");
+        assert_eq!(s.go_song_part(2), None, "the song has two parts");
+        s.set_part(Some(0));
+        assert_eq!(s.go_song_part(2), Some(zones(2)));
+        assert_eq!(s.go_song_part(3), None, "part 4 would be the next song's");
+        assert_eq!((s.part(), s.steps()), (Some(2), 2));
+    }
+
     fn note(s: &mut Show, n: u8, on: bool) -> Take {
         s.take(PEDAL, 0, ShowMsg::Note(n), if on { 127 } else { 0 })
     }
@@ -753,7 +814,7 @@ mod tests {
 
     #[test]
     fn every_other_action_is_handed_to_the_engine_once_per_press_and_counted() {
-        let others: Vec<ShowControl> = [ShowAction::Panic, ShowAction::TapTempo, ShowAction::Tuner, ShowAction::MasterMute, ShowAction::BackingTrack, ShowAction::Record]
+        let others: Vec<ShowControl> = [ShowAction::Panic, ShowAction::TapTempo, ShowAction::Tuner, ShowAction::MasterMute, ShowAction::BackingTrack, ShowAction::Record, ShowAction::NextMarker, ShowAction::PrevMarker, ShowAction::LoopSection, ShowAction::StopAtSection]
             .iter()
             .enumerate()
             .map(|(i, &action)| ShowControl { device: None, channel: None, msg: ShowMsg::Note(60 + i as u8), action })

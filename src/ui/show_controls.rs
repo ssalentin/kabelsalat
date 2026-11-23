@@ -269,7 +269,7 @@ mod tests {
     const PEDAL: u32 = 1;
 
     /// Tall enough for the whole list: in a shorter window it scrolls.
-    const SIZE: Vec2 = Vec2::new(1280.0, 1400.0);
+    const SIZE: Vec2 = Vec2::new(1280.0, 1700.0);
 
     fn frame(app: &mut DemoApp, ctx: &egui::Context) {
         let mut raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)), ..Default::default() };
@@ -415,6 +415,9 @@ mod tests {
         assert!(s.sent.iter().any(|c| matches!(c, Command::RecordStart)), "the app starts recording: {:?}", s.sent);
         s.tap(&press_of(idx(ShowAction::BackingTrack)));
         assert_eq!(s.presses(ShowAction::BackingTrack), 1, "the backing track's press reached the engine");
+        for a in [ShowAction::NextMarker, ShowAction::PrevMarker, ShowAction::LoopSection, ShowAction::StopAtSection] {
+            s.tap(&press_of(idx(a)));
+        }
         for a in ShowAction::LEARNED {
             assert!(s.presses(a) >= 1, "{a:?} was never pressed");
         }

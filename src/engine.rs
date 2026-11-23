@@ -1584,6 +1584,19 @@ pub struct PlayerPub {
     pub duration: f32,
     /// Mix gain (0..1).
     pub gain: f32,
+    /// Which load plays (`PlayerControl::play`'s id; #291).
+    pub file: u64,
+    /// Play position in seconds, as of the last publication (about twenty
+    /// a second while the file plays).
+    pub pos: f32,
+    /// Markers the engine follows for this file.
+    pub markers: u8,
+    /// The section playing: how many markers are at or before `pos`.
+    pub section: u8,
+    /// What happens at the section's end.
+    pub at_end: crate::markers::AtEnd,
+    /// The marker a jump goes to once its bar line comes, or -1.
+    pub jump_to: i8,
 }
 
 impl Default for PlayerPub {
@@ -1601,6 +1614,12 @@ impl Default for PlayerPub {
             eff_bpm: 0.0,
             duration: 0.0,
             gain: 0.0,
+            file: 0,
+            pos: 0.0,
+            markers: 0,
+            section: 0,
+            at_end: crate::markers::AtEnd::Continue,
+            jump_to: -1,
         }
     }
 }
@@ -1788,14 +1807,71 @@ struct PlayerFile {
     anchor_file_beats: f64,
     /// A one-shot (loop off) played past its end.
     finished: bool,
+    /// Which load this is (`PlayerData::id`): markers are followed only
+    /// when they were sent for it.
+    id: u64,
+    m: PlayerMarks,
+}
+
+/// Where the file is among its markers (#291), and the seam being faded.
+#[derive(Clone, Copy, Default)]
+struct PlayerMarks {
+    /// `sec`, `lo` and `hi` are those of the position playing. Cleared by
+    /// everything that moves the position other than playing on.
+    known: bool,
+    /// The next section found fires no part: the markers changed under a
+    /// playing file, the position did not.
+    quiet: bool,
+    /// The section playing (`MarkerTable::section_at`) and its bounds in
+    /// file frames.
+    sec: usize,
+    lo: f64,
+    hi: f64,
+    /// A jump to this marker waits for song beat `jump_at`.
+    jump_to: Option<usize>,
+    jump_at: f64,
+    /// Where the next start begins, in seconds, instead of the Beat Offset:
+    /// after a stop at a section's end, or a jump while stopped.
+    resume: Option<f64>,
+    /// The outgoing side of a seam: it plays on from `tail_pos` for
+    /// `tail_left` frames, fading out, while the incoming side fades in
+    /// over `fade_in` frames.
+    tail_pos: f64,
+    tail_step: f64,
+    tail_left: u32,
+    fade_in: u32,
+}
+
+impl PlayerMarks {
+    /// Find the section of position `x` (file frames); answers the part its
+    /// marker selects.
+    fn locate(&mut self, marks: &crate::markers::MarkerTable, x: f64, file_sr: f64, frames: f64) -> Option<usize> {
+        self.sec = marks.section_at(x, file_sr);
+        (self.lo, self.hi) = marks.bounds_at(self.sec, file_sr, frames);
+        self.known = true;
+        let quiet = std::mem::take(&mut self.quiet);
+        self.sec.checked_sub(1).and_then(|i| marks.part(i)).filter(|_| !quiet)
+    }
+
+    /// Start a seam: what played up to `x` fades out from there.
+    fn seam(&mut self, x: f64, step: f64, fade: u32) {
+        self.tail_pos = x;
+        self.tail_step = step;
+        self.tail_left = fade;
+        self.fade_in = fade;
+    }
 }
 
 /// Start sounding from the configured point (Beat Offset), anchored to the
 /// song clock at `song_beats`. Returns the start position in file frames.
 fn player_start_now(p: &mut PlayerFile, cfg: PlayerCfg, song_beats: f64) -> f64 {
     let ref_bpm = cfg.ref_bpm(p.duration);
-    let start_beats = cfg.start_beats(ref_bpm, p.duration);
+    let start_beats = match p.m.resume.take() {
+        Some(secs) => secs.clamp(0.0, p.duration) * ref_bpm / 60.0,
+        None => cfg.start_beats(ref_bpm, p.duration),
+    };
     let pos = start_beats * 60.0 / ref_bpm * p.file_sr;
+    p.m = PlayerMarks::default();
     p.pending = false;
     p.finished = false;
     p.pos = pos;
@@ -1962,6 +2038,13 @@ pub struct GraphEngine {
     // several-MB allocation on the audio thread would stall it).
     player: Option<PlayerFile>,
     player_cfg: PlayerCfg,
+    /// The markers of file load `player_marks_file` (#291), and what the
+    /// section playing does at its end.
+    player_marks: crate::markers::MarkerTable,
+    player_marks_file: u64,
+    player_at_end: crate::markers::AtEnd,
+    /// Frames played since the position was last published.
+    player_pub_frames: usize,
     player_gain: f32,
     player_buf: Vec<f32>,
     /// Decode thread → audio: one decoded file per `play_file`.
@@ -2213,6 +2296,10 @@ impl GraphEngine {
             system_buf: vec![0.0; 8192 * 2],
             player: None,
             player_cfg: PlayerCfg::default(),
+            player_marks: crate::markers::MarkerTable::EMPTY,
+            player_marks_file: 0,
+            player_at_end: crate::markers::AtEnd::Continue,
+            player_pub_frames: 0,
             player_gain: 0.0,
             player_buf: vec![0.0; 8192 * 2],
             player_rx: None,
@@ -2892,7 +2979,50 @@ impl GraphEngine {
             eff_bpm: p.map_or(0.0, |p| cfg.ref_bpm(p.duration) as f32),
             duration: p.map_or(0.0, |p| p.duration as f32),
             gain: self.player_gain,
+            file: p.map_or(0, |p| p.id),
+            pos: p.map_or(0.0, |p| (p.pos / p.file_sr).clamp(0.0, p.duration) as f32),
+            markers: p.map_or(0, |p| self.player_table(p.id).len() as u8),
+            section: p.map_or(0, |p| {
+                let x = p.m.resume.filter(|_| !p.enabled || p.pending).map_or(p.pos, |secs| secs * p.file_sr);
+                self.player_table(p.id).section_at(x, p.file_sr) as u8
+            }),
+            at_end: self.player_at_end,
+            jump_to: p.and_then(|p| p.m.jump_to).map_or(-1, |m| m as i8),
         }
+    }
+
+    /// The markers the engine follows for file load `id`: those sent for it.
+    fn player_table(&self, id: u64) -> crate::markers::MarkerTable {
+        if self.player_marks_file == id { self.player_marks } else { crate::markers::MarkerTable::EMPTY }
+    }
+
+    /// A marker action (`Command::PlayerMarker`, or a show control; #291).
+    /// A jump of a playing file is taken in `fill_player`: at the next bar
+    /// line when the file is synced and the transport rolls, else in the
+    /// next frame. A stopped file starts there the next time it starts.
+    fn player_marker(&mut self, action: crate::markers::MarkerAction) {
+        use crate::markers::MarkerAction;
+        if matches!(action, MarkerAction::Loop(_) | MarkerAction::StopAtEnd(_)) {
+            let next = self.player_at_end.after(action);
+            self.player_dirty |= next != self.player_at_end;
+            self.player_at_end = next;
+            return;
+        }
+        let waits = self.player_cfg.sync && self.master_clock == MasterClock::Playing;
+        let bar = next_bar_beats(self.transport.beats, self.transport.sig);
+        let Some(id) = self.player.as_ref().map(|p| p.id) else { return };
+        let table = self.player_table(id);
+        let Some(p) = self.player.as_mut() else { return };
+        let stopped = !p.enabled || p.pending;
+        let here = p.m.resume.filter(|_| stopped).map_or(p.pos, |secs| secs * p.file_sr);
+        let Some(to) = crate::markers::target(&table, table.section_at(here, p.file_sr), p.m.jump_to, action) else { return };
+        if stopped {
+            p.m.resume = table.at(to);
+        } else {
+            p.m.jump_to = Some(to);
+            p.m.jump_at = if waits { bar } else { f64::NEG_INFINITY };
+        }
+        self.player_dirty = true;
     }
 
     /// Load a decoded file (from the decode thread's ring): adopt the
@@ -2917,7 +3047,11 @@ impl GraphEngine {
             anchor_song_beats: 0.0,
             anchor_file_beats: 0.0,
             finished: false,
+            id: d.id,
+            m: PlayerMarks::default(),
         };
+        // A loop or a stop was asked of the track before, not of this one.
+        self.player_at_end = crate::markers::AtEnd::Continue;
         if self.player_cfg.sync && self.master_clock.is_active() {
             p.pending = true;
             p.target_beats = self.player_target_beats();
@@ -3026,6 +3160,24 @@ impl GraphEngine {
         let clock_live = rolling && (self.transport.beats > 0.0 || self.transport.seconds > 0.0);
         let ref_bpm = cfg.ref_bpm(p.duration);
         let total_beats = (ref_bpm * p.duration / 60.0).max(1e-9);
+        let frames_f = p.frames as f64;
+        // Song-clock-derived position while synced and rolling; else the
+        // position integrates.
+        let synced = cfg.sync && rolling;
+        // File frames per output frame: what the song clock runs at (sync
+        // on) or the file's own rate (sync off).
+        let step = if synced {
+            beat_inc * 60.0 / ref_bpm * p.file_sr
+        } else if cfg.sync {
+            bpm / ref_bpm * p.file_sr / sr
+        } else {
+            p.file_sr / sr
+        };
+        // Markers (#291): only those sent for the load that plays.
+        let marks = if self.player_marks_file == p.id { self.player_marks } else { crate::markers::MarkerTable::EMPTY };
+        let mut at_end = self.player_at_end;
+        let fade = ((sr * crate::markers::FADE_SECS) as u32).max(1);
+        let mut part: Option<usize> = None;
         let mut dirty = false;
         for i in 0..frames {
             let song_b = block_start_beats + i as f64 * beat_inc;
@@ -3043,70 +3195,150 @@ impl GraphEngine {
                     dirty = true;
                 }
             } else if p.enabled && !p.finished {
-                if cfg.sync && rolling {
+                if synced {
                     // Song-clock-derived position: file beats advance 1:1
                     // with song beats at matched varispeed, so the loop
                     // pass lasts exactly its beats in song beats and a
                     // tempo change is followed without a phase jump.
                     let file_beats = p.anchor_file_beats + (song_b - p.anchor_song_beats);
                     let b = if cfg.loop_on { file_beats.rem_euclid(total_beats) } else { file_beats };
-                    let t = b * 60.0 / ref_bpm;
-                    if !cfg.loop_on && t >= p.duration {
-                        p.finished = true;
+                    let x = b * 60.0 / ref_bpm * p.file_sr;
+                    pos = Some(x);
+                    p.pos = x; // coherent handover to free-run
+                } else {
+                    // Free-run: read at the current position, then advance.
+                    if cfg.loop_on {
+                        p.pos = p.pos.rem_euclid(frames_f);
+                    }
+                    pos = Some(p.pos);
+                    p.pos += step;
+                }
+            }
+            if pos.is_some_and(|x| !x.is_finite()) {
+                // Heal (rule 32): a non-finite position restarts the file
+                // instead of seeding NaNs into the mix.
+                pos = Some(player_start_now(p, cfg, song_b)).filter(|x| x.is_finite());
+            }
+            // A jump to a marker that is due: at once, or at its bar line
+            // (rule 128: the marker sits ON the line, so the anchor is the
+            // line itself, not the frame after it).
+            if let Some(to) = p.m.jump_to.filter(|_| p.enabled && !p.pending) {
+                if !synced || song_b >= p.m.jump_at {
+                    let line = if synced && p.m.jump_at.is_finite() { p.m.jump_at } else { song_b };
+                    let secs = marks.at(to).unwrap_or(0.0).min(p.duration);
+                    let quiet = p.m.quiet;
+                    p.m = PlayerMarks { quiet, ..PlayerMarks::default() };
+                    if let Some(x) = pos {
+                        p.m.seam(x, step, fade);
+                    }
+                    let x = (secs + if synced { (song_b - line) * 60.0 / ref_bpm } else { 0.0 }) * p.file_sr;
+                    p.anchor_file_beats = secs * ref_bpm / 60.0;
+                    p.anchor_song_beats = line;
+                    p.pos = if synced { x } else { x + step };
+                    p.finished = false;
+                    pos = Some(x);
+                    dirty = true;
+                }
+            }
+            if let Some(x) = pos {
+                if !p.m.known {
+                    part = p.m.locate(&marks, x, p.file_sr, frames_f).or(part);
+                    dirty = true;
+                } else if !(p.m.lo <= x && x < p.m.hi) {
+                    // Playback left its section. Playing on, it is just
+                    // past the end (or, in a looping file's last section,
+                    // just past the file's start); anything else moved the
+                    // position, and the section is only found again.
+                    let wrapped = cfg.loop_on && x < p.m.lo && p.m.hi >= frames_f;
+                    let over = if wrapped { x } else { x - p.m.hi };
+                    let len = p.m.hi - p.m.lo;
+                    let played_on = (0.0..=step * 2.0 + 1.0).contains(&over) && over < len;
+                    if played_on && at_end == crate::markers::AtEnd::Loop {
+                        // Back to the section's start, as far past it as
+                        // playback was past the end: the section lasts its
+                        // own length, to the sample. Synced, the song-clock
+                        // mapping moves back by that length, so a section
+                        // of whole bars stays on the bar (rule 128).
+                        let to = p.m.lo + over;
+                        p.m.seam(x, step, fade);
+                        if synced {
+                            p.anchor_file_beats -= len / p.file_sr * ref_bpm / 60.0;
+                            p.pos = to;
+                        } else {
+                            p.pos = to + step;
+                        }
+                        p.finished = false;
+                        pos = Some(to);
+                    } else if played_on && at_end == crate::markers::AtEnd::Stop {
+                        // Stop here, once; the next start goes on from the
+                        // next section (from the top after the last one).
+                        p.m.seam(x, step, fade);
+                        p.m.resume = (p.m.hi < frames_f).then(|| p.m.hi / p.file_sr);
+                        p.enabled = false;
+                        at_end = crate::markers::AtEnd::Continue;
+                        pos = None;
                         dirty = true;
                     } else {
-                        pos = Some(t * p.file_sr);
-                        p.pos = t * p.file_sr; // coherent handover to free-run
-                    }
-                } else {
-                    // Free-run: read at the current position, then advance
-                    // by the rate the song clock would run at (sync on) or
-                    // the file's own rate (sync off).
-                    if cfg.loop_on {
-                        p.pos = p.pos.rem_euclid(p.frames as f64);
-                    } else if p.pos >= p.frames as f64 {
-                        p.finished = true;
+                        part = p.m.locate(&marks, x, p.file_sr, frames_f).or(part);
                         dirty = true;
                     }
-                    let rate = if cfg.sync { bpm / ref_bpm } else { 1.0 };
-                    pos = Some(p.pos);
-                    p.pos += rate * p.file_sr / sr;
-                    if p.pos >= p.frames as f64 {
-                        if cfg.loop_on {
-                            p.pos = p.pos.rem_euclid(p.frames as f64);
-                        } else {
-                            p.finished = true;
-                            dirty = true;
-                        }
+                }
+            }
+            if let Some(x) = pos.filter(|&x| !cfg.loop_on && x >= frames_f) {
+                // A one-shot played past its end.
+                p.pos = x;
+                p.finished = true;
+                pos = None;
+                dirty = true;
+            }
+            let mut out = [0.0f32; 2];
+            if let Some(x) = pos {
+                // A looped position sitting exactly on the end (float
+                // rounding at the seam) wraps; it must never re-anchor.
+                let x = if cfg.loop_on && x >= frames_f { x.rem_euclid(frames_f) } else { x };
+                if (0.0..frames_f).contains(&x) {
+                    out = read_frame(&p.samples, p.frames, x, cfg.loop_on);
+                    if p.m.fade_in > 0 {
+                        let g = 1.0 - p.m.fade_in as f32 / fade as f32;
+                        out = [out[0] * g, out[1] * g];
                     }
                 }
             }
-            let (sound, x) = match pos {
-                Some(x) if x.is_finite() => {
-                    // A looped position sitting exactly on the end (float
-                    // rounding at the seam) wraps; it must never re-anchor.
-                    let x = if cfg.loop_on && x >= p.frames as f64 { x.rem_euclid(p.frames as f64) } else { x };
-                    ((0.0..p.frames as f64).contains(&x), x)
+            p.m.fade_in = p.m.fade_in.saturating_sub(1);
+            if p.m.tail_left > 0 {
+                // The outgoing side of a seam plays on while it fades.
+                if cfg.loop_on || (0.0..frames_f).contains(&p.m.tail_pos) {
+                    let g = p.m.tail_left as f32 / fade as f32;
+                    let s = read_frame(&p.samples, p.frames, p.m.tail_pos, cfg.loop_on);
+                    out = [out[0] + s[0] * g, out[1] + s[1] * g];
                 }
-                Some(_) => {
-                    // Heal (rule 32): a non-finite position restarts the
-                    // file instead of seeding NaNs into the mix.
-                    let start = player_start_now(p, cfg, song_b);
-                    (start.is_finite() && (0.0..p.frames as f64).contains(&start), start)
-                }
-                None => (false, 0.0),
-            };
-            if sound {
-                let s = read_frame(&p.samples, p.frames, x, cfg.loop_on);
-                self.player_buf[i * 2] = s[0];
-                self.player_buf[i * 2 + 1] = s[1];
-            } else {
-                self.player_buf[i * 2] = 0.0;
-                self.player_buf[i * 2 + 1] = 0.0;
+                p.m.tail_pos += p.m.tail_step;
+                p.m.tail_left -= 1;
             }
+            self.player_buf[i * 2] = out[0];
+            self.player_buf[i * 2 + 1] = out[1];
+        }
+        // The position is published about twenty times a second while the
+        // file plays: the waveform's playhead reads it.
+        if p.enabled && !p.pending && !p.finished {
+            self.player_pub_frames += frames;
+            if self.player_pub_frames as f64 >= sr / 20.0 {
+                self.player_pub_frames = 0;
+                dirty = true;
+            }
+        }
+        if at_end != self.player_at_end {
+            self.player_at_end = at_end;
+            dirty = true;
         }
         if dirty {
             self.player_dirty = true;
+        }
+        // A marker's part (rule 197): the switch runs here, in the engine,
+        // in the block playback reached the marker; the app follows.
+        if let Some(zones) = part.and_then(|n| self.show.go_song_part(n)) {
+            self.set_rig_zones(zones);
+            self.mix_dirty = true;
         }
     }
 
@@ -4343,6 +4575,10 @@ impl GraphEngine {
                 let on = self.player.as_ref().is_some_and(|p| !p.enabled && !p.pending);
                 self.set_player_enable(on);
             }
+            Take::Act(ShowAction::NextMarker) => self.player_marker(crate::markers::MarkerAction::Next),
+            Take::Act(ShowAction::PrevMarker) => self.player_marker(crate::markers::MarkerAction::Prev),
+            Take::Act(ShowAction::LoopSection) => self.player_marker(crate::markers::MarkerAction::Loop(None)),
+            Take::Act(ShowAction::StopAtSection) => self.player_marker(crate::markers::MarkerAction::StopAtEnd(None)),
             // The app's own: done from the published presses.
             Take::Act(ShowAction::Tuner | ShowAction::Record) => {}
             Take::Act(ShowAction::NextSong | ShowAction::PrevSong | ShowAction::NextPart | ShowAction::PrevPart | ShowAction::SongOfProgram) => {}
@@ -6691,6 +6927,22 @@ impl GraphEngine {
                 self.player_dirty = true;
             }
             Command::SetPlayerEnable { on } => self.set_player_enable(on),
+            Command::SetPlayerMarkers { file, markers } => {
+                if (self.player_marks_file, self.player_marks) != (file, markers) {
+                    self.player_marks_file = file;
+                    self.player_marks = markers;
+                    // The position did not move: the section is found
+                    // again without its marker's part, and a jump that
+                    // waited named a marker of the old table.
+                    if let Some(p) = self.player.as_mut().filter(|p| p.m.known) {
+                        p.m.known = false;
+                        p.m.quiet = true;
+                        p.m.jump_to = None;
+                    }
+                    self.player_dirty = true;
+                }
+            }
+            Command::PlayerMarker { action } => self.player_marker(action),
             // Global transport = MASTER: fan out to every transport-capable
             // node (all start together on the downbeat). Per-node
             // SetNodePlaying overrides individually afterwards and never
@@ -10512,6 +10764,64 @@ mod tests {
         assert_eq!(e.rig_zones[..2], [OFF, RigZone::OPEN], "and moves no song");
         assert!(passed(&mut e, &mut bus, program(PEDAL, 0)).is_empty());
         assert_eq!(e.rig_zones[..2], [RigZone::OPEN, OFF], "program 0 selects song 1");
+    }
+
+    /// #291: a marker that selects a part switches the rigs' zones in the
+    /// engine, in the block the file's position reaches the marker.
+    #[test]
+    fn a_marker_that_selects_a_part_switches_the_sound_in_the_block_it_is_reached() {
+        use crate::control::RigZone;
+        let (mut e, mut bus) = load_two_rigs(None, None);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        e.set_graph_pub(pub_.clone());
+        // One song, two parts: rig A alone, then rig B alone.
+        let part = |a: RigZone, b: RigZone| {
+            let mut z = [RigZone::OPEN; crate::control::MAX_RIGS];
+            z[0] = a;
+            z[1] = b;
+            z
+        };
+        let parts = [part(RigZone::OPEN, OFF), part(OFF, RigZone::OPEN)].into_iter().map(|zones| crate::show::ShowPart { song: 0, skip: false, zones }).collect();
+        bus.send(Command::SetShowParts { parts: crate::show::ShowParts::new(parts) });
+        bus.send(Command::SetShowPart { part: Some(0) });
+        bus.send(zones(RigZone::OPEN, OFF));
+        let (tx, rx) = rtrb::RingBuffer::new(2);
+        let (back_tx, _back) = rtrb::RingBuffer::new(2);
+        e.set_player_channels(rx, back_tx);
+        let mut tx = tx;
+        let mut data = crate::player::selftest::sine_loop();
+        data.id = 5;
+        // A marker at 0.2 s selects part 1.
+        let mut marker = crate::markers::Marker::new("Chorus", 0.2);
+        marker.part = Some(1);
+        bus.send(Command::SetPlayerMarkers { file: 5, markers: crate::markers::MarkerTable::new(&[marker]) });
+        bus.send(Command::SetPlayerCfg { loop_on: Some(false), sync: Some(false), beats: None, offset: None, bpm: None });
+        assert!(tx.push(data).is_ok());
+        let mut buf = vec![0.0f32; 512 * 2];
+        let mut switched = None;
+        for block in 0..30 {
+            e.render(&mut buf, 2);
+            if switched.is_none() && e.rig_zones[..2] == [OFF, RigZone::OPEN] {
+                switched = Some(block);
+            }
+        }
+        // 0.2 s = 9600 frames, inside block 18 (9216..9728) of 512 frames.
+        assert_eq!(switched, Some(18), "the switch ran in the block the marker was reached");
+        let g = pub_.lock().unwrap();
+        assert_eq!((g.show_part, g.show_steps), (Some(1), 1), "the app is told which part the engine moved to");
+        drop(g);
+        // A table sent while the file plays (the position did not move)
+        // does not fire its part.
+        let table = crate::markers::MarkerTable::new(&[{
+            let mut m = crate::markers::Marker::new("Chorus", 0.3);
+            m.part = Some(1);
+            m
+        }]);
+        bus.send(Command::SetPlayerMarkers { file: 5, markers: table });
+        bus.send(Command::SetShowPart { part: Some(0) });
+        bus.send(zones(RigZone::OPEN, OFF));
+        e.render(&mut buf, 2);
+        assert_eq!(e.rig_zones[..2], [RigZone::OPEN, OFF], "a marker table sent mid-section does not fire its part");
     }
 
     #[test]

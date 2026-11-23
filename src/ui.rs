@@ -179,6 +179,7 @@ use crate::theme::{alpha, mix};
 
 mod console;
 mod levels;
+mod markers_ui;
 mod show_controls;
 mod show_mode;
 mod preshow;
@@ -3575,7 +3576,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "set_audio_backend", "list_app_streams", "set_app_stream", "add_rig", "clone_rig", "delete_rig",
     "save_rig", "load_rig", "list_rig_presets", "load_template",
-    "list_instruments", "install_instrument", "play_file", "stop_file",
+    "list_instruments", "install_instrument", "play_file", "stop_file", "backing_markers",
     "set_scale", "set_arp",
     "set_strip_mix", "set_node_bypass", "duplicate_node", "reset_node_params", "randomize_node_params",
     "add_insert", "remove_insert",
@@ -4254,6 +4255,15 @@ struct DemoApp {
     plugin_folders: plugin_folders::PluginFoldersState,
     /// The song and backing track the player was started with last (#278).
     setlist_backing_song: Option<(usize, String)>,
+    /// The file-load id of that track (`PlayerControl::play`), the load the
+    /// markers were last imported for and the table the engine was last sent
+    /// (#291).
+    track_load_id: u64,
+    markers_imported: Option<u64>,
+    markers_sent: Option<(u64, crate::markers::MarkerTable)>,
+    /// A track view the tests give instead of a playing file.
+    #[cfg(test)]
+    track_fixture: Option<markers_ui::TrackView>,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
     /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
     /// node id like the session's strips (`remap_session` carries them).
@@ -4908,6 +4918,11 @@ impl DemoApp {
             audio_doctor: Default::default(),
             plugin_folders: Default::default(),
             setlist_backing_song: None,
+            track_load_id: 0,
+            markers_imported: None,
+            markers_sent: None,
+            #[cfg(test)]
+            track_fixture: None,
             strips: Vec::new(),
             sends: Vec::new(),
             bus_outs: Vec::new(),
@@ -7408,6 +7423,7 @@ impl DemoApp {
             "system_audio" => "System audio level".into(),
             "play_file" => "Play audio file".into(),
             "stop_file" => "Stop audio file".into(),
+            "backing_markers" => "Backing-track markers".into(),
             "set_player" => "File player level".into(),
             "list_plugins" => "List plugins".into(),
             "list_instruments" => "List instruments".into(),
@@ -9371,7 +9387,7 @@ impl DemoApp {
         let cmds: Vec<Command> = match track {
             Some(t) if self.setlist_backing_song.as_ref() != Some(&t) => {
                 let Some(pc) = &self.player_ctrl else { return };
-                pc.play(&t.1);
+                self.track_load_id = pc.play(&t.1);
                 self.setlist_backing_song = Some(t);
                 self.player.loop_on = false;
                 vec![
@@ -10626,6 +10642,10 @@ impl DemoApp {
                     "file player unavailable (no audio)".into()
                 }
             }
+            "backing_markers" => match self.backing_markers_tool(args) {
+                Ok(s) => s,
+                Err(e) => format!("error: {e}"),
+            },
             "stop_file" => {
                 if let Some(bus) = &self.bus {
                     // Disable the play-enable; the file and its settings stay
@@ -19623,6 +19643,8 @@ impl DemoApp {
         // A part's send scene (#415): (song, part, capture it / clear it).
         let mut scene_edit: Option<(usize, usize, bool)> = None;
         let mut set_backing: Option<(usize, Option<String>)> = None;
+        let track_view = self.track_view();
+        let mut marker_edit: Option<markers_ui::MarkerEdit> = None;
         let mut vary_rig: Option<u8> = None;
         let mut split_rig: Option<(usize, usize, u8)> = None;
         let mut active_part_dirty = false;
@@ -19981,7 +20003,9 @@ impl DemoApp {
                                   split_rig: &mut Option<(usize, usize, u8)>,
                                   jump_to: &mut Option<(usize, usize)>,
                                   active_part_dirty: &mut bool,
-                                  window_dirty: &mut bool| {
+                                  window_dirty: &mut bool,
+                                  track_view: Option<&markers_ui::TrackView>,
+                                  marker_edit: &mut Option<markers_ui::MarkerEdit>| {
                     let Some(si) = edit_song.filter(|&i| i < setlist.songs.len()) else {
                         ui.add_space(24.0);
                         ui.label(
@@ -20068,6 +20092,11 @@ impl DemoApp {
                             *backing_open = None;
                         }
                     });
+                    if song.backing.is_some() {
+                        ui.add_space(4.0);
+                        let live = is_active_song.then_some(track_view).flatten();
+                        markers_ui::marker_block(ui, song, live, marker_edit);
+                    }
                     if *backing_open == Some(si) {
                         ui.add_space(4.0);
                         egui::Frame::new()
@@ -20510,6 +20539,8 @@ impl DemoApp {
                                 &mut jump_to,
                                 &mut active_part_dirty,
                                 &mut window_dirty,
+                                track_view.as_ref(),
+                                &mut marker_edit,
                             );
                         });
                     });
@@ -20560,6 +20591,8 @@ impl DemoApp {
                             &mut jump_to,
                             &mut active_part_dirty,
                             &mut window_dirty,
+                            track_view.as_ref(),
+                            &mut marker_edit,
                         );
                     }
                 }
@@ -20692,6 +20725,10 @@ impl DemoApp {
                 part.fx.clear();
                 self.notify_patch("Cleared saved part knobs");
             }
+        }
+        if let Some(edit) = marker_edit {
+            self.apply_marker_edit(edit);
+            window_dirty = true;
         }
         if let Some((si, path)) = set_backing {
             match crate::setlist::backing_path(path.as_deref()) {
@@ -35810,6 +35847,7 @@ impl DemoApp {
         // wins over a foot-switch step the engine took before it.
         self.follow_show();
         self.follow_show_presses();
+        self.sync_markers();
         self.poll_assistant();
         self.serve_ui_inbox();
         self.poll_preshow();

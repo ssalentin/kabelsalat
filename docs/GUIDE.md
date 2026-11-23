@@ -36,6 +36,7 @@ every keyboard shortcut.
   - [Control knobs and the mixer from your controller](#control-knobs-and-the-mixer-from-your-controller)
   - [Count in any metre](#count-in-any-metre)
   - [Be the clock](#be-the-clock)
+  - [Follow another clock](#follow-another-clock)
 - [Play live](#play-live)
   - [Play a setlist without a gap](#play-a-setlist-without-a-gap)
   - [Keep what stays through the whole show](#keep-what-stays-through-the-whole-show)
@@ -620,6 +621,25 @@ clock: 24 clocks per beat plus Start and Stop go to the MIDI outputs you wire
 offset and three latency modes (none, output, input) line the clock up with what
 you hear.
 
+### Follow another clock
+
+Switch on **FOLLOW** in the same matrix block and kabelsalat takes the clock of
+a drum machine or a DAW instead: pick its MIDI in port (or connect any app to
+the virtual port "kabelsalat: Clock In"). The tempo follows the clock, Start,
+Continue and Stop drive the transport, Song Position Pointer says where a
+Continue resumes, and every clock nudges the song position back onto the
+sender's, so a tempo ramp never walks the two apart (typically within a
+millisecond). If the clock cable drops, the tempo and the transport hold and the
+status says "lost"; the show goes on. Sending and following are never both on.
+Agents use `set_midi_clock` with `follow` and `input`.
+
+### Ableton Link
+
+Not in this release: Link's licence (GPL-2.0-or-later or a proprietary one)
+does not fit kabelsalat's MIT licence, so it is tracked on its own in the
+follow-up issue #452. MIDI Clock In and Out do the same job with
+hardware.
+
 ## Play live
 
 ### Play a setlist without a gap
@@ -778,6 +798,28 @@ same list from the `preshow_check` tool, and `kabelsalat preshow-check
 <session.ksalat>` prints it in a terminal (exit status 1 on a problem).
 
 <p align="center"><img src="shots/preshow.png" width="85%" alt="Setlist → Check show: nine checks with a tick, a warning mark or a cross — an unplugged FM-1, a missing Odin 2 and a missing backing track are problems, running on battery is a warning, and each row says what to do"/></p>
+
+### Send lighting, lyric and gear cues
+
+Every song and every part can send messages when the setlist enters it, for a
+lighting desk, a lyric prompter or a rack of gear that changes presets: MIDI
+program change, CC and note, and OSC over UDP. In **Setlist** open **Cues** on a
+song or part and write one line per message:
+
+```
+pc 1 5                          program change 5 on channel 1
+cc 1 20 127 @desk               controller 20 = 127, only to the port with "desk" in its name
+note 10 C3 100                  a note-on, released 100 ms later
+osc 192.168.1.50:8000 /cue/go 12 "chorus"   OSC: numbers, true/false, "quoted text"
+```
+
+Without `@port` a MIDI cue goes to every MIDI out port and to the virtual port
+"kabelsalat: Show Cues". Entering a song sends its cues, then its part's; moving
+between parts of the same song sends only the part's. Loading a session, editing
+or reordering sends nothing, and a foot switch's cue goes out from its own
+thread in the same moment the part switches: the audio thread never does I/O and
+a UI frame is not in the way. **Test** sends a list right now. Agents use
+`get_cues` and `set_cues`.
 
 ### Run the show from a pedal
 

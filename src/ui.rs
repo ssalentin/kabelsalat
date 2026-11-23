@@ -178,6 +178,7 @@ const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black k
 use crate::theme::{alpha, mix};
 
 mod console;
+mod cue_editor;
 mod levels;
 mod markers_ui;
 mod show_controls;
@@ -3628,6 +3629,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo", "set_show_mode", "set_rack_locked", "panic", "set_plugin_favorite",
     "get_setlist", "set_setlist_song", "set_part_sends", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check", "audio_doctor",
+    "get_cues", "set_cues",
     "save_setlist", "load_setlist", "list_setlists", "set_setlist_folder",
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
@@ -4266,6 +4268,8 @@ struct DemoApp {
     /// Macros and rig morphs (#289, #214), and what the engine has of them.
     macros: Vec<crate::macros::Macro>,
     macros_sent: crate::macros::MacrosSent,
+    /// Show cues (#401): the real app swaps in `cues::global()`.
+    cues: Arc<crate::cues::CueControl>,
     /// `GraphPub::show_steps` last followed.
     show_steps_seen: u64,
     /// `GraphPub::show_presses` last followed.
@@ -4638,6 +4642,8 @@ struct DemoApp {
     /// thread. The real app swaps in `clocksend::global()`; tests keep
     /// their own, so none of them touches another's or the user's.
     clock: Arc<crate::clocksend::ClockControl>,
+    /// MIDI Clock In (#401): following an external clock.
+    clock_in: Arc<crate::clockin::ClockInControl>,
     /// External agents: when the bridge last heard one and whether the user
     /// paused them. The real app swaps in `bridge::remote()`, like the clock.
     remote: Arc<crate::bridge::Remote>,
@@ -4969,6 +4975,7 @@ impl DemoApp {
             show_sent: crate::show::ShowSent::default(),
             macros: Vec::new(),
             macros_sent: crate::macros::MacrosSent::default(),
+            cues: crate::cues::CueControl::new(),
             show_steps_seen: 0,
             show_presses_seen: [0; crate::show::ShowAction::ALL.len()],
             tuner_on: false,
@@ -5178,6 +5185,7 @@ impl DemoApp {
             rig_snapshot: Arc::new(Mutex::new(crate::control::RigSnapshot::default())),
             graph_pub: None,
             clock: crate::clocksend::ClockControl::new(),
+            clock_in: crate::clockin::ClockInControl::new(),
             remote: Arc::default(),
             last_graph_rev: 0,
             player_ctrl: None,
@@ -7492,6 +7500,7 @@ impl DemoApp {
                 args.get("session").and_then(|v| v.as_str()).unwrap_or("session")
             ),
             "set_show_control" => "Show control".into(),
+            "set_cues" => "Show cues".into(),
             "set_level" => match args.get("level").and_then(|v| v.as_str()) {
                 Some(l) => format!("Level · {l}"),
                 None => "Set level".into(),
@@ -9654,6 +9663,9 @@ impl DemoApp {
         if let Some(pos) = moved {
             self.setlist_edit_song = Some(pos.song);
             self.apply_setlist_part();
+            if let Some(i) = self.setlist.active_index() {
+                self.cues.enter(i);
+            }
             self.sync_setlist_window();
             self.announce_if_unloaded_jump(pos.song, was_ready_before);
         }
@@ -9667,6 +9679,9 @@ impl DemoApp {
             .ok_or_else(|| format!("song {song} part {part} is out of range"))?;
         self.setlist_edit_song = Some(pos.song);
         self.apply_setlist_part();
+        if let Some(i) = self.setlist.active_index() {
+            self.cues.enter(i);
+        }
         self.sync_setlist_window();
         self.announce_if_unloaded_jump(pos.song, was_ready);
         Ok(pos)
@@ -9819,6 +9834,9 @@ impl DemoApp {
                 }
                 part.buses = crate::setlist::part_buses(item, &graph)?;
                 part.scene = crate::setlist::part_scene(item, &graph)?;
+                if let Some(c) = item.get("cues") {
+                    part.cues = crate::setlist::cue_lines_of(c)?;
+                }
                 if item.get("capture_knobs").and_then(|v| v.as_bool()).unwrap_or(false) {
                     let (params, plugin_params, fx) = self.capture_part_state(&part.rigs);
                     part.params = params;
@@ -9881,7 +9899,7 @@ impl DemoApp {
                 }
             }
             if let Some(parts) = parsed_parts {
-                self.setlist.songs[idx].parts = parts;
+                self.setlist.replace_parts(idx, parts);
             }
             if let Some(to) = args.get("move_to").and_then(|v| v.as_u64()).map(|n| n as usize) {
                 if to >= self.setlist.songs.len() { return Err(format!("move_to {to} is out of range")); }
@@ -9953,6 +9971,7 @@ impl DemoApp {
     /// Send the engine what changed of the setlist's show controls, parts
     /// and active part (#261).
     fn publish_show(&mut self) {
+        self.cues.publish(&self.setlist);
         let Some(bus) = &self.bus else { return };
         let mut b = bus.lock().unwrap_or_else(|e| e.into_inner());
         self.show_sent.publish(&self.setlist, |cmd| b.send(cmd));
@@ -11893,6 +11912,23 @@ impl DemoApp {
                 }
                 Err(e) => format!("error: {e}"),
             },
+            "get_cues" => {
+                let mut v = self.setlist.cues_json();
+                v["output"] = self.cues.status_json();
+                v.to_string()
+            }
+            "set_cues" => match self.setlist.set_cues(args) {
+                Ok(cues) => {
+                    if args.get("test").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        self.cues.fire(cues);
+                    }
+                    self.publish_show();
+                    let mut v = self.setlist.cues_json();
+                    v["output"] = self.cues.status_json();
+                    v.to_string()
+                }
+                Err(e) => format!("error: {e}"),
+            },
             "get_midi_clock" => self.midi_clock_json().to_string(),
             "set_midi_clock" => match self.set_midi_clock(args) {
                 Ok(json) => {
@@ -13403,6 +13439,33 @@ impl DemoApp {
                     edits.push(serde_json::json!({"offset_ms": cfg.offset_ms + delta}));
                 }
             }
+        });
+        ui.add_space(6.0);
+        // MIDI Clock In (#401): follow an external clock.
+        let fcfg = self.clock_in.config();
+        let fstats = self.clock_in.stats();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if theme::wrapped_chip_button(ui, if fcfg.enabled { "FOLLOW ON" } else { "FOLLOW OFF" }, fcfg.enabled)
+                .on_hover_text("lock tempo, Start/Stop and position to an external MIDI clock (not while sending)")
+                .clicked() {
+                edits.push(serde_json::json!({"follow": !fcfg.enabled}));
+            }
+            for key in &fstats.inputs {
+                let short = key.rsplit_once(':').map_or(key.as_str(), |(_, p)| p);
+                let on = fcfg.input.as_deref() == Some(key.as_str());
+                if theme::wrapped_chip_button(ui, short, on).on_hover_text(key.as_str()).clicked() {
+                    edits.push(serde_json::json!({"input": if on { "" } else { key.as_str() }}));
+                }
+            }
+            let state = if !fcfg.enabled {
+                "or connect an app to \"kabelsalat: Clock In\"".to_string()
+            } else if fstats.locked {
+                format!("locked · {:.1} BPM · {:+.1} ms", fstats.bpm_in, fstats.error_ms)
+            } else {
+                "waiting for a clock".to_string()
+            };
+            ui.label(egui::RichText::new(state).size(11.0).color(if fcfg.enabled && fstats.locked { theme::LIVE_TEAL } else { theme::INK_2 }));
         });
         ui.add_space(8.0);
 
@@ -20648,6 +20711,7 @@ impl DemoApp {
                             song.notes.clear();
                             *notes_open = None;
                         }
+                        cue_editor::cue_chip(ui, ("song", si), "this song", &song.cues);
                     });
                     if *notes_open == Some(si) {
                         ui.add_space(4.0);
@@ -20673,6 +20737,7 @@ impl DemoApp {
                                     });
                             });
                     }
+                    cue_editor::cue_body(ui, ("song", si), &mut song.cues);
                     ui.add_space(8.0);
 
                     // Add part row
@@ -20753,6 +20818,7 @@ impl DemoApp {
                                             {
                                                 *capture_knobs_for = Some((si, pi));
                                             }
+                                            cue_editor::cue_chip(ui, ("part", si, pi), "this part", &part.cues);
                                             if knob_count > 0
                                                 && theme::wrapped_chip_button(ui, "Clear knobs", false)
                                                     .on_hover_text("Clear saved knob/bypass overrides on this part")
@@ -20782,6 +20848,7 @@ impl DemoApp {
                                                 }
                                             }
                                         });
+                                        cue_editor::cue_body(ui, ("part", si, pi), &mut part.cues);
                                         ui.add_space(6.0);
                                         for (ri, rname) in rig_names.iter().enumerate() {
                                             let r_u8 = ri as u8;
@@ -28122,6 +28189,12 @@ impl DemoApp {
         }
     }
 
+    fn save_midi_clock_in(&self) {
+        if let Ok(v) = serde_json::to_value(self.clock_in.config()) {
+            let _ = crate::assistant::save_config_value("midi_clock_in", v);
+        }
+    }
+
     /// The clock as `get_midi_clock` reports it: settings, every MIDI out
     /// port (wired or not), the always-present virtual port and counters.
     fn midi_clock_json(&self) -> serde_json::Value {
@@ -28143,6 +28216,7 @@ impl DemoApp {
             "net_offset_ms": self.clock.net_offset_ms(),
             "virtual_port": "kabelsalat: MIDI Clock",
             "outputs": ports,
+            "follow": self.clock_in.status_json(),
             "ticks_sent": stats.ticks,
             "starts_sent": stats.starts,
             "alsa": if stats.alsa.is_empty() { "ok" } else { stats.alsa },
@@ -28186,9 +28260,26 @@ impl DemoApp {
             Some(name) => Some((self.clock_port_key(name)?, args.get("output_enabled").and_then(|v| v.as_bool()).unwrap_or(true))),
             None => None,
         };
+        let mut follow = args.get("follow").and_then(|v| v.as_bool());
+        // Sending takes over from following: two masters would chase each other.
+        if cfg.enabled && follow.is_none() && self.clock_in.config().enabled {
+            follow = Some(false);
+        }
+        let input = match args.get("input").and_then(|v| v.as_str()) {
+            Some("") => Some(None),
+            Some(name) => Some(Some(self.clock_in.input_key(name)?)),
+            None => None,
+        };
+        if follow == Some(true) && cfg.enabled {
+            return Err("MIDI clock send and follow cannot both be on: two masters would chase each other".into());
+        }
         self.clock.set_config(cfg);
         if let Some((key, on)) = wiring { self.clock.set_wired(&key, on); }
         self.save_midi_clock();
+        if follow.is_some() || input.is_some() {
+            self.clock_in.set(follow, input);
+            self.save_midi_clock_in();
+        }
         Ok(self.midi_clock_json().to_string())
     }
 
@@ -37790,6 +37881,9 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // block; the clock thread schedules ticks from it (never per UI frame).
     let clock_pos = crate::clocksend::ClockPos::new();
     engine.set_clock_pos(clock_pos.clone());
+    // Show cues (#401): the parts a foot switch steps to reach the cue thread
+    // through a lock-free ring, never through a UI frame.
+    engine.set_cue_steps(crate::cues::global().engine_ring());
     // System-audio capture: other apps' streams (e.g. YouTube), one reader
     // each, never our own output (#27). Muted by default (gain 0); the
     // audio-out scan thread starts readers once the gain comes up.
@@ -38071,8 +38165,13 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                         // MIDI clock send: attach the engine and start the
                         // thread (it owns the ALSA sequencer client).
                         let clock = crate::clocksend::global();
+                        let clock_pos_in = clock_pos.clone();
                         clock.set_engine(clock_pos, bus.clone());
                         crate::clocksend::spawn_clock_thread(clock);
+                        let clock_in = crate::clockin::global();
+                        clock_in.set_engine(clock_pos_in, bus.clone());
+                        crate::clockin::spawn_clockin_thread(clock_in);
+                        crate::cues::spawn_cue_thread(crate::cues::global());
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
                         // socket is unavailable the app just runs without it.
@@ -38161,6 +38260,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.clock = crate::clocksend::global();
+                    app.clock_in = crate::clockin::global();
+                    app.cues = crate::cues::global();
                     app.remote = crate::bridge::remote();
                     app.player_ctrl = Some(player_ctrl);
                     app.player_retire_rx = Some(player_retire_rx);

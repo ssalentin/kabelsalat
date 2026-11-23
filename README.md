@@ -189,6 +189,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   → [Controllers](docs/GUIDE.md#control-knobs-and-the-mixer-from-your-controller)
 - **Metronome in any time signature**, and MIDI clock out to drum machines.
   → [Metre](docs/GUIDE.md#count-in-any-metre), [Clock](docs/GUIDE.md#be-the-clock)
+- **Follow a hardware clock** (tempo, Start/Stop, position) and **send MIDI/OSC
+  cues per song and part** to lighting and gear.
+  → [Follow](docs/GUIDE.md#follow-another-clock), [Cues](docs/GUIDE.md#send-lighting-lyric-and-gear-cues)
 
 **Engine and assistant**
 - **See the load per unit** and fix crackles with **Audio Doctor**.

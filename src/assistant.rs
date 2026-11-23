@@ -1427,14 +1427,24 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["next_song","prev_song","next_part","prev_part","panic","tap_tempo","tuner","master_mute","backing_track","record","song_of_program"]},"cc":{"type":"integer"},"note":{"type":["integer","string"]},"program":{"type":"integer"},"device":{"type":"integer"},"clear":{"type":"boolean"},"on":{"type":"boolean"}},"required":["action"]}
         }},
         {"type":"function","function":{
+            "name":"get_cues",
+            "description":"Read the show cues: the messages (MIDI program change / CC / note, OSC) each song and each part sends when the setlist enters it, as lines like \"pc 1 5\", plus what was sent so far and whether MIDI output is available.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_cues",
+            "description":"Replace the cues of a song (song = 0-based index) or of one of its parts (also part = 0-based index); cues is an array of lines, [] or null clears. Lines: \"pc <channel 1-16> <program 0-127>\", \"cc <channel> <controller> <value>\", \"note <channel> <note or name like C3> [velocity]\" (each may end in \"@<part of a MIDI out port name>\" to use one port; default every MIDI out port and the virtual port 'kabelsalat: Show Cues'), \"osc <host>:<port> </address> [args: numbers, true/false, \"quoted text\"]\". Entering a song sends its cues, then its part's; a part inside the same song sends only the part's. Loading a session or editing sends nothing. test: true also sends the cues now.",
+            "parameters":{"type":"object","properties":{"song":{"type":"integer"},"part":{"type":"integer"},"cues":{"type":["array","null"],"items":{"type":"string"}},"test":{"type":"boolean"}},"required":["song"]}
+        }},
+        {"type":"function","function":{
             "name":"get_midi_clock",
             "description":"Read the MIDI Clock Send: whether kabelsalat sends MIDI beat clock (24 per beat) plus Start/Stop to external gear and apps, the sync offset, latency mode, song position pointer, every MIDI out port (live, wired) and the virtual port apps can subscribe to.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_midi_clock",
-            "description":"Configure the MIDI Clock Send (kabelsalat is the master clock). enabled: send clock/Start/Stop with the transport. offset_ms: shift the clock against the audio (negative = earlier; a pre-roll is added automatically at play). latency_mode: none (align to the audio output) | output (also include the sound device's output latency, for gear mixed outside kabelsalat) | input (align to the audio input, for gear fed back into kabelsalat). song_position: send Song Position Pointer + Continue when resuming. output + output_enabled: wire the clock to (or unplug it from) one MIDI out port, named as in get_midi_clock (a part of the name is enough). Starts with the next transport start.",
-            "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"offset_ms":{"type":"number"},"latency_mode":{"type":"string","enum":["none","output","input"]},"song_position":{"type":"boolean"},"output":{"type":"string"},"output_enabled":{"type":"boolean"}}}
+            "description":"Configure the MIDI Clock Send (kabelsalat is the master clock). enabled: send clock/Start/Stop with the transport. offset_ms: shift the clock against the audio (negative = earlier; a pre-roll is added automatically at play). latency_mode: none (align to the audio output) | output (also include the sound device's output latency, for gear mixed outside kabelsalat) | input (align to the audio input, for gear fed back into kabelsalat). song_position: send Song Position Pointer + Continue when resuming. output + output_enabled: wire the clock to (or unplug it from) one MIDI out port, named as in get_midi_clock (a part of the name is enough). Starts with the next transport start. follow: true makes kabelsalat the follower instead (MIDI Clock In): the tempo, Start/Continue/Stop and the song position lock to an external clock (a drum machine, a DAW), and input names the MIDI in port to follow (part of a name from get_midi_clock follow.inputs; \"\" clears; apps can also connect to the virtual port 'kabelsalat: Clock In'). Sending and following are never both on.",
+            "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"offset_ms":{"type":"number"},"latency_mode":{"type":"string","enum":["none","output","input"]},"song_position":{"type":"boolean"},"output":{"type":"string"},"output_enabled":{"type":"boolean"},"follow":{"type":"boolean"},"input":{"type":"string"}}}
         }},
         {"type":"function","function":{
             "name":"load_template",

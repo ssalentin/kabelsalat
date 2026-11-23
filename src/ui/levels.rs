@@ -178,7 +178,7 @@ impl DemoApp {
                     egui::Frame::new()
                         .fill(theme::DARK_PANEL_HI)
                         .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                        .corner_radius(6.0)
+                        .corner_radius(theme::RADIUS_CARD)
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -188,16 +188,16 @@ impl DemoApp {
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing.x = 3.0;
-                                    if theme::chip_button(ui, "×", false).on_hover_text("remove the set (its songs stay)").clicked() {
+                                    if theme::ghost_icon_chip(ui, "×", false).on_hover_text("remove the set (its songs stay)").clicked() {
                                         edits.push(SetEdit::Remove(id));
                                     }
-                                    if can_down && theme::chip_button(ui, "↓", false).on_hover_text("move the set down").clicked() {
+                                    if can_down && theme::ghost_icon_chip(ui, "↓", false).on_hover_text("move the set down").clicked() {
                                         edits.push(SetEdit::Move(id, false));
                                     }
-                                    if can_up && theme::chip_button(ui, "↑", false).on_hover_text("move the set up").clicked() {
+                                    if can_up && theme::ghost_icon_chip(ui, "↑", false).on_hover_text("move the set up").clicked() {
                                         edits.push(SetEdit::Move(id, true));
                                     }
-                                    if theme::chip_button(ui, "Skip", skip).on_hover_text("stepping jumps over this set's songs").clicked() {
+                                    if theme::live_toggle_chip(ui, "Skip", skip).on_hover_text("stepping jumps over this set's songs").clicked() {
                                         edits.push(SetEdit::Skip(id, !skip));
                                     }
                                 });
@@ -211,7 +211,7 @@ impl DemoApp {
                                         continue;
                                     }
                                     let label = format!("{}. {}", si + 1, song.name);
-                                    if theme::wrapped_chip_button(ui, &label, on).on_hover_text(if on { "take out of the set" } else { "put into the set" }).clicked() {
+                                    if theme::wrapped_live_toggle_chip(ui, &label, on).on_hover_text(if on { "take out of the set" } else { "put into the set" }).clicked() {
                                         edits.push(SetEdit::Member(id, si, !on));
                                     }
                                 }

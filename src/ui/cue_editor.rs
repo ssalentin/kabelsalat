@@ -53,7 +53,7 @@ pub(super) fn cue_chip(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::D
         (false, 0) => "+ Cues".to_string(),
         (false, n) => format!("Cues ({n}) ▾"),
     };
-    if theme::wrapped_chip_button(ui, &lbl, buf.open || n > 0)
+    if theme::wrapped_live_toggle_chip(ui, &lbl, buf.open || n > 0)
         .on_hover_text(format!("MIDI and OSC messages sent when the setlist enters {who}"))
         .clicked()
     {
@@ -71,7 +71,7 @@ pub(super) fn cue_body(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::D
         egui::Frame::new()
             .fill(theme::PAPER_SINK)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-            .corner_radius(6.0)
+            .corner_radius(theme::RADIUS_CARD)
             .inner_margin(egui::Margin::same(6))
             .show(ui, |ui| {
                 ui.add(

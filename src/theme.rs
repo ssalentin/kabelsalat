@@ -477,11 +477,48 @@ pub fn tracked_label(ui: &mut egui::Ui, text: &str, size: f32, tracking_em: f32,
     resp
 }
 
-/// Section label for egui chrome: uppercase, 10px, tracked +0.14em, INK_2.
+/// Strict 3-tier Hurricane corner radius scale (shape scarcity):
+/// - `RADIUS_CONTROL` (2px): buttons, chips, segmented controls, badges, inputs.
+/// - `RADIUS_CARD` (4px): cards, nested frames, popovers, menus, tooltips, modals.
+/// - `RADIUS_SHEET` (28px): stage hero sheets and overlays (chassis uses 36px).
+pub const RADIUS_CONTROL: f32 = 2.0;
+pub const RADIUS_CARD: f32 = 4.0;
+pub const RADIUS_SHEET: f32 = 28.0;
+/// Standard single-row chrome control height.
+pub const CONTROL_H: f32 = 26.0;
 /// Horizontal text padding of `primary_button`.
 pub const PRIMARY_PAD_X: f32 = 12.0;
 /// Horizontal text padding of `chip_button` and `danger_button` (12.5px text).
 pub const CHIP_PAD_X: f32 = 10.0;
+/// Standard horizontal padding inside a [`segmented_item`].
+pub const SEGMENT_PAD_X: f32 = 10.0;
+/// Inner padding of [`segmented_tray`].
+pub const SEGMENT_TRAY_PAD: f32 = 2.0;
+/// Gap between items inside [`segmented_tray`].
+pub const SEGMENT_GAP: f32 = 2.0;
+
+/// Which interior edge of a docked panel gets a 1px [`HAIRLINE`] divider.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PanelEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Draw a single 1px [`HAIRLINE`] along one interior edge of a docked panel
+/// (replacing 4-sided frame strokes that double up along outer window edges).
+pub fn paint_panel_edge(painter: &egui::Painter, rect: Rect, edge: PanelEdge) {
+    let s = Stroke::new(1.0, HAIRLINE);
+    let [a, b] = match edge {
+        PanelEdge::Top => [Pos2::new(rect.left(), rect.top() + 0.5), Pos2::new(rect.right(), rect.top() + 0.5)],
+        PanelEdge::Bottom => [Pos2::new(rect.left(), rect.bottom() - 0.5), Pos2::new(rect.right(), rect.bottom() - 0.5)],
+        PanelEdge::Left => [Pos2::new(rect.left() + 0.5, rect.top()), Pos2::new(rect.left() + 0.5, rect.bottom())],
+        PanelEdge::Right => [Pos2::new(rect.right() - 0.5, rect.top()), Pos2::new(rect.right() - 0.5, rect.bottom())],
+    };
+    painter.line_segment([a, b], s);
+}
 
 /// Width `primary_button` takes for `text`.
 pub fn primary_button_width(ui: &egui::Ui, text: &str) -> f32 {
@@ -491,6 +528,28 @@ pub fn primary_button_width(ui: &egui::Ui, text: &str) -> f32 {
 /// Width `chip_button` or `danger_button` takes for `text`.
 pub fn chip_button_width(ui: &egui::Ui, text: &str) -> f32 {
     button_text_width(ui, egui::RichText::new(text).size(12.5)) + CHIP_PAD_X * 2.0
+}
+
+/// Width one [`segmented_item`] takes for `text` with `font` and `pad_x`.
+pub fn segmented_item_width(ui: &egui::Ui, text: &str, font: FontId, pad_x: f32) -> f32 {
+    (ui.painter().layout_no_wrap(text.to_owned(), font, CREAM).size().x + pad_x * 2.0).ceil()
+}
+
+/// Exact outer width of a [`segmented_tray`] containing segments of `item_widths`.
+pub fn segmented_tray_width(item_widths: &[f32]) -> f32 {
+    if item_widths.is_empty() {
+        return 0.0;
+    }
+    SEGMENT_TRAY_PAD * 2.0
+        + item_widths.iter().sum::<f32>()
+        + SEGMENT_GAP * (item_widths.len() - 1) as f32
+}
+
+fn wrap_if_needed(ui: &mut egui::Ui, width: f32) {
+    let left_of_line = ui.max_rect().right() - ui.cursor().min.x;
+    if left_of_line < width && ui.cursor().min.x > ui.max_rect().left() + 0.5 {
+        ui.end_row();
+    }
 }
 
 fn button_text_width(ui: &egui::Ui, text: egui::RichText) -> f32 {
@@ -504,15 +563,90 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
     tracked_label(ui, &text.to_uppercase(), 10.0, 0.14, INK_2)
 }
 
-/// Primary action button (Send, Load, Add, Capture): ACCENT_DEEP fill,
-/// ON_ACCENT text (5.32:1), near-sharp sheet radius, no border; hover darkens.
+/// Visual contrast mode of a [`segmented_item`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SegmentStyle {
+    /// Primary top-bar workspace navigation (`CHIP_ON` cream plate for active).
+    Primary,
+    /// Secondary sub-tabs/filters (`DARK_PANEL_HI` raised plate, never tomato).
+    Quiet,
+}
+
+/// Single-bordered recessed tray (`PAPER_SINK` + 1px `HAIRLINE`) holding
+/// borderless [`segmented_item`] controls without double outer strokes.
+pub fn segmented_tray<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+    egui::Frame::new()
+        .fill(PAPER_SINK)
+        .stroke(Stroke::new(1.0, HAIRLINE))
+        .corner_radius(RADIUS_CONTROL)
+        .inner_margin(egui::Margin::same(SEGMENT_TRAY_PAD as i8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SEGMENT_GAP;
+                add(ui)
+            })
+            .inner
+        })
+}
+
+/// One clickable segment inside a [`segmented_tray`].
+pub fn segmented_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    height: f32,
+    font: FontId,
+    active: bool,
+    style: SegmentStyle,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hov = resp.hovered();
+        let (fill, stroke, txt) = match (active, style) {
+            (true, SegmentStyle::Primary) => (
+                if hov { mix(CHIP_ON, DARK_PANEL, 0.08) } else { CHIP_ON },
+                None,
+                DARK_PANEL,
+            ),
+            (true, SegmentStyle::Quiet) => (
+                mix(DARK_PANEL_HI, CREAM, if hov { 0.12 } else { 0.08 }),
+                Some(mix(HAIRLINE, CREAM, 0.22)),
+                INK,
+            ),
+            (false, _) => (
+                if hov { mix(PAPER_SINK, CREAM, 0.06) } else { Color32::TRANSPARENT },
+                None,
+                if hov { CREAM } else { CREAM_MID },
+            ),
+        };
+        let p = ui.painter();
+        if fill != Color32::TRANSPARENT {
+            p.rect_filled(rect, RADIUS_CONTROL, fill);
+        }
+        if let Some(sc) = stroke {
+            p.rect_stroke(rect, RADIUS_CONTROL, Stroke::new(1.0, sc), egui::StrokeKind::Inside);
+        }
+        let max_w = (rect.width() - 6.0).max(12.0);
+        let mut job = egui::text::LayoutJob::simple_singleline(label.to_owned(), font, txt);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(max_w);
+        let g = ui.fonts_mut(|f| f.layout_job(job));
+        p.galley(rect.center() - g.size() * 0.5, g, txt);
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// Primary action button (Send, Load, Add, Install, Save): ACCENT_DEEP fill,
+/// ON_ACCENT text (5.32:1), sharp 2px radius, no border; hover darkens.
 pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.scope(|ui| {
         let base = egui::style::WidgetVisuals {
             bg_fill: ACCENT_DEEP,
             weak_bg_fill: ACCENT_DEEP,
             bg_stroke: Stroke::NONE,
-            corner_radius: 2.0.into(),
+            corner_radius: RADIUS_CONTROL.into(),
             fg_stroke: Stroke::new(1.0, ON_ACCENT),
             expansion: 0.0,
         };
@@ -527,46 +661,45 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         v.widgets.active = hot;
         v.widgets.open = base;
         ui.spacing_mut().button_padding = egui::vec2(PRIMARY_PAD_X, 5.0);
-        ui.add(egui::Button::new(egui::RichText::new(text).color(ON_ACCENT)).corner_radius(2.0).min_size(egui::vec2(0.0, 26.0)))
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).color(ON_ACCENT))
+                .corner_radius(RADIUS_CONTROL)
+                .min_size(egui::vec2(0.0, CONTROL_H)),
+        )
     }).inner
 }
 
-/// Real button chip (user request 2026-11-15: buttons, not underlined text).
-/// On/active = cream fill + near-black text; off = raised dark chip with a
-/// hairline. Tomato stays reserved for the flip CTA, selection and primary
-/// actions — a row of engaged chips reads calm, not alarming. Text color is
-/// driven by the widget visuals so hover feedback applies.
-/// `chip_button` inside a `horizontal_wrapped` row. The chip's own scope
-/// only gets the rest of the current line, so it never wraps by itself: it
-/// overflowed the row and widened everything below. Start the next line
-/// first when the chip would not fit.
+/// Wrapped helper matching [`chip_button`] for `horizontal_wrapped` rows (rule 169).
 pub fn wrapped_chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
-    // In a wrapping layout `available_width` is the whole row, not what is
-    // left of the line.
-    let left_of_line = ui.max_rect().right() - ui.cursor().min.x;
-    if left_of_line < chip_button_width(ui, text) && ui.cursor().min.x > ui.max_rect().left() + 0.5 {
-        ui.end_row();
-    }
+    wrap_if_needed(ui, chip_button_width(ui, text));
     chip_button(ui, text, on)
 }
 
-pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+#[derive(Clone, Copy)]
+struct StyledButtonColors {
+    fill: Color32,
+    hot_fill: Color32,
+    stroke: Stroke,
+    hot_stroke: Stroke,
+    text: Color32,
+    hot_text: Color32,
+}
+
+fn styled_chip_button(ui: &mut egui::Ui, text: &str, colors: StyledButtonColors, height: f32) -> egui::Response {
     ui.scope(|ui| {
-        let (fill, txt) = if on { (CHIP_ON, DARK_PANEL) } else { (DARK_PANEL_HI, CREAM) };
         let base = egui::style::WidgetVisuals {
-            bg_fill: fill,
-            weak_bg_fill: fill,
-            bg_stroke: Stroke::new(1.0, if on { CHIP_ON } else { HAIRLINE }),
-            corner_radius: 2.0.into(),
-            fg_stroke: Stroke::new(1.0, txt),
+            bg_fill: colors.fill,
+            weak_bg_fill: colors.fill,
+            bg_stroke: colors.stroke,
+            corner_radius: RADIUS_CONTROL.into(),
+            fg_stroke: Stroke::new(1.0, colors.text),
             expansion: 0.0,
         };
-        let hot_fill = if on { mix(CHIP_ON, DARK_PANEL, 0.10) } else { mix(DARK_PANEL_HI, CREAM, 0.07) };
         let hot = egui::style::WidgetVisuals {
-            bg_fill: hot_fill,
-            weak_bg_fill: hot_fill,
-            bg_stroke: Stroke::new(1.0, if on { hot_fill } else { MUTED }),
-            fg_stroke: Stroke::new(1.0, if on { DARK_PANEL } else { CREAM }),
+            bg_fill: colors.hot_fill,
+            weak_bg_fill: colors.hot_fill,
+            bg_stroke: colors.hot_stroke,
+            fg_stroke: Stroke::new(1.0, colors.hot_text),
             ..base
         };
         let v = ui.visuals_mut();
@@ -574,16 +707,150 @@ pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
         v.widgets.hovered = hot;
         v.widgets.active = hot;
         v.widgets.open = base;
-        // Breathing room: boxed text never touches the chip edge (rule 7).
         ui.spacing_mut().button_padding = egui::vec2(CHIP_PAD_X, 5.0);
-        // Explicit text color: visuals.override_text_color would otherwise
-        // force cream on the cream ON-fill (invisible label).
         ui.add(
-            egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
-                .corner_radius(2.0)
-                .min_size(egui::vec2(0.0, 26.0)),
+            egui::Button::new(egui::RichText::new(text).size(12.5).color(colors.text))
+                .corner_radius(RADIUS_CONTROL)
+                .min_size(egui::vec2(0.0, height)),
         )
     }).inner
+}
+
+pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    let (fill, hot_fill, stroke, hot_stroke, text_col, hot_text) = if on {
+        let hf = mix(CHIP_ON, DARK_PANEL, 0.10);
+        (CHIP_ON, hf, Stroke::new(1.0, CHIP_ON), Stroke::new(1.0, hf), DARK_PANEL, DARK_PANEL)
+    } else {
+        let hf = mix(DARK_PANEL_HI, CREAM, 0.07);
+        (DARK_PANEL_HI, hf, Stroke::new(1.0, HAIRLINE), Stroke::new(1.0, MUTED), CREAM, CREAM)
+    };
+    styled_chip_button(ui, text, StyledButtonColors { fill, hot_fill, stroke, hot_stroke, text: text_col, hot_text }, CONTROL_H)
+}
+
+/// Calm secondary filter chip: borderless at rest, subtle raised plate when active.
+pub fn quiet_filter_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    let colors = if on {
+        StyledButtonColors {
+            fill: mix(DARK_PANEL_HI, CREAM, 0.09),
+            hot_fill: mix(DARK_PANEL_HI, CREAM, 0.13),
+            stroke: Stroke::new(1.0, mix(HAIRLINE, CREAM, 0.22)),
+            hot_stroke: Stroke::new(1.0, MUTED),
+            text: INK,
+            hot_text: INK,
+        }
+    } else {
+        StyledButtonColors {
+            fill: Color32::TRANSPARENT,
+            hot_fill: DARK_PANEL_HI,
+            stroke: Stroke::NONE,
+            hot_stroke: Stroke::new(1.0, HAIRLINE),
+            text: CREAM_DIM,
+            hot_text: CREAM,
+        }
+    };
+    styled_chip_button(ui, text, colors, 24.0)
+}
+
+/// Wrapped variant of [`quiet_filter_chip`] (rule 169).
+pub fn wrapped_quiet_filter_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    wrap_if_needed(ui, chip_button_width(ui, text));
+    quiet_filter_chip(ui, text, on)
+}
+
+/// Category navigation filter chip: borderless at rest, high-contrast `CHIP_ON`
+/// cream pill only for the selected category (avoids a grid of inactive boxes).
+pub fn nav_filter_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    if on {
+        return chip_button(ui, text, true);
+    }
+    styled_chip_button(
+        ui,
+        text,
+        StyledButtonColors {
+            fill: Color32::TRANSPARENT,
+            hot_fill: DARK_PANEL_HI,
+            stroke: Stroke::NONE,
+            hot_stroke: Stroke::new(1.0, HAIRLINE),
+            text: CREAM_MID,
+            hot_text: CREAM,
+        },
+        CONTROL_H,
+    )
+}
+
+/// Wrapped variant of [`nav_filter_chip`] (rule 169).
+pub fn wrapped_nav_filter_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    wrap_if_needed(ui, chip_button_width(ui, text));
+    nav_filter_chip(ui, text, on)
+}
+
+/// Calm engaged boolean toggle: subtle bordered chip when off, muted `LIVE_TEAL`
+/// surface + border when active so views with many engaged toggles stay restful.
+pub fn live_toggle_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    let colors = if on {
+        StyledButtonColors {
+            fill: mix(DARK_PANEL_HI, LIVE_TEAL, 0.17),
+            hot_fill: mix(DARK_PANEL_HI, LIVE_TEAL, 0.24),
+            stroke: Stroke::new(1.0, alpha(LIVE_TEAL, 0.72)),
+            hot_stroke: Stroke::new(1.0, LIVE_TEAL),
+            text: INK,
+            hot_text: INK,
+        }
+    } else {
+        StyledButtonColors {
+            fill: DARK_PANEL,
+            hot_fill: DARK_PANEL_HI,
+            stroke: Stroke::new(1.0, HAIRLINE),
+            hot_stroke: Stroke::new(1.0, MUTED),
+            text: CREAM_DIM,
+            hot_text: CREAM,
+        }
+    };
+    styled_chip_button(ui, text, colors, CONTROL_H)
+}
+
+/// Wrapped variant of [`live_toggle_chip`] (rule 169).
+pub fn wrapped_live_toggle_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    wrap_if_needed(ui, chip_button_width(ui, text));
+    live_toggle_chip(ui, text, on)
+}
+
+/// Quiet utility icon button (`↑`, `↓`, `×`): borderless at rest, elevates on hover.
+pub fn ghost_icon_chip(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    if on {
+        return chip_button(ui, text, true);
+    }
+    styled_chip_button(
+        ui,
+        text,
+        StyledButtonColors {
+            fill: Color32::TRANSPARENT,
+            hot_fill: DARK_PANEL_HI,
+            stroke: Stroke::NONE,
+            hot_stroke: Stroke::new(1.0, HAIRLINE),
+            text: CREAM_DIM,
+            hot_text: CREAM,
+        },
+        CONTROL_H,
+    )
+}
+
+/// Accent-outlined action button for repeated card CTAs (matches [`add_rig_button`]):
+/// spares solid tomato for singular primary CTAs while clearly signaling the primary card action.
+pub fn accent_outline_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    styled_chip_button(
+        ui,
+        text,
+        StyledButtonColors {
+            fill: DARK_PANEL,
+            hot_fill: alpha(ACCENT, 0.16),
+            stroke: Stroke::new(1.0, mix(HAIRLINE, ACCENT, 0.48)),
+            hot_stroke: Stroke::new(1.0, ACCENT),
+            text: CREAM,
+            hot_text: INK,
+        },
+        CONTROL_H,
+    )
 }
 
 /// Destructive action button (Delete, Confirm delete): outlined uses
@@ -600,7 +867,7 @@ pub fn danger_button(ui: &mut egui::Ui, text: &str, filled: bool) -> egui::Respo
             bg_fill: fill,
             weak_bg_fill: fill,
             bg_stroke: Stroke::new(1.0, stroke),
-            corner_radius: 2.0.into(),
+            corner_radius: RADIUS_CONTROL.into(),
             fg_stroke: Stroke::new(1.0, txt),
             expansion: 0.0,
         };
@@ -623,8 +890,8 @@ pub fn danger_button(ui: &mut egui::Ui, text: &str, filled: bool) -> egui::Respo
         ui.spacing_mut().button_padding = egui::vec2(CHIP_PAD_X, 5.0);
         ui.add(
             egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
-                .corner_radius(2.0)
-                .min_size(egui::vec2(0.0, 26.0)),
+                .corner_radius(RADIUS_CONTROL)
+                .min_size(egui::vec2(0.0, CONTROL_H)),
         )
     })
     .inner
@@ -640,7 +907,7 @@ pub fn add_rig_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
             bg_fill: DARK_PANEL_HI,
             weak_bg_fill: DARK_PANEL_HI,
             bg_stroke: Stroke::new(1.0, base_stroke),
-            corner_radius: 2.0.into(),
+            corner_radius: RADIUS_CONTROL.into(),
             fg_stroke: Stroke::new(1.0, CREAM),
             expansion: 0.0,
         };
@@ -679,8 +946,8 @@ pub fn add_rig_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         );
         ui.add(
             egui::Button::new(job)
-                .corner_radius(2.0)
-                .min_size(egui::vec2(0.0, 26.0)),
+                .corner_radius(RADIUS_CONTROL)
+                .min_size(egui::vec2(0.0, CONTROL_H)),
         )
     }).inner
 }
@@ -697,7 +964,7 @@ pub fn visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();
     v.panel_fill = PAPER;
     v.window_fill = PAPER;
-    v.window_corner_radius = 4.0.into();
+    v.window_corner_radius = RADIUS_CARD.into();
     v.window_stroke = Stroke::new(1.0, HAIRLINE);
     v.window_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: alpha(Color32::BLACK, 0.45) };
     v.popup_shadow = egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: alpha(Color32::BLACK, 0.40) };
@@ -711,7 +978,7 @@ pub fn visuals() -> egui::Visuals {
     v.error_fg_color = CLIP_BRIGHT;
     v.interact_cursor = Some(egui::CursorIcon::PointingHand);
 
-    let r = 2.0;
+    let r = RADIUS_CONTROL;
     v.widgets.noninteractive.bg_fill = PAPER;
     v.widgets.noninteractive.weak_bg_fill = PAPER;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
@@ -989,7 +1256,7 @@ pub fn dropdown_popup_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(DARK_PANEL)
         .stroke(Stroke::new(1.0, HAIRLINE))
-        .corner_radius(4.0)
+        .corner_radius(RADIUS_CARD)
         .inner_margin(egui::Margin::same(6))
         .shadow(egui::Shadow {
             offset: [0, 6],
@@ -1009,9 +1276,32 @@ impl DropdownMenu<'_> {
     /// One selectable row. Selected rows show a `LIVE_TEAL` dot and raised
     /// `DARK_PANEL_HI` plate (tomato stays reserved for rack selection/CTAs).
     pub fn item(&mut self, selected: bool, label: &str) -> bool {
+        self.row_inner(selected, true, false, label)
+    }
+
+    /// Context-menu / dropdown item with an enabled flag (dimmed when disabled).
+    pub fn item_enabled(&mut self, selected: bool, enabled: bool, label: &str) -> bool {
+        self.row_inner(selected, enabled, false, label)
+    }
+
+    /// Destructive context-menu item (`CLIP_BRIGHT` text, `DANGER_BG` hover).
+    pub fn danger_item(&mut self, enabled: bool, label: &str) -> bool {
+        self.row_inner(false, enabled, true, label)
+    }
+
+    /// Thin 1px horizontal divider inside a dropdown or context menu.
+    pub fn separator(&mut self) {
+        self.ui.add_space(2.0);
+        let w = self.ui.available_width().max(1.0);
+        let (r, _) = self.ui.allocate_exact_size(Vec2::new(w, 1.0), egui::Sense::hover());
+        self.ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, HAIRLINE));
+        self.ui.add_space(2.0);
+    }
+
+    fn row_inner(&mut self, selected: bool, enabled: bool, danger: bool, label: &str) -> bool {
         let pad_x = 8.0;
         let pad_y = 4.0;
-        let mark_w = 14.0;
+        let mark_w = if selected { 14.0 } else { 0.0 };
         let row_w = self.ui.available_width().max(120.0);
         let max_text_w = (row_w - pad_x * 2.0 - mark_w).max(20.0);
         let font = if selected {
@@ -1019,16 +1309,24 @@ impl DropdownMenu<'_> {
         } else {
             FontId::proportional(self.text_size)
         };
-        let mut job = egui::text::LayoutJob::simple_singleline(label.to_owned(), font, CREAM);
+        let txt_col = if !enabled {
+            MUTED
+        } else if danger {
+            CLIP_BRIGHT
+        } else {
+            CREAM
+        };
+        let mut job = egui::text::LayoutJob::simple_singleline(label.to_owned(), font, txt_col);
         job.wrap = egui::text::TextWrapping::truncate_at_width(max_text_w);
         let galley = self.ui.fonts_mut(|f| f.layout_job(job));
         let elided = galley.elided;
         let row_h = (galley.size().y + pad_y * 2.0).max(24.0);
-        let (rect, mut resp) = self.ui.allocate_exact_size(Vec2::new(row_w, row_h), egui::Sense::click());
+        let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+        let (rect, mut resp) = self.ui.allocate_exact_size(Vec2::new(row_w, row_h), sense);
         if self.ui.is_rect_visible(rect) {
-            let hovered = resp.hovered();
+            let hovered = enabled && resp.hovered();
             let fill = if hovered {
-                mix(DARK_PANEL_HI, CREAM, 0.08)
+                if danger { DANGER_BG } else { mix(DARK_PANEL_HI, CREAM, 0.08) }
             } else if selected {
                 DARK_PANEL_HI
             } else {
@@ -1036,21 +1334,21 @@ impl DropdownMenu<'_> {
             };
             let painter = self.ui.painter();
             if fill != Color32::TRANSPARENT {
-                painter.rect_filled(rect, 2.0, fill);
+                painter.rect_filled(rect, RADIUS_CONTROL, fill);
             }
             if selected && !hovered {
-                painter.rect_stroke(rect, 2.0, Stroke::new(1.0, HAIRLINE), egui::StrokeKind::Inside);
+                painter.rect_stroke(rect, RADIUS_CONTROL, Stroke::new(1.0, HAIRLINE), egui::StrokeKind::Inside);
             }
             if selected {
                 painter.circle_filled(Pos2::new(rect.left() + pad_x + 4.0, rect.center().y), 3.0, LIVE_TEAL);
             }
             let text_pos = Pos2::new(rect.left() + pad_x + mark_w, rect.center().y - galley.size().y * 0.5);
-            painter.galley(text_pos, galley, CREAM);
+            painter.galley(text_pos, galley, txt_col);
         }
         if elided {
             resp = resp.on_hover_text(label);
         }
-        resp.clicked()
+        enabled && resp.clicked()
     }
 
     /// Muted informational row (e.g. filter hint or empty state).
@@ -1675,5 +1973,15 @@ mod tests {
         step(&mut selected, vec![egui::Event::PointerButton { pos: gamma_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
         assert_eq!(selected, 2);
         assert!(!egui::Popup::is_any_open(&ctx));
+    }
+
+    #[test]
+    fn segmented_tray_width_matches_items_gaps_and_margins() {
+        assert_eq!(segmented_tray_width(&[]), 0.0);
+        assert_eq!(segmented_tray_width(&[40.0]), SEGMENT_TRAY_PAD * 2.0 + 40.0);
+        assert_eq!(
+            segmented_tray_width(&[40.0, 60.0]),
+            SEGMENT_TRAY_PAD * 2.0 + 40.0 + SEGMENT_GAP + 60.0
+        );
     }
 }

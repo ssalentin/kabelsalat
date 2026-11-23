@@ -2002,17 +2002,9 @@ pub(crate) fn sentence_case(s: &str) -> String {
         .join(" ")
 }
 
-/// Real chip toggle (user request 2026-11-15: buttons, not underlined text).
-/// On = near-black chip + cream text; off = recessed paper chip + hairline.
-fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
-    theme::chip_button(ui, name, on).clicked()
-}
-
-/// Nav item as a real button chip (§4.14, updated 2026-11-15): active/open =
-/// near-black fill + cream text; closed = recessed paper chip. No underlines.
-
-fn nav_button(ui: &mut egui::Ui, name: &str, view: StageView, active: bool) -> bool {
-    let tip = match view {
+/// Hover shortcut hint for a workspace view tab in the top bar.
+fn view_tooltip(view: StageView) -> &'static str {
+    match view {
         StageView::Rack => "Rack · key Tab",
         StageView::Mixer => "Mixer · key M",
         StageView::Matrix => "Matrix · key N",
@@ -2020,11 +2012,9 @@ fn nav_button(ui: &mut egui::Ui, name: &str, view: StageView, active: bool) -> b
         StageView::Plugins => "Plugins · key B",
         StageView::Settings => "Settings · key ,",
         StageView::Sessions => "Sessions",
-    };
-    theme::chip_button(ui, name, active).on_hover_text(tip).clicked()
+    }
 }
 
-/// 1px hairline vertical rule between nav items (§4.14).
 /// Open a folder in the desktop's file manager (detached; never in tests).
 fn open_folder(dir: &std::path::Path) {
     if cfg!(test) { return; } // tests never touch the user's folders (rule 37)
@@ -2033,6 +2023,7 @@ fn open_folder(dir: &std::path::Path) {
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
 }
 
+/// 1px hairline vertical rule between top-bar clusters (§4.14).
 fn nav_separator(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
     ui.painter().line_segment(
@@ -2041,30 +2032,29 @@ fn nav_separator(ui: &mut egui::Ui) {
     );
 }
 
-/// Top-bar Left Rail toggle icon (`◧`, key Q): vector-drawn so it never depends
-/// on OS font glyphs. Filled `CHIP_ON` when the rail is open.
+/// Flat-at-rest chrome shell for top-bar icon buttons: transparent until hovered
+/// (`DARK_PANEL_HI` + `HAIRLINE`), or `CHIP_ON` cream plate when toggled active.
+fn paint_toolbar_icon_shell(ui: &egui::Ui, rect: Rect, hov: bool, active: bool) -> Color32 {
+    let p = ui.painter();
+    if active {
+        let fill = if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON };
+        p.rect_filled(rect, theme::RADIUS_CONTROL, fill);
+        theme::DARK_PANEL
+    } else if hov {
+        p.rect_filled(rect, theme::RADIUS_CONTROL, theme::DARK_PANEL_HI);
+        p.rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+        theme::CREAM
+    } else {
+        theme::CREAM_MID
+    }
+}
+
+/// Top-bar Left Rail toggle icon (key Q): vector-drawn so it never depends on OS font glyphs.
 fn rail_toggle_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, theme::CONTROL_H), egui::Sense::click());
     if ui.is_rect_visible(rect) {
-        let hov = resp.hovered();
-        let fill = if open {
-            if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON }
-        } else if hov {
-            theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07)
-        } else {
-            theme::DARK_PANEL_HI
-        };
-        let stroke = if open {
-            theme::CHIP_ON
-        } else if hov {
-            theme::MUTED
-        } else {
-            theme::HAIRLINE
-        };
-        let fg = if open { theme::DARK_PANEL } else if hov { theme::CREAM } else { theme::CREAM_MID };
+        let fg = paint_toolbar_icon_shell(ui, rect, resp.hovered(), open);
         let p = ui.painter();
-        p.rect_filled(rect, 2.0, fill);
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
         let box_r = Rect::from_center_size(rect.center(), egui::vec2(13.0, 10.0));
         if open {
             let strip = Rect::from_min_max(box_r.min, Pos2::new(box_r.left() + 4.5, box_r.bottom()));
@@ -2083,27 +2073,10 @@ fn rail_toggle_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
 /// Top-bar Settings gear icon button (key `,`): monochrome vector gear so it
 /// matches Hurricane's flat chrome on every platform.
 fn settings_icon_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, theme::CONTROL_H), egui::Sense::click());
     if ui.is_rect_visible(rect) {
-        let hov = resp.hovered();
-        let fill = if active {
-            if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON }
-        } else if hov {
-            theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07)
-        } else {
-            theme::DARK_PANEL_HI
-        };
-        let stroke = if active {
-            theme::CHIP_ON
-        } else if hov {
-            theme::MUTED
-        } else {
-            theme::HAIRLINE
-        };
-        let fg = if active { theme::DARK_PANEL } else if hov { theme::CREAM } else { theme::CREAM_MID };
+        let fg = paint_toolbar_icon_shell(ui, rect, resp.hovered(), active);
         let p = ui.painter();
-        p.rect_filled(rect, 2.0, fill);
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
         let c = rect.center();
         p.circle_stroke(c, 2.7, Stroke::new(1.35, fg));
         for k in 0..8 {
@@ -2116,42 +2089,30 @@ fn settings_icon_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
     resp
 }
 
-/// Top-bar Rack Edit Lock padlock icon button (Ctrl+L): monochrome vector
-/// padlock so it matches Hurricane's flat chrome on every platform. Filled
-/// `CHIP_ON` with a closed shackle when locked, dark with an open shackle
-/// when unlocked.
+/// Top-bar Rack Edit Lock padlock icon button (Ctrl+L): quiet vector open padlock
+/// at rest, warm amber caution surface with closed shackle when locked.
 fn rack_lock_button(ui: &mut egui::Ui, locked: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, theme::CONTROL_H), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
-        let fill = if locked {
-            if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON }
-        } else if hov {
-            theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07)
-        } else {
-            theme::DARK_PANEL_HI
-        };
-        let stroke = if locked {
+        let fg = if locked {
+            let p = ui.painter();
+            let fill = theme::alpha(theme::CABLE_AMBER, if hov { 0.24 } else { 0.16 });
+            p.rect_filled(rect, theme::RADIUS_CONTROL, fill);
+            p.rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, theme::CABLE_AMBER), egui::StrokeKind::Inside);
             theme::CABLE_AMBER
-        } else if hov {
-            theme::MUTED
         } else {
-            theme::HAIRLINE
+            paint_toolbar_icon_shell(ui, rect, hov, false)
         };
-        let fg = if locked { theme::DARK_PANEL } else if hov { theme::CREAM } else { theme::CREAM_MID };
         let p = ui.painter();
-        p.rect_filled(rect, 2.0, fill);
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
         let c = rect.center();
-        // Padlock body.
         let body = Rect::from_center_size(c + Vec2::new(0.0, 2.5), egui::vec2(10.0, 7.2));
         if locked {
             p.rect_filled(body, 1.5, fg);
-            p.circle_filled(body.center(), 1.25, fill);
+            p.circle_filled(body.center(), 1.25, theme::mix(theme::PAPER, theme::CABLE_AMBER, 0.16));
         } else {
             p.rect_stroke(body, 1.5, Stroke::new(1.35, fg), egui::StrokeKind::Inside);
         }
-        // Padlock shackle arch.
         let r = 3.0_f32;
         let arch_cx = if locked { c.x } else { c.x + 1.5 };
         let arch_cy = body.top() - 1.2;
@@ -2176,8 +2137,8 @@ fn rack_lock_button(ui: &mut egui::Ui, locked: bool) -> egui::Response {
     resp
 }
 
-/// Top-bar Session document pill (`● <name> ▾`): always shows the active
-/// session and autosave state; clicking toggles the anchored Session popover.
+/// Top-bar Session document breadcrumb (`● <name> ⌄`): flat at rest to keep
+/// header chrome quiet, elevating with a 1px hairline on hover or when open.
 fn session_pill_button(
     ui: &mut egui::Ui,
     name: &str,
@@ -2186,40 +2147,40 @@ fn session_pill_button(
     max_w: f32,
 ) -> egui::Response {
     let font = theme::medium_font(12.0);
-    let label_max = (max_w - 38.0).max(24.0);
+    let label_max = (max_w - 36.0).max(24.0);
     let galley = DemoApp::ellipsized(ui.painter(), name, font, theme::CREAM, label_max);
-    let w = (galley.size().x + 38.0).clamp(68.0, max_w.max(68.0));
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+    let w = (galley.size().x + 36.0).clamp(62.0, max_w.max(62.0));
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, theme::CONTROL_H), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
-        let fill = if open || hov { theme::DARK_PANEL_HI } else { theme::DARK_PANEL };
-        let stroke = if open { theme::ACCENT } else if hov { theme::MUTED } else { theme::HAIRLINE };
         let p = ui.painter();
-        p.rect_filled(rect, 2.0, fill);
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-        let dot_c = Pos2::new(rect.left() + 10.0, rect.center().y);
+        if open || hov {
+            let fill = if open { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.08) } else { theme::DARK_PANEL_HI };
+            let stroke = if open { theme::HAIRLINE_DARK } else { theme::HAIRLINE };
+            p.rect_filled(rect, theme::RADIUS_CONTROL, fill);
+            p.rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        }
+        let dot_c = Pos2::new(rect.left() + 9.0, rect.center().y);
         let dot_col = if saved_clean { theme::LIVE_TEAL } else { theme::CABLE_AMBER };
         p.circle_filled(dot_c, 3.0, dot_col);
-        p.galley(Pos2::new(rect.left() + 18.0, rect.center().y - galley.size().y * 0.5), galley, theme::CREAM);
-        let cc = Pos2::new(rect.right() - 8.5, rect.center().y);
+        p.galley(Pos2::new(rect.left() + 17.0, rect.center().y - galley.size().y * 0.5), galley, theme::CREAM);
+        // Stroked vector chevron matching theme::Dropdown.
+        let cx = rect.right() - 9.0;
+        let cy = rect.center().y;
+        let dy = if open { 1.6 } else { -1.6 };
         let ccol = if open || hov { theme::CREAM } else { theme::CREAM_DIM };
-        let pts = if open {
-            vec![cc + Vec2::new(-3.0, 1.5), cc + Vec2::new(3.0, 1.5), cc + Vec2::new(0.0, -2.0)]
-        } else {
-            vec![cc + Vec2::new(-3.0, -1.5), cc + Vec2::new(3.0, -1.5), cc + Vec2::new(0.0, 2.0)]
-        };
-        p.add(egui::Shape::convex_polygon(pts, ccol, Stroke::NONE));
+        let s = Stroke::new(1.35, ccol);
+        p.line_segment([Pos2::new(cx - 3.2, cy + dy), Pos2::new(cx, cy - dy)], s);
+        p.line_segment([Pos2::new(cx, cy - dy), Pos2::new(cx + 3.2, cy + dy)], s);
     }
     if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
     resp
 }
 
 /// Compact inline rig pill for the top bar when the Left Rail is closed:
-/// active rig shows `N · Name` + a live teal meter bar; inactive rigs show a
-/// compact numbered pill (`2`) with a bottom horizontal teal meter bar while
-/// sounding. When a setlist is active (`zone_live = Some(live)`), a single
-/// top-right dot shows whether the rig is live in the current part (teal) or
-/// out of song (muted, with a recessed inactive pill).
+/// active rig matches the Left Rail (`DARK_PANEL_HI` + 2.5px `ACCENT` left bar)
+/// so it never competes with active workspace tabs; inactive numbered pills
+/// stay quiet until hovered or sounding (`LIVE_TEAL` bottom bar).
 fn inline_rig_pill(
     ui: &mut egui::Ui,
     rig: usize,
@@ -2236,7 +2197,7 @@ fn inline_rig_pill(
         let text = format!("{} · {name}", rig + 1);
         let meter_slot = 22.0;
         let max_text = (max_active_w - 16.0 - meter_slot).max(24.0);
-        let g = DemoApp::ellipsized(ui.painter(), &text, font, theme::DARK_PANEL, max_text);
+        let g = DemoApp::ellipsized(ui.painter(), &text, font, theme::CREAM, max_text);
         let w = (g.size().x + 16.0 + meter_slot).clamp(56.0, max_active_w.max(56.0));
         (g, w)
     } else {
@@ -2245,27 +2206,27 @@ fn inline_rig_pill(
         let w = (g.size().x + 16.0).max(26.0);
         (g, w)
     };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, theme::CONTROL_H), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
         let fill = if active {
-            if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON }
-        } else if out_of_song {
-            if hov { theme::DARK_PANEL_HI } else { theme::PAPER_SINK }
+            if hov { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.06) } else { theme::DARK_PANEL_HI }
         } else if hov {
-            theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07)
-        } else {
             theme::DARK_PANEL_HI
+        } else if out_of_song {
+            theme::PAPER_SINK
+        } else {
+            Color32::TRANSPARENT
         };
         let stroke = if active {
-            theme::CHIP_ON
-        } else if hov {
-            theme::MUTED
+            Some(if hov { theme::CREAM_DIM } else { theme::MUTED })
+        } else if hov || out_of_song {
+            Some(theme::HAIRLINE)
         } else {
-            theme::HAIRLINE
+            None
         };
         let fg = if active {
-            theme::DARK_PANEL
+            theme::CREAM
         } else if out_of_song {
             if hov { theme::CREAM_MID } else { theme::MUTED }
         } else if hov {
@@ -2274,15 +2235,26 @@ fn inline_rig_pill(
             theme::CREAM_MID
         };
         let p = ui.painter();
-        p.rect_filled(rect, 2.0, fill);
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        if fill != Color32::TRANSPARENT {
+            p.rect_filled(rect, theme::RADIUS_CONTROL, fill);
+        }
+        if let Some(sc) = stroke {
+            p.rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, sc), egui::StrokeKind::Inside);
+        }
+        if active {
+            let bar = Rect::from_min_size(
+                Pos2::new(rect.left() + 1.0, rect.top() + 4.0),
+                egui::vec2(2.5, rect.height() - 8.0),
+            );
+            p.rect_filled(bar, 1.0, theme::ACCENT);
+        }
         if agent_alpha > 0.01 {
             p.rect_stroke(rect.expand(1.5), 3.0, Stroke::new(1.5, theme::alpha(theme::AGENT_COLOR, agent_alpha)), egui::StrokeKind::Outside);
         }
         if active {
             p.galley(Pos2::new(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5), galley, fg);
-            let mr = Rect::from_min_size(Pos2::new(rect.right() - 22.0, rect.center().y - 1.5), egui::vec2(15.0, 3.0));
-            p.rect_filled(mr, 1.0, theme::alpha(theme::DARK_PANEL, 0.25));
+            let mr = Rect::from_min_size(Pos2::new(rect.right() - 21.0, rect.center().y - 1.5), egui::vec2(14.0, 3.0));
+            p.rect_filled(mr, 1.0, theme::METER_TRACK);
             let mw = mr.width() * level.clamp(0.0, 1.0);
             if mw > 0.5 {
                 p.rect_filled(Rect::from_min_size(mr.min, egui::vec2(mw, 3.0)), 1.0, theme::LIVE_TEAL);
@@ -2309,19 +2281,25 @@ fn inline_rig_pill(
     resp
 }
 
-/// Compact `+` accent-outlined button for adding a rig from the collapsed top bar.
+/// Compact `+` button for adding a rig from the collapsed top bar (flat at rest,
+/// `ACCENT_BRIGHT` `+` glyph matching `theme::add_rig_button`).
 fn compact_add_rig_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, theme::CONTROL_H), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let hov = resp.hovered();
-        let fill = if hov { theme::alpha(theme::ACCENT, 0.16) } else { theme::DARK_PANEL_HI };
-        let stroke = if hov { theme::ACCENT } else { theme::ACCENT_DEEP };
         let p = ui.painter();
-        p.rect_filled(rect, 2.0, fill);
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        if hov {
+            p.rect_filled(rect, theme::RADIUS_CONTROL, theme::alpha(theme::ACCENT, 0.14));
+            p.rect_stroke(
+                rect,
+                theme::RADIUS_CONTROL,
+                Stroke::new(1.0, theme::mix(theme::HAIRLINE, theme::ACCENT, 0.55)),
+                egui::StrokeKind::Inside,
+            );
+        }
         let c = rect.center();
-        p.line_segment([c + Vec2::new(-4.0, 0.0), c + Vec2::new(4.0, 0.0)], Stroke::new(1.5, theme::CREAM));
-        p.line_segment([c + Vec2::new(0.0, -4.0), c + Vec2::new(0.0, 4.0)], Stroke::new(1.5, theme::CREAM));
+        p.line_segment([c + Vec2::new(-4.0, 0.0), c + Vec2::new(4.0, 0.0)], Stroke::new(1.5, theme::ACCENT_BRIGHT));
+        p.line_segment([c + Vec2::new(0.0, -4.0), c + Vec2::new(0.0, 4.0)], Stroke::new(1.5, theme::ACCENT_BRIGHT));
     }
     if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
     resp
@@ -2332,7 +2310,7 @@ fn paint_nav_more(ui: &egui::Ui, rect: Rect, active: bool, hov: bool) {
     if ui.is_rect_visible(rect) {
         let p = ui.painter();
         if active || hov {
-            p.rect_filled(rect, 2.0, theme::DARK_PANEL_HI);
+            p.rect_filled(rect, theme::RADIUS_CONTROL, theme::DARK_PANEL_HI);
         }
         let col = if active || hov { theme::CREAM } else { theme::CREAM_DIM };
         let c = rect.center();
@@ -2351,8 +2329,8 @@ fn nav_more_button(ui: &mut egui::Ui, rect: Rect, id: egui::Id, active: bool) ->
     resp
 }
 
-/// Per-rig demo phrase ▶ / ■ button in the Left Rail (#200), painted from the
-/// Hurricane palette. Disabled when the rig has no instrument.
+/// Per-rig demo phrase ▶ / ■ button in the Left Rail (#200), flat at rest
+/// and raised on hover/playing to match the Hurricane palette.
 fn paint_nav_demo_button(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -2363,18 +2341,22 @@ fn paint_nav_demo_button(
     if ui.is_rect_visible(rect) {
         let hov = enabled && hovered;
         let (fill, stroke, fg) = if !enabled {
-            (theme::PAPER_SINK, theme::HAIRLINE, theme::MUTED)
+            (Color32::TRANSPARENT, None, theme::MUTED)
         } else if playing {
             let f = if hov { theme::mix(theme::CHIP_ON, theme::INK, 0.08) } else { theme::CHIP_ON };
-            (f, f, theme::DARK_PANEL)
+            (f, None, theme::DARK_PANEL)
         } else if hov {
-            (theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::MUTED, theme::CREAM)
+            (theme::DARK_PANEL_HI, Some(theme::HAIRLINE), theme::CREAM)
         } else {
-            (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID)
+            (Color32::TRANSPARENT, None, theme::CREAM_MID)
         };
         let p = ui.painter();
-        p.rect_filled(rect, 2.0, fill);
-        p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        if fill != Color32::TRANSPARENT {
+            p.rect_filled(rect, theme::RADIUS_CONTROL, fill);
+        }
+        if let Some(sc) = stroke {
+            p.rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, sc), egui::StrokeKind::Inside);
+        }
         let sym = if playing { "■" } else { "▶" };
         let g = p.layout_no_wrap(sym.into(), theme::medium_font(9.5), fg);
         p.galley(rect.center() - g.size() * 0.5, g, fg);
@@ -2582,7 +2564,8 @@ struct DspChip {
 }
 
 impl DspChip {
-    const GAP: f32 = 6.0;
+    const GAP: f32 = 5.0;
+    const PAD_X: f32 = 8.0;
 }
 
 /// The REC menu's retrospective item: its label, and whether it can save.
@@ -2604,50 +2587,64 @@ fn retro_save_item(status: &crate::record::RecordStatus) -> (String, bool) {
     (format!("Save the last {}:{:02}", s / 60, s % 60), retro.kept_seconds > 0.0)
 }
 
-fn rec_chip(ui: &mut egui::Ui, recording: bool, pending: bool, secs: f64) -> egui::Response {
-    let (fill, stroke, txt) = if recording {
-        (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::ON_ACCENT)
-    } else if pending {
-        (theme::DARK_PANEL_HI, theme::ACCENT_DEEP, theme::CREAM)
-    } else {
-        (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID)
-    };
-    let dot = if recording { "●" } else if pending { "◐" } else { "○" };
-    let label = if recording && pending {
-        format!("{dot} REC {}:{:02} · BAR", (secs as u64) / 60, (secs as u64) % 60)
+/// Layout helpers for [`rec_chip`]: vector-painted circle/dot prevents OS
+/// fallback tofu while keeping the exact `"REC..."` label test-discoverable.
+fn rec_chip_label(recording: bool, pending: bool, secs: f64) -> String {
+    if recording && pending {
+        format!("REC {}:{:02} · BAR", (secs as u64) / 60, (secs as u64) % 60)
     } else if recording {
-        format!("{dot} REC {}:{:02}", (secs as u64) / 60, (secs as u64) % 60)
+        format!("REC {}:{:02}", (secs as u64) / 60, (secs as u64) % 60)
     } else if pending {
-        format!("{dot} REC · BAR")
+        "REC · BAR".to_string()
     } else {
-        format!("{dot} REC")
-    };
-    ui.scope(|ui| {
-        let base = egui::style::WidgetVisuals {
-            bg_fill: fill,
-            weak_bg_fill: fill,
-            bg_stroke: Stroke::new(1.0, stroke),
-            corner_radius: 2.0.into(),
-            fg_stroke: Stroke::new(1.0, txt),
-            expansion: 0.0,
+        "REC".to_string()
+    }
+}
+
+fn rec_chip_width(ui: &egui::Ui, label: &str, recording: bool) -> f32 {
+    let font = if recording { FontId::monospace(11.5) } else { theme::medium_font(12.0) };
+    let tw = ui.painter().layout_no_wrap(label.to_owned(), font, theme::CREAM).size().x;
+    (tw + 28.0).ceil()
+}
+
+fn rec_chip(ui: &mut egui::Ui, recording: bool, pending: bool, secs: f64) -> egui::Response {
+    let label = rec_chip_label(recording, pending, secs);
+    let font = if recording { FontId::monospace(11.5) } else { theme::medium_font(12.0) };
+    let w = rec_chip_width(ui, &label, recording);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, theme::CONTROL_H), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hov = resp.hovered();
+        let (fill, stroke, txt) = if recording {
+            let f = if hov { theme::mix(theme::ACCENT_DEEP, theme::INK, 0.08) } else { theme::ACCENT_DEEP };
+            (f, None, theme::ON_ACCENT)
+        } else if pending {
+            let f = if hov { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.06) } else { theme::DARK_PANEL_HI };
+            (f, Some(theme::ACCENT_DEEP), theme::CREAM)
+        } else if hov {
+            (theme::DARK_PANEL_HI, Some(theme::MUTED), theme::CREAM)
+        } else {
+            (theme::DARK_PANEL, Some(theme::HAIRLINE), theme::CREAM_MID)
         };
-        let hot = egui::style::WidgetVisuals {
-            bg_fill: if recording { theme::mix(theme::ACCENT_DEEP, theme::INK, 0.08) } else { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07) },
-            weak_bg_fill: fill,
-            ..base
-        };
-        let v = ui.visuals_mut();
-        v.widgets.inactive = base;
-        v.widgets.hovered = hot;
-        v.widgets.active = hot;
-        v.widgets.open = base;
-        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
-        ui.add(
-            egui::Button::new(egui::RichText::new(label).size(12.5).color(txt))
-                .corner_radius(2.0)
-                .min_size(egui::vec2(0.0, 26.0)),
-        )
-    }).inner
+        let p = ui.painter();
+        p.rect_filled(rect, theme::RADIUS_CONTROL, fill);
+        if let Some(sc) = stroke {
+            p.rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, sc), egui::StrokeKind::Inside);
+        }
+        let dot_c = Pos2::new(rect.left() + 10.5, rect.center().y);
+        if recording {
+            p.circle_filled(dot_c, 3.6, theme::ON_ACCENT);
+        } else if pending {
+            p.circle_stroke(dot_c, 3.6, Stroke::new(1.25, theme::ACCENT_BRIGHT));
+            p.circle_filled(dot_c, 1.8, theme::ACCENT_BRIGHT);
+        } else {
+            let ring_col = if hov { theme::ACCENT_BRIGHT } else { theme::CREAM_DIM };
+            p.circle_stroke(dot_c, 3.5, Stroke::new(1.25, ring_col));
+        }
+        let g = p.layout_no_wrap(label, font, txt);
+        p.galley(Pos2::new(rect.left() + 19.0, rect.center().y - g.size().y * 0.5), g, txt);
+    }
+    if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+    resp
 }
 
 /// Build a rack unit from a control-plane node. The face (jacks + knobs) is
@@ -12691,8 +12688,8 @@ impl DemoApp {
                     theme::section_label(ui, "Presets");
                     let current = self.lv2_preset_name.clone().unwrap_or_else(|| "Default".into());
                     ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
-                    ui.add_sized([ui.available_width(), 20.0],
-                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search presets…"));
+                    let filter_w = (ui.available_width() - 18.0).max(120.0);
+                    Self::recessed_input(ui, &mut self.sound_filter, filter_w, "search presets…");
                     let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
                     egui::ScrollArea::vertical().id_salt("lv2_preset_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
                         let mut shown = 0usize;
@@ -13262,7 +13259,7 @@ impl DemoApp {
             )
             .fill(theme::PAPER_SINK)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-            .corner_radius(3.0)
+            .corner_radius(theme::RADIUS_CONTROL)
             .min_size(egui::vec2(0.0, 22.0));
             let resp = ui.scope(|ui| {
                 ui.spacing_mut().button_padding = pad;
@@ -13284,7 +13281,7 @@ impl DemoApp {
             )
             .fill(theme::alpha(theme::CABLE_AMBER, 0.12))
             .stroke(Stroke::new(1.0, theme::alpha(theme::CABLE_AMBER, 0.55)))
-            .corner_radius(3.0)
+            .corner_radius(theme::RADIUS_CONTROL)
             .min_size(egui::vec2(0.0, 22.0));
             let resp = ui.scope(|ui| {
                 ui.spacing_mut().button_padding = pad;
@@ -13621,7 +13618,7 @@ impl DemoApp {
         let fstats = self.clock_in.stats();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if theme::wrapped_chip_button(ui, if fcfg.enabled { "FOLLOW ON" } else { "FOLLOW OFF" }, fcfg.enabled)
+            if theme::wrapped_live_toggle_chip(ui, if fcfg.enabled { "FOLLOW ON" } else { "FOLLOW OFF" }, fcfg.enabled)
                 .on_hover_text("lock tempo, Start/Stop and position to an external MIDI clock (not while sending)")
                 .clicked() {
                 edits.push(serde_json::json!({"follow": !fcfg.enabled}));
@@ -17045,47 +17042,44 @@ impl DemoApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .stroke(Stroke::NONE)
                     .inner_margin(egui::Margin::same(0)),
             )
             .show(root, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let full_w = ui.available_width().max(120.0);
 
                 // ── Top 2-tab rail header: RIGS (N) | LIBRARY ──
-                let (tabs_rect, _) = ui.allocate_exact_size(egui::vec2(full_w, 32.0), egui::Sense::hover());
-                ui.painter().rect_filled(tabs_rect, 0.0, theme::PAPER_SINK);
-                ui.painter().line_segment(
-                    [tabs_rect.left_bottom(), tabs_rect.right_bottom()],
-                    Stroke::new(1.0, theme::HAIRLINE),
-                );
-                let half_w = (full_w * 0.5).floor();
-                let tab_specs = [
-                    (format!("RIGS ({rig_count})"), RailTab::Rigs, Rect::from_min_size(tabs_rect.min, egui::vec2(half_w, tabs_rect.height()))),
-                    ("LIBRARY".to_string(), RailTab::Library, Rect::from_min_max(Pos2::new(tabs_rect.left() + half_w, tabs_rect.top()), tabs_rect.max)),
-                ];
-                let tab_font = theme::medium_font(10.5);
-                for (ti, (label, tab, trect)) in tab_specs.into_iter().enumerate() {
-                    self.rail_tab_rects[ti] = trect;
-                    let on = self.rail_tab == tab;
-                    let tresp = ui.interact(trect, egui::Id::unique(("rail_tab", ti)), egui::Sense::click());
-                    let hov = tresp.hovered();
-                    if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                    if on {
-                        ui.painter().rect_filled(trect, 0.0, theme::PAPER);
-                        let ul = Rect::from_min_max(Pos2::new(trect.left(), trect.bottom() - 2.0), trect.max);
-                        ui.painter().rect_filled(ul, 0.0, theme::ACCENT);
-                    } else if hov {
-                        ui.painter().rect_filled(trect, 0.0, theme::DARK_PANEL_HI);
-                    }
-                    let col = if on { theme::CREAM } else if hov { theme::CREAM } else { theme::CREAM_MID };
-                    let g = Self::ellipsized(ui.painter(), &label, tab_font.clone(), col, (trect.width() - 8.0).max(16.0));
-                    ui.painter().galley(trect.center() - g.size() * 0.5, g, col);
-                    if tresp.clicked() {
-                        self.rail_tab = tab;
-                        self.nav_rig_menu = None;
-                    }
-                }
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(9, 7))
+                    .show(ui, |ui| {
+                        let inner_w = ui.available_width().max(120.0);
+                        let half_w = ((inner_w - theme::SEGMENT_TRAY_PAD * 2.0 - theme::SEGMENT_GAP) * 0.5).floor().max(40.0);
+                        let tab_font = theme::medium_font(10.5);
+                        let rig_lbl = format!("RIGS ({rig_count})");
+                        let tabs = [
+                            (rig_lbl.as_str(), RailTab::Rigs),
+                            ("LIBRARY", RailTab::Library),
+                        ];
+                        theme::segmented_tray(ui, |ui| {
+                            for (ti, (label, tab)) in tabs.into_iter().enumerate() {
+                                let tresp = theme::segmented_item(
+                                    ui,
+                                    label,
+                                    half_w,
+                                    22.0,
+                                    tab_font.clone(),
+                                    self.rail_tab == tab,
+                                    theme::SegmentStyle::Quiet,
+                                );
+                                self.rail_tab_rects[ti] = tresp.rect;
+                                if tresp.clicked() {
+                                    self.rail_tab = tab;
+                                    self.nav_rig_menu = None;
+                                }
+                            }
+                        });
+                    });
+                Self::stage_hairline(ui);
 
                 // ── Rail body (padded) ──
                 egui::Frame::new()
@@ -17108,10 +17102,13 @@ impl DemoApp {
                                             let (ar, aresp) = ui.allocate_exact_size(egui::vec2(add_w, 26.0), egui::Sense::click());
                                             let hov = aresp.hovered();
                                             let fill = if hov { theme::alpha(theme::ACCENT, 0.16) } else { theme::DARK_PANEL_HI };
-                                            let stroke = if hov { theme::ACCENT } else { theme::ACCENT_DEEP };
-                                            ui.painter().rect_filled(ar, 2.0, fill);
-                                            ui.painter().rect_stroke(ar, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-                                            let g = Self::ellipsized(ui.painter(), "+ Rig", theme::medium_font(12.0), theme::CREAM, (ar.width() - 8.0).max(16.0));
+                                            let stroke = if hov { theme::ACCENT } else { theme::mix(theme::HAIRLINE, theme::ACCENT, 0.45) };
+                                            ui.painter().rect_filled(ar, theme::RADIUS_CONTROL, fill);
+                                            ui.painter().rect_stroke(ar, theme::RADIUS_CONTROL, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+                                            let mut job = egui::text::LayoutJob::default();
+                                            job.append("+", 0.0, egui::TextFormat { font_id: theme::medium_font(12.5), color: theme::ACCENT_BRIGHT, ..Default::default() });
+                                            job.append(" Rig", 0.0, egui::TextFormat { font_id: theme::medium_font(12.0), color: theme::CREAM, ..Default::default() });
+                                            let g = ui.fonts_mut(|f| f.layout_job(job));
                                             ui.painter().galley(ar.center() - g.size() * 0.5, g, theme::CREAM);
                                             if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
                                             self.add_rig_rect = ar;
@@ -17130,55 +17127,35 @@ impl DemoApp {
                                 );
                                 ui.add_space(2.0);
 
-                                // Segmented filter: ALL | CHANNELS | PLUGINS (tomato for active).
-                                egui::Frame::new()
-                                    .fill(theme::PAPER_SINK)
-                                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                    .corner_radius(2.0)
-                                    .inner_margin(egui::Margin::same(2))
-                                    .show(ui, |ui| {
-                                        let inner_w = ui.available_width().max(120.0);
-                                        let segs = [
-                                            ("ALL", NavFilter::All),
-                                            ("CHANNELS", NavFilter::Channels),
-                                            ("PLUGINS", NavFilter::Plugins),
-                                        ];
-                                        let font = theme::medium_font(9.5);
-                                        let natural: Vec<f32> = segs.iter()
-                                            .map(|(lbl, _)| ui.painter().layout_no_wrap((*lbl).into(), font.clone(), theme::INK).size().x + 10.0)
-                                            .collect();
-                                        let sum: f32 = natural.iter().sum();
-                                        let extra = ((inner_w - sum).max(0.0)) / segs.len() as f32;
-                                        let widths: Vec<f32> = natural.iter().map(|w| (w + extra).floor()).collect();
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 2.0;
-                                            for (si, ((lbl, f), w)) in segs.iter().zip(widths).enumerate() {
-                                                let on = self.nav_filter == *f;
-                                                let (rect, resp) = ui.allocate_exact_size(egui::vec2((w - 1.5).max(24.0), 22.0), egui::Sense::click());
-                                                self.nav_filter_rects[si] = rect;
-                                                let hov = resp.hovered();
-                                                let fill = if on {
-                                                    theme::ACCENT_DEEP
-                                                } else if hov {
-                                                    theme::DARK_PANEL_HI
-                                                } else {
-                                                    Color32::TRANSPARENT
-                                                };
-                                                let txt = if on {
-                                                    theme::ON_ACCENT
-                                                } else if hov {
-                                                    theme::CREAM
-                                                } else {
-                                                    theme::CREAM_MID
-                                                };
-                                                ui.painter().rect_filled(rect, 2.0, fill);
-                                                let g = Self::ellipsized(ui.painter(), lbl, font.clone(), txt, (rect.width() - 4.0).max(12.0));
-                                                ui.painter().galley(rect.center() - g.size() * 0.5, g, txt);
-                                                if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                                                if resp.clicked() { self.nav_filter = *f; }
-                                            }
-                                        });
-                                    });
+                                // Segmented filter: ALL | CHANNELS | PLUGINS
+                                let segs = [
+                                    ("ALL", NavFilter::All),
+                                    ("CHANNELS", NavFilter::Channels),
+                                    ("PLUGINS", NavFilter::Plugins),
+                                ];
+                                let seg_font = theme::medium_font(9.5);
+                                let tray_inner_w = (body_w - theme::SEGMENT_TRAY_PAD * 2.0 - theme::SEGMENT_GAP * 2.0).max(80.0);
+                                let natural: Vec<f32> = segs.iter()
+                                    .map(|(lbl, _)| theme::segmented_item_width(ui, lbl, seg_font.clone(), 5.0))
+                                    .collect();
+                                let sum: f32 = natural.iter().sum();
+                                let extra = ((tray_inner_w - sum).max(0.0)) / segs.len() as f32;
+                                let widths: Vec<f32> = natural.iter().map(|w| (w + extra).floor().max(24.0)).collect();
+                                theme::segmented_tray(ui, |ui| {
+                                    for (si, ((lbl, f), w)) in segs.iter().zip(widths).enumerate() {
+                                        let resp = theme::segmented_item(
+                                            ui,
+                                            lbl,
+                                            w,
+                                            22.0,
+                                            seg_font.clone(),
+                                            self.nav_filter == *f,
+                                            theme::SegmentStyle::Quiet,
+                                        );
+                                        self.nav_filter_rects[si] = resp.rect;
+                                        if resp.clicked() { self.nav_filter = *f; }
+                                    }
+                                });
                                 ui.add_space(3.0);
                                 Self::stage_hairline(ui);
                                 ui.add_space(3.0);
@@ -17219,12 +17196,12 @@ impl DemoApp {
                                                     if body_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
 
                                                     if active {
-                                                        ui.painter().rect_filled(rect, 3.0, theme::DARK_PANEL);
-                                                        ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                                        ui.painter().rect_filled(rect, theme::RADIUS_CONTROL, theme::DARK_PANEL);
+                                                        ui.painter().rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                                                         let bar = Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 4.0), egui::vec2(2.5, rect.height() - 8.0));
                                                         ui.painter().rect_filled(bar, 1.0, theme::ACCENT);
                                                     } else if hov {
-                                                        ui.painter().rect_filled(rect, 3.0, theme::DARK_PANEL_HI);
+                                                        ui.painter().rect_filled(rect, theme::RADIUS_CONTROL, theme::DARK_PANEL_HI);
                                                     }
                                                     if agent_t > 0.01 {
                                                         ui.painter().rect_stroke(rect.expand(1.0), 3.0, Stroke::new(1.5, theme::alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Outside);
@@ -17336,8 +17313,8 @@ impl DemoApp {
                                                     } else {
                                                         theme::HAIRLINE
                                                     };
-                                                    ui.painter().rect_filled(rect, 3.0, fill);
-                                                    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                                    ui.painter().rect_filled(rect, theme::RADIUS_CONTROL, fill);
+                                                    ui.painter().rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, border), egui::StrokeKind::Inside);
                                                     if let Some(c) = color {
                                                         let spine = Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 3.0), egui::vec2(2.5, rect.height() - 6.0));
                                                         ui.painter().rect_filled(spine, 1.5, *c);
@@ -17384,8 +17361,8 @@ impl DemoApp {
                                                     if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
                                                     let fill = if hov { theme::DARK_PANEL_HI } else { theme::PAPER_SINK };
                                                     let border = if selected { theme::ACCENT } else { theme::HAIRLINE };
-                                                    ui.painter().rect_filled(rect, 3.0, fill);
-                                                    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                                    ui.painter().rect_filled(rect, theme::RADIUS_CONTROL, fill);
+                                                    ui.painter().rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, border), egui::StrokeKind::Inside);
                                                     let icon_c = Pos2::new(rect.left() + 10.0, rect.center().y);
                                                     let icon_col = if selected { theme::ACCENT } else if bypassed { theme::MUTED } else { theme::CREAM_MID };
                                                     match *kind_label {
@@ -17434,8 +17411,8 @@ impl DemoApp {
                                                 let hov = resp.hovered();
                                                 if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
                                                 let fill = if hov { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.06) } else { theme::DARK_PANEL_HI };
-                                                ui.painter().rect_filled(rect, 3.0, fill);
-                                                ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                                ui.painter().rect_filled(rect, theme::RADIUS_CONTROL, fill);
+                                                ui.painter().rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                                                 let spine = Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 3.0), egui::vec2(2.5, rect.height() - 6.0));
                                                 ui.painter().rect_filled(spine, 1.5, theme::LIVE_TEAL);
                                                 let g = Self::ellipsized(ui.painter(), &blabel, theme::medium_font(11.5), theme::CREAM, (rect.width() - 18.0).max(16.0));
@@ -17448,8 +17425,8 @@ impl DemoApp {
                                                     let prect = Rect::from_min_max(Pos2::new(slot.left() + 12.0, slot.top()), slot.max);
                                                     let presp = ui.interact(prect, egui::Id::unique(("nav_aux_plug", bnode, pnode)), egui::Sense::click());
                                                     if presp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                                                    ui.painter().rect_filled(prect, 2.5, if presp.hovered() { theme::DARK_PANEL_HI } else { theme::PAPER_SINK });
-                                                    ui.painter().rect_stroke(prect, 2.5, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                                    ui.painter().rect_filled(prect, theme::RADIUS_CONTROL, if presp.hovered() { theme::DARK_PANEL_HI } else { theme::PAPER_SINK });
+                                                    ui.painter().rect_stroke(prect, theme::RADIUS_CONTROL, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                                                     let kg = ui.painter().layout_no_wrap(kind_label.into(), FontId::proportional(9.0), theme::CREAM_DIM);
                                                     let kx = prect.right() - 7.0 - kg.size().x;
                                                     ui.painter().galley(Pos2::new(kx, prect.center().y - kg.size().y * 0.5), kg, theme::CREAM_DIM);
@@ -17463,48 +17440,37 @@ impl DemoApp {
                             }
                             RailTab::Library => {
                                 // Sub-tab switcher: SESSIONS | SETLISTS | RIGS | TEMPLATES
-                                egui::Frame::new()
-                                    .fill(theme::PAPER_SINK)
-                                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                    .corner_radius(2.0)
-                                    .inner_margin(egui::Margin::same(2))
-                                    .show(ui, |ui| {
-                                        let inner_w = ui.available_width().max(120.0);
-                                        let segs = [
-                                            ("SESSIONS", LibraryTab::Sessions),
-                                            ("SETLISTS", LibraryTab::Setlists),
-                                            ("RIGS", LibraryTab::Rigs),
-                                            ("TEMPLATES", LibraryTab::Templates),
-                                        ];
-                                        let font = theme::medium_font(9.0);
-                                        let gap = 2.0;
-                                        let avail = (inner_w - gap * (segs.len() as f32 - 1.0)).max(80.0);
-                                        let natural: Vec<f32> = segs.iter()
-                                            .map(|(lbl, _)| ui.painter().layout_no_wrap((*lbl).into(), font.clone(), theme::INK).size().x + 6.0)
-                                            .collect();
-                                        let sum: f32 = natural.iter().sum();
-                                        let scale = avail / sum.max(1.0);
-                                        let widths: Vec<f32> = natural.iter().map(|w| (w * scale).floor()).collect();
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = gap;
-                                            for ((lbl, lt), w) in segs.iter().zip(widths) {
-                                                let on = self.library_tab == *lt;
-                                                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w.max(20.0), 22.0), egui::Sense::click());
-                                                let hov = resp.hovered();
-                                                let fill = if on { theme::ACCENT_DEEP } else if hov { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT };
-                                                let txt = if on { theme::ON_ACCENT } else if hov { theme::CREAM } else { theme::CREAM_MID };
-                                                ui.painter().rect_filled(rect, 2.0, fill);
-                                                let g = Self::ellipsized(ui.painter(), lbl, font.clone(), txt, (rect.width() - 4.0).max(12.0));
-                                                ui.painter().galley(rect.center() - g.size() * 0.5, g, txt);
-                                                if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                                                if resp.clicked() {
-                                                    self.library_tab = *lt;
-                                                    self.confirm_session = None;
-                                                    self.confirm_setlist = None;
-                                                }
-                                            }
-                                        });
-                                    });
+                                let segs = [
+                                    ("SESSIONS", LibraryTab::Sessions),
+                                    ("SETLISTS", LibraryTab::Setlists),
+                                    ("RIGS", LibraryTab::Rigs),
+                                    ("TEMPLATES", LibraryTab::Templates),
+                                ];
+                                let lib_font = theme::medium_font(9.0);
+                                let tray_inner_w = (body_w - theme::SEGMENT_TRAY_PAD * 2.0 - theme::SEGMENT_GAP * 3.0).max(80.0);
+                                let natural: Vec<f32> = segs.iter()
+                                    .map(|(lbl, _)| theme::segmented_item_width(ui, lbl, lib_font.clone(), 3.0))
+                                    .collect();
+                                let sum: f32 = natural.iter().sum();
+                                let scale = tray_inner_w / sum.max(1.0);
+                                let widths: Vec<f32> = natural.iter().map(|w| (w * scale).floor().max(20.0)).collect();
+                                theme::segmented_tray(ui, |ui| {
+                                    for ((lbl, lt), w) in segs.iter().zip(widths) {
+                                        if theme::segmented_item(
+                                            ui,
+                                            lbl,
+                                            w,
+                                            22.0,
+                                            lib_font.clone(),
+                                            self.library_tab == *lt,
+                                            theme::SegmentStyle::Quiet,
+                                        ).clicked() {
+                                            self.library_tab = *lt;
+                                            self.confirm_session = None;
+                                            self.confirm_setlist = None;
+                                        }
+                                    }
+                                });
                                 ui.add_space(4.0);
 
                                 match self.library_tab {
@@ -17513,7 +17479,7 @@ impl DemoApp {
                                         egui::Frame::new()
                                             .fill(theme::PAPER_SINK)
                                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                            .corner_radius(3.0)
+                                            .corner_radius(theme::RADIUS_CARD)
                                             .inner_margin(egui::Margin::same(7))
                                             .show(ui, |ui| {
                                                 ui.spacing_mut().item_spacing.y = 5.0;
@@ -17593,11 +17559,15 @@ impl DemoApp {
                                                                     .truncate()
                                                                     .sense(egui::Sense::click()),
                                                                 );
-                                                                lbl.context_menu(|ui| {
-                                                                    if ui.button("Load").clicked() { load_session = Some(name.clone()); ui.close(); }
-                                                                    if ui.button("Overwrite with current…").clicked() { self.confirm_session = Some(SessionConfirm::Overwrite(name.clone())); ui.close(); }
-                                                                    if ui.button("Delete…").clicked() { self.confirm_session = Some(SessionConfirm::Delete(name.clone())); ui.close(); }
-                                                                });
+                                                                theme::Dropdown::new(("rail_sess_ctx", name), "")
+                                                                    .popup_min_width(180.0)
+                                                                    .text_size(12.0)
+                                                                    .show_context_menu(&lbl, |menu| {
+                                                                        if menu.item(false, "Load") { load_session = Some(name.clone()); }
+                                                                        if menu.item(false, "Overwrite with current…") { self.confirm_session = Some(SessionConfirm::Overwrite(name.clone())); }
+                                                                        menu.separator();
+                                                                        if menu.danger_item(true, "Delete…") { self.confirm_session = Some(SessionConfirm::Delete(name.clone())); }
+                                                                    });
                                                             });
                                                         });
                                                     });
@@ -17715,15 +17685,15 @@ impl DemoApp {
                                         egui::Frame::new()
                                             .fill(theme::PAPER_SINK)
                                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                            .corner_radius(3.0)
+                                            .corner_radius(theme::RADIUS_CARD)
                                             .inner_margin(egui::Margin::same(7))
                                             .show(ui, |ui| {
                                                 ui.spacing_mut().item_spacing.y = 4.0;
                                                 let w = ui.available_width().max(80.0);
                                                 let (sr, sresp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
                                                 let hov = sresp.hovered();
-                                                ui.painter().rect_filled(sr, 2.0, if hov { theme::alpha(theme::ACCENT, 0.16) } else { theme::DARK_PANEL_HI });
-                                                ui.painter().rect_stroke(sr, 2.0, Stroke::new(1.0, if hov { theme::ACCENT } else { theme::ACCENT_DEEP }), egui::StrokeKind::Inside);
+                                                ui.painter().rect_filled(sr, theme::RADIUS_CONTROL, if hov { theme::alpha(theme::ACCENT, 0.16) } else { theme::DARK_PANEL_HI });
+                                                ui.painter().rect_stroke(sr, theme::RADIUS_CONTROL, Stroke::new(1.0, if hov { theme::ACCENT } else { theme::mix(theme::HAIRLINE, theme::ACCENT, 0.48) }), egui::StrokeKind::Inside);
                                                 let save_lbl = format!("Save '{} · {}' as preset…", active_rig + 1, active_rig_name);
                                                 let g = Self::ellipsized(ui.painter(), &save_lbl, theme::medium_font(11.0), theme::CREAM, (sr.width() - 10.0).max(16.0));
                                                 ui.painter().galley(sr.center() - g.size() * 0.5, g, theme::CREAM);
@@ -17769,20 +17739,21 @@ impl DemoApp {
                                                                         .sense(egui::Sense::click()),
                                                                 );
                                                                 let locked = self.rack_locked;
-                                                                lbl.context_menu(|ui| {
-                                                                    if rig_count < Self::MAX_RIGS && ui.add_enabled(!locked, egui::Button::new("Add as new rig")).clicked() {
-                                                                        load_rig_preset = Some((name.clone(), None));
-                                                                        ui.close();
-                                                                    }
-                                                                    if ui.add_enabled(!locked, egui::Button::new(format!("Replace rig {} · {}", active_rig + 1, active_rig_name))).clicked() {
-                                                                        load_rig_preset = Some((name.clone(), Some(active_rig)));
-                                                                        ui.close();
-                                                                    }
-                                                                    if ui.button("Delete preset").clicked() {
-                                                                        delete_rig_preset = Some(name.clone());
-                                                                        ui.close();
-                                                                    }
-                                                                });
+                                                                theme::Dropdown::new(("rail_preset_ctx", name), "")
+                                                                    .popup_min_width(196.0)
+                                                                    .text_size(12.0)
+                                                                    .show_context_menu(&lbl, |menu| {
+                                                                        if rig_count < Self::MAX_RIGS && menu.item_enabled(false, !locked, "Add as new rig") {
+                                                                            load_rig_preset = Some((name.clone(), None));
+                                                                        }
+                                                                        if menu.item_enabled(false, !locked, &format!("Replace rig {} · {}", active_rig + 1, active_rig_name)) {
+                                                                            load_rig_preset = Some((name.clone(), Some(active_rig)));
+                                                                        }
+                                                                        menu.separator();
+                                                                        if menu.danger_item(true, "Delete preset") {
+                                                                            delete_rig_preset = Some(name.clone());
+                                                                        }
+                                                                    });
                                                             });
                                                         });
                                                     });
@@ -17794,7 +17765,7 @@ impl DemoApp {
                                         egui::Frame::new()
                                             .fill(theme::PAPER_SINK)
                                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                            .corner_radius(3.0)
+                                            .corner_radius(theme::RADIUS_CARD)
                                             .inner_margin(egui::Margin::same(7))
                                             .show(ui, |ui| {
                                                 ui.label(egui::RichText::new("Starter templates").font(theme::medium_font(11.5)).color(theme::INK));
@@ -17870,6 +17841,7 @@ impl DemoApp {
                     });
             });
 
+        theme::paint_panel_edge(root.painter(), resp.response.rect, theme::PanelEdge::Right);
         self.nav_panel_rect = resp.response.rect;
         if let Some(node) = toggle_fold {
             if !self.nav_folded.remove(&node) {
@@ -18158,47 +18130,38 @@ impl DemoApp {
                     ui.add(egui::Label::new(egui::RichText::new(&autosave_note).size(11.0).color(note_col)).truncate());
 
                     // 3-tab bar: SESSIONS (N) | SETLISTS (M) | TEMPLATES
-                    egui::Frame::new()
-                        .fill(theme::PAPER_SINK)
-                        .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                        .corner_radius(2.0)
-                        .inner_margin(egui::Margin::same(2))
-                        .show(ui, |ui| {
-                            let inner_w = ui.available_width().max(120.0);
-                            let tabs = [
-                                (format!("SESSIONS ({})", names.len()), LibraryTab::Sessions),
-                                (format!("SETLISTS ({})", setlists.len()), LibraryTab::Setlists),
-                                ("TEMPLATES".to_string(), LibraryTab::Templates),
-                            ];
-                            let font = theme::medium_font(9.5);
-                            let gap = 2.0;
-                            let avail = (inner_w - gap * (tabs.len() as f32 - 1.0)).max(90.0);
-                            let natural: Vec<f32> = tabs.iter()
-                                .map(|(lbl, _)| ui.painter().layout_no_wrap(lbl.clone().into(), font.clone(), theme::INK).size().x + 8.0)
-                                .collect();
-                            let sum: f32 = natural.iter().sum();
-                            let scale = avail / sum.max(1.0);
-                            let widths: Vec<f32> = natural.iter().map(|w| (w * scale).floor()).collect();
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = gap;
-                                for ((lbl, tab), w) in tabs.into_iter().zip(widths) {
-                                    let on = self.session_popover_tab == tab;
-                                    let (r, resp) = ui.allocate_exact_size(egui::vec2(w.max(24.0), 22.0), egui::Sense::click());
-                                    let hov = resp.hovered();
-                                    let fill = if on { theme::ACCENT_DEEP } else if hov { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT };
-                                    let txt = if on { theme::ON_ACCENT } else if hov { theme::CREAM } else { theme::CREAM_MID };
-                                    ui.painter().rect_filled(r, 2.0, fill);
-                                    let g = Self::ellipsized(ui.painter(), &lbl, font.clone(), txt, (r.width() - 6.0).max(12.0));
-                                    ui.painter().galley(r.center() - g.size() * 0.5, g, txt);
-                                    if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                                    if resp.clicked() {
-                                        self.session_popover_tab = tab;
-                                        self.confirm_session = None;
-                                        self.confirm_setlist = None;
-                                    }
-                                }
-                            });
-                        });
+                    let sess_lbl = format!("SESSIONS ({})", names.len());
+                    let set_lbl = format!("SETLISTS ({})", setlists.len());
+                    let sp_tabs = [
+                        (sess_lbl.as_str(), LibraryTab::Sessions),
+                        (set_lbl.as_str(), LibraryTab::Setlists),
+                        ("TEMPLATES", LibraryTab::Templates),
+                    ];
+                    let sp_font = theme::medium_font(9.5);
+                    let tray_inner_w = (width - theme::SEGMENT_TRAY_PAD * 2.0 - theme::SEGMENT_GAP * 2.0).max(90.0);
+                    let natural: Vec<f32> = sp_tabs.iter()
+                        .map(|(lbl, _)| theme::segmented_item_width(ui, lbl, sp_font.clone(), 4.0))
+                        .collect();
+                    let sum: f32 = natural.iter().sum();
+                    let scale = tray_inner_w / sum.max(1.0);
+                    let widths: Vec<f32> = natural.iter().map(|w| (w * scale).floor().max(24.0)).collect();
+                    theme::segmented_tray(ui, |ui| {
+                        for ((lbl, tab), w) in sp_tabs.into_iter().zip(widths) {
+                            if theme::segmented_item(
+                                ui,
+                                lbl,
+                                w,
+                                22.0,
+                                sp_font.clone(),
+                                self.session_popover_tab == tab,
+                                theme::SegmentStyle::Quiet,
+                            ).clicked() {
+                                self.session_popover_tab = tab;
+                                self.confirm_session = None;
+                                self.confirm_setlist = None;
+                            }
+                        }
+                    });
 
                     let max_list_h = (screen.bottom() - anchor.y - 160.0).clamp(110.0, 220.0);
                     egui::ScrollArea::vertical()
@@ -18370,10 +18333,18 @@ impl DemoApp {
                                                         .truncate()
                                                         .sense(egui::Sense::click()),
                                                     );
-                                                    lbl.context_menu(|ui| {
-                                                        if ui.button("Overwrite with current…").clicked() { self.confirm_session = Some(SessionConfirm::Overwrite(name.clone())); ui.close(); }
-                                                        if ui.button("Delete…").clicked() { self.confirm_session = Some(SessionConfirm::Delete(name.clone())); ui.close(); }
-                                                    });
+                                                    theme::Dropdown::new(("pop_sess_ctx", name), "")
+                                                        .popup_min_width(180.0)
+                                                        .text_size(12.0)
+                                                        .show_context_menu(&lbl, |menu| {
+                                                            if menu.item(false, "Overwrite with current…") {
+                                                                self.confirm_session = Some(SessionConfirm::Overwrite(name.clone()));
+                                                            }
+                                                            menu.separator();
+                                                            if menu.danger_item(true, "Delete…") {
+                                                                self.confirm_session = Some(SessionConfirm::Delete(name.clone()));
+                                                            }
+                                                        });
                                                 });
                                             });
                                         });
@@ -19154,7 +19125,7 @@ impl DemoApp {
             ui.set_width(320.0);
             ui.label(egui::RichText::new("Rename rig").font(theme::medium_font(16.0)).color(theme::INK));
             ui.add_space(8.0);
-            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("rename_rig_text").desired_width(300.0).char_limit(24));
+            let edit = Self::recessed_input_with(ui, &mut text, 284.0, "Rig name…", Some("rename_rig_text"), Some(24));
             if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
             if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { decision = Some(true); }
             ui.add_space(14.0);
@@ -19436,7 +19407,7 @@ impl DemoApp {
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Saves units, cables, knobs, sound, matrix routes and mix.").size(12.5).color(theme::INK_2));
             ui.add_space(8.0);
-            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("save_rig_text").desired_width(320.0).char_limit(48));
+            let edit = Self::recessed_input_with(ui, &mut text, 304.0, "Preset name…", Some("save_rig_text"), Some(48));
             if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
             if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { decision = Some(true); }
             ui.add_space(14.0);
@@ -19620,19 +19591,18 @@ impl DemoApp {
         self.rack_lock_btn_rect = Rect::NOTHING;
         self.top_demo_stop_rect = Rect::NOTHING;
 
-        egui::Panel::top("rig_inputs")
+        let bar_resp = egui::Panel::top("rig_inputs")
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .stroke(Stroke::NONE)
                     .inner_margin(egui::Margin::symmetric(10, 8)),
             )
             .show(root, |ui| {
                 let win_w = ui.ctx().content_rect().width().max(320.0);
                 let compact = win_w < 1080.0;
                 let narrow = win_w < 920.0;
-                let show_wordmark = win_w >= 1180.0 || (win_w >= 1000.0 && self.nav_open);
 
                 self.refresh_engine_stats();
                 let dsp = self.dsp_chip_layout(ui);
@@ -19642,6 +19612,12 @@ impl DemoApp {
                 let agent_last = self.remote.last_ms.load(Relaxed);
                 let agent_recent = agent_last > 0 && crate::bridge::now_ms().saturating_sub(agent_last) < 15_000;
                 let agent_visible = agent_paused || agent_recent;
+                let (agent_label, agent_tip) = match (agent_paused, compact) {
+                    (true, false) => ("Agent paused", "external agents (MCP) may not change this rack — click to allow"),
+                    (true, true) => ("Paused", "external agents (MCP) may not change this rack — click to allow"),
+                    (false, false) => ("● Agent connected", "an external agent (MCP) is working on this rack — click to pause it"),
+                    (false, true) => ("●", "an external agent (MCP) is working on this rack — click to pause it"),
+                };
 
                 let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
                 let snap = self.recorder.as_ref().map(|r| r.snapshot());
@@ -19649,37 +19625,72 @@ impl DemoApp {
                 let secs = snap.as_ref().map(|s| s.seconds).unwrap_or(0.0);
                 let rec_err = snap.as_ref().and_then(|s| s.error.clone());
                 let show_sync = win_w >= 980.0 || (!agent_visible && win_w >= 880.0);
-                let show_take = !recording
-                    && win_w >= 1180.0
-                    && snap.as_ref().is_some_and(|s| s.takes > 0 && s.finalized && s.path.is_some());
+                let take_path = snap.as_ref().and_then(|s| s.path.clone()).filter(|_| {
+                    !recording && win_w >= 1180.0 && snap.as_ref().is_some_and(|s| s.takes > 0 && s.finalized)
+                });
                 let show_retro = !recording
                     && win_w >= 1180.0
                     && snap.as_ref().is_some_and(|s| retro_save_item(s).1);
 
-                // Estimate fixed widths so the inline rig pills never push the
-                // View tabs or right-aligned controls past the window edge.
+                // Reserve width for transient right-side badges before picking
+                // full wordmark / dock labels so Lock and View never get overlapped.
+                let transient_w = if agent_visible { 136.0 } else { 0.0 }
+                    + if self.demo_playing.is_some() { 102.0 } else { 0.0 }
+                    + if take_path.is_some() { 130.0 } else { 0.0 }
+                    + if show_retro { 58.0 } else { 0.0 };
+                let eff_w = win_w - transient_w;
+                let show_wordmark = eff_w >= 1180.0 || (eff_w >= 1000.0 && self.nav_open);
+                let compact_docks = compact || eff_w < 1080.0;
+
+                // Measure exact segmented-control and chip widths so inline rig
+                // pills never push View tabs or right controls past the edge.
                 let gap = if compact { 4.0 } else { 6.0 };
-                let dock_w = if compact { 76.0 } else { 148.0 };
-                let agent_w = if !agent_visible {
-                    0.0
-                } else if compact {
-                    if agent_paused { 60.0 } else { 28.0 }
-                } else {
-                    136.0
+                let seg_h = ROW_H - theme::SEGMENT_TRAY_PAD * 2.0;
+
+                let tight_views = win_w < 840.0;
+                let views = [
+                    ("Rack", StageView::Rack),
+                    ("Mixer", StageView::Mixer),
+                    ("Matrix", StageView::Matrix),
+                    (if tight_views { "Set" } else { "Setlist" }, StageView::Setlist),
+                    (if tight_views { "Plug" } else { "Plugins" }, StageView::Plugins),
+                ];
+                let view_font = theme::medium_font(if tight_views { 12.0 } else { 12.5 });
+                let view_pad_x = if tight_views { 6.0 } else { theme::SEGMENT_PAD_X };
+                let view_widths: [f32; 5] = views.map(|(name, _)| theme::segmented_item_width(ui, name, view_font.clone(), view_pad_x));
+                let view_tray_w = theme::segmented_tray_width(&view_widths);
+                let view_w = view_tray_w + 1.0 + 26.0 + gap * 2.0;
+
+                let (kb_lbl, ai_lbl) = if compact_docks { ("Keys", "AI") } else { ("Keyboard", "Assistant") };
+                let dock_font = theme::medium_font(if compact_docks { 12.0 } else { 12.5 });
+                let dock_pad_x = if narrow { 6.0 } else if compact_docks { 7.0 } else { theme::SEGMENT_PAD_X };
+                let kb_w = theme::segmented_item_width(ui, kb_lbl, dock_font.clone(), dock_pad_x);
+                let ai_w = self.assistant_enabled.then(|| theme::segmented_item_width(ui, ai_lbl, dock_font.clone(), dock_pad_x));
+                let dock_w = match ai_w {
+                    Some(aw) => theme::segmented_tray_width(&[kb_w, aw]),
+                    None => theme::segmented_tray_width(&[kb_w]),
                 };
-                let rec_w = if recording { 92.0 } else { 64.0 };
-                let sync_w = if show_sync { 52.0 } else { 0.0 };
-                let take_w = if show_take { 180.0 } else { 0.0 };
-                let retro_w = if show_retro { 58.0 + gap } else { 0.0 };
-                let demo_lbl = if narrow { "■" } else if compact { "■ Demo" } else { "■ Stop demo" };
+
+                let rec_label = rec_chip_label(recording, pending, secs);
+                let rec_w = rec_chip_width(ui, &rec_label, recording);
+                let sync_w = if show_sync { theme::chip_button_width(ui, "SYNC") + gap } else { 0.0 };
+                let agent_w = if agent_visible { theme::chip_button_width(ui, agent_label) + gap } else { 0.0 };
+                let take_play_lbl = if self.take_play_until > self.ui_time { "■ Stop" } else { "▶ Play" };
+                let take_w = if take_path.is_some() {
+                    theme::chip_button_width(ui, "Folder") + theme::chip_button_width(ui, take_play_lbl) + gap * 2.0
+                } else {
+                    0.0
+                };
+                let retro_w = if show_retro { theme::chip_button_width(ui, "Retro") + gap } else { 0.0 };
+                let demo_lbl = if narrow { "■" } else if compact_docks { "■ Demo" } else { "■ Stop demo" };
                 let demo_w = if self.demo_playing.is_some() {
                     theme::chip_button_width(ui, demo_lbl) + gap
                 } else {
                     0.0
                 };
-                let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + (if show_sync { gap } else { 0.0 })
-                    + rec_w + gap + retro_w + take_w + demo_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
-                let view_w = (if compact { 240.0 } else { 268.0 }) + 26.0 + gap;
+                let right_sep_w = if narrow { 0.0 } else { (1.0 + gap) * 2.0 };
+                let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + rec_w + gap
+                    + retro_w + take_w + demo_w + agent_w + right_sep_w + dock_w + 8.0;
 
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), ROW_H),
@@ -19687,7 +19698,7 @@ impl DemoApp {
                     |ui| {
                         ui.spacing_mut().item_spacing.x = gap;
 
-                        // ── Brand mark (wordmark hides first when tight) ──
+                        // ── Zone 1 (Left): Brand, Left Rail toggle, Session breadcrumb, Inline rig pills ──
                         let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), egui::Sense::hover());
                         if !show_wordmark {
                             theme::crossed_wires(ui.painter(), mark.center(), 16.0, theme::PAPER, theme::MarkStyle::Mono);
@@ -19705,7 +19716,6 @@ impl DemoApp {
                         }
                         nav_separator(ui);
 
-                        // ── Left Rail toggle (◧, key Q) ──
                         let rt = rail_toggle_button(ui, self.nav_open)
                             .on_hover_text("Left rail: rigs, channels & session library · key Q");
                         self.rail_toggle_rect = rt.rect;
@@ -19714,7 +19724,6 @@ impl DemoApp {
                             if !self.nav_open { self.nav_rig_menu = None; }
                         }
 
-                        // ── Session document pill (● Name ▾) ──
                         let session_max_w = if narrow { 62.0 } else if compact { 104.0 } else { 150.0 };
                         let pill_name = self.session_pill_label();
                         let sp = session_pill_button(ui, &pill_name, self.session_is_saved(), self.session_popover_open, session_max_w)
@@ -19728,7 +19737,6 @@ impl DemoApp {
                             }
                         }
 
-                        // ── Inline compact rig pills (ONLY when Left Rail is closed) ──
                         if !self.nav_open {
                             let (slash_r, _) = ui.allocate_exact_size(egui::vec2(7.0, ROW_H), egui::Sense::hover());
                             ui.painter().text(slash_r.center(), egui::Align2::CENTER_CENTER, "/", FontId::proportional(13.0), theme::MUTED);
@@ -19742,7 +19750,7 @@ impl DemoApp {
                             let needs_scroll = est_pills_w > rig_budget;
 
                             let mut draw_pills = |ui: &mut egui::Ui| -> Rect {
-                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.spacing_mut().item_spacing.x = 3.0;
                                 let mut active_rect = Rect::NOTHING;
                                 for rig in 0..n {
                                     let active = rig == self.active_rig;
@@ -19771,43 +19779,42 @@ impl DemoApp {
                                         }
                                     }
                                     let locked = self.rack_locked;
-                                    chip.context_menu(|ui| {
-                                        if ui.add_enabled(!locked, egui::Button::new("Rename…")).clicked() {
-                                            self.rename_rig_dialog = Some((rig, name.clone()));
-                                            ui.close();
-                                        }
-                                        if n < Self::MAX_RIGS && ui.add_enabled(!locked, egui::Button::new("Clone rig")).clicked() {
-                                            clone_rig = Some(rig);
-                                            ui.close();
-                                        }
-                                        if ui.button("Save rig preset…").clicked() {
-                                            self.save_rig_dialog = Some((rig, name.clone()));
-                                            ui.close();
-                                        }
-                                        if ui.add_enabled(!locked, egui::Button::new("Replace from preset…")).clicked() {
-                                            self.load_rig_dialog = Some(Some(rig));
-                                            ui.close();
-                                        }
-                                        if n > 1 && ui.add_enabled(!locked, egui::Button::new("Delete rig…")).clicked() {
-                                            self.confirm_delete_rig = Some(rig);
-                                            ui.close();
-                                        }
-                                        if let Some(kind) = self.rig_demo_phrase(rig) {
-                                            let demo_on = self.demo_playing.is_some_and(|d| d.rig == rig as u8);
-                                            if ui.button(if demo_on { "Stop demo phrase" } else { "Play demo phrase" }).clicked() {
-                                                inline_demo = Some(if demo_on {
-                                                    Command::DemoStop
-                                                } else {
-                                                    Command::DemoPlay { rig: rig as u8, phrase: kind }
-                                                });
-                                                ui.close();
+                                    theme::Dropdown::new(("rig_pill_ctx", rig), "")
+                                        .popup_min_width(196.0)
+                                        .text_size(12.0)
+                                        .show_context_menu(&chip, |menu| {
+                                            if menu.item_enabled(false, !locked, "Rename…") {
+                                                self.rename_rig_dialog = Some((rig, name.clone()));
                                             }
-                                        }
-                                        if ui.button("MIDI input → Matrix").clicked() {
-                                            open_matrix_rig = Some(rig);
-                                            ui.close();
-                                        }
-                                    });
+                                            if n < Self::MAX_RIGS && menu.item_enabled(false, !locked, "Clone rig") {
+                                                clone_rig = Some(rig);
+                                            }
+                                            if menu.item(false, "Save rig preset…") {
+                                                self.save_rig_dialog = Some((rig, name.clone()));
+                                            }
+                                            if menu.item_enabled(false, !locked, "Replace from preset…") {
+                                                self.load_rig_dialog = Some(Some(rig));
+                                            }
+                                            if let Some(kind) = self.rig_demo_phrase(rig) {
+                                                let demo_on = self.demo_playing.is_some_and(|d| d.rig == rig as u8);
+                                                if menu.item(demo_on, if demo_on { "Stop demo phrase" } else { "Play demo phrase" }) {
+                                                    inline_demo = Some(if demo_on {
+                                                        Command::DemoStop
+                                                    } else {
+                                                        Command::DemoPlay { rig: rig as u8, phrase: kind }
+                                                    });
+                                                }
+                                            }
+                                            if menu.item(false, "MIDI input → Matrix") {
+                                                open_matrix_rig = Some(rig);
+                                            }
+                                            if n > 1 {
+                                                menu.separator();
+                                                if menu.danger_item(!locked, "Delete rig…") {
+                                                    self.confirm_delete_rig = Some(rig);
+                                                }
+                                            }
+                                        });
                                     if active { active_rect = chip.rect; }
                                     self.rig_chip_rects.push(chip.rect);
                                 }
@@ -19826,11 +19833,7 @@ impl DemoApp {
                                     .max_width(rig_budget)
                                     .max_height(ROW_H)
                                     .show(ui, |ui| {
-                                        // Content-sized row so the strip really scrolls.
                                         let active_rect = ui.horizontal(|ui| draw_pills(ui)).inner;
-                                        // Performance mode: a rig switch brings the
-                                        // rig's pill into view; the player's own
-                                        // scrolling is left alone.
                                         if follow && active_rect.is_positive() && !ui.clip_rect().contains_rect(active_rect) {
                                             ui.scroll_to_rect(active_rect, Some(egui::Align::Center));
                                         }
@@ -19843,29 +19846,36 @@ impl DemoApp {
 
                         nav_separator(ui);
 
-                        // ── VIEW group: 5 live workspace views (Rack, Mixer, Matrix, Setlist, Plugins) ──
-                        let tight_views = win_w < 840.0;
-                        let views = [
-                            ("Rack", StageView::Rack),
-                            ("Mixer", StageView::Mixer),
-                            ("Matrix", StageView::Matrix),
-                            (if tight_views { "Set" } else { "Setlist" }, StageView::Setlist),
-                            (if tight_views { "Plug" } else { "Plugins" }, StageView::Plugins),
-                        ];
+                        // ── Zone 2 (Center-Left): Single-tray View segmented control + Rack lock + Setlist stepper ──
                         let mut pick = None;
-                        let group = ui.scope(|ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            for (name, view) in views {
-                                if nav_button(ui, name, view, self.stage_view == view) { pick = Some(view); }
-                            }
-                        }).response.rect;
-                        ui.painter().rect_stroke(group.expand(2.0), 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
-                        self.view_group_rect = group;
+                        let vgroup = ui.allocate_ui_with_layout(
+                            egui::vec2(view_tray_w, ROW_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                theme::segmented_tray(ui, |ui| {
+                                    for ((name, view), w) in views.into_iter().zip(view_widths) {
+                                        let r = theme::segmented_item(
+                                            ui,
+                                            name,
+                                            w,
+                                            seg_h,
+                                            view_font.clone(),
+                                            self.stage_view == view,
+                                            theme::SegmentStyle::Primary,
+                                        )
+                                        .on_hover_text(view_tooltip(view));
+                                        if r.clicked() { pick = Some(view); }
+                                    }
+                                }).response.rect
+                            },
+                        ).inner;
+                        self.view_group_rect = vgroup;
                         if let Some(view) = pick {
                             if view == StageView::Rack || view != self.stage_view { self.toggle_stage(view); }
                         }
 
-                        // ── Rack edit lock toggle (Ctrl+L, #363) ──
+                        nav_separator(ui);
+
                         let lock_tip = if self.rack_locked {
                             "Rack locked for editing · click or Ctrl+L to unlock"
                         } else {
@@ -19883,7 +19893,7 @@ impl DemoApp {
                             });
                         }
 
-                        // ── Setlist stepper (shown when a setlist has songs and there is room) ──
+                        // Unified Setlist stepper (shown when a setlist has songs and room allows)
                         if !self.setlist.songs.is_empty() && (ui.available_width() - right_w) >= 100.0 {
                             nav_separator(ui);
                             let mut step_act: Option<&'static str> = None;
@@ -19893,43 +19903,75 @@ impl DemoApp {
                                 None => format!("Setlist ({})", self.setlist.songs.len()),
                             };
                             let active = self.setlist.active.is_some();
-                            let max_lbl = ((ui.available_width() - right_w) - 62.0).clamp(56.0, 200.0);
-                            ui.scope(|ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                let shift_step = ui.input(|i| i.modifiers.shift);
-                                if theme::chip_button(ui, "‹", false)
-                                    .on_hover_text("Previous part · PageUp (Shift+click: previous song)")
-                                    .clicked()
-                                {
-                                    step_act = Some(if shift_step { "prev_song" } else { "prev_part" });
+                            let max_lbl = ((ui.available_width() - right_w) - 62.0).clamp(56.0, 210.0);
+                            let lbl_font = theme::medium_font(12.0);
+                            let dot_slot = if active { 11.0 } else { 0.0 };
+                            let lbl_col = if active { theme::CREAM } else { theme::INK_2 };
+                            let g = Self::ellipsized(ui.painter(), &label, lbl_font, lbl_col, (max_lbl - 16.0 - dot_slot).max(24.0));
+                            let mid_w = (g.size().x + 16.0 + dot_slot).clamp(56.0, max_lbl);
+                            let tray_w = 22.0 + 1.0 + mid_w + 1.0 + 22.0;
+                            let (tray_rect, _) = ui.allocate_exact_size(egui::vec2(tray_w, ROW_H), egui::Sense::hover());
+                            let prev_rect = Rect::from_min_size(tray_rect.min, egui::vec2(22.0, ROW_H));
+                            let mid_rect = Rect::from_min_size(Pos2::new(prev_rect.right() + 1.0, tray_rect.top()), egui::vec2(mid_w, ROW_H));
+                            let next_rect = Rect::from_min_size(Pos2::new(mid_rect.right() + 1.0, tray_rect.top()), egui::vec2(22.0, ROW_H));
+                            let prev_resp = ui.interact(prev_rect, ui.scope_id().with("sl_prev"), egui::Sense::click());
+                            let mid_resp = ui.interact(mid_rect, ui.scope_id().with("sl_mid"), egui::Sense::click());
+                            let next_resp = ui.interact(next_rect, ui.scope_id().with("sl_next"), egui::Sense::click());
+
+                            if ui.is_rect_visible(tray_rect) {
+                                let p = ui.painter();
+                                let tray_stroke = if active { theme::LIVE_TEAL } else { theme::HAIRLINE };
+                                p.rect_filled(tray_rect, theme::RADIUS_CONTROL, theme::PAPER_SINK);
+                                if prev_resp.hovered() {
+                                    p.rect_filled(prev_rect, theme::RADIUS_CONTROL, theme::DARK_PANEL_HI);
                                 }
-                                let mid = ui.add_sized(
-                                    [max_lbl, 26.0],
-                                    egui::Button::new(
-                                        egui::RichText::new(&label)
-                                            .size(11.5)
-                                            .color(if active { theme::INK } else { theme::INK_2 }),
-                                    )
-                                    .fill(if active { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT })
-                                    .stroke(Stroke::new(1.0, if active { theme::LIVE_TEAL } else { theme::HAIRLINE }))
-                                    .truncate(),
-                                )
-                                .on_hover_text("Open Setlist view (F12) · PageUp/PageDown step parts");
-                                if mid.clicked() { open_sl = true; }
-                                if theme::chip_button(ui, "›", false)
-                                    .on_hover_text("Next part · PageDown (Shift+click: next song)")
-                                    .clicked()
-                                {
-                                    step_act = Some(if shift_step { "next_song" } else { "next_part" });
+                                if mid_resp.hovered() {
+                                    p.rect_filled(mid_rect, 0.0, theme::DARK_PANEL_HI);
                                 }
-                            });
+                                if next_resp.hovered() {
+                                    p.rect_filled(next_rect, theme::RADIUS_CONTROL, theme::DARK_PANEL_HI);
+                                }
+                                p.rect_stroke(tray_rect, theme::RADIUS_CONTROL, Stroke::new(1.0, tray_stroke), egui::StrokeKind::Inside);
+                                p.line_segment([Pos2::new(prev_rect.right() + 0.5, tray_rect.top() + 4.0), Pos2::new(prev_rect.right() + 0.5, tray_rect.bottom() - 4.0)], Stroke::new(1.0, theme::HAIRLINE));
+                                p.line_segment([Pos2::new(mid_rect.right() + 0.5, tray_rect.top() + 4.0), Pos2::new(mid_rect.right() + 0.5, tray_rect.bottom() - 4.0)], Stroke::new(1.0, theme::HAIRLINE));
+
+                                let pc = prev_rect.center();
+                                let prev_col = if prev_resp.hovered() { theme::CREAM } else { theme::CREAM_MID };
+                                p.line_segment([pc + Vec2::new(1.8, -3.5), pc + Vec2::new(-1.8, 0.0)], Stroke::new(1.35, prev_col));
+                                p.line_segment([pc + Vec2::new(-1.8, 0.0), pc + Vec2::new(1.8, 3.5)], Stroke::new(1.35, prev_col));
+
+                                let nc = next_rect.center();
+                                let next_col = if next_resp.hovered() { theme::CREAM } else { theme::CREAM_MID };
+                                p.line_segment([nc + Vec2::new(-1.8, -3.5), nc + Vec2::new(1.8, 0.0)], Stroke::new(1.35, next_col));
+                                p.line_segment([nc + Vec2::new(1.8, 0.0), nc + Vec2::new(-1.8, 3.5)], Stroke::new(1.35, next_col));
+
+                                let mut tx = mid_rect.left() + 8.0;
+                                if active {
+                                    p.circle_filled(Pos2::new(tx + 3.0, mid_rect.center().y), 3.0, theme::LIVE_TEAL);
+                                    tx += dot_slot;
+                                }
+                                p.galley(Pos2::new(tx, mid_rect.center().y - g.size().y * 0.5), g, lbl_col);
+                            }
+                            if prev_resp.hovered() || mid_resp.hovered() || next_resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            let shift_step = ui.input(|i| i.modifiers.shift);
+                            if prev_resp.on_hover_text("Previous part · PageUp (Shift+click: previous song)").clicked() {
+                                step_act = Some(if shift_step { "prev_song" } else { "prev_part" });
+                            }
+                            if mid_resp.on_hover_text("Open Setlist view (F12) · PageUp/PageDown step parts").clicked() {
+                                open_sl = true;
+                            }
+                            if next_resp.on_hover_text("Next part · PageDown (Shift+click: next song)").clicked() {
+                                step_act = Some(if shift_step { "next_song" } else { "next_part" });
+                            }
                             if let Some(a) = step_act { let _ = self.step_setlist(a); }
                             if open_sl && self.stage_view != StageView::Setlist {
                                 self.toggle_stage(StageView::Setlist);
                             }
                         }
 
-                        // ── Info line (I toggles): fits in the middle slack, else moves to hint footer ──
+                        // Info line (I toggles): fits in the middle slack, else moves to hint footer
                         let slack = ui.available_width() - right_w;
                         self.info_in_hint = self.show_stats && slack < 140.0;
                         if self.info_in_hint { let _ = self.stats_text(); }
@@ -19942,9 +19984,7 @@ impl DemoApp {
                             });
                         }
 
-                        // ── Right-anchored controls: Settings ⚙ ← DSP ← SYNC ← REC ← Agent ← Dock ──
-                        // Settings is fixed width on the far right, so DSP stays pinned at its
-                        // right edge and expands strictly leftward when xruns appear.
+                        // ── Zone 3 (Right): Settings ⚙ ← DSP | SYNC REC ← Take/Retro/Demo/Agent | Dock ──
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = gap;
 
@@ -19963,9 +20003,11 @@ impl DemoApp {
                                 }
                             }
 
+                            if !narrow { nav_separator(ui); }
+
                             if show_sync {
                                 let sync = self.record_sync;
-                                if theme::chip_button(ui, "SYNC", sync)
+                                if theme::live_toggle_chip(ui, "SYNC", sync)
                                     .on_hover_text("start/stop recording with the master transport (Space)")
                                     .clicked()
                                 {
@@ -19978,18 +20020,19 @@ impl DemoApp {
                             if rec_resp.clicked() {
                                 self.toggle_recording();
                             }
-                            rec_resp.context_menu(|ui| {
-                                let label = if self.record_sync { "✓ Sync with transport (Space)" } else { "Sync with transport (Space)" };
-                                if ui.button(label).clicked() {
-                                    self.set_record_sync(!self.record_sync);
-                                    ui.close();
-                                }
-                                let (label, can) = retro_save_item(&snap.clone().unwrap_or_default());
-                                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
-                                    let _ = self.save_retro_take(None);
-                                    ui.close();
-                                }
-                            });
+                            theme::Dropdown::new("rec_ctx", "")
+                                .popup_min_width(240.0)
+                                .text_size(12.0)
+                                .show_context_menu(&rec_resp, |menu| {
+                                    if menu.item(self.record_sync, "Sync with transport (Space)") {
+                                        self.set_record_sync(!self.record_sync);
+                                    }
+                                    menu.separator();
+                                    let (label, can) = retro_save_item(&snap.clone().unwrap_or_default());
+                                    if menu.item_enabled(false, can, &label) {
+                                        let _ = self.save_retro_take(None);
+                                    }
+                                });
                             if let Some(err) = rec_err {
                                 if win_w >= 1100.0 {
                                     ui.label(egui::RichText::new(err).size(11.0).color(theme::ACCENT_BRIGHT))
@@ -20011,18 +20054,16 @@ impl DemoApp {
                                 }
                             }
 
-                            if show_take {
-                                if let Some(path) = snap.as_ref().and_then(|s| s.path.clone()) {
-                                    if theme::chip_button(ui, "Folder", false).on_hover_text("open the recordings folder").clicked() {
-                                        open_folder(&crate::record::record_dir());
-                                    }
-                                    let playing = self.take_play_until > self.ui_time;
-                                    if theme::chip_button(ui, if playing { "■ Stop" } else { "▶ Play" }, playing)
-                                        .on_hover_text("play the last take through the master")
-                                        .clicked()
-                                    {
-                                        self.toggle_take_playback(&path, secs);
-                                    }
+                            if let Some(path) = take_path {
+                                if theme::chip_button(ui, "Folder", false).on_hover_text("open the recordings folder").clicked() {
+                                    open_folder(&crate::record::record_dir());
+                                }
+                                let playing = self.take_play_until > self.ui_time;
+                                if theme::chip_button(ui, take_play_lbl, playing)
+                                    .on_hover_text("play the last take through the master")
+                                    .clicked()
+                                {
+                                    self.toggle_take_playback(&path, secs);
                                 }
                             }
 
@@ -20042,69 +20083,81 @@ impl DemoApp {
                             }
 
                             if agent_visible {
-                                let (label, tip) = match (agent_paused, compact) {
-                                    (true, false) => ("Agent paused", "external agents (MCP) may not change this rack — click to allow"),
-                                    (true, true) => ("Paused", "external agents (MCP) may not change this rack — click to allow"),
-                                    (false, false) => ("● Agent connected", "an external agent (MCP) is working on this rack — click to pause it"),
-                                    (false, true) => ("●", "an external agent (MCP) is working on this rack — click to pause it"),
-                                };
-                                let r = theme::chip_button(ui, label, agent_paused).on_hover_text(tip);
+                                let r = theme::chip_button(ui, agent_label, agent_paused).on_hover_text(agent_tip);
                                 if !agent_paused {
-                                    ui.painter().rect_stroke(r.rect, 2.0, Stroke::new(1.2, theme::AGENT_COLOR), egui::StrokeKind::Inside);
+                                    ui.painter().rect_stroke(r.rect, theme::RADIUS_CONTROL, Stroke::new(1.0, theme::AGENT_COLOR), egui::StrokeKind::Inside);
                                 }
                                 self.agent_chip_rect = r.rect;
                                 if r.clicked() { self.remote.paused.store(!agent_paused, Relaxed); }
                             }
 
-                            // Dock group (`Keyboard` | `Assistant`, compact `Keys` | `AI`),
-                            // kept left-to-right internally so Keyboard is always left.
+                            if !narrow { nav_separator(ui); }
+
+                            // Tightly bounded Dock segmented tray (fixes full-slack phantom box bug).
                             let mut dock = None;
-                            let dgroup = ui.scope(|ui| {
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                    ui.spacing_mut().item_spacing.x = 2.0;
-                                    let (kb_lbl, ai_lbl) = if compact { ("Keys", "AI") } else { ("Keyboard", "Assistant") };
-                                    if theme::chip_button(ui, kb_lbl, self.keyboard_open())
-                                        .on_hover_text("Keyboard · key V").clicked()
-                                    {
-                                        dock = Some(DockView::Keyboard);
-                                    }
-                                    if self.assistant_enabled {
-                                        let listening = crate::listen::stage();
-                                        let tip = match (&listening, self.assistant.busy) {
-                                            (Some(_), _) => "Assistant · listening to the master · key C",
-                                            (None, true) => "Assistant · working · key C",
-                                            (None, false) => "Assistant · key C",
-                                        };
-                                        let chip = theme::chip_button(ui, ai_lbl, self.assistant_open()).on_hover_text(tip);
-                                        // The dock may show the keyboard while a turn runs:
-                                        // the button itself says the assistant is at work,
-                                        // and how far a recording of the master is.
-                                        if self.assistant.busy || listening.is_some() {
-                                            let pulse = if self.reduce_motion { 0.9 } else { 0.55 + 0.45 * ((self.ui_time * 5.5).sin() * 0.5 + 0.5) };
-                                            ui.painter().rect_stroke(chip.rect, 2.0, Stroke::new(1.2, theme::alpha(theme::AGENT_COLOR, pulse)), egui::StrokeKind::Inside);
-                                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                            let dgroup = ui.allocate_ui_with_layout(
+                                egui::vec2(dock_w, ROW_H),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    theme::segmented_tray(ui, |ui| {
+                                        if theme::segmented_item(
+                                            ui,
+                                            kb_lbl,
+                                            kb_w,
+                                            seg_h,
+                                            dock_font.clone(),
+                                            self.keyboard_open(),
+                                            theme::SegmentStyle::Primary,
+                                        )
+                                        .on_hover_text("Keyboard · key V")
+                                        .clicked()
+                                        {
+                                            dock = Some(DockView::Keyboard);
                                         }
-                                        if let Some(progress) = listening.and_then(|s| s.progress(std::time::Instant::now())) {
-                                            let mut bar = Rect::from_min_max(Pos2::new(chip.rect.left(), chip.rect.bottom() - 3.0), chip.rect.max);
-                                            bar.set_width(chip.rect.width() * progress);
-                                            ui.painter().rect_filled(bar, 1.0, theme::AGENT_COLOR);
+                                        if let Some(aw) = ai_w {
+                                            let listening = crate::listen::stage();
+                                            let tip = match (&listening, self.assistant.busy) {
+                                                (Some(_), _) => "Assistant · listening to the master · key C",
+                                                (None, true) => "Assistant · working · key C",
+                                                (None, false) => "Assistant · key C",
+                                            };
+                                            let chip = theme::segmented_item(
+                                                ui,
+                                                ai_lbl,
+                                                aw,
+                                                seg_h,
+                                                dock_font.clone(),
+                                                self.assistant_open(),
+                                                theme::SegmentStyle::Primary,
+                                            )
+                                            .on_hover_text(tip);
+                                            if self.assistant.busy || listening.is_some() {
+                                                let pulse = if self.reduce_motion { 0.9 } else { 0.55 + 0.45 * ((self.ui_time * 5.5).sin() * 0.5 + 0.5) };
+                                                ui.painter().rect_stroke(chip.rect, theme::RADIUS_CONTROL, Stroke::new(1.2, theme::alpha(theme::AGENT_COLOR, pulse)), egui::StrokeKind::Inside);
+                                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                                            }
+                                            if let Some(progress) = listening.and_then(|s| s.progress(std::time::Instant::now())) {
+                                                let mut bar = Rect::from_min_max(Pos2::new(chip.rect.left(), chip.rect.bottom() - 2.5), chip.rect.max);
+                                                bar.set_width(chip.rect.width() * progress);
+                                                ui.painter().rect_filled(bar, 1.0, theme::AGENT_COLOR);
+                                            }
+                                            self.assistant_chip_rect = chip.rect;
+                                            if chip.clicked() {
+                                                dock = Some(DockView::Assistant);
+                                            }
+                                        } else {
+                                            self.assistant_chip_rect = Rect::NOTHING;
                                         }
-                                        self.assistant_chip_rect = chip.rect;
-                                        if chip.clicked() {
-                                            dock = Some(DockView::Assistant);
-                                        }
-                                    } else {
-                                        self.assistant_chip_rect = Rect::NOTHING;
-                                    }
-                                });
-                            }).response.rect;
-                            ui.painter().rect_stroke(dgroup.expand(2.0), 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
+                                    }).response.rect
+                                },
+                            ).inner;
                             self.dock_group_rect = dgroup;
                             if let Some(d) = dock { self.toggle_dock(d); }
                         });
                     },
                 );
             });
+        theme::paint_panel_edge(root.painter(), bar_resp.response.rect, theme::PanelEdge::Bottom);
 
         if let Some(r) = switch_rig { self.set_active_rig(r); }
         if add_rig {
@@ -20132,27 +20185,64 @@ impl DemoApp {
         }
     }
 
-    fn recessed_input(ui: &mut egui::Ui, text: &mut String, width: f32, hint: &str) -> egui::Response {
+    fn recessed_input_with(
+        ui: &mut egui::Ui,
+        text: &mut String,
+        width: f32,
+        hint: &str,
+        id_salt: Option<&'static str>,
+        char_limit: Option<usize>,
+    ) -> egui::Response {
         egui::Frame::new()
             .fill(theme::PAPER_SINK)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-            .corner_radius(2.0)
+            .corner_radius(theme::RADIUS_CONTROL)
             .inner_margin(egui::Margin::symmetric(8, 5))
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(text)
-                        .frame(egui::Frame::NONE)
-                        .desired_width(width)
-                        .hint_text(hint),
-                )
+                let mut ed = egui::TextEdit::singleline(text)
+                    .frame(egui::Frame::NONE)
+                    .desired_width(width)
+                    .hint_text(hint);
+                if let Some(salt) = id_salt {
+                    ed = ed.id_salt(salt);
+                }
+                if let Some(limit) = char_limit {
+                    ed = ed.char_limit(limit);
+                }
+                ui.add(ed)
             })
             .inner
+    }
+
+    fn recessed_input(ui: &mut egui::Ui, text: &mut String, width: f32, hint: &str) -> egui::Response {
+        Self::recessed_input_with(ui, text, width, hint, None, None)
     }
 
     fn stage_hairline(ui: &mut egui::Ui) {
         let w = ui.available_width().max(1.0);
         let (r, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
         ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+    }
+
+    /// Unified Hurricane full-stage header: 18px Medium title + inline truncated
+    /// 12.5px status or quiet subtitle, and a crisp 1px `stage_hairline` rule underneath.
+    fn stage_header(
+        ui: &mut egui::Ui,
+        title: &str,
+        subtitle: &str,
+        status: Option<(&str, Color32)>,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).font(theme::medium_font(18.0)).color(theme::INK));
+            ui.add_space(12.0);
+            if ui.available_width() >= 40.0 {
+                let (sub_txt, sub_col) = status.unwrap_or((subtitle, theme::INK_2));
+                ui.add(egui::Label::new(egui::RichText::new(sub_txt).size(12.5).color(sub_col)).truncate());
+            }
+        });
+        ui.add_space(10.0);
+        Self::stage_hairline(ui);
+        ui.add_space(12.0);
     }
 
     fn save_current_session(&mut self, dir: &std::path::Path) {
@@ -20270,7 +20360,7 @@ impl DemoApp {
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
-        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        painter.rect_filled(sheet, theme::RADIUS_SHEET, theme::DARK_PANEL);
         let help = self.show_help;
         let n_rigs = self.rig_count();
         let rig_names: Vec<String> = (0..n_rigs).map(|r| self.rig_name(r)).collect();
@@ -20456,7 +20546,7 @@ impl DemoApp {
                 let avail_h = ui.available_height().max(120.0);
                 let two_col = avail_w >= 680.0;
                 let left_w = if two_col { (avail_w * 0.36).clamp(240.0, 360.0) } else { avail_w };
-                let right_w = if two_col { (avail_w - left_w - 22.0).max(260.0) } else { avail_w };
+                let right_w = if two_col { (avail_w - left_w - 25.0).max(260.0) } else { avail_w };
 
                 let draw_left = |ui: &mut egui::Ui,
                                  setlist: &mut crate::setlist::Setlist,
@@ -20499,7 +20589,7 @@ impl DemoApp {
                             *import_open = !*import_open;
                         }
                         let win_on = setlist.load_ahead.is_some();
-                        if theme::wrapped_chip_button(ui, "Load ahead", win_on)
+                        if theme::wrapped_live_toggle_chip(ui, "Load ahead", win_on)
                             .on_hover_text("Keep only the current song and the next few hosted in memory; the rest load in the background without blocking audio")
                             .clicked()
                         {
@@ -20529,7 +20619,7 @@ impl DemoApp {
                         egui::Frame::new()
                             .fill(theme::DARK_PANEL_HI)
                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                            .corner_radius(6.0)
+                            .corner_radius(theme::RADIUS_CARD)
                             .inner_margin(egui::Margin::same(6))
                             .show(ui, |ui| {
                                 if saved.is_empty() {
@@ -20564,6 +20654,7 @@ impl DemoApp {
                         .min_scrolled_height(list_h.min(min_list_h))
                         .max_height(list_h)
                         .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
                             if setlist.songs.is_empty() {
                                 ui.label(egui::RichText::new("No songs yet.").size(12.5).color(theme::INK_2));
                             }
@@ -20571,18 +20662,18 @@ impl DemoApp {
                             for (si, song) in setlist.songs.iter().enumerate() {
                                 let selected = *edit_song == Some(si);
                                 let is_live = setlist.active.is_some_and(|p| p.song == si);
-                                let stroke_col = if is_live {
-                                    theme::LIVE_TEAL
+                                let stroke = if is_live {
+                                    Stroke::new(1.0, theme::LIVE_TEAL)
                                 } else if selected {
-                                    theme::ACCENT
+                                    Stroke::new(1.0, theme::HAIRLINE)
                                 } else {
-                                    theme::HAIRLINE
+                                    Stroke::NONE
                                 };
-                                egui::Frame::new()
-                                    .fill(if selected { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT })
-                                    .stroke(Stroke::new(1.0, stroke_col))
-                                    .corner_radius(6.0)
-                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                let song_frame = egui::Frame::new()
+                                    .fill(if selected || is_live { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT })
+                                    .stroke(stroke)
+                                    .corner_radius(theme::RADIUS_CARD)
+                                    .inner_margin(egui::Margin::symmetric(10, 5))
                                     .show(ui, |ui| {
                                         // Draw right-side buttons first in a fixed-height row so title/meta truncate into the remaining width (rule 196).
                                         let row_w = ui.available_width();
@@ -20600,16 +20691,16 @@ impl DemoApp {
                                                     *remove_song = Some(si);
                                                     *confirm_remove_song = None;
                                                 }
-                                            } else if theme::chip_button(ui, "×", false).on_hover_text("Remove song").clicked() {
+                                            } else if theme::ghost_icon_chip(ui, "×", false).on_hover_text("Remove song").clicked() {
                                                 *confirm_remove_song = Some(si);
                                             }
-                                            if si + 1 < count && theme::chip_button(ui, "↓", false).on_hover_text("Move down").clicked() {
+                                            if si + 1 < count && theme::ghost_icon_chip(ui, "↓", false).on_hover_text("Move down").clicked() {
                                                 *move_song = Some((si, si + 1));
                                             }
-                                            if si > 0 && theme::chip_button(ui, "↑", false).on_hover_text("Move up").clicked() {
+                                            if si > 0 && theme::ghost_icon_chip(ui, "↑", false).on_hover_text("Move up").clicked() {
                                                 *move_song = Some((si, si - 1));
                                             }
-                                            if theme::chip_button(ui, "▶", is_live).on_hover_text("Play song (part 1)").clicked() {
+                                            if theme::live_toggle_chip(ui, "▶", is_live).on_hover_text("Play song (part 1)").clicked() {
                                                 *jump_to = Some((si, 0));
                                             }
                                             let meta = {
@@ -20681,7 +20772,18 @@ impl DemoApp {
                                             if r.double_clicked() { *jump_to = Some((si, 0)); }
                                         });
                                     });
-                                ui.add_space(4.0);
+                                let fr = song_frame.response.rect;
+                                if si > 0 {
+                                    let y = fr.top() - 2.0;
+                                    ui.painter().line_segment(
+                                        [Pos2::new(fr.left() + 6.0, y), Pos2::new(fr.right() - 6.0, y)],
+                                        Stroke::new(1.0, theme::HAIRLINE),
+                                    );
+                                }
+                                if selected || is_live {
+                                    let bar = Rect::from_min_size(Pos2::new(fr.left() + 1.0, fr.top() + 5.0), egui::vec2(3.0, fr.height() - 10.0));
+                                    ui.painter().rect_filled(bar, 1.0, if is_live { theme::LIVE_TEAL } else { theme::ACCENT });
+                                }
                             }
                         });
 
@@ -20752,7 +20854,7 @@ impl DemoApp {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         Self::recessed_input(ui, &mut song.name, 190.0, "Song title");
                         let mut has_bpm = song.bpm.is_some();
-                        if theme::wrapped_chip_button(ui, "BPM", has_bpm).clicked() {
+                        if theme::wrapped_live_toggle_chip(ui, "BPM", has_bpm).clicked() {
                             has_bpm = !has_bpm;
                             song.bpm = if has_bpm { Some(120.0) } else { None };
                             if is_active_song { *active_part_dirty = true; }
@@ -20763,13 +20865,13 @@ impl DemoApp {
                             }
                         }
                         let has_sig = song.time_sig.is_some();
-                        if theme::wrapped_chip_button(ui, "Metre", has_sig).clicked() {
+                        if theme::wrapped_live_toggle_chip(ui, "Metre", has_sig).clicked() {
                             song.time_sig = if has_sig { None } else { Some(crate::transport::TimeSig::default()) };
                             if is_active_song { *active_part_dirty = true; }
                         }
                         if let Some(sig) = &mut song.time_sig {
                             let label = sig.to_string();
-                            if theme::wrapped_chip_button(ui, &label, true)
+                            if theme::wrapped_chip_button(ui, &label, false)
                                 .on_hover_text("Cycle common time signatures")
                                 .clicked()
                             {
@@ -20819,7 +20921,7 @@ impl DemoApp {
                         egui::Frame::new()
                             .fill(theme::DARK_PANEL_HI)
                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                            .corner_radius(6.0)
+                            .corner_radius(theme::RADIUS_CARD)
                             .inner_margin(egui::Margin::same(6))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -20895,7 +20997,7 @@ impl DemoApp {
                         egui::Frame::new()
                             .fill(theme::PAPER_SINK)
                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                            .corner_radius(6.0)
+                            .corner_radius(theme::RADIUS_CARD)
                             .inner_margin(egui::Margin::same(6))
                             .show(ui, |ui| {
                                 egui::ScrollArea::vertical()
@@ -20944,7 +21046,7 @@ impl DemoApp {
                                 egui::Frame::new()
                                     .fill(theme::DARK_PANEL_HI)
                                     .stroke(Stroke::new(1.0, if is_live { theme::LIVE_TEAL } else { theme::HAIRLINE }))
-                                    .corner_radius(8.0)
+                                    .corner_radius(theme::RADIUS_CARD)
                                     .inner_margin(egui::Margin::same(10))
                                     .show(ui, |ui| {
                                         let name_w = (ui.available_width() * 0.36).clamp(80.0, 140.0);
@@ -20966,14 +21068,14 @@ impl DemoApp {
                                                             *remove_part = Some((si, pi));
                                                             *confirm_remove_part = None;
                                                         }
-                                                    } else if theme::chip_button(ui, "×", false).on_hover_text("Remove part").clicked() {
+                                                    } else if theme::ghost_icon_chip(ui, "×", false).on_hover_text("Remove part").clicked() {
                                                         *confirm_remove_part = Some((si, pi));
                                                     }
                                                 }
-                                                if pi + 1 < part_count && theme::chip_button(ui, "↓", false).on_hover_text("Move part down").clicked() {
+                                                if pi + 1 < part_count && theme::ghost_icon_chip(ui, "↓", false).on_hover_text("Move part down").clicked() {
                                                     *move_part = Some((si, pi, pi + 1));
                                                 }
-                                                if pi > 0 && theme::chip_button(ui, "↑", false).on_hover_text("Move part up").clicked() {
+                                                if pi > 0 && theme::ghost_icon_chip(ui, "↑", false).on_hover_text("Move part up").clicked() {
                                                     *move_part = Some((si, pi, pi - 1));
                                                 }
                                                 if theme::chip_button(ui, "Dup", false).on_hover_text("Duplicate part").clicked() {
@@ -20989,7 +21091,7 @@ impl DemoApp {
                                             } else {
                                                 format!("Save knobs ({knob_count})")
                                             };
-                                            if theme::wrapped_chip_button(ui, &knob_lbl, knob_count > 0)
+                                            if theme::wrapped_live_toggle_chip(ui, &knob_lbl, knob_count > 0)
                                                 .on_hover_text("Snapshot current rack knobs, pinned plugin knobs and effect bypasses of this part's live rigs")
                                                 .clicked()
                                             {
@@ -21010,7 +21112,7 @@ impl DemoApp {
                                                     Some(sc) => format!("Sends: {}", sc.label(&bus_name)),
                                                     None => "Save sends".to_string(),
                                                 };
-                                                if theme::wrapped_chip_button(ui, &scene_lbl, part.scene.is_some())
+                                                if theme::wrapped_live_toggle_chip(ui, &scene_lbl, part.scene.is_some())
                                                     .on_hover_text("Send scene: store the mixer's send levels and the aux buses' effect bypasses and knobs in this part. A switch to the part ramps the sends there and lets the last part's tail ring out, also for a rig at show level. Click again to store the current mixer.")
                                                     .clicked()
                                                 {
@@ -21027,6 +21129,8 @@ impl DemoApp {
                                         });
                                         cue_editor::cue_body(ui, ("part", si, pi), &mut part.cues);
                                         ui.add_space(6.0);
+                                        Self::stage_hairline(ui);
+                                        ui.add_space(6.0);
                                         for (ri, rname) in rig_names.iter().enumerate() {
                                             let r_u8 = ri as u8;
                                             let existing_idx = part.rigs.iter().position(|r| r.rig == r_u8);
@@ -21034,7 +21138,7 @@ impl DemoApp {
                                             let mut show_fx_row = false;
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                                if theme::wrapped_chip_button(ui, &format!("{} · {rname}", ri + 1), on).clicked() {
+                                                if theme::wrapped_live_toggle_chip(ui, &format!("{} · {rname}", ri + 1), on).clicked() {
                                                     on = !on;
                                                     if on {
                                                         part.set_rig(PartRig::new(r_u8));
@@ -21115,7 +21219,7 @@ impl DemoApp {
                                                         moved = true;
                                                     }
                                                     let curve = pr.curve;
-                                                    if theme::wrapped_chip_button(ui, curve.as_str(), curve != crate::layer::VelCurve::Linear)
+                                                    if theme::wrapped_live_toggle_chip(ui, curve.as_str(), curve != crate::layer::VelCurve::Linear)
                                                         .on_hover_text("Velocity curve: linear, soft (quiet playing louder), hard (needs a firmer touch)")
                                                         .clicked()
                                                     {
@@ -21145,7 +21249,7 @@ impl DemoApp {
                                                             for (fx_node, fx_name, current_bypass) in fxs {
                                                                 let bypassed = part.fx_bypass(*fx_node).unwrap_or(*current_bypass);
                                                                 let active = !bypassed;
-                                                                if theme::wrapped_chip_button(ui, fx_name, active)
+                                                                if theme::wrapped_live_toggle_chip(ui, fx_name, active)
                                                                     .on_hover_text(if active { "Active in this part — click to bypass" } else { "Bypassed in this part — click to enable" })
                                                                     .clicked()
                                                                 {
@@ -21195,7 +21299,7 @@ impl DemoApp {
                                                     } else {
                                                         "at show or set level: takes signal whatever the part says"
                                                     };
-                                                    if theme::wrapped_chip_button(ui, name, on).on_hover_text(tip).clicked() {
+                                                    if theme::wrapped_live_toggle_chip(ui, name, on).on_hover_text(tip).clicked() {
                                                         if on { part.buses.retain(|b| b != node) } else { part.buses.push(*node) }
                                                         if is_live { *active_part_dirty = true; }
                                                     }
@@ -21231,6 +21335,9 @@ impl DemoApp {
                             );
                         });
                         ui.add_space(10.0);
+                        let (div_r, _) = ui.allocate_exact_size(egui::vec2(1.0, avail_h), egui::Sense::hover());
+                        ui.painter().line_segment([div_r.center_top(), div_r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                        ui.add_space(14.0);
                         ui.allocate_ui_with_layout(egui::vec2(right_w, avail_h), egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             if self.preshow.open {
                                 self.preshow_panel(ui, avail_h - 8.0);
@@ -21525,41 +21632,29 @@ impl DemoApp {
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
-        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        painter.rect_filled(sheet, theme::RADIUS_SHEET, theme::DARK_PANEL);
         let help = self.show_help;
         let names = Self::list_saved_sessions(dir);
-
-        let patch_notice = self.active_patch_notice().map(str::to_owned);
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Sessions").font(theme::medium_font(18.0)).color(theme::INK));
-                    ui.add_space(12.0);
-                    let (sub_txt, sub_col) = match &patch_notice {
-                        Some(n) => (n.as_str(), theme::ACCENT_BRIGHT),
-                        None => ("save and load patches · starter templates · Tab / Esc: back to the rack", theme::INK_2),
-                    };
-                    ui.label(
-                        egui::RichText::new(sub_txt)
-                            .size(13.0)
-                            .color(sub_col),
-                    );
-                    if !self.session_msg.is_empty() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let col = if self.session_msg.contains("failed") {
-                                theme::CLIP_BRIGHT
-                            } else {
-                                theme::LIVE_TEAL
-                            };
-                            ui.label(egui::RichText::new(&self.session_msg).size(12.5).color(col));
-                        });
-                    }
-                });
-                ui.add_space(12.0);
-                Self::stage_hairline(ui);
-                ui.add_space(14.0);
+                let notice = self.active_patch_notice().map(str::to_owned);
+                let sess_msg = self.session_msg.clone();
+                let status = if let Some(n) = notice.as_deref() {
+                    Some((n, theme::ACCENT_BRIGHT))
+                } else if !sess_msg.is_empty() {
+                    let col = if sess_msg.contains("failed") { theme::CLIP_BRIGHT } else { theme::LIVE_TEAL };
+                    Some((sess_msg.as_str(), col))
+                } else {
+                    None
+                };
+                Self::stage_header(
+                    ui,
+                    "Sessions",
+                    "save and load patches · starter templates · Tab / Esc: back to the rack",
+                    status,
+                );
 
                 let avail_w = ui.available_width();
                 let h = ui.available_height().max(80.0);
@@ -22614,51 +22709,37 @@ impl DemoApp {
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
-        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        painter.rect_filled(sheet, theme::RADIUS_SHEET, theme::DARK_PANEL);
         let help = self.show_help;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                // Title + subtitle in a plain row (a wrapped row's galleys start
-                // at its left edge and overlap, rule 100); the subtitle
-                // truncates. The confirmation gets a row of its own (#65).
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Plugins").font(theme::medium_font(18.0)).color(theme::INK));
-                    ui.add_space(12.0);
-                    let (sub_txt, sub_col) = match self.active_patch_notice() {
-                        Some(n) => (n, theme::ACCENT_BRIGHT),
-                        None => ("Instruments, effects, MIDI FX and utilities · Tab / Esc: back to the rack", theme::INK_2),
-                    };
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(sub_txt)
-                                .size(13.0)
-                                .color(sub_col),
-                        )
-                        .truncate(),
-                    );
-                });
+                Self::stage_header(
+                    ui,
+                    "Plugins",
+                    "Instruments, effects, MIDI FX and utilities · Tab / Esc: back to the rack",
+                    self.active_patch_notice().map(|n| (n, theme::ACCENT_BRIGHT)),
+                );
                 if !self.plugin_msg.is_empty() {
                     let col = if self.plugin_msg.contains("failed") || self.plugin_msg.contains("At most") {
                         theme::CLIP_BRIGHT
                     } else {
                         theme::LIVE_TEAL
                     };
-                    ui.add_space(4.0);
                     ui.add(egui::Label::new(egui::RichText::new(&self.plugin_msg).size(12.5).color(col)).wrap());
+                    ui.add_space(4.0);
                 }
                 // Installed, but built for another CPU: each on a row of its
                 // own (rule 136), so nobody looks for a plugin that is on
                 // disk and missing from the list.
                 const UNLOADABLE_ROWS: usize = 2;
                 for reason in self.plugins_unloadable.iter().take(UNLOADABLE_ROWS) {
-                    ui.add_space(4.0);
                     ui.add(egui::Label::new(egui::RichText::new(reason).size(12.5).color(theme::INK_2)).wrap());
+                    ui.add_space(4.0);
                 }
                 if self.plugins_unloadable.len() > UNLOADABLE_ROWS {
                     let more = self.plugins_unloadable.len() - UNLOADABLE_ROWS;
-                    ui.add_space(4.0);
                     ui.add(egui::Label::new(
                         egui::RichText::new(if more == 1 {
                             "1 more installed plugin is built for another CPU".to_string()
@@ -22666,8 +22747,9 @@ impl DemoApp {
                             format!("{more} more installed plugins are built for another CPU")
                         }).size(12.5).color(theme::INK_2),
                     ).wrap());
+                    ui.add_space(4.0);
                 }
-                ui.add_space(10.0);
+                ui.add_space(2.0);
 
                 // Counts on the chips follow the format filter; the
                 // subcategory chips belong to the type in view.
@@ -22715,7 +22797,7 @@ impl DemoApp {
                     }
                     cats.push((PluginCategory::Install, format!("Install ({})", crate::catalog::CATALOG.len())));
                     for (cat, label) in cats {
-                        if theme::wrapped_chip_button(ui, &label, self.plugin_category == cat).clicked() && self.plugin_category != cat {
+                        if theme::wrapped_nav_filter_chip(ui, &label, self.plugin_category == cat).clicked() && self.plugin_category != cat {
                             self.plugin_category = cat;
                             self.plugin_subtype = None;
                             if cat == PluginCategory::Install {
@@ -22723,20 +22805,21 @@ impl DemoApp {
                             }
                         }
                     }
+                    nav_separator(ui);
                     // Favorites and Recent narrow whatever type is in view (#307).
                     for (view, label, tip) in [
                         (ShelfView::Favorites, format!("★ Favorites ({})", shelf_counts[0]), "only the plugins you starred"),
                         (ShelfView::Recent, format!("Recent ({})", shelf_counts[1]), "the plugins you added last, newest first"),
                     ] {
                         let on = self.plugin_shelf_view == Some(view);
-                        if theme::wrapped_chip_button(ui, &label, on).on_hover_text(tip).clicked() {
+                        if theme::wrapped_live_toggle_chip(ui, &label, on).on_hover_text(tip).clicked() {
                             self.plugin_shelf_view = if on { None } else { Some(view) };
                             if self.plugin_category == PluginCategory::Install {
                                 self.plugin_category = PluginCategory::All;
                             }
                         }
                     }
-                    if theme::wrapped_chip_button(ui, "Refresh", false)
+                    if theme::wrapped_quiet_filter_chip(ui, "Refresh", false)
                         .on_hover_text("rescan plugins, retrying bundles that failed before")
                         .clicked()
                     {
@@ -22747,18 +22830,18 @@ impl DemoApp {
                     self.refresh_plugins_with(true);
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 if self.plugin_category == PluginCategory::Install {
                     chip_row(ui, &mut |ui| {
                         let n_of = |ty| crate::catalog::CATALOG.iter().filter(|e| e.plugin_type == ty).count();
-                        if theme::wrapped_chip_button(ui, "All catalog", self.plugin_catalog_type.is_none()).clicked() {
+                        if theme::wrapped_quiet_filter_chip(ui, "All catalog", self.plugin_catalog_type.is_none()).clicked() {
                             self.plugin_catalog_type = None;
                         }
                         for ty in [PluginType::Instrument, PluginType::Effect, PluginType::MidiFx] {
                             let cnt = n_of(ty);
                             if cnt == 0 { continue; }
                             let on = self.plugin_catalog_type == Some(ty);
-                            if theme::wrapped_chip_button(ui, &format!("{} ({cnt})", ty.label()), on).clicked() {
+                            if theme::wrapped_quiet_filter_chip(ui, &format!("{} ({cnt})", ty.label()), on).clicked() {
                                 self.plugin_catalog_type = if on { None } else { Some(ty) };
                             }
                         }
@@ -22766,25 +22849,25 @@ impl DemoApp {
                 } else {
                     if sub_counts.len() > 1 {
                         chip_row(ui, &mut |ui| {
-                            if theme::wrapped_chip_button(ui, "All", self.plugin_subtype.is_none()).clicked() {
+                            if theme::wrapped_quiet_filter_chip(ui, "All", self.plugin_subtype.is_none()).clicked() {
                                 self.plugin_subtype = None;
                             }
                             for &(sub, n) in &sub_counts {
                                 let on = self.plugin_subtype == Some(sub);
-                                if theme::wrapped_chip_button(ui, &format!("{} ({n})", sub.label()), on).clicked() {
+                                if theme::wrapped_quiet_filter_chip(ui, &format!("{} ({n})", sub.label()), on).clicked() {
                                     self.plugin_subtype = if on { None } else { Some(sub) };
                                 }
                             }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
                     }
                     chip_row(ui, &mut |ui| {
-                        if theme::wrapped_chip_button(ui, "All formats", self.plugin_format.is_none()).clicked() {
+                        if theme::wrapped_quiet_filter_chip(ui, "All formats", self.plugin_format.is_none()).clicked() {
                             self.plugin_format = None;
                         }
                         for fmt in PluginFormat::ALL {
                             let on = self.plugin_format == Some(fmt);
-                            if theme::wrapped_chip_button(ui, fmt.label(), on).clicked() {
+                            if theme::wrapped_quiet_filter_chip(ui, fmt.label(), on).clicked() {
                                 self.plugin_format = if on { None } else { Some(fmt) };
                             }
                         }
@@ -23288,7 +23371,7 @@ impl DemoApp {
                                                     ui.label(egui::RichText::new(note).size(11.5).color(theme::CREAM_DIM));
                                                 }
                                                 for (i, (label, hint, act)) in card.actions.into_iter().enumerate() {
-                                                    let resp = if i == 0 { theme::primary_button(ui, label) } else { theme::chip_button(ui, label, false) };
+                                                    let resp = if i == 0 { theme::accent_outline_button(ui, label) } else { theme::chip_button(ui, label, false) };
                                                     if resp.on_hover_text(hint).clicked() {
                                                         *action = Some((act, Some(e.key())));
                                                     }
@@ -23384,7 +23467,7 @@ impl DemoApp {
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
-        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        painter.rect_filled(sheet, theme::RADIUS_SHEET, theme::DARK_PANEL);
         let help = self.show_help;
         let summaries = self.settings_summaries(ui.ctx().pixels_per_point());
         let mut actions: Vec<SettingsAction> = Vec::new();
@@ -23392,27 +23475,19 @@ impl DemoApp {
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
+                let sub = format!("Tab / Esc: back to the rack · kabelsalat {}", crate::VERSION);
+                let notice = self.active_patch_notice().map(str::to_owned);
+                let msg = self.settings_msg.clone();
+                let status = if let Some(n) = notice.as_deref() {
+                    Some((n, theme::ACCENT_BRIGHT))
+                } else if !msg.is_empty() {
+                    let col = if msg.contains("failed") { theme::CLIP_BRIGHT } else { theme::LIVE_TEAL };
+                    Some((msg.as_str(), col))
+                } else {
+                    None
+                };
+                Self::stage_header(ui, "Settings", &sub, status);
                 ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(format!("Tab / Esc: back to the rack · kabelsalat {}", crate::VERSION))
-                        .size(12.5)
-                        .color(theme::INK_2),
-                );
-                // The last change's outcome, on a row of its own that is
-                // always reserved, so nothing moves when it appears (rule 136).
-                let (msg_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
-                if let Some(notice) = self.active_patch_notice() {
-                    let g = Self::ellipsized(ui.painter(), notice, FontId::proportional(12.5), theme::ACCENT_BRIGHT, msg_rect.width());
-                    ui.painter().galley(Pos2::new(msg_rect.left(), msg_rect.center().y - g.size().y * 0.5), g, theme::ACCENT_BRIGHT);
-                } else if !self.settings_msg.is_empty() {
-                    let col = if self.settings_msg.contains("failed") { theme::CLIP_BRIGHT } else { theme::LIVE_TEAL };
-                    let g = Self::ellipsized(ui.painter(), &self.settings_msg, FontId::proportional(12.5), col, msg_rect.width());
-                    ui.painter().galley(Pos2::new(msg_rect.left(), msg_rect.center().y - g.size().y * 0.5), g, col);
-                }
-                ui.add_space(6.0);
-                Self::stage_hairline(ui);
-                ui.add_space(14.0);
 
                 let avail_w = ui.available_width().max(200.0);
                 let body_h = ui.available_height().max(80.0);
@@ -23542,7 +23617,7 @@ impl DemoApp {
                 } else {
                     Color32::TRANSPARENT
                 };
-                ui.painter().rect_filled(rect, 3.0, fill);
+                ui.painter().rect_filled(rect, theme::RADIUS_CARD, fill);
                 if on {
                     let bar = Rect::from_min_size(Pos2::new(rect.left(), rect.top() + 6.0), egui::vec2(3.0, rect.height() - 12.0));
                     ui.painter().rect_filled(bar, 1.5, if p.is_agent() { theme::AGENT_COLOR } else { theme::ACCENT });
@@ -23587,15 +23662,25 @@ impl DemoApp {
                 let on = self.settings_page == p;
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(seg_w(ui, p), 26.0), egui::Sense::click());
                 let hov = resp.hovered();
-                let (fill, txt) = match (on, agent) {
-                    (true, false) => (theme::ACCENT_DEEP, theme::ON_ACCENT),
-                    (true, true) => (theme::AGENT_COLOR, theme::AGENT_COLOR_TEXT),
-                    (false, _) if hov => (theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::CREAM),
-                    (false, _) => (theme::DARK_PANEL_HI, theme::CREAM_MID),
+                let (fill, stroke, txt) = if on {
+                    (theme::DARK_PANEL_HI, Some(theme::HAIRLINE), theme::INK)
+                } else if hov {
+                    (theme::DARK_PANEL_HI, Some(theme::HAIRLINE), theme::CREAM)
+                } else {
+                    (Color32::TRANSPARENT, None, theme::CREAM_MID)
                 };
-                ui.painter().rect_filled(rect, 2.0, fill);
-                if !on {
-                    ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                if fill != Color32::TRANSPARENT {
+                    ui.painter().rect_filled(rect, theme::RADIUS_CONTROL, fill);
+                }
+                if let Some(sc) = stroke {
+                    ui.painter().rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, sc), egui::StrokeKind::Inside);
+                }
+                if on {
+                    let bar = Rect::from_min_size(
+                        Pos2::new(rect.left() + 4.0, rect.bottom() - 2.5),
+                        egui::vec2((rect.width() - 8.0).max(8.0), 2.5),
+                    );
+                    ui.painter().rect_filled(bar, 1.0, if agent { theme::AGENT_COLOR } else { theme::ACCENT });
                 }
                 let g = ui.painter().layout_no_wrap(p.label().into(), font.clone(), txt);
                 ui.painter().galley(rect.center() - g.size() * 0.5, g, txt);
@@ -24605,8 +24690,8 @@ impl DemoApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::symmetric(14, 8)),
+                    .stroke(Stroke::NONE)
+                    .inner_margin(egui::Margin::symmetric(14, 9)),
             )
             .show(root, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
@@ -24637,7 +24722,7 @@ impl DemoApp {
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (C)").clicked() {
+                            if theme::ghost_icon_chip(ui, "×", false).on_hover_text("hide the assistant (C)").clicked() {
                                 self.dock = DockView::None;
                             }
                             if self.assistant.key_set {
@@ -25049,6 +25134,7 @@ impl DemoApp {
                     self.dock = DockView::None;
                 }
             });
+        theme::paint_panel_edge(root.painter(), resp.response.rect, theme::PanelEdge::Top);
         self.dock_rect = resp.response.rect;
         self.assistant_rect = resp.response.rect;
         self.assistant_input_rect = input_rect;
@@ -25185,7 +25271,7 @@ impl DemoApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .stroke(Stroke::NONE)
                     .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(root, |ui| {
@@ -25234,6 +25320,7 @@ impl DemoApp {
                     };
                 });
             });
+        theme::paint_panel_edge(root.painter(), resp.response.rect, theme::PanelEdge::Top);
         self.dock_rect = resp.response.rect;
         self.dock_kb_rect = kb_rect;
         self.kb_deck_rect = deck_rect;
@@ -30427,21 +30514,17 @@ impl DemoApp {
         theme::paper_bg(&painter, rect);
 
         let (sheet, inner) = self.stage_sheet_rects(rect, 160.0);
-        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        painter.rect_filled(sheet, theme::RADIUS_SHEET, theme::DARK_PANEL);
         let help = self.show_help;
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("MIDI Matrix").font(theme::medium_font(18.0)).color(theme::INK));
-                    ui.add_space(12.0);
-                    let (sub_txt, sub_col) = match self.active_patch_notice() {
-                        Some(n) => (n, theme::ACCENT_BRIGHT),
-                        None => ("any source → any rig · click: route · right-click: shape the rule · Tab / Esc: back to the rack", theme::INK_2),
-                    };
-                    ui.add(egui::Label::new(egui::RichText::new(sub_txt).size(13.0).color(sub_col)).truncate());
-                });
-                ui.add_space(12.0);
+                Self::stage_header(
+                    ui,
+                    "MIDI Matrix",
+                    "any source → any rig · click: route · right-click: shape the rule · Tab / Esc: back to the rack",
+                    self.active_patch_notice().map(|n| (n, theme::ACCENT_BRIGHT)),
+                );
                 let editor_w = if self.rule_editor.is_some() { 320.0 } else { 0.0 };
                 let h = ui.available_height();
                 ui.horizontal_top(|ui| {
@@ -30569,7 +30652,7 @@ impl DemoApp {
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
-        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        painter.rect_filled(sheet, theme::RADIUS_SHEET, theme::DARK_PANEL);
         let help = self.show_help;
         let n = self.rig_count();
         self.mixer_fader_rects.clear();
@@ -30610,16 +30693,13 @@ impl DemoApp {
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Mixer").font(theme::medium_font(18.0)).color(theme::INK));
-                    ui.add_space(12.0);
-                    let (sub_txt, sub_col) = match self.active_patch_notice() {
-                        Some(n) => (n, theme::ACCENT_BRIGHT),
-                        None => ("every source → its rig bus → Master out · dB faders · inserts = the cable chain · Tab / Esc: back to the rack", theme::INK_2),
-                    };
-                    ui.add(egui::Label::new(egui::RichText::new(sub_txt).size(13.0).color(sub_col)).truncate());
-                });
-                ui.add_space(14.0);
+                Self::stage_header(
+                    ui,
+                    "Mixer",
+                    "every source → its rig bus → Master out · dB faders · inserts = the cable chain · Tab / Esc: back to the rack",
+                    self.active_patch_notice().map(|n| (n, theme::ACCENT_BRIGHT)),
+                );
+                ui.add_space(2.0);
                 // Strip height: name + meta + source slot + inserts + fader +
                 // readout + bus controls. A short sheet keeps a usable fader
                 // and scrolls the rest.
@@ -31760,7 +31840,7 @@ impl DemoApp {
             ui.set_width(320.0);
             ui.label(egui::RichText::new("Rename strip").font(theme::medium_font(16.0)).color(theme::INK));
             ui.add_space(8.0);
-            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("strip_rename_text").desired_width(300.0).char_limit(24));
+            let edit = Self::recessed_input_with(ui, &mut text, 284.0, "Strip name…", Some("strip_rename_text"), Some(24));
             if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
             if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { decided = Some(Some(text.clone())); }
             ui.add_space(12.0);
@@ -31797,13 +31877,7 @@ impl DemoApp {
             .fixed_pos(screen.center() - egui::vec2(95.0, 40.0))
             .constrain(true)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(theme::DARK_PANEL)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::same(10))
-                    .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(130) })
-                    .show(ui, |ui| {
+                theme::dropdown_popup_frame().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                         ui.set_min_width(190.0);
                         ui.label(egui::RichText::new("Strip colour").font(theme::medium_font(12.5)).color(theme::INK));
                         ui.add_space(8.0);
@@ -31840,48 +31914,41 @@ impl DemoApp {
             .fixed_pos(screen.center() - egui::vec2(175.0, 190.0))
             .constrain(true)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(theme::DARK_PANEL)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::same(10))
-                    .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(130) })
-                    .show(ui, |ui| {
-                        ui.set_width(340.0);
-                        ui.label(egui::RichText::new("Add insert").font(theme::medium_font(12.5)).color(theme::INK));
-                        ui.add_space(4.0);
-                        ui.add_sized([ui.available_width(), 20.0],
-                            egui::TextEdit::singleline(&mut self.insert_filter).hint_text("filter effects by name or category…"));
-                        ui.add_space(6.0);
-                        // Category chips: a few hundred LV2 effects are too many to scroll.
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                            if theme::wrapped_chip_button(ui, "All", self.insert_subtype.is_none() && !self.insert_builtin_only).clicked() {
+                theme::dropdown_popup_frame().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                    ui.set_width(340.0);
+                    ui.label(egui::RichText::new("Add insert").font(theme::medium_font(12.5)).color(theme::INK));
+                    ui.add_space(4.0);
+                    Self::recessed_input(ui, &mut self.insert_filter, 322.0, "filter effects by name or category…");
+                    ui.add_space(6.0);
+                    // Category chips: a few hundred LV2 effects are too many to scroll.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        if theme::wrapped_quiet_filter_chip(ui, "All", self.insert_subtype.is_none() && !self.insert_builtin_only).clicked() {
+                            self.insert_subtype = None;
+                            self.insert_builtin_only = false;
+                        }
+                        if theme::wrapped_quiet_filter_chip(ui, "Built-in", self.insert_builtin_only).clicked() {
+                            self.insert_builtin_only = !self.insert_builtin_only;
+                            if self.insert_builtin_only {
                                 self.insert_subtype = None;
+                            }
+                        }
+                        for (sub, lbl) in [
+                            (PluginSubtype::DelayReverb, "Delay & Reverb"),
+                            (PluginSubtype::EqFilter, "EQ & Filter"),
+                            (PluginSubtype::Dynamics, "Dynamics"),
+                            (PluginSubtype::DriveAmp, "Drive & Amp"),
+                            (PluginSubtype::Modulation, "Modulation"),
+                            (PluginSubtype::Analyzer, "Analyzers"),
+                        ] {
+                            let on = self.insert_subtype == Some(sub) && !self.insert_builtin_only;
+                            if theme::wrapped_quiet_filter_chip(ui, lbl, on).clicked() {
                                 self.insert_builtin_only = false;
+                                self.insert_subtype = if on { None } else { Some(sub) };
                             }
-                            if theme::wrapped_chip_button(ui, "Built-in", self.insert_builtin_only).clicked() {
-                                self.insert_builtin_only = !self.insert_builtin_only;
-                                if self.insert_builtin_only {
-                                    self.insert_subtype = None;
-                                }
-                            }
-                            for (sub, lbl) in [
-                                (PluginSubtype::DelayReverb, "Delay & Reverb"),
-                                (PluginSubtype::EqFilter, "EQ & Filter"),
-                                (PluginSubtype::Dynamics, "Dynamics"),
-                                (PluginSubtype::DriveAmp, "Drive & Amp"),
-                                (PluginSubtype::Modulation, "Modulation"),
-                                (PluginSubtype::Analyzer, "Analyzers"),
-                            ] {
-                                let on = self.insert_subtype == Some(sub) && !self.insert_builtin_only;
-                                if theme::wrapped_chip_button(ui, lbl, on).clicked() {
-                                    self.insert_builtin_only = false;
-                                    self.insert_subtype = if on { None } else { Some(sub) };
-                                }
-                            }
-                        });
+                        }
+                    });
                         ui.add_space(6.0);
                         let filter = self.insert_filter.trim().to_string();
                         egui::ScrollArea::vertical().id_salt("insert_picker_scroll").max_height(250.0).auto_shrink([false, false]).show(ui, |ui| {
@@ -33507,38 +33574,46 @@ impl DemoApp {
             LoadLevel::Critical => (theme::CLIP_BRIGHT, Some(theme::CLIP_RED)),
         };
         let xruns = (st.xruns > 0).then(|| format!("{} xrun{}", st.xruns, if st.xruns == 1 { "" } else { "s" }));
-        let font = FontId::proportional(12.5);
+        let label_font = theme::medium_font(10.5);
+        let value_font = FontId::monospace(11.5);
         let (label, value, value_w, xruns) = ui.fonts_mut(|f| (
-            f.layout_no_wrap("DSP".into(), font.clone(), theme::CREAM_MID),
-            f.layout_no_wrap(value, font.clone(), value_col),
-            f.layout_no_wrap("100 %".into(), font.clone(), theme::CREAM).size().x,
-            xruns.map(|t| f.layout_no_wrap(t, font.clone(), theme::CLIP_BRIGHT)),
+            f.layout_no_wrap("DSP".into(), label_font, theme::CREAM_DIM),
+            f.layout_no_wrap(value, value_font.clone(), value_col),
+            f.layout_no_wrap("100 %".into(), value_font.clone(), theme::CREAM).size().x,
+            xruns.map(|t| f.layout_no_wrap(t, value_font.clone(), theme::CLIP_BRIGHT)),
         ));
-        let width = theme::CHIP_PAD_X * 2.0 + label.size().x + DspChip::GAP + value_w
+        let width = DspChip::PAD_X * 2.0 + label.size().x + DspChip::GAP + value_w
             + xruns.as_ref().map_or(0.0, |g| DspChip::GAP * 2.0 + g.size().x);
         DspChip { label, value, value_w, xruns, stroke, width: width.ceil() }
     }
 
-    /// The DSP readout: a click opens Engine Info.
+    /// The DSP readout: a recessed telemetry well; clicking opens Engine Info.
     fn dsp_chip(&mut self, ui: &mut egui::Ui, chip: DspChip) -> egui::Response {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(chip.width, 26.0), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(chip.width, theme::CONTROL_H), egui::Sense::click());
         self.dsp_chip_rect = rect;
         if ui.is_rect_visible(rect) {
             let open = self.engine_info_open;
-            let fill = if open || resp.hovered() { mix(theme::DARK_PANEL_HI, theme::CREAM, if open { 0.10 } else { 0.07 }) } else { theme::DARK_PANEL_HI };
+            let fill = if open {
+                theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.06)
+            } else if resp.hovered() {
+                theme::DARK_PANEL_HI
+            } else {
+                theme::PAPER_SINK
+            };
             let stroke = chip.stroke.unwrap_or(if open { theme::HAIRLINE_DARK } else if resp.hovered() { theme::MUTED } else { theme::HAIRLINE });
             let p = ui.painter();
-            p.rect_filled(rect, 2.0, fill);
-            p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+            p.rect_filled(rect, theme::RADIUS_CONTROL, fill);
+            p.rect_stroke(rect, theme::RADIUS_CONTROL, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
             let mid = |g: &Arc<egui::Galley>| rect.center().y - g.size().y * 0.5;
-            let mut x = rect.left() + theme::CHIP_PAD_X;
-            p.galley(Pos2::new(x, mid(&chip.label)), chip.label.clone(), theme::CREAM_MID);
+            let mut x = rect.left() + DspChip::PAD_X;
+            p.galley(Pos2::new(x, mid(&chip.label)), chip.label.clone(), theme::CREAM_DIM);
             x += chip.label.size().x + DspChip::GAP + chip.value_w;
             p.galley(Pos2::new(x - chip.value.size().x, mid(&chip.value)), chip.value.clone(), theme::CREAM);
             if let Some(g) = &chip.xruns {
                 p.galley(Pos2::new(x + DspChip::GAP * 2.0, mid(g)), g.clone(), theme::CLIP_BRIGHT);
             }
         }
+        if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
         let st = &self.engine_stats;
         let mut tip = if st.audio_live {
             format!("DSP load: rendering takes {:.0} % of each {:.2} ms buffer on average", st.dsp_percent, st.buffer_ms)
@@ -34501,18 +34576,7 @@ impl DemoApp {
             .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
             .constrain(true)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(theme::DARK_PANEL)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::same(10))
-                    .shadow(egui::Shadow {
-                        offset: [0, 6],
-                        blur: 16,
-                        spread: 0,
-                        color: Color32::from_black_alpha(130),
-                    })
-                    .show(ui, |ui| {
+                theme::dropdown_popup_frame().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                         ui.set_min_width(170.0);
                         ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
                         let status = match (&capture, binding) {
@@ -34715,18 +34779,7 @@ impl DemoApp {
             .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
             .constrain(true)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(theme::DARK_PANEL)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::same(10))
-                    .shadow(egui::Shadow {
-                        offset: [0, 6],
-                        blur: 16,
-                        spread: 0,
-                        color: Color32::from_black_alpha(130),
-                    })
-                    .show(ui, |ui| {
+                theme::dropdown_popup_frame().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                         ui.set_min_width(232.0);
                         ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
                         let status = match current {
@@ -35465,8 +35518,14 @@ impl DemoApp {
                 egui::Frame::new()
                     .fill(theme::DARK_PANEL)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .corner_radius(6.0)
+                    .corner_radius(theme::RADIUS_CARD)
                     .inner_margin(egui::Margin::symmetric(12, 6))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(130),
+                    })
                     .show(ui, |ui| {
                         ui.set_max_width((screen.width() - 48.0).max(160.0));
                         ui.add(
@@ -35710,18 +35769,7 @@ impl DemoApp {
             .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
             .constrain(true)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(theme::DARK_PANEL)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::same(10))
-                    .shadow(egui::Shadow {
-                        offset: [0, 6],
-                        blur: 16,
-                        spread: 0,
-                        color: Color32::from_black_alpha(130),
-                    })
-                    .show(ui, |ui| {
+                theme::dropdown_popup_frame().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                         ui.set_min_width(184.0);
                         ui.label(egui::RichText::new(&title).font(theme::medium_font(12.5)).color(theme::INK));
                         theme::tracked_label(ui, &subtitle, 9.0, 0.12, kind.color());
@@ -43191,6 +43239,43 @@ mod split_bpm_tests {
         let kb = app.dock_group_rect.left_center() + Vec2::new(12.0, 0.0);
         click(&mut app, &ctx, kb);
         assert!(app.keyboard_open() && app.stage_view == StageView::Rack);
+    }
+
+    #[test]
+    fn top_bar_lock_never_overlaps_dock_with_agent_and_demo_at_1280() {
+        let (mut app, ctx) = demo();
+        app.load_multi_rig_demo();
+        app.nav_open = false;
+        app.set_rack_locked(true);
+        app.remote.last_ms.store(crate::bridge::now_ms(), std::sync::atomic::Ordering::Relaxed);
+        app.demo_playing = Some(crate::engine::DemoPub { rig: 0, phrase: crate::demo::PhraseKind::Keys });
+
+        let size = Vec2::new(1280.0, 800.0);
+        for _ in 0..3 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+        }
+
+        assert!(app.rack_lock_btn_rect.is_positive(), "lock button laid out");
+        assert!(app.dock_group_rect.is_positive(), "dock tray laid out");
+        assert!(
+            app.rack_lock_btn_rect.right() + 2.0 < app.dock_group_rect.left(),
+            "Lock button must stay left of Dock tray: lock={:?} dock={:?}",
+            app.rack_lock_btn_rect,
+            app.dock_group_rect
+        );
+        assert!(app.agent_chip_rect.is_positive(), "agent chip laid out");
+        assert!(app.top_demo_stop_rect.is_positive(), "Stop demo chip laid out");
+        assert!(app.top_demo_stop_rect.right() <= size.x, "Stop demo fits inside 1280px");
+        assert!(app.add_rig_rect.is_positive(), "inline + rig button laid out");
+        assert!(
+            app.add_rig_rect.right() < app.view_group_rect.left(),
+            "inline + rig button stays left of View tray: add={:?} view={:?}",
+            app.add_rig_rect,
+            app.view_group_rect
+        );
     }
 
     #[test]
@@ -53890,6 +53975,199 @@ mod offline_shots {
                     shot(&mut app, Vec2::new(w, h), &dir.join(file));
                 }
             }
+        }
+    }
+
+    /// Comprehensive Hurricane visual audit screenshots across top-bar widths,
+    /// setlist/locked/agent states, stages, and docks.
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat design_audit_shots -- --ignored"]
+    fn design_audit_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live_stats = |xruns| crate::engine_info::EngineCounters {
+            sample_rate: 48_000,
+            callback_frames: 256,
+            render_avg_ns: 1_173_333, // ~22% of 5.33 ms
+            xruns,
+            ..Default::default()
+        };
+        let seed_setlist = |a: &mut DemoApp| {
+            let _ = a.exec_tool("set_setlist_song", &serde_json::json!({
+                "name": "Opening",
+                "bpm": 118.0,
+                "parts": [
+                    {"name": "Verse", "rigs": [{"rig": 0}]},
+                    {"name": "Chorus", "rigs": [{"rig": 0}, {"rig": 1}], "save_knobs": true}
+                ]
+            }));
+            let _ = a.exec_tool("set_setlist_song", &serde_json::json!({
+                "name": "Bridge Jam",
+                "bpm": 124.0,
+                "parts": [{"name": "Main", "rigs": [{"rig": 1}]}]
+            }));
+            let _ = a.exec_tool("set_setlist_song", &serde_json::json!({
+                "name": "Finale",
+                "bpm": 130.0,
+                "parts": [{"name": "Outro", "rigs": [{"rig": 0}, {"rig": 1}]}]
+            }));
+            let _ = a.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 1}));
+            a.rig_zones = a.setlist.active_zones();
+        };
+        let seed_plugins = |a: &mut DemoApp| {
+            a.plugins_loaded = true;
+            a.plugins_clap = vec![
+                ClapPluginInfo {
+                    id: SURGE_ID.into(),
+                    name: "Surge XT".into(),
+                    vendor: "Surge Synth Team".into(),
+                    features: vec!["instrument".into(), "synthesizer".into()],
+                },
+                ClapPluginInfo {
+                    id: "org.surge-synth-team.surge-xt-fx".into(),
+                    name: "Surge XT Effects".into(),
+                    vendor: "Surge Synth Team".into(),
+                    features: vec!["audio-effect".into(), "multi-effects".into()],
+                },
+            ];
+            a.plugins_lv2 = vec![
+                Lv2PluginInfo {
+                    uri: "http://gareus.org/oss/lv2/b_synth".into(),
+                    name: "setBfree DSP Tonewheel Organ".into(),
+                    author: "Robin Gareus".into(),
+                    lv2_class: "InstrumentPlugin".into(),
+                    num_ports: 4,
+                    is_instrument: true,
+                    is_midi_fx: false,
+                    ..Default::default()
+                },
+                Lv2PluginInfo {
+                    uri: "http://lsp-plug.in/plugins/lv2/compressor_lr".into(),
+                    name: "LSP Compressor Stereo".into(),
+                    author: "LSP Plugins".into(),
+                    lv2_class: "CompressorPlugin".into(),
+                    num_ports: 12,
+                    is_instrument: false,
+                    is_midi_fx: false,
+                    ..Default::default()
+                },
+                Lv2PluginInfo {
+                    uri: "http://guitarix.sourceforge.net/plugins/gx_zita_rev1_stereo".into(),
+                    name: "GxZita Reverb".into(),
+                    author: "Guitarix".into(),
+                    lv2_class: "ReverbPlugin".into(),
+                    num_ports: 8,
+                    is_instrument: false,
+                    is_midi_fx: false,
+                    ..Default::default()
+                },
+                Lv2PluginInfo {
+                    uri: "http://kxstudio.sf.net/carla/plugins/miditranspose".into(),
+                    name: "Carla MIDI Transpose".into(),
+                    author: "falkTX".into(),
+                    lv2_class: "UtilityPlugin".into(),
+                    num_ports: 3,
+                    is_instrument: false,
+                    is_midi_fx: true,
+                    ..Default::default()
+                },
+            ];
+        };
+
+        // 1. Top bar & Rack across widths and live states
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            app.test_counters = Some(live_stats(0));
+            shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join("rack-1600x1000.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            seed_setlist(&mut app);
+            app.test_counters = Some(live_stats(0));
+            shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("rack-1280x800-setlist.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            app.test_counters = Some(live_stats(0));
+            shot(&mut app, Vec2::new(900.0, 700.0), &dir.join("rack-900x700.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            while app.rig_count() < 4 { app.edit_rigs(None); }
+            app.test_counters = Some(live_stats(3));
+            shot(&mut app, Vec2::new(760.0, 520.0), &dir.join("rack-760x520-4rigs.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            app.set_rack_locked(true);
+            app.remote.last_ms.store(crate::bridge::now_ms(), std::sync::atomic::Ordering::Relaxed);
+            app.demo_playing = Some(crate::engine::DemoPub { rig: 0, phrase: crate::demo::PhraseKind::Keys });
+            app.test_counters = Some(live_stats(0));
+            shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("rack-locked-agent-1280x800.png"));
+        }
+
+        // 2. Full-stage views & docks
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            app.stage_view = StageView::Mixer;
+            shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join("mixer-1600x1000.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            app.stage_view = StageView::Matrix;
+            shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join("matrix-1600x1000.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            seed_setlist(&mut app);
+            app.setlist.songs[0].time_sig = Some(crate::transport::TimeSig::default());
+            app.setlist_edit_song = Some(0);
+            app.stage_view = StageView::Setlist;
+            shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join("setlist-1600x1000.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            seed_plugins(&mut app);
+            app.stage_view = StageView::Plugins;
+            app.plugin_category = PluginCategory::Effects;
+            shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join("plugins-effects-1600x1000.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            seed_plugins(&mut app);
+            app.catalog_roots = Some(vec![]);
+            app.stage_view = StageView::Plugins;
+            app.plugin_category = PluginCategory::Install;
+            shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("plugins-install-1280x800.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.stage_view = StageView::Settings;
+            app.settings_page = SettingsPage::Audio;
+            shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("settings-audio-1280x800.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.stage_view = StageView::Settings;
+            app.settings_page = SettingsPage::Models;
+            shot(&mut app, Vec2::new(781.0, 468.0), &dir.join("settings-narrow-781x468.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.dock = DockView::Assistant;
+            shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("assistant-dock-1280x800.png"));
+        }
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.dock = DockView::Keyboard;
+            shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("keyboard-dock-1280x800.png"));
         }
     }
 }

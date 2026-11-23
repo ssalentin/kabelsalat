@@ -185,6 +185,19 @@ pub fn open_stream(
     render: RenderCb,
     on_error: ErrorCb,
 ) -> anyhow::Result<OpenedStream> {
+    let opened = open_stream_inner(choice, target_device, expected_rate, buffer_frames, render, on_error)?;
+    crate::audio_doctor::log_startup_rt_warning_once();
+    Ok(opened)
+}
+
+fn open_stream_inner(
+    choice: AudioBackendChoice,
+    target_device: Option<&str>,
+    expected_rate: Option<f64>,
+    buffer_frames: u32,
+    render: RenderCb,
+    on_error: ErrorCb,
+) -> anyhow::Result<OpenedStream> {
     let choice = effective_choice(choice);
     match choice {
         AudioBackendChoice::PipeWire => {
@@ -499,6 +512,18 @@ extern "C" fn pw_state_changed_cb(data: *mut c_void, _old: c_int, state: c_int, 
     }
 }
 
+/// Resolve the frame count for one PipeWire process callback given the
+/// buffer's `requested` quantum, the configured `default_frames`, and the
+/// buffer's `max_frames` capacity. Never panics or hangs on a quantum
+/// mismatch (GigChain #54).
+pub(crate) fn pw_callback_frames(requested: usize, default_frames: usize, max_frames: usize) -> usize {
+    if requested > 0 {
+        requested.min(max_frames)
+    } else {
+        default_frames.min(max_frames)
+    }
+}
+
 extern "C" fn pw_process_cb(data: *mut c_void) {
     if data.is_null() {
         return;
@@ -525,11 +550,7 @@ extern "C" fn pw_process_cb(data: *mut c_void) {
                 const STRIDE: usize = CH * std::mem::size_of::<f32>();
                 let max_frames = (d.maxsize as usize) / STRIDE;
                 let req = (*pw_buf).requested as usize;
-                let frames = if req > 0 {
-                    req.min(max_frames)
-                } else {
-                    st.default_frames.min(max_frames)
-                };
+                let frames = pw_callback_frames(req, st.default_frames, max_frames);
                 if frames > 0 {
                     let out = std::slice::from_raw_parts_mut(d.data as *mut f32, frames * CH);
                     let lat_ns = ((frames as f64 / st.sample_rate.max(1.0)) * 1e9) as u64;
@@ -1401,5 +1422,22 @@ mod tests {
         assert_eq!(pod.obj_id, SPA_PARAM_ENUM_FORMAT);
         assert_eq!(pod.props[3][4], 48000);
         assert_eq!(pod.props[4][4], 2);
+    }
+
+    /// GigChain #54: mismatched PipeWire quantum vs requested buffer size
+    /// clamps safely to buffer capacity without panicking or hanging.
+    #[test]
+    fn pw_callback_frames_handles_quantum_mismatch_safely() {
+        // PipeWire offers smaller quantum (64) than requested (256)
+        assert_eq!(pw_callback_frames(64, 256, 1024), 64);
+        // PipeWire offers larger quantum (1024) than requested (128), within max
+        assert_eq!(pw_callback_frames(1024, 128, 2048), 1024);
+        // PipeWire offers larger quantum than buffer max_frames: clamped
+        assert_eq!(pw_callback_frames(2048, 256, 512), 512);
+        // PipeWire leaves requested == 0: falls back to default_frames clamped to max
+        assert_eq!(pw_callback_frames(0, 256, 512), 256);
+        assert_eq!(pw_callback_frames(0, 1024, 512), 512);
+        // Zero-capacity buffer yields 0 frames without underflow
+        assert_eq!(pw_callback_frames(256, 256, 0), 0);
     }
 }

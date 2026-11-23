@@ -1991,4 +1991,16 @@ Learned so far (2026-11-15, UI polish pass):
     blocking `lilv` world discovery in `frame_feeds`, never `dlclose` UI `.so`
     handles, and run `hide`/`cleanup` before dropping the parent X11
     `PluginWindow`.
+226. **Retrigger held notes cleanly:** before sending Note On to a voice or LV2
+    slot whose per-slot held-note bitmask already has that pitch set, emit Note
+    Off first so a repeated Note On never leaves an orphan voice on a single
+    Note Off (GigChain #53).
+227. **Never blocklist externally killed plugin scans:** in CLAP and VST3
+    subprocess scanners, map `SIGKILL`/`SIGTERM`/`SIGINT`/`SIGHUP` to
+    `ScanFail::Setup` (uncached), reserving `ScanFail::Verdict` (negative cache)
+    for crash signals (`SIGSEGV`/`SIGABRT`/etc.) and non-zero exits (GigChain
+    #55).
+228. **Drain CLAP `out_events` on the audio thread:** forward plugin-initiated
+    `ParamValueEvent`s from `ev_out` via a lock-free ring to `ClapVoiceMain`
+    instead of discarding `ev_out` between blocks (GigChain #60).
 

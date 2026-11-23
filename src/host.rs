@@ -583,6 +583,9 @@ pub struct ClapVoice {
     sample_rate: f64,
     ev_in: EventBuffer,
     ev_out: EventBuffer,
+    /// Lock-free ring carrying plugin-initiated `ParamValueEvent`s from
+    /// `ev_out` on the audio thread back to `ClapVoiceMain` (GigChain #60).
+    out_param_tx: rtrb::Producer<(u32, f64)>,
     process_errors: u64,
     gate: Arc<StateGate>,
     /// What the plugin reported when it was activated, or after a
@@ -739,6 +742,7 @@ impl ClapVoice {
         let (audio_link, main_link) = restart_link();
 
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let (out_param_tx, out_param_rx) = rtrb::RingBuffer::<(u32, f64)>::new(EVENT_CAP as usize);
         let gate = Arc::new(StateGate::default());
         let is_effect = entry_is_effect(&entry, &id_str);
         let voice = ClapVoice {
@@ -758,6 +762,7 @@ impl ClapVoice {
             sample_rate,
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
+            out_param_tx,
             process_errors: 0,
             gate: gate.clone(),
             latency: shared_latency.clone(),
@@ -780,6 +785,8 @@ impl ClapVoice {
             restart: Restart::Idle,
             served: Served::default(),
             sample_rate,
+            out_param_rx,
+            pending_param_edits: Vec::new(),
             _entry: entry,
         });
         main.as_clap_mut().unwrap().refresh_main_controls();
@@ -796,6 +803,7 @@ impl ClapVoice {
         vst3: crate::vst3::Vst3Voice,
     ) -> Self {
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let (out_param_tx, _) = rtrb::RingBuffer::<(u32, f64)>::new(1);
         let (link, _main_link) = restart_link();
         Self {
             voice_id: NEXT_VOICE_ID.fetch_add(1, Ordering::Relaxed),
@@ -814,6 +822,7 @@ impl ClapVoice {
             sample_rate,
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
+            out_param_tx,
             process_errors: 0,
             gate: Arc::new(StateGate::default()),
             latency,
@@ -833,6 +842,7 @@ impl ClapVoice {
         sandbox: sandbox::SandboxVoice,
     ) -> Self {
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let (out_param_tx, _) = rtrb::RingBuffer::<(u32, f64)>::new(1);
         let (link, _main_link) = restart_link();
         Self {
             voice_id: NEXT_VOICE_ID.fetch_add(1, Ordering::Relaxed),
@@ -851,6 +861,7 @@ impl ClapVoice {
             sample_rate,
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
+            out_param_tx,
             process_errors: 0,
             gate: Arc::new(StateGate::default()),
             latency,
@@ -1197,6 +1208,18 @@ impl ClapVoice {
             Some(&transport_event(transport)),
         );
         self.gate.leave();
+        // Forward plugin-initiated parameter changes (e.g. from native CLAP
+        // editor or internal modulation) lock-free to the main thread (GigChain #60).
+        for ev in self.ev_out.iter() {
+            if let Some(pv) = ev.as_event::<ParamValueEvent>() {
+                if let Some(id) = pv.param_id() {
+                    let val = pv.value();
+                    if val.is_finite() {
+                        let _ = self.out_param_tx.push((id.get(), val));
+                    }
+                }
+            }
+        }
         let failed = match status {
             Ok(ps) => {
                 self.last_status = ps;
@@ -1707,6 +1730,27 @@ mod param_event_tests {
         push_cmd(&mut events, &[], 0, VoiceCmd::Param(ClapId::new(40), 0.5));
         assert_eq!(events.len(), 2, "a plugin without parameters gets none");
     }
+
+    /// GigChain #60: plugin-initiated parameter value changes emitted via CLAP
+    /// `out_events` during `process()` are forwarded lock-free to the host.
+    #[test]
+    fn clap_plugin_out_param_events_are_observed_by_host() {
+        let (mut voice, mut main, probe) = probe::host_probe();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let tr = crate::transport::Transport::default();
+
+        // Plugin changes its own parameter (e.g. from native editor or internal modulation).
+        probe.emit_param_value(0, 0.75);
+        voice.render(&mut buf, tr);
+        main.pump();
+
+        let edits = main.drain_param_edits();
+        assert_eq!(edits, vec![(0, 0.75)], "host must observe CLAP out_events ParamValueEvent");
+        assert!(main.drain_param_edits().is_empty(), "drain clears observed edits");
+        assert!((main.param_value(0).unwrap() - 0.75).abs() < 1e-6);
+
+        main.retire(voice);
+    }
 }
 
 #[cfg(test)]
@@ -2052,6 +2096,10 @@ struct ClapMainInner {
     restart: Restart,
     served: Served,
     sample_rate: f64,
+    /// Plugin-initiated parameter value changes from `ClapVoice::render_block`
+    /// (`ev_out`), drained lock-free on the main thread (GigChain #60).
+    out_param_rx: rtrb::Consumer<(u32, f64)>,
+    pending_param_edits: Vec<(u32, f64)>,
     _entry: PluginEntry,
 }
 
@@ -2206,6 +2254,7 @@ impl ClapMainInner {
     ///   `process()` call, which carries the parameter events both ways. An
     ///   inactive one gets `params.flush()` here.
     pub fn service(&mut self) {
+        self.drain_out_params();
         let (callback, flush) = self.instance.access_shared_handler(|h| {
             (h.callback_requested.swap(false, Ordering::SeqCst), h.flush_requested.swap(false, Ordering::SeqCst))
         });
@@ -2217,6 +2266,17 @@ impl ClapMainInner {
         if flush {
             self.flush_inactive();
         }
+    }
+
+    fn drain_out_params(&mut self) {
+        while let Ok(edit) = self.out_param_rx.pop() {
+            self.pending_param_edits.push(edit);
+        }
+    }
+
+    pub fn drain_param_edits(&mut self) -> Vec<(u32, f64)> {
+        self.drain_out_params();
+        std::mem::take(&mut self.pending_param_edits)
     }
 
     /// What `service` did so far.
@@ -2283,12 +2343,23 @@ impl ClapMainInner {
     }
 
     /// `params.flush()` for an inactive plugin, with no events to send.
-    /// What the plugin reports back is not kept: values are read from it.
+    /// Any parameter edits the plugin emits in `ev_out` are captured for
+    /// `drain_param_edits()` (GigChain #60).
     fn flush_inactive(&mut self) {
         let Some(params) = self.exts.params else { return };
         let Some(mut handle) = self.instance.inactive_plugin_handle() else { return };
         let (ev_in, mut ev_out) = (EventBuffer::new(), EventBuffer::new());
         params.flush(&mut handle, &ev_in.as_input(), &mut ev_out.as_output());
+        for ev in ev_out.iter() {
+            if let Some(pv) = ev.as_event::<ParamValueEvent>() {
+                if let Some(id) = pv.param_id() {
+                    let val = pv.value();
+                    if val.is_finite() {
+                        self.pending_param_edits.push((id.get(), val));
+                    }
+                }
+            }
+        }
         self.served.flushes += 1;
     }
 
@@ -2722,6 +2793,15 @@ impl ClapVoiceMain {
             VoiceMainBackend::Vst3(v) => {
                 let _ = v.service();
             }
+        }
+    }
+
+    /// Drain plugin-initiated parameter edits (from CLAP `out_events` /
+    /// `flush` or VST3 `performEdit` / `outputParameterChanges`, GigChain #60).
+    pub fn drain_param_edits(&mut self) -> Vec<(u32, f64)> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.drain_param_edits(),
+            VoiceMainBackend::Vst3(v) => v.drain_param_edits(),
         }
     }
 
@@ -3901,13 +3981,19 @@ fn run_scan_subprocess(
     unsafe { libc::kill(-pid, libc::SIGKILL) };
     let status = child.wait().map_err(|e| ScanFail::Setup(format!("failed reaping scanner: {e}")))?;
     if !status.success() {
+        use std::os::unix::process::ExitStatusExt;
         let (err, truncated) = stderr.unwrap_or_default();
         let err_tail = String::from_utf8_lossy(&err).trim().to_string();
-        if err_tail.is_empty() {
-            return Err(ScanFail::Verdict(format!("scanner exited with {status}")));
-        }
         let more = if truncated { "…" } else { "" };
-        return Err(ScanFail::Verdict(format!("scanner exited with {status}: {more}{err_tail}")));
+        let msg = if err_tail.is_empty() {
+            format!("scanner exited with {status}")
+        } else {
+            format!("scanner exited with {status}: {more}{err_tail}")
+        };
+        if status.signal().is_some_and(is_external_kill_signal) {
+            return Err(ScanFail::Setup(msg));
+        }
+        return Err(ScanFail::Verdict(msg));
     }
     let Ok((stdout, stdout_truncated)) = stdout else {
         return Err(timed_out());
@@ -3916,6 +4002,13 @@ fn run_scan_subprocess(
         return Err(ScanFail::Verdict(format!("scanner stdout exceeded {} bytes", SCAN_STDOUT_MAX)));
     }
     parse_scan_output(&stdout).map_err(|e| ScanFail::Verdict(format!("{e:#}")))
+}
+
+/// Signals caused by external termination (app shutdown, user kill, OOM)
+/// rather than a plugin crash. A scanner killed by one of these must NOT be
+/// negatively cached / blocklisted (GigChain #55).
+fn is_external_kill_signal(sig: i32) -> bool {
+    matches!(sig, libc::SIGKILL | libc::SIGTERM | libc::SIGINT | libc::SIGHUP)
 }
 
 fn scan_one_bundle(
@@ -4844,5 +4937,46 @@ mod clap_scan_tests {
             elapsed < Duration::from_millis(600),
             "expected concurrent batching under 600ms, took {elapsed:?}"
         );
+    }
+
+    /// GigChain #55: external kill signals (SIGTERM/SIGKILL, e.g. app killed
+    /// during scan or OOM) must NOT blocklist/cache-fail a CLAP bundle, while
+    /// genuine crash signals (SIGSEGV) still get cached.
+    #[test]
+    fn external_kill_signal_is_not_blocklisted_while_crash_signal_is() {
+        let tmp = TempDir::new("kill-vs-crash");
+        let killed = tmp.0.join("killed.clap");
+        let crashed = tmp.0.join("crashed.clap");
+        std::fs::write(&killed, b"fake-killed").unwrap();
+        std::fs::write(&crashed, b"fake-crashed").unwrap();
+        let cache_file = tmp.0.join("cache").join("clap-scan.json");
+
+        let paths = vec![killed.clone(), crashed.clone()];
+        let kill_or_crash = sh_cmd(r#"case "$1" in *killed.clap) kill -TERM $$ ;; *) kill -SEGV $$ ;; esac"#);
+        let first = list_clap_plugins_with(
+            &paths,
+            &kill_or_crash,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            CLAP_SCAN_PARALLELISM,
+        );
+        assert!(first.is_empty());
+
+        // Second scan with a healthy scanner (same untouched bundles):
+        // `killed.clap` was NOT cached so it rescans and succeeds;
+        // `crashed.clap` WAS cached so it remains blocklisted.
+        let healthy = sh_cmd(
+            r#"name=$(basename "$1" .clap)
+            printf '[{"id":"id.%s","name":"%s","vendor":"V","features":[]}]\n' "$name" "$name""#,
+        );
+        let second = list_clap_plugins_with(
+            &paths,
+            &healthy,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            CLAP_SCAN_PARALLELISM,
+        );
+        let ids: Vec<&str> = second.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["id.killed"], "SIGTERM must not blocklist bundle, SIGSEGV must stay cached");
     }
 }

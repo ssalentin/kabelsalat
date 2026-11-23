@@ -34,14 +34,17 @@ every keyboard shortcut.
   - [Play a setlist without a gap](#play-a-setlist-without-a-gap)
   - [Keep what stays through the whole show](#keep-what-stays-through-the-whole-show)
   - [Go on stage with Show mode](#go-on-stage-with-show-mode)
+  - [Song notes and chord charts](#song-notes-and-chord-charts)
   - [Check the show before the first song](#check-the-show-before-the-first-song)
   - [Run the show from a pedal](#run-the-show-from-a-pedal)
   - [Play along with a backing track](#play-along-with-a-backing-track)
+  - [Running backing tracks for a band](#running-backing-tracks-for-a-band)
   - [Record your set](#record-your-set)
   - [Get back on stage after a crash](#get-back-on-stage-after-a-crash)
 - [Engine and audio](#engine-and-audio)
   - [Keep an eye on the engine](#keep-an-eye-on-the-engine)
   - [Diagnose latency and xruns with Audio Doctor](#diagnose-latency-and-xruns-with-audio-doctor)
+  - [Raspberry Pi and headless rigs (ARM64)](#raspberry-pi-and-headless-rigs-arm64)
 - [The assistant and AI agents](#the-assistant-and-ai-agents)
   - [Ask the assistant — or your own AI agent](#ask-the-assistant--or-your-own-ai-agent)
 
@@ -498,11 +501,13 @@ assistant and MCP agents can read, build and step the setlist.
 
 ### Keep what stays through the whole show
 
-A vocal mic, a master reverb or a volume pedal is set up once and stays through
-every song. Each rig, aux bus and MIDI controller binding lives at **show**
-level (no song switch touches it: it keeps the whole keyboard, its fader and
-its knobs), at the level of a **set** (a named group of songs) or at **song**
-level (only where the setlist's parts use it). A rig or bus a part uses is at
+A vocal mic, a guitar input FX rig, a master reverb or a volume pedal is set up
+once and stays through every song. Each rig, aux bus and MIDI controller binding
+lives at **show** level (no song switch touches it: it keeps the whole keyboard,
+its fader and its knobs — or turn on **Vary per song** on a show-level rig to
+keep one persistent input chain while changing per-song bypasses and knobs), at
+the level of a **set** (a named group of songs) or at **song** level (only where
+the setlist's parts use it). A rig or bus a part uses is at
 song level by itself; everything else is at show level, which is also how
 older sessions load. Group songs into sets under **Setlist → Sets & levels**,
 move a set or skip it as a whole, and choose each level there or on the
@@ -524,6 +529,18 @@ PageUp / PageDown (Shift for songs) and a foot switch still step the setlist,
 you hold **Esc** until its line fills (a second), then let go.
 
 <p align="center"><img src="shots/show-mode.png" width="85%" alt="Show mode: the song Moonlight Drive in large type with its part Chorus and 118 BPM 4/4, the next song Riders on the Storm, meters for the master and the organ, a clock, the Panic button and the hint to hold Esc to leave"/></p>
+
+### Song notes and chord charts
+
+Each song in the Setlist editor has a collapsible **Notes / Chords** field for
+cues, lyrics, reminders, or [ChordPro](https://www.chordpro.org/) lead sheets
+(`[Am]` chord brackets, `{title:...}`, `{c:...}` / `{comment:...}` section
+headers). When a song has notes, **Show mode** (**F2**) displays them in a
+clean scrollable panel alongside the stage readout without crowding the
+two-metre-readable song and part title: ChordPro chords are highlighted above or
+inline with the lyrics and `{comment:...}` lines render as section headers,
+while plain text renders cleanly as written. Notes are saved inside the session
+file (and omitted when empty so existing sessions stay compatible).
 
 ### Check the show before the first song
 
@@ -572,7 +589,28 @@ length in beats so an aligned loop never drifts off the metronome, and **offset*
 shifts the start. With sync on and the transport rolling, it starts on the next
 bar line. Attach a WAV file directly in the Setlist song editor (**Pick WAV…**
 or drop a `.wav` file onto the app), or name one via `set_setlist_song` with
-`backing`: selecting the song starts it, and a song without one stops it.
+`backing`: selecting the song starts it, a song's backing track stops cleanly at
+the end of the song rather than looping unexpectedly (unless **loop** is
+explicitly enabled), and switching to a song without one stops playback.
+
+### Running backing tracks for a band
+
+Bands moving from custom DAW scripts (such as Ardour setlist scripts) can run a
+full backing-track show from one session:
+
+- **Reorder and group sets:** arrange songs in **Setlist** (**F12**) and group
+  them into sets under **Setlist → Sets & levels**; skip a set or adjust song
+  order between soundcheck and stage without re-exporting audio.
+- **Keep the click out of the PA:** put the **Metronome** in its own rig and
+  route that rig's bus to a dedicated headphone/IEM output in the mixer (see
+  [Send a bus to its own sound card](#send-a-bus-to-its-own-sound-card)), while
+  backing tracks and instruments go to **Master out**.
+- **Step hands-free:** bind a MIDI foot switch or page-turner pedal under
+  **Setlist → Show controls** to step songs/parts and start or stop the backing
+  track.
+- **Read it from across the stage:** switch to **Show mode** (**F2**) for
+  two-metre-readable song titles, next-song preview, optional song notes/chord
+  charts, live meters, and editing lock.
 
 ### Record your set
 
@@ -640,6 +678,37 @@ jumps straight here. Agents can run the same read-only diagnostic with the
 terminal.
 
 <p align="center"><img src="shots/audio-doctor.png" width="85%" alt="Settings → Audio → Audio Doctor showing PipeWire, realtime priority, CPU governor, USB autosuspend, buffer and xrun checks with one-click Fix buttons, round-trip latency readout, and live xrun check"/></p>
+
+### Raspberry Pi and headless rigs (ARM64)
+
+Every release ships a native ARM64 AppImage (`kabelsalat-aarch64.AppImage`) for
+Raspberry Pi 4/5, Asahi Linux, and other ARM64 Linux boards:
+
+```sh
+curl -LO https://github.com/ssalentin/kabelsalat/releases/latest/download/kabelsalat-aarch64.AppImage
+chmod +x kabelsalat-aarch64.AppImage
+./kabelsalat-aarch64.AppImage
+```
+
+For compact sound modules, battery-powered rigs, or headless setups without a
+monitor:
+
+- **Headless and remote control:** run `kabelsalat mcp` for a headless engine
+  driven over MCP, or `kabelsalat mcp --attach` / `kabelsalat send '<json>'` to
+  control a running instance from a script or SSH session. You can also check a
+  show or audio setup over SSH with `kabelsalat preshow-check <session.ksalat>`
+  and `kabelsalat audio-doctor --json`.
+- **Save RAM on long setlists:** enable **Load ahead** in **Setlist** so only
+  the current song, show/set-level rigs, and the next few upcoming songs stay
+  hosted in memory while the rest load in the background. On machines with under
+  3 GB of RAM, retrospective recording (**Keep the last**) starts disabled
+  automatically.
+- **Keep CPU and power predictable:** inactive rigs automatically sleep once
+  their tails drop below −100 dBFS, so large multi-song sessions only pay DSP
+  cost for active rigs. Run `kabelsalat audio-doctor` to check realtime
+  priority, the CPU frequency governor (`performance` instead of `powersave`),
+  and USB autosuspend for your audio interface and MIDI controllers; start with
+  a 256-frame buffer (5.3 ms at 48 kHz) and raise it to 512 if xruns appear.
 
 ## The assistant and AI agents
 

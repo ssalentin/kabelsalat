@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
 use clap_sys::entry::clap_plugin_entry;
-use clap_sys::events::{clap_event_param_value, clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE};
+use clap_sys::events::{clap_event_header, clap_event_note, clap_event_param_value, clap_input_events, clap_output_events, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE};
 use clap_sys::ext::audio_ports::{clap_audio_port_info, clap_plugin_audio_ports, CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_MONO, CLAP_PORT_STEREO};
 use clap_sys::ext::params::{clap_host_params, clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE};
 use clap_sys::ext::tail::{clap_host_tail, clap_plugin_tail, CLAP_EXT_TAIL};
@@ -65,6 +65,11 @@ pub struct Probe {
     sine_on_note: AtomicBool,
     note_held: AtomicBool,
     sine_phase: AtomicU64,
+    /// Recorded `(key, is_note_on)` note events delivered to `process()`.
+    note_events: Mutex<Vec<(u16, bool)>>,
+    /// Plugin-initiated `(param_id, value)` events to emit via `out_events` on
+    /// the next `process()` or `flush()` call (GigChain #60).
+    pending_out_params: Mutex<Vec<(u32, f64)>>,
     host: AtomicPtr<clap_host>,
 }
 
@@ -89,8 +94,27 @@ impl Probe {
             sine_on_note: AtomicBool::new(false),
             note_held: AtomicBool::new(false),
             sine_phase: AtomicU64::new(0.0f64.to_bits()),
+            note_events: Mutex::new(Vec::new()),
+            pending_out_params: Mutex::new(Vec::new()),
             host: AtomicPtr::new(std::ptr::null_mut()),
         })
+    }
+
+    pub fn note_events(&self) -> Vec<(u16, bool)> {
+        self.note_events.lock().unwrap().clone()
+    }
+
+    pub fn clear_note_events(&self) {
+        self.note_events.lock().unwrap().clear();
+    }
+
+    /// Queue a plugin-initiated parameter value change to be emitted in
+    /// `clap_process.out_events` (or `params.flush` out_events).
+    pub fn emit_param_value(&self, param_id: u32, value: f64) {
+        if param_id == 0 {
+            self.level.store((value as f32).to_bits(), Ordering::SeqCst);
+        }
+        self.pending_out_params.lock().unwrap().push((param_id, value));
     }
 
     pub fn set_sine_on_note(&self, on: bool) {
@@ -364,16 +388,49 @@ unsafe fn apply_events(probe: &Probe, events: *const clap_input_events) {
                     probe.level.store((ev.value as f32).to_bits(), Ordering::SeqCst);
                 }
             }
-            CLAP_EVENT_NOTE_ON if sine_on_note => {
-                if !probe.note_held.swap(true, Ordering::SeqCst) {
+            CLAP_EVENT_NOTE_ON => {
+                let ev = &*(header as *const clap_event_note);
+                probe.note_events.lock().unwrap().push((ev.key as u16, true));
+                if sine_on_note && !probe.note_held.swap(true, Ordering::SeqCst) {
                     probe.sine_phase.store(0.0f64.to_bits(), Ordering::SeqCst);
                 }
             }
-            CLAP_EVENT_NOTE_OFF if sine_on_note => {
-                probe.note_held.store(false, Ordering::SeqCst);
+            CLAP_EVENT_NOTE_OFF => {
+                let ev = &*(header as *const clap_event_note);
+                probe.note_events.lock().unwrap().push((ev.key as u16, false));
+                if sine_on_note {
+                    probe.note_held.store(false, Ordering::SeqCst);
+                }
             }
             _ => {}
         }
+    }
+}
+
+unsafe fn emit_out_events(probe: &Probe, out: *const clap_output_events) {
+    if out.is_null() {
+        return;
+    }
+    let Some(try_push) = (*out).try_push else { return };
+    let pending: Vec<(u32, f64)> = probe.pending_out_params.lock().unwrap().drain(..).collect();
+    for (param_id, value) in pending {
+        let ev = clap_event_param_value {
+            header: clap_event_header {
+                size: std::mem::size_of::<clap_event_param_value>() as u32,
+                time: 0,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_PARAM_VALUE,
+                flags: 0,
+            },
+            param_id,
+            cookie: std::ptr::null_mut(),
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value,
+        };
+        try_push(out, &ev.header);
     }
 }
 
@@ -385,6 +442,7 @@ unsafe extern "C" fn plugin_process(p: *const clap_plugin, process: *const clap_
     let process = &*process;
     probe.last_steady_time.store(process.steady_time, Ordering::SeqCst);
     apply_events(probe, process.in_events);
+    emit_out_events(probe, process.out_events);
     let level = f32::from_bits(probe.level.load(Ordering::SeqCst));
     let n = process.frames_count as usize;
     if probe.in_ports.is_empty() || process.audio_inputs_count == 0 {
@@ -548,8 +606,9 @@ unsafe extern "C" fn params_value_to_text(_p: *const clap_plugin, _id: u32, _val
 unsafe extern "C" fn params_text_to_value(_p: *const clap_plugin, _id: u32, _text: *const c_char, _out: *mut f64) -> bool {
     false
 }
-unsafe extern "C" fn params_flush(p: *const clap_plugin, in_: *const clap_input_events, _out: *const clap_output_events) {
+unsafe extern "C" fn params_flush(p: *const clap_plugin, in_: *const clap_input_events, out: *const clap_output_events) {
     let probe = probe_of(p);
     probe.record("flush");
     apply_events(probe, in_);
+    emit_out_events(probe, out);
 }

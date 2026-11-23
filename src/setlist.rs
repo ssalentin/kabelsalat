@@ -252,6 +252,9 @@ pub struct Song {
     /// starts when the song is selected (#278).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backing: Option<String>,
+    /// Optional lyrics, cues, or ChordPro chart shown in Show mode.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
 }
 
 impl Song {
@@ -263,8 +266,141 @@ impl Song {
             parts,
             set: None,
             backing: None,
+            notes: String::new(),
         }
     }
+}
+
+/// Kind of ChordPro `{directive:...}` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartDirective {
+    Title,
+    Subtitle,
+    Section,
+}
+
+/// One inline piece of a lyric/chord line: an optional `[Chord]` tag or plain text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChartSegment {
+    Chord(String),
+    Text(String),
+}
+
+/// One parsed line of a song's notes / ChordPro chart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChartLine {
+    Blank,
+    Directive { kind: ChartDirective, text: String },
+    Line(Vec<ChartSegment>),
+}
+
+/// Parse song notes / ChordPro text into structured lines for display.
+///
+/// Recognizes `{title:...}` / `{t:...}`, `{subtitle:...}` / `{st:...}`,
+/// `{comment:...}` / `{c:...}` / `{comment_italic:...}` / `{ci:...}`,
+/// `{start_of_chorus}` / `{soc}`, `{start_of_verse}` / `{sov}`,
+/// `{start_of_bridge}` / `{sob}` (skipping closing `{end_of_...}` markers),
+/// and inline `[Chord]` tags. Plain text without ChordPro markup is preserved
+/// verbatim as `ChartLine::Line(vec![ChartSegment::Text(..)])`.
+pub fn parse_chart(notes: &str) -> Vec<ChartLine> {
+    let mut out = Vec::new();
+    for raw in notes.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            out.push(ChartLine::Blank);
+            continue;
+        }
+        if trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.len() >= 2 {
+            let inner = trimmed[1..trimmed.len() - 1].trim();
+            let (key_raw, val_raw) = match inner.split_once(':') {
+                Some((k, v)) => (k.trim(), Some(v.trim())),
+                None => (inner, None),
+            };
+            let key = key_raw.to_ascii_lowercase();
+            match key.as_str() {
+                "title" | "t" => {
+                    if let Some(v) = val_raw.filter(|v| !v.is_empty()) {
+                        out.push(ChartLine::Directive { kind: ChartDirective::Title, text: v.to_string() });
+                    }
+                    continue;
+                }
+                "subtitle" | "st" => {
+                    if let Some(v) = val_raw.filter(|v| !v.is_empty()) {
+                        out.push(ChartLine::Directive { kind: ChartDirective::Subtitle, text: v.to_string() });
+                    }
+                    continue;
+                }
+                "comment" | "c" | "comment_italic" | "ci" | "comment_box" | "cb" => {
+                    if let Some(v) = val_raw.filter(|v| !v.is_empty()) {
+                        out.push(ChartLine::Directive { kind: ChartDirective::Section, text: v.to_string() });
+                    }
+                    continue;
+                }
+                "start_of_chorus" | "soc" => {
+                    let label = val_raw.filter(|v| !v.is_empty()).unwrap_or("Chorus");
+                    out.push(ChartLine::Directive { kind: ChartDirective::Section, text: label.to_string() });
+                    continue;
+                }
+                "start_of_verse" | "sov" => {
+                    let label = val_raw.filter(|v| !v.is_empty()).unwrap_or("Verse");
+                    out.push(ChartLine::Directive { kind: ChartDirective::Section, text: label.to_string() });
+                    continue;
+                }
+                "start_of_bridge" | "sob" => {
+                    let label = val_raw.filter(|v| !v.is_empty()).unwrap_or("Bridge");
+                    out.push(ChartLine::Directive { kind: ChartDirective::Section, text: label.to_string() });
+                    continue;
+                }
+                "end_of_chorus" | "eoc" | "end_of_verse" | "eov" | "end_of_bridge" | "eob" => {
+                    continue;
+                }
+                _ => {
+                    if let Some(v) = val_raw.filter(|v| !v.is_empty()) {
+                        out.push(ChartLine::Directive { kind: ChartDirective::Section, text: format!("{key_raw}: {v}") });
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(ChartLine::Line(parse_chart_segments(raw)));
+    }
+    out
+}
+
+/// Split one line into inline `[Chord]` and plain text segments.
+pub fn parse_chart_segments(line: &str) -> Vec<ChartSegment> {
+    let mut segs = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        let before = &rest[..open];
+        let after_open = &rest[open + 1..];
+        if let Some(close) = after_open.find(']') {
+            let chord = after_open[..close].trim();
+            if !chord.is_empty() {
+                if !before.is_empty() {
+                    segs.push(ChartSegment::Text(before.to_string()));
+                }
+                segs.push(ChartSegment::Chord(chord.to_string()));
+                rest = &after_open[close + 1..];
+                continue;
+            }
+        }
+        let literal = &rest[..open + 1];
+        if let Some(ChartSegment::Text(prev)) = segs.last_mut() {
+            prev.push_str(literal);
+        } else {
+            segs.push(ChartSegment::Text(literal.to_string()));
+        }
+        rest = after_open;
+    }
+    if !rest.is_empty() {
+        if let Some(ChartSegment::Text(prev)) = segs.last_mut() {
+            prev.push_str(rest);
+        } else {
+            segs.push(ChartSegment::Text(rest.to_string()));
+        }
+    }
+    segs
 }
 
 /// Active position in a [`Setlist`].
@@ -1164,5 +1300,67 @@ mod tests {
         assert_eq!(parse_note("Bb2"), Some(46));
         assert_eq!(parse_note("60"), Some(60));
         assert_eq!(parse_note("128"), None);
+    }
+
+    #[test]
+    fn song_notes_round_trip_and_backwards_compat() {
+        // Old session JSON without `notes` deserializes cleanly to empty string.
+        let legacy = r#"{"name":"Old Song","parts":[{"name":"Main","rigs":[]}]}"#;
+        let old: Song = serde_json::from_str(legacy).unwrap();
+        assert_eq!(old.notes, "");
+
+        // Empty notes are omitted from serialized JSON.
+        let json_empty = serde_json::to_string(&old).unwrap();
+        assert!(!json_empty.contains("\"notes\""), "empty notes should be skipped: {json_empty}");
+
+        // Non-empty notes round-trip verbatim.
+        let mut s = Song::new("Charted", vec![Part::new("Verse", vec![PartRig::new(0)])]);
+        s.notes = "{c: Intro}\n[Am]Let's [G]go".into();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"notes\""));
+        let back: Song = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn chordpro_parser_extracts_chords_comments_and_plain_lines() {
+        let text = "\
+{title: Moonlight Drive}
+{st: Key of Am}
+{c: Verse 1}
+[Am]Let's swim to the [G]moon, uh [Fmaj7]huh
+
+{soc}
+Plain lyric line without chords
+[C][G/B]Two chords together
+{eoc}
+Unclosed [bracket stays literal
+";
+        let lines = parse_chart(text);
+        assert_eq!(
+            lines,
+            vec![
+                ChartLine::Directive { kind: ChartDirective::Title, text: "Moonlight Drive".into() },
+                ChartLine::Directive { kind: ChartDirective::Subtitle, text: "Key of Am".into() },
+                ChartLine::Directive { kind: ChartDirective::Section, text: "Verse 1".into() },
+                ChartLine::Line(vec![
+                    ChartSegment::Chord("Am".into()),
+                    ChartSegment::Text("Let's swim to the ".into()),
+                    ChartSegment::Chord("G".into()),
+                    ChartSegment::Text("moon, uh ".into()),
+                    ChartSegment::Chord("Fmaj7".into()),
+                    ChartSegment::Text("huh".into()),
+                ]),
+                ChartLine::Blank,
+                ChartLine::Directive { kind: ChartDirective::Section, text: "Chorus".into() },
+                ChartLine::Line(vec![ChartSegment::Text("Plain lyric line without chords".into())]),
+                ChartLine::Line(vec![
+                    ChartSegment::Chord("C".into()),
+                    ChartSegment::Chord("G/B".into()),
+                    ChartSegment::Text("Two chords together".into()),
+                ]),
+                ChartLine::Line(vec![ChartSegment::Text("Unclosed [bracket stays literal".into())]),
+            ]
+        );
     }
 }

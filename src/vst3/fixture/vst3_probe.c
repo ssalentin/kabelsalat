@@ -245,6 +245,7 @@ struct ProbePlugin {
     double sample_rate;
     double gain;
     double mode_stepped;
+    double program;
     int note_active;
     int note_pitch;
     double phase;
@@ -528,6 +529,7 @@ static tresult proc_process(void *this_, ProcessData *data) {
                     uint32_t id = q->vtbl->getParameterId(q);
                     if (id == 0) p->gain = val;
                     else if (id == 1) p->mode_stepped = val;
+                    else if (id == 2) p->program = val;
                 }
             }
         }
@@ -586,11 +588,11 @@ static tresult edit_set_state(void *this_, IBStream *st) { (void)this_; (void)st
 static tresult edit_get_state(void *this_, IBStream *st) { (void)this_; (void)st; return kResultOk; }
 static int32_t edit_param_count(void *this_) {
     ProbePlugin *p = ((SubIface *)this_)->self;
-    return p->is_effect ? 1 : 2;
+    return p->is_effect ? 1 : 3;
 }
 static tresult edit_param_info(void *this_, int32_t idx, ParameterInfo *info) {
     ProbePlugin *p = ((SubIface *)this_)->self;
-    if (!info || idx < 0 || idx >= (p->is_effect ? 1 : 2)) return kInvalidArgument;
+    if (!info || idx < 0 || idx >= (p->is_effect ? 1 : 3)) return kInvalidArgument;
     memset(info, 0, sizeof(*info));
     if (idx == 0) {
         info->id = 0;
@@ -600,13 +602,20 @@ static tresult edit_param_info(void *this_, int32_t idx, ParameterInfo *info) {
         info->stepCount = 0;
         info->defaultNormalizedValue = 1.0;
         info->flags = 1; /* kCanAutomate */
-    } else {
+    } else if (idx == 1) {
         info->id = 1;
         utf16_copy(info->title, 128, "Wave");
         utf16_copy(info->shortTitle, 128, "Wave");
         info->stepCount = 2;
         info->defaultNormalizedValue = 0.0;
         info->flags = 1 | 8; /* kCanAutomate | kIsList */
+    } else {
+        info->id = 2;
+        utf16_copy(info->title, 128, "Program");
+        utf16_copy(info->shortTitle, 128, "Prog");
+        info->stepCount = 3;
+        info->defaultNormalizedValue = 0.0;
+        info->flags = 1 | 8 | (1 << 15); /* kCanAutomate | kIsList | kIsProgramChange */
     }
     return kResultOk;
 }
@@ -616,6 +625,14 @@ static tresult edit_val_to_str(void *this_, uint32_t id, double val, uint16_t st
         if (val < 0.25) utf16_copy(str, 128, "Sine");
         else if (val < 0.75) utf16_copy(str, 128, "Tri");
         else utf16_copy(str, 128, "Saw");
+        return kResultOk;
+    }
+    if (id == 2) {
+        int idx = (int)llround(val * 3.0);
+        if (idx <= 0) utf16_copy(str, 128, "Init");
+        else if (idx == 1) utf16_copy(str, 128, "Brass");
+        else if (idx == 2) utf16_copy(str, 128, "Pad");
+        else utf16_copy(str, 128, "Lead");
         return kResultOk;
     }
     /* Format integer percent cleanly without needing stdio float locale issues */
@@ -640,12 +657,14 @@ static double edit_get_param(void *this_, uint32_t id) {
     ProbePlugin *p = ((SubIface *)this_)->self;
     if (id == 0) return p->gain;
     if (id == 1) return p->mode_stepped;
+    if (id == 2) return p->program;
     return 0.0;
 }
 static tresult edit_set_param(void *this_, uint32_t id, double v) {
     ProbePlugin *p = ((SubIface *)this_)->self;
     if (id == 0) { p->gain = v; return kResultOk; }
     if (id == 1) { p->mode_stepped = v; return kResultOk; }
+    if (id == 2) { p->program = v; return kResultOk; }
     return kInvalidArgument;
 }
 static tresult edit_set_handler(void *this_, IComponentHandler *h) {

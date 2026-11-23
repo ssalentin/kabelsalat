@@ -4047,6 +4047,8 @@ struct DemoApp {
     setlist_backing_open: Option<usize>,
     /// Input buffer for attaching a backing track path.
     setlist_backing_input: String,
+    /// Song index whose Notes / Chords editor is expanded in Setlist.
+    setlist_notes_open: Option<usize>,
     /// Pending two-step delete confirmations.
     confirm_remove_song: Option<usize>,
     confirm_remove_part: Option<(usize, usize)>,
@@ -4692,6 +4694,7 @@ impl DemoApp {
             setlist_edit_song: None,
             setlist_backing_open: None,
             setlist_backing_input: String::new(),
+            setlist_notes_open: None,
             confirm_remove_song: None,
             confirm_remove_part: None,
             confirm_remove_bus: None,
@@ -9041,26 +9044,34 @@ impl DemoApp {
     }
 
     /// A switch into a song that names a backing track starts it in the file
-    /// player (at its gain, or 0.8 when it is off); a switch to a song
-    /// without one stops the track a song started (#278). Parts of the same
-    /// song leave it playing.
+    /// player (at its gain, or 0.8 when it is off, with loop forced off so the
+    /// track stops cleanly at the end of the song); a switch to a song without
+    /// one stops the track a song started (#278). Parts of the same song leave
+    /// it playing.
     fn follow_song_backing(&mut self) {
         let track = self.setlist.active.and_then(|p| Some((p.song, self.setlist.songs.get(p.song)?.backing.clone()?)));
-        let cmd = match track {
+        let cmds: Vec<Command> = match track {
             Some(t) if self.setlist_backing_song.as_ref() != Some(&t) => {
                 let Some(pc) = &self.player_ctrl else { return };
                 pc.play(&t.1);
                 self.setlist_backing_song = Some(t);
-                Command::SetPlayer { gain: if self.player.gain > 0.0 { self.player.gain } else { 0.8 } }
+                self.player.loop_on = false;
+                vec![
+                    Command::SetPlayerCfg { loop_on: Some(false), sync: None, beats: None, offset: None, bpm: None },
+                    Command::SetPlayer { gain: if self.player.gain > 0.0 { self.player.gain } else { 0.8 } },
+                ]
             }
             None if self.setlist_backing_song.is_some() => {
                 self.setlist_backing_song = None;
-                Command::SetPlayerEnable { on: false }
+                vec![Command::SetPlayerEnable { on: false }]
             }
             _ => return,
         };
         if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(cmd);
+            let mut bus = bus.lock().unwrap_or_else(|e| e.into_inner());
+            for cmd in cmds {
+                let _ = bus.send(cmd);
+            }
         }
     }
 
@@ -9181,6 +9192,7 @@ impl DemoApp {
                 "time_signature": s.time_sig.map(|t| t.to_json()),
                 "set": self.setlist.set_of(si).map(|x| x.name.as_str()),
                 "backing": s.backing,
+                "notes": s.notes,
                 "load_state": self.song_load_state(si).as_str(),
                 "parts": parts,
             })
@@ -9334,6 +9346,15 @@ impl DemoApp {
             if let Some(v) = args.get("backing") {
                 self.setlist.songs[idx].backing = parse_backing(v)?;
             }
+            if let Some(v) = args.get("notes") {
+                if v.is_null() {
+                    self.setlist.songs[idx].notes.clear();
+                } else if let Some(s) = v.as_str() {
+                    self.setlist.songs[idx].notes = s.to_string();
+                } else {
+                    return Err("notes must be a string or null".into());
+                }
+            }
             if let Some(parts) = parsed_parts {
                 self.setlist.songs[idx].parts = parts;
             }
@@ -9373,6 +9394,13 @@ impl DemoApp {
             }
             if let Some(v) = args.get("backing") {
                 song.backing = parse_backing(v)?;
+            }
+            if let Some(v) = args.get("notes") {
+                if let Some(s) = v.as_str() {
+                    song.notes = s.to_string();
+                } else if !v.is_null() {
+                    return Err("notes must be a string or null".into());
+                }
             }
             self.setlist.songs.push(song);
             let idx = self.setlist.songs.len() - 1;
@@ -12492,12 +12520,20 @@ impl DemoApp {
             MatrixRow::HwAll => ("ANY HW", Some("every device")),
             MatrixRow::HwDev(_) => ("HW", None),
         };
+        const MAX_DEV_W: f32 = 220.0;
+        const MAX_PORT_W: f32 = 140.0;
         let ink = if src.live { theme::INK } else { theme::INK_2 };
         let p = ui.painter();
-        let name = (!src.continues).then(|| p.layout_no_wrap(src.name.clone(), theme::medium_font(14.0), ink));
+        let name = (!src.continues).then(|| {
+            if matches!(src.row, MatrixRow::HwDev(_)) {
+                Self::ellipsized(p, &src.name, theme::medium_font(14.0), ink, MAX_DEV_W)
+            } else {
+                p.layout_no_wrap(src.name.clone(), theme::medium_font(14.0), ink)
+            }
+        });
         let sub = sub.map(|t| p.layout_no_wrap(t.into(), egui::FontId::proportional(12.0), theme::INK_2));
         let chip_font = theme::medium_font(10.5);
-        let port = src.port.clone().map(|t| p.layout_no_wrap(t, chip_font.clone(), theme::CREAM_META));
+        let port = src.port.as_deref().map(|t| Self::ellipsized(p, t, chip_font.clone(), theme::CREAM_META, MAX_PORT_W));
         let offline = (!src.live).then(|| p.layout_no_wrap("UNPLUGGED".into(), chip_font.clone(), theme::INK_2));
         let badge = p.layout_no_wrap(badge_text.into(), chip_font.clone(), if hw { theme::MIDI_BLUE } else { theme::CREAM_META });
         let chip_w = |g: &std::sync::Arc<egui::Galley>| g.size().x + 16.0;
@@ -12506,7 +12542,16 @@ impl DemoApp {
         if let Some(g) = &sub { w += g.size().x + GAP; }
         if let Some(g) = &port { w += chip_w(g) + GAP; }
         if let Some(g) = &offline { w += chip_w(g); }
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::hover());
+        if matches!(src.row, MatrixRow::HwDev(_)) {
+            let tip = match (&src.port, src.live) {
+                (Some(port), true) => format!("{} · {port}", src.name),
+                (Some(port), false) => format!("{} · {port} (unplugged)", src.name),
+                (None, true) => src.name.clone(),
+                (None, false) => format!("{} (unplugged)", src.name),
+            };
+            resp.on_hover_text(tip);
+        }
         let p = ui.painter();
         let cy = rect.center().y;
         let mut x = rect.left();
@@ -12797,10 +12842,14 @@ impl DemoApp {
                     .wrap_mode(egui::TextWrapMode::Extend));
             });
             for (key, live) in &ports {
-                let short = key.rsplit_once(':').map_or(key.as_str(), |(_, p)| p).to_string();
+                let short = key.rsplit_once(':').map_or(key.as_str(), |(_, p)| p);
                 ui.vertical(|ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(short).font(theme::medium_font(13.0)).color(theme::INK))
-                        .wrap_mode(egui::TextWrapMode::Extend));
+                    ui.set_max_width(180.0);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(short).font(theme::medium_font(13.0)).color(theme::INK))
+                            .truncate(),
+                    )
+                    .on_hover_text(key.as_str());
                     ui.add(egui::Label::new(egui::RichText::new(if *live { "MIDI OUT ✓" } else { "unplugged" }).size(11.0)
                         .color(if *live { theme::LIVE_TEAL } else { theme::INK_2 })).wrap_mode(egui::TextWrapMode::Extend));
                 });
@@ -19452,6 +19501,7 @@ impl DemoApp {
                                   new_part_name: &mut String,
                                   backing_open: &mut Option<usize>,
                                   backing_input: &mut String,
+                                  notes_open: &mut Option<usize>,
                                   confirm_remove_part: &mut Option<(usize, usize)>,
                                   add_part_for: &mut Option<usize>,
                                   move_part: &mut Option<(usize, usize, usize)>,
@@ -19590,6 +19640,64 @@ impl DemoApp {
                                         }
                                     });
                                 }
+                            });
+                    }
+                    ui.add_space(6.0);
+
+                    // Notes / Chords row
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        theme::section_label(ui, "Notes");
+                        let has_notes = !song.notes.trim().is_empty();
+                        let line_count = song.notes.lines().filter(|l| !l.trim().is_empty()).count();
+                        let summary = if has_notes {
+                            format!("{line_count} line{}", if line_count == 1 { "" } else { "s" })
+                        } else {
+                            "none".into()
+                        };
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .size(11.5)
+                                .color(if has_notes { theme::CABLE_AMBER } else { theme::INK_2 }),
+                        );
+                        let editing_notes = *notes_open == Some(si);
+                        let lbl = if editing_notes {
+                            "Hide notes ▴"
+                        } else if has_notes {
+                            "Edit notes ▾"
+                        } else {
+                            "+ Notes / Chords"
+                        };
+                        if theme::wrapped_chip_button(ui, lbl, editing_notes).clicked() {
+                            *notes_open = if editing_notes { None } else { Some(si) };
+                        }
+                        if has_notes && theme::wrapped_chip_button(ui, "Clear", false).clicked() {
+                            song.notes.clear();
+                            *notes_open = None;
+                        }
+                    });
+                    if *notes_open == Some(si) {
+                        ui.add_space(4.0);
+                        egui::Frame::new()
+                            .fill(theme::PAPER_SINK)
+                            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(6))
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("setlist_notes_edit_scroll", si))
+                                    .max_height(140.0)
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut song.notes)
+                                                .desired_rows(5)
+                                                .desired_width(f32::INFINITY)
+                                                .font(egui::FontId::monospace(12.0))
+                                                .text_color(theme::CREAM)
+                                                .frame(egui::Frame::NONE)
+                                                .hint_text("Lyrics, cues, or ChordPro: {c: Chorus} [Am]Hello [G]world…"),
+                                        );
+                                    });
                             });
                     }
                     ui.add_space(8.0);
@@ -19899,6 +20007,7 @@ impl DemoApp {
                                 &mut self.setlist_new_part_name,
                                 &mut self.setlist_backing_open,
                                 &mut self.setlist_backing_input,
+                                &mut self.setlist_notes_open,
                                 &mut self.confirm_remove_part,
                                 &mut add_part_for,
                                 &mut move_part,
@@ -19947,6 +20056,7 @@ impl DemoApp {
                             &mut self.setlist_new_part_name,
                             &mut self.setlist_backing_open,
                             &mut self.setlist_backing_input,
+                            &mut self.setlist_notes_open,
                             &mut self.confirm_remove_part,
                             &mut add_part_for,
                             &mut move_part,
@@ -19971,6 +20081,7 @@ impl DemoApp {
             self.preshow.open = false;
             self.setlist_levels_open = false;
             self.setlist_backing_open = None;
+            self.setlist_notes_open = None;
             self.confirm_remove_part = None;
         }
         if toggle_check {
@@ -22122,6 +22233,7 @@ impl DemoApp {
                 let (line, col) = &summaries[p as usize];
                 let g = Self::ellipsized(ui.painter(), line, FontId::proportional(11.0), *col, text_w);
                 ui.painter().galley(Pos2::new(rect.left() + 14.0, rect.bottom() - 6.0 - g.size().y), g, *col);
+                let resp = if !line.is_empty() { resp.on_hover_text(line.as_str()) } else { resp };
                 if resp.clicked() {
                     self.settings_page = p;
                 }

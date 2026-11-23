@@ -600,6 +600,40 @@ fn eval_realtime(facts: &DoctorFacts) -> CheckRow {
     }
 }
 
+/// Non-blocking startup realtime-priority check (GigChain #71): returns a
+/// warning message when the audio thread is running without realtime priority
+/// (or when neither PAM `RLIMIT_RTPRIO` nor `rtkit-daemon` is available), and
+/// `None` when realtime priority is active or available.
+pub fn startup_rt_warning(rt: &RealtimeFacts) -> Option<String> {
+    let mut facts = DoctorFacts::default();
+    facts.realtime = rt.clone();
+    let row = eval_realtime(&facts);
+    if row.status != Status::Ok {
+        Some(row.text)
+    } else {
+        None
+    }
+}
+
+/// Spawn a one-shot non-blocking check after audio stream startup and log a
+/// warning to stderr if the audio render thread lacks realtime priority
+/// (GigChain #71). Never blocks startup or the audio thread.
+pub fn log_startup_rt_warning_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("rt-startup-check".into())
+            .spawn(|| {
+                // Give the first audio callback a moment to record its scheduling policy.
+                std::thread::sleep(Duration::from_millis(250));
+                let rt = gather_realtime();
+                if let Some(msg) = startup_rt_warning(&rt) {
+                    eprintln!("audio: WARNING: {msg} (open Audio Doctor to fix)");
+                }
+            });
+    });
+}
+
 fn summarize_governors(govs: &[String]) -> String {
     let mut unique: Vec<&str> = Vec::new();
     for g in govs {
@@ -1894,5 +1928,42 @@ update: id:0 key:'clock.force-rate' value:'0' type:''
         let ok_diag = diagnose_xrun_run(&ok_run, &healthy_facts());
         assert_eq!(ok_diag.status, Status::Ok);
         assert!(ok_diag.recommended_fix.is_none());
+    }
+
+    /// GigChain #71: startup RT check warns when running without realtime
+    /// priority and stays silent when RT scheduling is active.
+    #[test]
+    fn startup_rt_warning_fires_when_audio_thread_lacks_realtime_priority() {
+        let rt_ok = RealtimeFacts {
+            audio_thread_rt: Some(true),
+            rlimit_rtprio_soft: 0,
+            rlimit_rtprio_hard: 0,
+            rtkit_active: Some(true),
+            rtkit_installed: true,
+            in_realtime_group: false,
+        };
+        assert!(startup_rt_warning(&rt_ok).is_none());
+
+        let rt_sandboxed = RealtimeFacts {
+            audio_thread_rt: Some(false),
+            rlimit_rtprio_soft: 0,
+            rlimit_rtprio_hard: 0,
+            rtkit_active: Some(true),
+            rtkit_installed: true,
+            in_realtime_group: false,
+        };
+        let warn = startup_rt_warning(&rt_sandboxed).expect("normal-priority audio thread must warn");
+        assert!(warn.contains("normal priority"), "{warn}");
+
+        let no_rt = RealtimeFacts {
+            audio_thread_rt: Some(false),
+            rlimit_rtprio_soft: 0,
+            rlimit_rtprio_hard: 0,
+            rtkit_active: Some(false),
+            rtkit_installed: false,
+            in_realtime_group: false,
+        };
+        let prob = startup_rt_warning(&no_rt).expect("missing rtkit + RLIMIT_RTPRIO=0 must warn");
+        assert!(prob.contains("Realtime priority is unavailable"), "{prob}");
     }
 }

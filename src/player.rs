@@ -930,4 +930,20 @@ mod engine_tests {
         assert_eq!(back.len(), FILE_SR as usize * 2);
         assert_eq!(r.state().bpm, 87.5, "filename BPM adopted");
     }
+
+    /// Backing tracks default to stop-at-end (`loop_on == false`): loading a
+    /// track with default config plays through once and stops silently at end.
+    #[test]
+    fn backing_track_defaults_to_stop_at_end_without_looping() {
+        assert!(!super::PlayerCfg::default().loop_on, "default player config must not loop");
+        let mut r = Rig::new();
+        r.load(sine_loop());
+        let mut played_peak = 0.0f32;
+        r.run(2 * 48_000, 512, |p, _, _| played_peak = p.iter().fold(played_peak, |m, s| m.max(s.abs())));
+        assert!(played_peak > 0.5, "backing track played audio ({played_peak})");
+        assert!(r.state().loaded && !r.state().playing && !r.state().loop_on, "stopped at end: {:?}", r.state());
+        let mut after_peak = 0.0f32;
+        r.run(24_000, 512, |p, _, _| after_peak = p.iter().fold(after_peak, |m, s| m.max(s.abs())));
+        assert_eq!(after_peak, 0.0, "silent after track end, no unexpected loop");
+    }
 }

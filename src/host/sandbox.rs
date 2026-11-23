@@ -1455,6 +1455,8 @@ struct SpawnedWorker {
 fn spawn_worker_process(shm_fd: RawFd, child_fd: RawFd, label: &str) -> Result<Child> {
     let exe = std::env::current_exe().context("current_exe")?;
     let mut cmd = Command::new(&exe);
+    // The worker searches the custom plugin folders its host searches (#414).
+    cmd.env(crate::plugin_dirs::ENV, crate::plugin_dirs::env_value());
     if let Some(extra_vst3) = crate::vst3::scan::extra_bundles_env() {
         cmd.env("KABELSALAT_EXTRA_VST3_BUNDLES", extra_vst3);
     }

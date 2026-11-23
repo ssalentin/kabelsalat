@@ -3160,7 +3160,8 @@ pub fn run_test() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Standard CLAP search directories: `~/.clap`, `/usr/lib/clap`,
-/// `/usr/local/lib/clap`, and `$CLAP_PATH` entries, deduplicated in order.
+/// `/usr/local/lib/clap`, `$CLAP_PATH` entries, then the custom folders of
+/// Settings → Plugins (#414), deduplicated in order.
 pub fn clap_search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut push_unique = |p: PathBuf| {
@@ -3179,6 +3180,9 @@ pub fn clap_search_dirs() -> Vec<PathBuf> {
                 push_unique(PathBuf::from(part));
             }
         }
+    }
+    for dir in crate::plugin_dirs::custom(crate::plugin_dirs::Format::Clap) {
+        push_unique(dir);
     }
     dirs
 }

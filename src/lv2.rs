@@ -925,6 +925,7 @@ pub fn control_infos_for_uri(uri: &str) -> Vec<Lv2ControlInfo> {
             return Vec::new();
         }
         lilv_world_load_all(world);
+        load_extra_bundles(world);
         let plugin = find_plugin(world, uri);
         let infos = if plugin.is_null() {
             Vec::new()
@@ -1830,6 +1831,7 @@ pub fn midi_programs(uri: &str) -> Vec<(u8, String)> {
                 return Vec::new();
             }
             lilv_world_load_all(world);
+            load_extra_bundles(world);
             let plugin = find_plugin(world, uri);
             let ext = lilv_new_uri(world, LV2_MIDNAM_INTERFACE_URI.as_ptr() as *const c_char);
             let declared = !plugin.is_null() && lilv_plugin_has_extension_data(plugin, ext);
@@ -1906,14 +1908,25 @@ fn bundle_cstring(dir: &std::path::Path) -> Option<std::ffi::CString> {
     std::ffi::CString::new(path).ok()
 }
 
+/// The bundles to load beside lilv's own search path: the registered ones,
+/// then the bundles in the custom LV2 folders of Settings → Plugins (#414;
+/// lilv itself reads only `LV2_PATH`).
 fn extra_bundle_cstrings() -> Vec<std::ffi::CString> {
-    EXTRA_BUNDLES
+    let mut list: Vec<std::ffi::CString> = EXTRA_BUNDLES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|p| p.to_str().is_ok_and(|s| std::path::Path::new(s).is_dir()))
         .cloned()
-        .collect()
+        .collect();
+    for bundle in crate::plugin_dirs::lv2_bundles(&lv2_standard_paths()) {
+        if let Some(path) = bundle_cstring(&bundle) {
+            if !list.contains(&path) {
+                list.push(path);
+            }
+        }
+    }
+    list
 }
 
 unsafe fn load_extra_bundles(world: *mut LilvWorld) {
@@ -3034,7 +3047,8 @@ fn parse_turtle_presets(src: &str) -> Vec<ParsedPresetStmt> {
     out
 }
 
-fn lv2_search_paths() -> Vec<std::path::PathBuf> {
+/// The folders lilv searches by itself: `LV2_PATH`, then the standard ones.
+fn lv2_standard_paths() -> Vec<std::path::PathBuf> {
     let mut raw = Vec::new();
     if let Ok(lv2_path) = std::env::var("LV2_PATH") {
         for p in lv2_path.split(':') {
@@ -3048,6 +3062,14 @@ fn lv2_search_paths() -> Vec<std::path::PathBuf> {
     }
     raw.push(std::path::PathBuf::from("/usr/lib/lv2"));
     raw.push(std::path::PathBuf::from("/usr/local/lib/lv2"));
+    raw
+}
+
+/// Every folder that holds LV2 bundles: lilv's own, then the custom folders
+/// of Settings → Plugins (#414).
+fn lv2_search_paths() -> Vec<std::path::PathBuf> {
+    let mut raw = lv2_standard_paths();
+    raw.extend(crate::plugin_dirs::custom(crate::plugin_dirs::Format::Lv2));
 
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();

@@ -46,7 +46,7 @@ pub fn save_config_value(field: &str, value: Value) -> std::io::Result<()> {
 
 /// Merge key/value pairs into a config JSON file (mode 0600), preserving
 /// unrelated fields.
-fn save_config_values_to(path: &std::path::Path, pairs: &[(&str, Value)]) -> std::io::Result<()> {
+pub(crate) fn save_config_values_to(path: &std::path::Path, pairs: &[(&str, Value)]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1208,6 +1208,21 @@ pub(crate) fn tools() -> Value {
             "name":"list_plugins",
             "description":"List built-in units and installed CLAP/VST3/LV2 plugins organized by type (Instruments, Effects, MIDI FX, Utilities) and effect subcategory (Delay & Reverb, EQ & Filter, Dynamics, Drive & Amp, Modulation, Pitch & Spatial, Multi-FX, Analyzers, …). Pass optional type, category, format, or query to narrow large lists.",
             "parameters":{"type":"object","properties":{"type":{"type":"string","enum":["all","instrument","effect","midi_fx","utility"],"description":"Filter by plugin type (default all)"},"category":{"type":"string","description":"Filter by subcategory (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"},"format":{"type":"string","enum":["all","builtin","clap","vst3","lv2"],"description":"Filter by plugin format (default all)"},"query":{"type":"string","description":"Optional search words matching name, author/vendor, cid/uri/id, or category"},"limit":{"type":"integer","description":"Max items per section (default 24 unfiltered, 60 filtered)"}}}
+        }},
+        {"type":"function","function":{
+            "name":"list_plugin_folders",
+            "description":"List where plugins are searched, per format (clap, vst3, lv2): the user's custom folders (Settings → Plugins; each with whether it exists), the folders named by CLAP_PATH / VST3_PATH / LV2_PATH, and the standard folders. 'scanning' is true while a background rescan runs.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"add_plugin_folder",
+            "description":"Add a custom plugin search folder for one format (the same list as Settings → Plugins). It is remembered across restarts and the installed plugins are rescanned in the background: call list_plugins a few seconds later. Use it when the user keeps plugins outside the standard folders.",
+            "parameters":{"type":"object","properties":{"format":{"type":"string","enum":["clap","vst3","lv2"],"description":"Plugin format the folder holds"},"path":{"type":"string","description":"The folder: a full path, or one starting with ~"}},"required":["format","path"]}
+        }},
+        {"type":"function","function":{
+            "name":"remove_plugin_folder",
+            "description":"Take a custom plugin search folder (from list_plugin_folders) off the list of one format. Nothing on disk is deleted; the installed plugins are rescanned in the background. Standard folders and the *_PATH environment variables cannot be removed.",
+            "parameters":{"type":"object","properties":{"format":{"type":"string","enum":["clap","vst3","lv2"],"description":"Plugin format"},"path":{"type":"string","description":"The custom folder to remove"}},"required":["format","path"]}
         }},
         {"type":"function","function":{
             "name":"list_instruments",

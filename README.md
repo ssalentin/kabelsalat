@@ -107,6 +107,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   all three formats.
   → [Browse plugins](docs/GUIDE.md#browse-and-install-plugins-by-type),
   [VST3 & plugin GUIs](docs/GUIDE.md#vst3-plugins-and-native-plugin-guis)
+- **Keep plugins wherever you like:** add your own CLAP, VST3 and LV2 folders
+  under **Settings → Plugins**; they are remembered and rescanned in the
+  background. → [Plugin folders](docs/GUIDE.md#search-your-own-plugin-folders)
 - **Install 23 tested plugins with one click** (Surge XT, Dexed, Vitalium,
   setBfree, Aeolus, Guitarix, …). → [Catalog](docs/GUIDE.md#install-instruments-from-the-catalog),
   [tested plugins](docs/PLUGINS.md)
@@ -192,9 +195,9 @@ Packaging details: [docs/PACKAGING.md](docs/PACKAGING.md).
   offers a fix for each. In a terminal: `kabelsalat audio-doctor`.
 - **A plugin is missing from the browser:** kabelsalat looks in `~/.clap`,
   `~/.vst3`, `~/.lv2`, `/usr/lib/{clap,vst3,lv2}` and
-  `/usr/local/lib/{clap,vst3,lv2}`. Add other folders with `CLAP_PATH`,
-  `VST3_PATH` or `LV2_PATH`. A plugin built for another CPU says so instead of
-  loading.
+  `/usr/local/lib/{clap,vst3,lv2}`. Add other folders under **Settings →
+  Plugins** (or with `CLAP_PATH`, `VST3_PATH` or `LV2_PATH`). A plugin built
+  for another CPU says so instead of loading.
 - **Typing Chinese, Japanese or Korean:** start with `KABELSALAT_IME=1`; text
   fields otherwise read the keyboard directly.
 - **It crashed:** it restarts by itself and reopens your session. The report

@@ -183,6 +183,7 @@ mod show_controls;
 mod show_mode;
 mod preshow;
 mod audio_doctor;
+mod plugin_folders;
 mod shared;
 mod window_load;
 use levels::LevelItem;
@@ -3004,12 +3005,13 @@ enum SettingsPage {
     Audio,
     Session,
     Display,
+    Plugins,
     Models,
     Keys,
 }
 
 impl SettingsPage {
-    const APP: [SettingsPage; 3] = [SettingsPage::Audio, SettingsPage::Session, SettingsPage::Display];
+    const APP: [SettingsPage; 4] = [SettingsPage::Audio, SettingsPage::Session, SettingsPage::Display, SettingsPage::Plugins];
     const AGENT: [SettingsPage; 2] = [SettingsPage::Models, SettingsPage::Keys];
 
     fn label(self) -> &'static str {
@@ -3017,6 +3019,7 @@ impl SettingsPage {
             SettingsPage::Audio => "Audio",
             SettingsPage::Session => "Session",
             SettingsPage::Display => "Display",
+            SettingsPage::Plugins => "Plugins",
             SettingsPage::Models => "Models",
             SettingsPage::Keys => "API key",
         }
@@ -3031,6 +3034,7 @@ impl SettingsPage {
             SettingsPage::Audio => "Where kabelsalat plays and how much latency it adds.",
             SettingsPage::Session => "How your work is kept and how playback starts.",
             SettingsPage::Display => "How the app moves and how large it is drawn.",
+            SettingsPage::Plugins => "Where kabelsalat looks for plugins. Your own folders are searched after the standard ones, are remembered, and a change rescans in the background.",
             SettingsPage::Models => "The models the assistant works with. Nothing here changes the sound.",
             SettingsPage::Keys => "One OpenRouter key reaches every model the assistant uses. Stored locally in ~/.config/kabelsalat/config.json (0600) and sent only to openrouter.ai. Saving restarts the assistant.",
         }
@@ -3054,6 +3058,7 @@ enum SettingsAction {
     SetAudioOutput(Option<String>),
     SetBufferSize(u32),
     SetRetroMinutes(u32),
+    Plugins(plugin_folders::FolderAction),
 }
 
 /// The bottom dock holds exactly one occupant at a time: no dock, the full-width
@@ -3433,6 +3438,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
     "record_save_last",
+    "list_plugin_folders", "add_plugin_folder", "remove_plugin_folder",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3465,6 +3471,8 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "set_rack_locked"
             | "panic"
             | "record_save_last"
+            | "add_plugin_folder"
+            | "remove_plugin_folder"
     )
 }
 
@@ -4073,6 +4081,8 @@ struct DemoApp {
     preshow: preshow::PreshowState,
     /// Audio Doctor (#211): diagnostics, fixes, latency probe and xrun test.
     audio_doctor: audio_doctor::AudioDoctorState,
+    /// Settings → Plugins: the open folder editor and which folders exist (#414).
+    plugin_folders: plugin_folders::PluginFoldersState,
     /// The song and backing track the player was started with last (#278).
     setlist_backing_song: Option<(usize, String)>,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
@@ -4718,6 +4728,7 @@ impl DemoApp {
             rack_lock_btn_rect: Rect::NOTHING,
             preshow: Default::default(),
             audio_doctor: Default::default(),
+            plugin_folders: Default::default(),
             setlist_backing_song: None,
             strips: Vec::new(),
             sends: Vec::new(),
@@ -7120,6 +7131,12 @@ impl DemoApp {
             "set_player" => "File player level".into(),
             "list_plugins" => "List plugins".into(),
             "list_instruments" => "List instruments".into(),
+            "list_plugin_folders" => "List plugin folders".into(),
+            "add_plugin_folder" | "remove_plugin_folder" => format!(
+                "{} {} plugin folder",
+                if name.starts_with("add") { "Add" } else { "Remove" },
+                args.get("format").and_then(|v| v.as_str()).unwrap_or("").to_uppercase(),
+            ),
             "install_instrument" => format!("Install {}", args.get("id").and_then(|v| v.as_str()).unwrap_or("instrument")),
             "undo" => "Undo last edit".into(),
             "redo" => "Redo edit".into(),
@@ -11064,6 +11081,7 @@ impl DemoApp {
                     Err(e) => format!("list_plugins: {e}"),
                 }
             }
+            "list_plugin_folders" | "add_plugin_folder" | "remove_plugin_folder" => self.plugin_folder_tool(name, args),
             "list_instruments" => {
                 let installing_id = self.install.as_ref().filter(|i| i.running).map(|i| i.id.clone());
                 let entries: Vec<serde_json::Value> = crate::catalog::CATALOG
@@ -22176,7 +22194,7 @@ impl DemoApp {
 
     /// One line per page for the rail: what is set there now, and a warning
     /// colour when the page holds something the user has to fix.
-    fn settings_summaries(&self, ppp: f32) -> [(String, Color32); 5] {
+    fn settings_summaries(&self, ppp: f32) -> [(String, Color32); 6] {
         use crate::llm::Role;
         let ok = theme::CREAM_DIM;
         let warn = theme::ACCENT_BRIGHT;
@@ -22211,6 +22229,7 @@ impl DemoApp {
             (format!("{shown_buf} frames · {out}"), ok),
             (format!("autosave {} · count-in {}", on_off(self.autosave.enabled), on_off(self.count_in_enabled)), ok),
             (format!("{:.2}× · motion {}", ppp, if self.reduce_motion { "reduced" } else { "full" }), ok),
+            (Self::plugin_folders_summary(), ok),
             models,
             keys_line,
         ]
@@ -22228,7 +22247,7 @@ impl DemoApp {
 
     /// The vertical page list: App pages, then Agent pages under their own
     /// heading, each with a line of what is set there.
-    fn settings_rail(&mut self, ui: &mut egui::Ui, w: f32, summaries: &[(String, Color32); 5]) {
+    fn settings_rail(&mut self, ui: &mut egui::Ui, w: f32, summaries: &[(String, Color32); 6]) {
         for (gi, pages) in [&SettingsPage::APP[..], &SettingsPage::AGENT[..]].into_iter().enumerate() {
             if gi > 0 {
                 ui.add_space(12.0);
@@ -22361,6 +22380,7 @@ impl DemoApp {
                     SettingsPage::Audio => self.settings_audio_page(ui, actions),
                     SettingsPage::Session => self.settings_session_page(ui, actions),
                     SettingsPage::Display => self.settings_display_page(ui, actions),
+                    SettingsPage::Plugins => self.settings_plugins_page(ui, actions),
                     SettingsPage::Models => self.settings_models_page(ui, actions),
                     SettingsPage::Keys => self.settings_keys_page(ui, actions),
                 }
@@ -22945,6 +22965,7 @@ impl DemoApp {
                     (Ok(()), m) => format!("Keeping the last {m} min"),
                 };
             }
+            SettingsAction::Plugins(action) => self.apply_plugin_folder_action(action),
         }
     }
 
@@ -46251,7 +46272,7 @@ mod settings_and_dropdown_tests {
         }
     }
 
-    fn run_frame(
+    pub(super) fn run_frame(
         app: &mut DemoApp,
         ctx: &egui::Context,
         size: Vec2,
@@ -46293,14 +46314,14 @@ mod settings_and_dropdown_tests {
         (texts, fg_rects, middle)
     }
 
-    fn key(k: Key) -> Vec<egui::Event> {
+    pub(super) fn key(k: Key) -> Vec<egui::Event> {
         vec![
             egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
             egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
         ]
     }
 
-    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) {
+    pub(super) fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) {
         let ptr = |pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -46328,7 +46349,7 @@ mod settings_and_dropdown_tests {
     /// Opens a Settings page by clicking its entry in the rail or the tab
     /// row (the leftmost text with that label: a page title sits right of
     /// the rail) and returns the frame of the page it shows.
-    fn open_settings_page(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, label: &str) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+    pub(super) fn open_settings_page(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, label: &str) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
         let (texts, _, _) = warm(app, ctx, size);
         let pos = texts
             .iter()
@@ -46343,7 +46364,7 @@ mod settings_and_dropdown_tests {
 
     /// Every text galley of the Settings sheet stays inside the sheet,
     /// keeps its words on one line, and overlaps no other galley.
-    fn assert_settings_text_layout(app: &DemoApp, texts: &[(String, Rect)], size: Vec2) {
+    pub(super) fn assert_settings_text_layout(app: &DemoApp, texts: &[(String, Rect)], size: Vec2) {
         let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
         let sheet: Vec<&(String, Rect)> = texts
             .iter()
@@ -50813,7 +50834,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 47] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 48] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -50927,6 +50948,7 @@ mod window_size_layout_tests {
             ("drums console", &|a| { a.kb_expanded = true; super::main_control_tests::give_clap_units_main_knobs(a); a.rig_types = vec![Some(crate::keyboard::KeyboardType::Drums)] }),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
+            ("settings-plugins", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Plugins }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
             ("settings-keys", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Keys }),
             ("show mode", &|a| a.set_show_mode(true)),
@@ -51676,7 +51698,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 24] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 25] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -51736,6 +51758,7 @@ mod offline_shots {
             }),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
+            ("settings-plugins", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Plugins }),
             ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
             ("settings-keys", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Keys }),
             ("sessions", &|a| a.stage_view = StageView::Sessions),

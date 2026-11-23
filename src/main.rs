@@ -46,6 +46,7 @@ mod meter;
 mod midi;
 mod player;
 mod preshow;
+mod plugin_dirs;
 mod plugins;
 mod plugin_window;
 mod preview;
@@ -68,6 +69,7 @@ const MODES: &str = "app [--headless], crash-test, sandbox-test, preview, analys
 
 fn main() -> anyhow::Result<()> {
     plugin_window::ensure_x11_egl_platform();
+    plugin_dirs::init();
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
     match mode.as_str() {
         "app" => watchdog::run_app(std::env::args().any(|a| a == "--headless")),

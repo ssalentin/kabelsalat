@@ -475,6 +475,9 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
             let name = p.name.trim();
             if name.is_empty() { return Err("part name cannot be empty".into()); }
             let mut part = Part::new(name, Vec::new());
+            if let Some(c) = &p.cues {
+                part.cues = crate::cues::parse_lines(c.iter().map(String::as_str))?;
+            }
             for &b in p.buses.iter().flatten() {
                 if !graph.is_bus(b) {
                     return Err(format!("node {b} is not an aux bus (get_sends lists them)"));
@@ -546,7 +549,8 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
             };
         }
         if let Some(ps) = &args.parts {
-            st.setlist.songs[idx].parts = parse_parts(ps)?;
+            let parts = parse_parts(ps)?;
+            st.setlist.replace_parts(idx, parts);
         }
         if let Some(b) = &args.backing {
             st.setlist.songs[idx].backing = crate::setlist::backing_path(b.as_deref())?;
@@ -936,6 +940,8 @@ struct SetlistPartArg {
     fx: Option<Vec<SetlistPartFxArg>>,
     /// Aux bus node ids that take signal in this part while at song level.
     buses: Option<Vec<NodeId>>,
+    /// Cue lines sent when the setlist enters this part (see `set_cues`).
+    cues: Option<Vec<String>>,
     /// Snapshot the current knob values and effect bypasses of those rigs into this part.
     capture_knobs: Option<bool>,
     /// The part's send scene (#415): {sends: [{rig | node, bus, level}], fx: [{node, bypass}], params: [{node, param, value}]}.
@@ -1099,6 +1105,21 @@ struct SetSetlistFolderArgs {
     path: Option<String>,
 }
 
+/// Arguments for `set_cues`.
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetCuesArgs {
+    /// 0-based song index.
+    song: usize,
+    /// 0-based part index; omit to set the song's own cues.
+    part: Option<usize>,
+    /// Cue lines: "pc 1 5", "cc 1 20 127", "note 1 C3 [velocity]" (each may
+    /// end in "@<part of a MIDI out port>"), "osc host:port /address [args]".
+    /// An empty array clears.
+    cues: Option<Vec<String>>,
+    /// Also send the cues now (needs the running app).
+    test: Option<bool>,
+}
+
 /// Arguments for `set_show_control`.
 #[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 struct SetShowControlArgs {
@@ -1165,6 +1186,12 @@ struct SetMidiClockArgs {
     output: Option<String>,
     /// Wire (default) or unplug that port.
     output_enabled: Option<bool>,
+    /// Follow an external MIDI clock (tempo, Start/Stop, position) instead
+    /// of sending one.
+    follow: Option<bool>,
+    /// The MIDI in port to follow, by (part of) the name `get_midi_clock`
+    /// lists under follow.inputs; "" clears.
+    input: Option<String>,
 }
 
 /// Arguments for `set_record_sync`.
@@ -3135,11 +3162,12 @@ impl McpServer {
         Self::ui_bridge_tool("get_midi_clock", json!({}))
     }
 
-    #[tool(name = "set_midi_clock", description = "Configure the MIDI Clock Send: enabled; offset_ms (negative = earlier, a pre-roll is added at play); latency_mode none (align to the audio output) | output (include the sound device's output latency, for gear mixed externally) | input (align to the audio input, for gear fed back into kabelsalat); song_position (SPP + Continue when resuming); output + output_enabled (wire the clock to one MIDI out port, by part of its name from get_midi_clock). Starts with the next transport start. Needs the running app.")]
+    #[tool(name = "set_midi_clock", description = "Configure the MIDI Clock Send: enabled; offset_ms (negative = earlier, a pre-roll is added at play); latency_mode none (align to the audio output) | output (include the sound device's output latency, for gear mixed externally) | input (align to the audio input, for gear fed back into kabelsalat); song_position (SPP + Continue when resuming); output + output_enabled (wire the clock to one MIDI out port, by part of its name from get_midi_clock). Starts with the next transport start. follow (bool) + input (a MIDI in port, part of a name from get_midi_clock follow.inputs; \"\" clears): follow an external MIDI clock instead (tempo, Start/Continue/Stop, song position); sending and following are never both on. Needs the running app.")]
     fn set_midi_clock(&self, Parameters(args): Parameters<SetMidiClockArgs>) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool("set_midi_clock", json!({
             "enabled": args.enabled, "offset_ms": args.offset_ms, "latency_mode": args.latency_mode,
             "song_position": args.song_position, "output": args.output, "output_enabled": args.output_enabled,
+            "follow": args.follow, "input": args.input,
         }))
     }
 
@@ -5552,6 +5580,31 @@ impl McpServer {
         tool_err("add_song_from_session requires the running app (connect with --attach)")
     }
 
+    /// Show cues of songs and parts (#401).
+    #[tool(name = "get_cues", description = "Read the show cues: the messages (MIDI program change / CC / note, OSC) each song and each part sends when the setlist enters it, as lines like \"pc 1 5\", plus what was sent so far and whether MIDI output is available (the running app).")]
+    fn get_cues(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("get_cues", json!({}));
+        }
+        ok_json(st.setlist.cues_json())
+    }
+
+    #[tool(name = "set_cues", description = "Replace the cues of a song (song = 0-based index) or of one of its parts (also part): cues is an array of lines, [] clears. Lines: \"pc <channel 1-16> <program 0-127>\", \"cc <channel> <controller> <value>\", \"note <channel> <note or name like C3> [velocity]\" (each may end in \"@<part of a MIDI out port name>\"; default every MIDI out port and the virtual port 'kabelsalat: Show Cues'), \"osc <host>:<port> </address> [args]\". Entering a song sends its cues, then its part's; a part of the same song sends only its own. Loading or editing sends nothing. test: true also sends them now (running app).")]
+    fn set_cues(&self, Parameters(args): Parameters<SetCuesArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let v = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_cues", v);
+        }
+        match st.setlist.set_cues(&v) {
+            Ok(_) => ok_json(st.setlist.cues_json()),
+            Err(e) => tool_err(e),
+        }
+    }
+
     /// Every show action and its control (#277).
     #[tool(name = "get_show_controls", description = "List the show actions a pedal, key or button can trigger (next_song, prev_song, next_part, prev_part, panic, tap_tempo, tuner, master_mute, backing_track, record), the control learned for each (a CC, a note or a program change, and from which hardware device), and every hardware device with whether its program change N picks song N+1 (song_of_program). Show controls work in every song: they are at show level.")]
     fn get_show_controls(&self) -> Result<CallToolResult, McpError> {
@@ -7094,6 +7147,7 @@ mod tests {
                     rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9), pan: Some(-0.25), vel_lo: None, vel_hi: None, vel_curve: None, float: None }]),
                     fx: None,
                     buses: None,
+                    cues: None,
                     capture_knobs: None, scene: None,
                 },
                 SetlistPartArg {
@@ -7104,6 +7158,7 @@ mod tests {
                     }]),
                     fx: None,
                     buses: None,
+                    cues: None,
                     capture_knobs: None, scene: None,
                 },
             ]),
@@ -7159,6 +7214,7 @@ mod tests {
                 rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: None, key_hi: None, transpose: None, level: None, pan: None, vel_lo: None, vel_hi: None, vel_curve: Some("loud".into()), float: None }]),
                 fx: None,
                 buses: None,
+                cues: None,
                 capture_knobs: None, scene: None,
             }]),
             move_to: None, remove: None,
@@ -7534,7 +7590,7 @@ mod tests {
                         transpose: None, level: None, pan: None,
                         vel_lo: None, vel_hi: None, vel_curve: None, float: None,
                     }]),
-                    fx: None, buses: None, capture_knobs: None, scene: None,
+                    fx: None, buses: None, cues: None, capture_knobs: None, scene: None,
                 },
             ]),
             move_to: None,

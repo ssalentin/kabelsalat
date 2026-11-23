@@ -53,6 +53,10 @@ pub const ADDRESS_SUBSCRIBERS: u8 = 254;
 /// `SNDRV_SEQ_QUEUE_DIRECT`: dispatch immediately, no queue scheduling.
 pub const QUEUE_DIRECT: u8 = 253;
 
+pub const EVENT_NOTEON: u8 = 6;
+pub const EVENT_NOTEOFF: u8 = 7;
+pub const EVENT_CONTROLLER: u8 = 10;
+pub const EVENT_PGMCHANGE: u8 = 11;
 pub const EVENT_SONGPOS: u8 = 20;
 pub const EVENT_START: u8 = 30;
 pub const EVENT_CONTINUE: u8 = 31;
@@ -279,6 +283,11 @@ impl PortDesc {
     /// (a destination, e.g. a hardware MIDI out or another app's input).
     pub fn can_receive(&self) -> bool {
         self.capability & PORT_CAP_WRITE != 0 && self.capability & PORT_CAP_SUBS_WRITE != 0
+    }
+    /// True when other clients may subscribe to read this port's events
+    /// (a source, e.g. a hardware MIDI in or another app's output).
+    pub fn can_send(&self) -> bool {
+        self.capability & PORT_CAP_READ != 0 && self.capability & PORT_CAP_SUBS_READ != 0
     }
 }
 
@@ -590,6 +599,40 @@ impl SeqClient {
         ev
     }
 
+    /// A channel message (note on/off, controller, program change) given
+    /// as its wire bytes, dispatched at once from `from_port`: to `dest`,
+    /// or to the port's subscribers. `None` for any other message.
+    pub fn midi_event(&self, from_port: u8, dest: Option<Addr>, bytes: &[u8]) -> Option<Event> {
+        let mut ev = Event::empty();
+        ev.queue = QUEUE_DIRECT;
+        ev.source = Addr { client: self.client, port: from_port };
+        ev.dest = dest.unwrap_or(Addr { client: ADDRESS_SUBSCRIBERS, port: ADDRESS_SUBSCRIBERS });
+        fill_midi(&mut ev, bytes).then_some(ev)
+    }
+
+    /// The monotonic time the kernel stamped a received event with (a port
+    /// set up with `stamp_port` on this client's own queue); `None` when
+    /// the event carries no real-time stamp.
+    pub fn event_mono_ns(&self, ev: &Event) -> Option<u64> {
+        (ev.flags & TIME_STAMP_REAL != 0 && self.queue_epoch_ns != 0)
+            .then(|| (self.queue_epoch_ns + ev.time.to_ns() as i64).max(0) as u64)
+    }
+
+    /// The ports of other clients that are gear or apps: MIDI outs to send
+    /// to (`outs`) or MIDI ins to listen to. Never the system client, our
+    /// own clients, or "Midi Through" unless `KABELSALAT_MIDI_THROUGH` asks.
+    pub fn gear_ports(&mut self, outs: bool) -> Vec<PortDesc> {
+        let own = self.client;
+        let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
+        self.list_ports()
+            .into_iter()
+            .filter(|p| if outs { p.can_receive() } else { p.can_send() })
+            .filter(|p| p.client != CLIENT_SYSTEM && p.client != own)
+            .filter(|p| !p.client_name.contains("kabelsalat"))
+            .filter(|p| through_ok || !p.client_name.contains("Midi Through"))
+            .collect()
+    }
+
     /// Total events handed to the kernel (diagnostics).
     pub fn events_written(&self) -> usize { self.written }
 
@@ -605,6 +648,35 @@ impl SeqClient {
             .map_err(|e| anyhow::anyhow!("REMOVE_EVENTS: {e}"))?;
         Ok(())
     }
+}
+
+/// Fill `ev` from a channel message's wire bytes. `snd_seq_ev_note` is
+/// { channel, note, velocity, off_velocity: u8, duration: u32 } and
+/// `snd_seq_ev_ctrl` is { channel: u8, pad[3], param: u32, value: i32 }.
+fn fill_midi(ev: &mut Event, bytes: &[u8]) -> bool {
+    let Some(&status) = bytes.first() else { return false };
+    let ch = (status & 0x0F) as u32;
+    let d = |i: usize| bytes.get(i).map(|b| (b & 0x7F) as u32);
+    match (status & 0xF0, d(1), d(2)) {
+        (0x90, Some(note), Some(vel)) if vel > 0 => {
+            ev.ty = EVENT_NOTEON;
+            ev.data[0] = u32::from_ne_bytes([ch as u8, note as u8, vel as u8, 0]);
+        }
+        (0x80 | 0x90, Some(note), Some(vel)) => {
+            ev.ty = EVENT_NOTEOFF;
+            ev.data[0] = u32::from_ne_bytes([ch as u8, note as u8, vel as u8, 0]);
+        }
+        (0xB0, Some(cc), Some(value)) => {
+            ev.ty = EVENT_CONTROLLER;
+            ev.data = [u32::from_ne_bytes([ch as u8, 0, 0, 0]), cc, value];
+        }
+        (0xC0, Some(program), _) => {
+            ev.ty = EVENT_PGMCHANGE;
+            ev.data = [u32::from_ne_bytes([ch as u8, 0, 0, 0]), 0, program];
+        }
+        _ => return false,
+    }
+    true
 }
 
 impl Drop for SeqClient {
@@ -631,6 +703,25 @@ pub fn mono_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_messages_become_sequencer_events_field_by_field() {
+        let ev = |bytes: &[u8]| {
+            let mut e = Event::empty();
+            fill_midi(&mut e, bytes).then_some(e)
+        };
+        let first = |e: &Event| e.data[0].to_ne_bytes();
+        let on = ev(&[0x99, 48, 100]).unwrap();
+        assert_eq!((on.ty, first(&on)), (EVENT_NOTEON, [9, 48, 100, 0]));
+        let off = ev(&[0x81, 48, 0]).unwrap();
+        assert_eq!((off.ty, first(&off)), (EVENT_NOTEOFF, [1, 48, 0, 0]));
+        assert_eq!(ev(&[0x90, 48, 0]).unwrap().ty, EVENT_NOTEOFF, "a note-on at velocity 0 is a note-off");
+        let cc = ev(&[0xB1, 20, 127]).unwrap();
+        assert_eq!((cc.ty, first(&cc)[0], cc.data[1], cc.data[2]), (EVENT_CONTROLLER, 1, 20, 127));
+        let pc = ev(&[0xCF, 5]).unwrap();
+        assert_eq!((pc.ty, first(&pc)[0], pc.data[2]), (EVENT_PGMCHANGE, 15, 5));
+        assert!(ev(&[0xF8]).is_none() && ev(&[0xB0, 1]).is_none() && ev(&[]).is_none());
+    }
 
     fn seq_or_skip() -> Option<SeqClient> {
         if !available() {

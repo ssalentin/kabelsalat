@@ -2035,6 +2035,9 @@ pub struct GraphEngine {
     transport_dirty: bool,
     /// MIDI clock send (#85): the song position, published every block.
     clock_pos: Option<Arc<crate::clocksend::ClockPos>>,
+    /// Show cues (#401): the part index the engine stepped to, for the cue
+    /// thread. A lock-free ring; the audio thread does no I/O.
+    cue_steps: Option<rtrb::Producer<u32>>,
     out_peak: Arc<AtomicU32>,
     // Per-edge audio levels (source node's block peak), published per block.
     edge_levels: Arc<EdgeLevels>,
@@ -2378,6 +2381,7 @@ impl GraphEngine {
             last_count_in_beat: 0,
             transport_dirty: false,
             clock_pos: None,
+            cue_steps: None,
             out_peak: Arc::new(AtomicU32::new(0)),
             edge_levels: Arc::new(EdgeLevels::new()),
             node_timer: crate::engine_info::NodeTimer::new(),
@@ -3714,6 +3718,12 @@ impl GraphEngine {
         self.clock_pos = Some(p);
     }
 
+    /// Attach the ring the cue thread reads the parts a foot switch stepped
+    /// to from (main-thread setup).
+    pub fn set_cue_steps(&mut self, p: rtrb::Producer<u32>) {
+        self.cue_steps = Some(p);
+    }
+
     pub fn set_graph_pub(&mut self, p: Arc<Mutex<GraphPub>>) {
         // Room for the voice & LV2 lists now, so publishing them never allocates
         // on the audio thread (the host reserves again when it sends `Grow`).
@@ -4841,7 +4851,12 @@ impl GraphEngine {
         match take {
             Take::Route => return false,
             Take::Consumed => {}
-            Take::Part(zones) => self.set_rig_zones(zones),
+            Take::Part(zones) => {
+                self.set_rig_zones(zones);
+                if let (Some(tx), Some(part)) = (self.cue_steps.as_mut(), self.show.part()) {
+                    let _ = tx.push(part as u32);
+                }
+            }
             Take::Act(ShowAction::Panic) => self.panic(),
             Take::Act(ShowAction::TapTempo) => {
                 if let Some(bpm) = self.tap.tap(self.clock_frames as f64 / self.sample_rate) {
@@ -7304,6 +7319,12 @@ impl GraphEngine {
                 let clamped = bpm.clamp(20.0, 300.0) as f64;
                 if (self.transport.bpm - clamped).abs() > 1e-6 {
                     self.transport.bpm = clamped;
+                    self.transport_dirty = true;
+                }
+            }
+            Command::NudgeBeats { delta } => {
+                if self.transport.playing && delta.is_finite() {
+                    self.transport.beats = (self.transport.beats + delta).max(0.0);
                     self.transport_dirty = true;
                 }
             }

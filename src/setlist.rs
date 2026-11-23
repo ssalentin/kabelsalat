@@ -12,6 +12,8 @@
 //! touches: see [`levels`] (#273).
 
 mod controls;
+mod cues;
+pub use cues::lines_of as cue_lines_of;
 mod instances;
 mod levels;
 mod scene;
@@ -172,6 +174,9 @@ pub struct Part {
     /// level the sending rig lives at. `None` leaves them alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene: Option<SendScene>,
+    /// Messages sent when the setlist enters this part (#401).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cues: Vec<crate::cues::Cue>,
 }
 
 impl Part {
@@ -184,6 +189,7 @@ impl Part {
             fx: Vec::new(),
             buses: Vec::new(),
             scene: None,
+            cues: Vec::new(),
         }
     }
 
@@ -267,6 +273,10 @@ pub struct Song {
     /// Optional lyrics, cues, or ChordPro chart shown in Show mode.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// Messages sent when the setlist enters this song (#401), before its
+    /// part's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cues: Vec<crate::cues::Cue>,
 }
 
 impl Song {
@@ -280,6 +290,7 @@ impl Song {
             backing: None,
             markers: Vec::new(),
             notes: String::new(),
+            cues: Vec::new(),
         }
     }
 }
@@ -517,6 +528,24 @@ impl Setlist {
             .flat_map(|(i, song)| {
                 let skip = self.song_skipped(i);
                 song.parts.iter().map(move |part| ShowPart { song: i, skip, zones: self.zones_of(song, part) })
+            })
+            .collect()
+    }
+
+    /// The cues of every part in `show_parts` order (#401); a cue's data
+    /// bytes and channel are made sendable (`Cue::normalized`).
+    pub fn cue_table(&self) -> Vec<crate::cues::CueSlot> {
+        let norm = |c: &[crate::cues::Cue]| c.iter().cloned().map(crate::cues::Cue::normalized).collect::<Vec<_>>();
+        self.songs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, song)| {
+                let song_cues = norm(&song.cues);
+                song.parts.iter().map(move |part| crate::cues::CueSlot {
+                    song: i,
+                    song_cues: song_cues.clone(),
+                    part_cues: norm(&part.cues),
+                })
             })
             .collect()
     }

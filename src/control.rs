@@ -1515,6 +1515,10 @@ pub enum Command {
     SetNodePlaying { node: NodeId, playing: bool },
     /// Set the tempo (BPM) of the metronomes and of the song clock.
     SetBpm { bpm: f32 },
+    /// Move the song clock by `delta` quarter notes (#401): the MIDI clock
+    /// follower's phase correction, a fraction of a beat at a time. The
+    /// position stays at 0 or above; a stopped clock is not moved.
+    NudgeBeats { delta: f64 },
     /// Configure master transport count-in: `bars` (1..=4) of metronome
     /// clicks before the song clock starts at beat 0 when `enabled` is true.
     SetCountIn { enabled: bool, bars: u8 },
@@ -1685,6 +1689,7 @@ impl Command {
             | Command::TransportStop
             | Command::SetNodePlaying { .. }
             | Command::SetBpm { .. }
+            | Command::NudgeBeats { .. }
             | Command::SetCountIn { .. }
             | Command::SetTimeSignature { .. }
             | Command::LoadLv2Preset { .. }

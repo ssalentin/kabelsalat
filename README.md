@@ -120,6 +120,10 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **Keep plugins wherever you like:** add your own CLAP, VST3 and LV2 folders
   under **Settings → Plugins**; they are remembered and rescanned in the
   background. → [Plugin folders](docs/GUIDE.md#search-your-own-plugin-folders)
+- **Add a plugin without leaving the rack:** press **Enter** or right-click
+  empty rack space for a fuzzy-search picker, with your starred **Favorites**
+  and **Recent** plugins on top.
+  → [Favorites, recents and quick-add](docs/GUIDE.md#favorites-recents-and-quick-add)
 - **Install 23 tested plugins with one click** (Surge XT, Dexed, Vitalium,
   setBfree, Aeolus, Guitarix, …). → [Catalog](docs/GUIDE.md#install-instruments-from-the-catalog),
   [tested plugins](docs/PLUGINS.md)

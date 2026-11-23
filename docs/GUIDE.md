@@ -22,6 +22,7 @@ every keyboard shortcut.
 - [Plugins](#plugins)
   - [Browse and install plugins by type](#browse-and-install-plugins-by-type)
   - [Search your own plugin folders](#search-your-own-plugin-folders)
+  - [Favorites, recents and quick-add](#favorites-recents-and-quick-add)
   - [VST3 plugins and native plugin GUIs](#vst3-plugins-and-native-plugin-guis)
   - [Install instruments from the catalog](#install-instruments-from-the-catalog)
   - [Plugin crash isolation](#plugin-crash-isolation)
@@ -310,6 +311,35 @@ same lists with `list_plugin_folders`, `add_plugin_folder` and
 `remove_plugin_folder`.
 
 <p align="center"><img src="shots/plugin-folders.png" width="85%" alt="Settings → Plugins with custom CLAP, VST3 and LV2 search folders, one of them marked not found"/></p>
+
+### Favorites, recents and quick-add
+
+Click the **☆** on any plugin card (built-in, CLAP, VST3 or LV2) to star it.
+The **★ Favorites** chip then shows only your starred plugins, grouped by
+type, and **Recent** shows the twelve you added to the rack last, newest
+first. Both narrow whatever type is in view, so **Effects** + **★ Favorites**
+is your short list of effects. Favorites and recents are kept in
+`~/.config/kabelsalat/config.json` (`plugin_favorites`, `plugin_recents`) and
+are there again after a restart.
+
+On the rack, press **Enter** or right-click empty rack space to open
+**quick-add**: a small picker over the rack that lists everything you can
+add, with favorites first, then recents, then the rest. Type to search; the
+search is fuzzy (`sxt` finds Surge XT, `rev` puts Reverb first) and also
+matches vendor, category and format. **↑ ↓** choose a row, and:
+
+| Key | Instrument | Effect or utility | MIDI FX |
+|---|---|---|---|
+| **Enter** or a click | layered into the rig in view | added to the rig in view | MIDI strip in front of the rig's instruments |
+| **Shift+Enter** or Shift+click | a new rig | master insert | the same |
+
+**Esc** or a click outside closes it. The chips narrow the list to
+**★ Favorites**, **Recent** or one type. On a locked rack (Ctrl+L) quick-add
+does not open and says why.
+
+Agents star plugins with `set_plugin_favorite` and read both shelves with
+`list_plugins` (`shelf: "favorites"` or `"recent"`); they add units with the
+tools they always had (`add_node`, `add_insert`, `add_rig`).
 
 ### VST3 plugins and native plugin GUIs
 

@@ -2025,3 +2025,17 @@ Learned so far (2026-11-15, UI polish pass):
     path and URI with a monotonic counter, call `lv2::remove_bundle(&dir)` before
     deletion, and skip non-existent dirs in `EXTRA_BUNDLES`.
 
+231. **A device that goes away has its held state released, and a stream that
+    dies is reopened by its own watcher (#402):** an unplugged MIDI keyboard
+    never sends the note-offs of the keys it held, so a chord held when the
+    cable came out droned until a restart, and the output stream had only an
+    error log line: a lost interface or a restarted PipeWire left the rig
+    silent. `HwDirect` keeps per-device held-note and pedal bits and
+    `hotplug::release_hw_device` sends them as note-offs when the hot-plug pass
+    sees the device gone; `audio_recover::Supervisor` owns the output stream,
+    takes a `StreamFault::Lost` or 2 s without a callback as a loss and reopens
+    with the same backend (never `Auto`), output, rate and buffer. A backend's
+    error path reports `Lost` only for an end of the stream, never for an
+    xrun. Check with `kabelsalat hotplug-test`
+    (`an_unplugged_keyboard_lets_go_of_its_held_keys_and_pedal_and_of_nothing_else`,
+    `audio_recover::tests`).

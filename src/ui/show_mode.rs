@@ -323,6 +323,7 @@ impl DemoApp {
         if self.recovery.has_notice() {
             indicators.push(("Restarted after crash", theme::ACCENT_BRIGHT));
         }
+        indicators.extend(self.hotplug_indicators());
         let (song_idx, notes) = sl.current().map_or((None, None), |(s, _, pos)| {
             (Some(pos.song), (!s.notes.trim().is_empty()).then(|| s.notes.clone()))
         });

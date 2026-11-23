@@ -186,6 +186,8 @@ mod audio_doctor;
 mod plugin_folders;
 mod shared;
 mod window_load;
+mod hotplug;
+pub(crate) use hotplug::midi_selftest as hotplug_midi_selftest;
 use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -404,6 +406,9 @@ fn rescan_hw_midi(hw: &HwMidi, conns: &mut Vec<Option<midir::MidiInputConnection
     let mut changed = !unplugged.is_empty();
     for i in unplugged {
         if let Some(c) = conns.get_mut(i).and_then(Option::take) { c.close(); }
+        // Its note-offs will never come (#402).
+        let n = hotplug::release_hw_device(i as u32, queues, direct);
+        if n > 0 { eprintln!("midi: device {i} unplugged with {n} key(s) down — released"); }
     }
     for (dev, name, port) in to_connect {
         if conns.len() <= dev { conns.resize_with(dev + 1, || None); }
@@ -472,6 +477,7 @@ fn hw_midi_in(dev: u32, msg: &[u8], queues: &HwQueues, direct: &HwDirect) {
         if st == 0x90 || st == 0x80 {
             let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
             let ev = NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() };
+            direct.track_note(dev, msg[1], st == 0x90 && msg[2] > 0);
             let sounded = direct.send(&ev);
             push_bounded(&queues.notes, (ev, sounded));
         } else if st == 0xB0 {
@@ -482,6 +488,9 @@ fn hw_midi_in(dev: u32, msg: &[u8], queues: &HwQueues, direct: &HwDirect) {
                 return;
             }
             let src = SourceId::Hardware(dev);
+            if cc == 64 {
+                direct.track_pedal(dev, ch, val >= 64);
+            }
             let _ = direct.send_cc(src, ch, cc, val, std::time::Instant::now());
             push_bounded(&queues.ccs, (src, ch, cc, val));
         }
@@ -504,6 +513,11 @@ struct HwDirect {
     /// Lock-free per-device bitmask of ignored MIDI CCs (0..=127), synced from
     /// `DemoApp::ignored_ccs` so noisy pots are dropped before engine & UI.
     ignored_ccs: [[std::sync::atomic::AtomicU64; 2]; MAX_HW_IGNORED_DEVS],
+    /// Per device: the keys that are down (one bit per note) and the
+    /// channels whose sustain pedal is down, so an unplugged device can be
+    /// released (#402, `hotplug::release_hw_device`).
+    held: [[std::sync::atomic::AtomicU64; 2]; MAX_HW_IGNORED_DEVS],
+    pedals: [std::sync::atomic::AtomicU32; MAX_HW_IGNORED_DEVS],
 }
 
 impl Default for HwDirect {
@@ -515,12 +529,39 @@ impl Default for HwDirect {
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
             ]),
+            held: std::array::from_fn(|_| [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ]),
+            pedals: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
         }
     }
 }
 
 impl HwDirect {
     fn set_keys_vel(&self, v: f32) { self.keys_vel.store(v.to_bits(), Ordering::Relaxed); }
+
+    /// A key of device `dev` went down or came up.
+    fn track_note(&self, dev: u32, note: u8, down: bool) {
+        let Some(mask) = self.held.get(dev as usize) else { return };
+        let (word, bit) = (&mask[((note & 0x7F) / 64) as usize], 1u64 << ((note & 0x7F) % 64));
+        if down { word.fetch_or(bit, Ordering::Relaxed); } else { word.fetch_and(!bit, Ordering::Relaxed); }
+    }
+
+    /// The sustain pedal of device `dev` on `channel` went down or came up.
+    fn track_pedal(&self, dev: u32, channel: u8, down: bool) {
+        let Some(mask) = self.pedals.get(dev as usize) else { return };
+        let bit = 1u32 << (channel & 0x0F);
+        if down { mask.fetch_or(bit, Ordering::Relaxed); } else { mask.fetch_and(!bit, Ordering::Relaxed); }
+    }
+
+    /// What device `dev` holds right now (notes, pedal channels), cleared.
+    fn take_held(&self, dev: u32) -> ([u64; 2], u32) {
+        let (Some(held), Some(pedals)) = (self.held.get(dev as usize), self.pedals.get(dev as usize)) else {
+            return ([0; 2], 0);
+        };
+        ([held[0].swap(0, Ordering::Relaxed), held[1].swap(0, Ordering::Relaxed)], pedals.swap(0, Ordering::Relaxed))
+    }
 
     fn is_cc_ignored(&self, dev: u32, cc: u8) -> bool {
         let Some(mask) = self.ignored_ccs.get(dev as usize) else { return false };
@@ -3720,6 +3761,8 @@ struct DemoApp {
     autosave: Autosave,
     /// The watchdog's marker and the note after a crash (#279).
     recovery: recovery::Recovery,
+    /// Device loss and return (#402): notices, Show-mode flags, input retries.
+    hotplug: hotplug::Hotplug,
     session_msg: String,
     confirm_session: Option<SessionConfirm>,
     /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
@@ -4521,6 +4564,7 @@ impl DemoApp {
                 saved: None,
             },
             recovery: Default::default(),
+            hotplug: Default::default(),
             session_msg: String::new(),
             confirm_session: None,
             patch_notice: None,
@@ -7576,7 +7620,12 @@ impl DemoApp {
         let rev = self.hw_midi.rev.load(std::sync::atomic::Ordering::Acquire);
         if rev == self.hw_midi_rev { return; }
         self.hw_midi_rev = rev;
+        let before: Vec<(String, bool)> = self.hw_devices.iter().cloned()
+            .zip(self.hw_live.iter().copied().chain(std::iter::repeat(true)))
+            .collect();
+        let mut after = Vec::new();
         if let Ok(d) = self.hw_midi.devices.lock() {
+            after = d.clone();
             self.hw_devices = d.iter().map(|(n, _)| n.clone()).collect();
             self.hw_live = d.iter().map(|(_, l)| *l).collect();
             let live: Vec<&str> = d.iter().filter(|(_, l)| *l).map(|(n, _)| n.as_str()).collect();
@@ -7586,6 +7635,7 @@ impl DemoApp {
                 format!("MIDI in: {}", live.join(", "))
             };
         }
+        self.note_midi_changes(&before, &after);
         self.sync_ignored_ccs();
     }
 
@@ -35413,6 +35463,7 @@ impl DemoApp {
         self.publish_show();
         self.crash_notice(&ctx);
         self.track_recovery();
+        self.track_hotplug();
 
         // Full frame rate while focused (the cables are the show) or while an
         // animation / agent run is active; ~30 fps when unfocused and idle.
@@ -36362,15 +36413,14 @@ fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Ve
     Ok((voices, mains))
 }
 
-/// Owns the live output stream (native PipeWire, JACK, or ALSA) plus the
-/// shared engine handle so the stream can be reopened live on a new backend,
-/// ALSA device, or buffer size without losing voices, patches, or rack state.
+/// Owns the live output stream (native PipeWire, JACK, or ALSA) through its
+/// supervisor (`audio_recover`, #402), so the stream can be reopened live on
+/// a new backend, ALSA device, or buffer size without losing voices, patches,
+/// or rack state, and comes back by itself after a device or server loss.
 struct AudioStreamHost {
     /// Plays buses routed to their own output (#147); stops when dropped.
     _bus_outs: Option<crate::audio_out::BusOutputs>,
-    stream: Option<crate::audio_backend::OutputStream>,
-    engine: Arc<Mutex<GraphEngine>>,
-    clock_pos: Arc<crate::clocksend::ClockPos>,
+    sup: crate::audio_recover::Supervisor<crate::audio_backend::OutputStream>,
     backend_choice: crate::audio_backend::AudioBackendChoice,
     active_backend: crate::audio_backend::ActiveBackend,
     target_device: Option<String>,
@@ -36382,43 +36432,101 @@ struct AudioStreamHost {
 }
 
 impl AudioStreamHost {
+    /// Take over the stream `opened` (opened with `health`) for `engine`.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        bus_outs: Option<crate::audio_out::BusOutputs>,
+        opened: crate::audio_backend::OpenedStream,
+        health: Arc<crate::audio_recover::Health>,
+        engine: Arc<Mutex<GraphEngine>>,
+        clock_pos: Arc<crate::clocksend::ClockPos>,
+        backend_choice: crate::audio_backend::AudioBackendChoice,
+        target_device: Option<String>,
+        startup_note: Option<String>,
+    ) -> Self {
+        use crate::audio_recover as rec;
+        // The engine keeps the rate it started with: every reopen asks for it.
+        let params = rec::Params {
+            choice: backend_choice,
+            target: target_device.clone(),
+            sample_rate: opened.sample_rate,
+            buffer_frames: opened.buffer_frames,
+        };
+        let opener: rec::Opener<crate::audio_backend::OutputStream> = Box::new(move |p, health| {
+            let o = open_output_stream(
+                engine.clone(),
+                clock_pos.clone(),
+                p.choice,
+                p.target.as_deref(),
+                Some(p.sample_rate),
+                p.buffer_frames,
+                health,
+            )?;
+            Ok(rec::Opened {
+                stream: o.stream,
+                backend: o.backend,
+                sample_rate: o.sample_rate,
+                buffer_frames: o.buffer_frames,
+                device_label: o.device_label,
+            })
+        });
+        let (active_backend, device_label, sample_rate, buffer_frames) =
+            (opened.backend, opened.device_label.clone(), opened.sample_rate, opened.buffer_frames);
+        let sup = rec::Supervisor::start(
+            rec::Opened {
+                stream: opened.stream,
+                backend: opened.backend,
+                sample_rate: opened.sample_rate,
+                buffer_frames: opened.buffer_frames,
+                device_label: opened.device_label,
+            },
+            health,
+            params,
+            opener,
+            rec::Timing::default(),
+        );
+        Self {
+            _bus_outs: bus_outs,
+            sup,
+            backend_choice,
+            active_backend,
+            target_device,
+            device_label,
+            startup_note,
+            sample_rate,
+            opened_sample_rate: sample_rate,
+            buffer_frames,
+        }
+    }
+
+    /// What is open now, into the fields the UI reads.
+    fn adopt(&mut self, info: &crate::audio_recover::Info) {
+        self.active_backend = info.backend;
+        self.device_label = info.device_label.clone();
+        self.opened_sample_rate = info.sample_rate;
+        self.buffer_frames = info.buffer_frames;
+        crate::bridge::set_active_audio_backend(Some(info.backend));
+    }
+
+    /// After a failed change the supervisor reopened what played before.
+    fn adopt_current(&mut self) {
+        if let Some(info) = self.sup.info() {
+            self.adopt(&info);
+        }
+    }
+
     /// Drop the current output stream (joining its callback thread) and open a
     /// new one at `frames`. Falls back to the previous buffer size on error so
     /// audio stays alive.
     fn set_buffer_frames(&mut self, frames: u32) -> Result<u32, String> {
-        let prev = self.buffer_frames;
-        let _ = self.stream.take();
-        match open_output_stream(
-            self.engine.clone(),
-            self.clock_pos.clone(),
-            self.backend_choice,
-            self.target_device.as_deref(),
-            Some(self.sample_rate),
-            frames,
-        ) {
-            Ok(opened) => {
-                self.stream = Some(opened.stream);
-                self.active_backend = opened.backend;
-                self.device_label = opened.device_label;
-                self.opened_sample_rate = opened.sample_rate;
-                self.buffer_frames = opened.buffer_frames;
-                crate::bridge::set_active_audio_backend(Some(opened.backend));
+        match self.sup.reopen_with(|p| p.buffer_frames = frames) {
+            Ok(info) => {
+                self.adopt(&info);
                 Ok(self.buffer_frames)
             }
             Err(err) => {
-                if let Ok(opened) = open_output_stream(
-                    self.engine.clone(),
-                    self.clock_pos.clone(),
-                    self.backend_choice,
-                    self.target_device.as_deref(),
-                    Some(self.sample_rate),
-                    prev,
-                ) {
-                    self.stream = Some(opened.stream);
-                    self.active_backend = opened.backend;
-                    self.device_label = opened.device_label;
-                }
-                Err(format!("{err}"))
+                self.adopt_current();
+                Err(err)
             }
         }
     }
@@ -36429,80 +36537,31 @@ impl AudioStreamHost {
         &mut self,
         choice: crate::audio_backend::AudioBackendChoice,
     ) -> Result<crate::audio_backend::ActiveBackend, String> {
-        let prev_choice = self.backend_choice;
-        let _ = self.stream.take();
-        match open_output_stream(
-            self.engine.clone(),
-            self.clock_pos.clone(),
-            choice,
-            self.target_device.as_deref(),
-            Some(self.sample_rate),
-            self.buffer_frames,
-        ) {
-            Ok(opened) => {
-                self.stream = Some(opened.stream);
+        match self.sup.reopen_with(|p| p.choice = choice) {
+            Ok(info) => {
                 self.backend_choice = choice;
-                self.active_backend = opened.backend;
-                self.device_label = opened.device_label;
-                self.opened_sample_rate = opened.sample_rate;
-                self.buffer_frames = opened.buffer_frames;
-                crate::bridge::set_active_audio_backend(Some(opened.backend));
-                Ok(opened.backend)
+                self.adopt(&info);
+                Ok(info.backend)
             }
             Err(err) => {
-                if let Ok(opened) = open_output_stream(
-                    self.engine.clone(),
-                    self.clock_pos.clone(),
-                    prev_choice,
-                    self.target_device.as_deref(),
-                    Some(self.sample_rate),
-                    self.buffer_frames,
-                ) {
-                    self.stream = Some(opened.stream);
-                    self.active_backend = opened.backend;
-                    self.device_label = opened.device_label;
-                    crate::bridge::set_active_audio_backend(Some(opened.backend));
-                }
-                Err(format!("{err}"))
+                self.adopt_current();
+                Err(err)
             }
         }
     }
 
     /// Reopen the stream on a new target device (used for direct ALSA PCM selection).
     fn set_target_device(&mut self, device: Option<String>) -> Result<(), String> {
-        let prev_dev = self.target_device.clone();
-        let _ = self.stream.take();
-        match open_output_stream(
-            self.engine.clone(),
-            self.clock_pos.clone(),
-            self.backend_choice,
-            device.as_deref(),
-            Some(self.sample_rate),
-            self.buffer_frames,
-        ) {
-            Ok(opened) => {
-                self.stream = Some(opened.stream);
+        let wanted = device.clone();
+        match self.sup.reopen_with(|p| p.target = wanted) {
+            Ok(info) => {
                 self.target_device = device;
-                self.active_backend = opened.backend;
-                self.device_label = opened.device_label;
-                self.opened_sample_rate = opened.sample_rate;
-                self.buffer_frames = opened.buffer_frames;
+                self.adopt(&info);
                 Ok(())
             }
             Err(err) => {
-                if let Ok(opened) = open_output_stream(
-                    self.engine.clone(),
-                    self.clock_pos.clone(),
-                    self.backend_choice,
-                    prev_dev.as_deref(),
-                    Some(self.sample_rate),
-                    self.buffer_frames,
-                ) {
-                    self.stream = Some(opened.stream);
-                    self.active_backend = opened.backend;
-                    self.device_label = opened.device_label;
-                }
-                Err(format!("{err}"))
+                self.adopt_current();
+                Err(err)
             }
         }
     }
@@ -36515,9 +36574,15 @@ fn open_output_stream(
     target_device: Option<&str>,
     expected_rate: Option<f64>,
     buffer_frames: u32,
+    health: Arc<crate::audio_recover::Health>,
 ) -> anyhow::Result<crate::audio_backend::OpenedStream> {
     let rate_for_cb = expected_rate.unwrap_or(48000.0);
-    crate::audio_backend::open_stream(
+    let beat = health.clone();
+    // A backend that fails while "Auto" tries the next one reports its end
+    // too: only what happens after the open counts as a loss.
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let armed_cb = armed.clone();
+    let opened = crate::audio_backend::open_stream(
         backend_choice,
         target_device,
         expected_rate,
@@ -36533,12 +36598,22 @@ fn open_output_stream(
                 data.fill(0.0);
             }
             crate::bridge::note_render(t0.elapsed(), data.len() / ch.max(1), rate_for_cb);
+            beat.beat();
         }),
-        Box::new(|e| {
-            crate::bridge::XRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("audio stream error: {e}");
+        Box::new(move |e| match e {
+            crate::audio_backend::StreamFault::Xrun(e) => {
+                crate::bridge::XRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("audio stream error: {e}");
+            }
+            crate::audio_backend::StreamFault::Lost(e) => {
+                if armed_cb.load(std::sync::atomic::Ordering::Acquire) {
+                    health.mark_lost(&e);
+                }
+            }
         }),
-    )
+    )?;
+    armed.store(true, std::sync::atomic::Ordering::Release);
+    Ok(opened)
 }
 
 struct BuiltAudio {
@@ -36633,6 +36708,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         .map(|taps| crate::audio_out::BusOutputs::spawn(taps, graph_pub.clone(), sample_rate as u32));
     let engine = Arc::new(Mutex::new(engine));
     let mut startup_note: Option<String> = None;
+    let health = crate::audio_recover::Health::new();
     let opened = match open_output_stream(
         engine.clone(),
         clock_pos.clone(),
@@ -36640,6 +36716,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         target_device.as_deref(),
         Some(sample_rate),
         wanted_buffer,
+        health.clone(),
     ) {
         Ok(o) => o,
         Err(e) if wanted_buffer != crate::bridge::BUFFER_FRAMES => {
@@ -36651,6 +36728,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
                 target_device.as_deref(),
                 Some(sample_rate),
                 crate::bridge::BUFFER_FRAMES,
+                health.clone(),
             )?
         }
         Err(e) if backend_choice != crate::audio_backend::AudioBackendChoice::Auto => {
@@ -36664,6 +36742,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
                 target_device.as_deref(),
                 Some(sample_rate),
                 wanted_buffer,
+                health.clone(),
             )?
         }
         Err(e) => return Err(e),
@@ -36671,20 +36750,16 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let active_buffer = opened.buffer_frames;
     crate::bridge::set_configured_buffer_frames(active_buffer);
     crate::bridge::set_active_audio_backend(Some(opened.backend));
-    let audio_host = AudioStreamHost {
-        _bus_outs: bus_outs,
-        stream: Some(opened.stream),
+    let audio_host = AudioStreamHost::new(
+        bus_outs,
+        opened,
+        health,
         engine,
-        clock_pos: clock_pos.clone(),
+        clock_pos.clone(),
         backend_choice,
-        active_backend: opened.backend,
         target_device,
-        device_label: opened.device_label,
         startup_note,
-        sample_rate: opened.sample_rate,
-        opened_sample_rate: opened.sample_rate,
-        buffer_frames: active_buffer,
-    };
+    );
     Ok(BuiltAudio {
         mains,
         controllers,
@@ -50056,21 +50131,9 @@ mod engine_info_tests {
         let (_bus, drain) = crate::control::command_bus();
         let engine = Arc::new(Mutex::new(GraphEngine::new(Graph::demo_patch(), drain, sr, Vec::new())));
         let clock_pos = crate::clocksend::ClockPos::new();
-        let opened = open_output_stream(engine.clone(), clock_pos.clone(), choice, None, Some(sr), 256).expect("open 256");
-        let mut audio_host = AudioStreamHost {
-            _bus_outs: None,
-            stream: Some(opened.stream),
-            engine,
-            clock_pos,
-            backend_choice: choice,
-            active_backend: opened.backend,
-            target_device: None,
-            device_label: opened.device_label,
-            startup_note: None,
-            sample_rate: opened.sample_rate,
-            opened_sample_rate: opened.sample_rate,
-            buffer_frames: opened.buffer_frames,
-        };
+        let health = crate::audio_recover::Health::new();
+        let opened = open_output_stream(engine.clone(), clock_pos.clone(), choice, None, Some(sr), 256, health.clone()).expect("open 256");
+        let mut audio_host = AudioStreamHost::new(None, opened, health, engine, clock_pos, choice, None, None);
         let wait_frames = |want: u32| -> u32 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             loop {

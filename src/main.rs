@@ -18,6 +18,7 @@ mod audio_backend;
 mod audio_doctor;
 mod audio_in;
 mod audio_out;
+mod audio_recover;
 mod binarch;
 mod bridge;
 mod capture;
@@ -195,6 +196,7 @@ fn main() -> anyhow::Result<()> {
         "record-test" => record::run_test(),
         "audio-in-test" => audio_in::run_test(),
         "audio-out-test" => audio_out::run_test(),
+        "hotplug-test" => audio_recover::run_test(),
         "monitor-latency-test" => audio_in::run_monitor_latency_test(),
         "guitar-rig-test" => engine::guitar_rig_test(),
         "analysis-test" => {

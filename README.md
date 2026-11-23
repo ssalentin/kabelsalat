@@ -143,6 +143,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   [Backing tracks](docs/GUIDE.md#play-along-with-a-backing-track),
   [Recording](docs/GUIDE.md#record-your-set),
   [Crash recovery](docs/GUIDE.md#get-back-on-stage-after-a-crash)
+- **Survive a bumped cable:** a lost audio interface or MIDI controller comes
+  back by itself mid-show, with its routing and bindings, and a notice says so.
+  → [Hot-plug](docs/GUIDE.md#unplug-and-replug-mid-show)
 
 **Controllers and tempo**
 - **MIDI learn** for every knob, fader and button, and ready-made profiles

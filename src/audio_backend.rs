@@ -118,8 +118,25 @@ impl ActiveBackend {
 /// Render callback invoked from the RT audio thread:
 /// `(interleaved_out, channels, optional_output_latency_ns)`.
 pub type RenderCb = Box<dyn FnMut(&mut [f32], usize, Option<u64>) + Send + 'static>;
+/// What a stream reports besides audio: a dropout it plays on after, or its
+/// own end (device unplugged, sound server gone), after which only a new
+/// stream plays again (`audio_recover`, #402).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamFault {
+    Xrun(String),
+    Lost(String),
+}
+
+impl std::fmt::Display for StreamFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamFault::Xrun(m) | StreamFault::Lost(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Error / xrun callback invoked when the stream reports an error or xrun.
-pub type ErrorCb = Box<dyn FnMut(String) + Send + 'static>;
+pub type ErrorCb = Box<dyn FnMut(StreamFault) + Send + 'static>;
 
 /// A live output stream owned by `AudioStreamHost`. Dropping it stops audio
 /// cleanly and joins its audio thread.
@@ -302,6 +319,7 @@ const PW_STREAM_FLAG_MAP_BUFFERS: u32 = 1 << 2;
 const PW_STREAM_FLAG_RT_PROCESS: u32 = 1 << 4;
 
 const PW_STREAM_STATE_ERROR: i32 = -1;
+const PW_STREAM_STATE_UNCONNECTED: i32 = 0;
 const PW_STREAM_STATE_PAUSED: i32 = 2;
 const PW_STREAM_STATE_STREAMING: i32 = 3;
 
@@ -493,12 +511,27 @@ struct PwState {
 
 unsafe impl Send for PwState {}
 
-extern "C" fn pw_state_changed_cb(data: *mut c_void, _old: c_int, state: c_int, error: *const c_char) {
+/// Is this PipeWire state change the end of a stream that was connected?
+/// The server going away (restart, crash) shows as "unconnected" after
+/// "paused" or "streaming", not as an error.
+pub(crate) fn pw_connection_lost(old: c_int, state: c_int) -> bool {
+    state == PW_STREAM_STATE_UNCONNECTED && old >= PW_STREAM_STATE_PAUSED
+}
+
+extern "C" fn pw_state_changed_cb(data: *mut c_void, old: c_int, state: c_int, error: *const c_char) {
     if data.is_null() {
         return;
     }
     let st = unsafe { &mut *(data as *mut PwState) };
     st.state.store(state, Ordering::Release);
+    if pw_connection_lost(old, state) {
+        let msg = if error.is_null() {
+            "PipeWire connection lost".to_string()
+        } else {
+            format!("PipeWire connection lost ({})", unsafe { CStr::from_ptr(error).to_string_lossy() })
+        };
+        (st.on_error)(StreamFault::Lost(msg));
+    }
     if state == PW_STREAM_STATE_ERROR {
         let msg = if error.is_null() {
             "PipeWire stream error".to_string()
@@ -508,7 +541,7 @@ extern "C" fn pw_state_changed_cb(data: *mut c_void, _old: c_int, state: c_int, 
         if let Ok(mut e) = st.last_err.try_lock() {
             *e = Some(msg.clone());
         }
-        (st.on_error)(msg);
+        (st.on_error)(StreamFault::Lost(msg));
     }
 }
 
@@ -801,6 +834,8 @@ struct JackApi {
     on_shutdown: unsafe extern "C" fn(*mut c_void, extern "C" fn(*mut c_void), *mut c_void),
     activate: unsafe extern "C" fn(*mut c_void) -> c_int,
     deactivate: unsafe extern "C" fn(*mut c_void) -> c_int,
+    /// Optional: without it, lost connections are not put back.
+    port_connected: Option<unsafe extern "C" fn(*const c_void) -> c_int>,
 }
 
 unsafe impl Send for JackApi {}
@@ -836,6 +871,7 @@ fn jack_api() -> Result<&'static JackApi, String> {
             on_shutdown: load_sym(handle, c"jack_on_shutdown")?,
             activate: load_sym(handle, c"jack_activate")?,
             deactivate: load_sym(handle, c"jack_deactivate")?,
+            port_connected: load_sym(handle, c"jack_port_connected").ok(),
         })
     })
     .as_ref()
@@ -915,7 +951,7 @@ extern "C" fn jack_process_cb(nframes: u32, arg: *mut c_void) -> c_int {
 extern "C" fn jack_xrun_cb(arg: *mut c_void) -> c_int {
     if !arg.is_null() {
         let st = unsafe { &mut *(arg as *mut JackState) };
-        (st.on_error)("JACK xrun".into());
+        (st.on_error)(StreamFault::Xrun("JACK xrun".into()));
     }
     0
 }
@@ -924,7 +960,7 @@ extern "C" fn jack_shutdown_cb(arg: *mut c_void) {
     if !arg.is_null() {
         let st = unsafe { &mut *(arg as *mut JackState) };
         st.shutdown.store(true, Ordering::Relaxed);
-        (st.on_error)("JACK server shut down".into());
+        (st.on_error)(StreamFault::Lost("JACK server shut down".into()));
     }
 }
 
@@ -932,6 +968,45 @@ pub struct JackStream {
     api: &'static JackApi,
     client: *mut c_void,
     state: *mut JackState,
+    /// (our port, the playback port it was connected to at open).
+    links: Vec<(CString, CString)>,
+}
+
+impl JackStream {
+    /// Put our two connections back when another client removed BOTH (a
+    /// patchbay or session manager that rerouted mid-show, Carla #2075). One
+    /// remaining connection is a routing somebody made; it is left alone.
+    fn mend_routing(&mut self) -> Option<String> {
+        let connected = self.api.port_connected?;
+        if self.client.is_null() || self.state.is_null() || self.links.is_empty() {
+            return None;
+        }
+        unsafe {
+            let st = &*self.state;
+            if st.shutdown.load(Ordering::Relaxed) {
+                return None;
+            }
+            if connected(st.out_l) > 0 || connected(st.out_r) > 0 {
+                return None;
+            }
+            let mut done = Vec::new();
+            for (src, dst) in &self.links {
+                if (self.api.connect)(self.client, src.as_ptr(), dst.as_ptr()) == 0 {
+                    done.push(format!("{} → {}", src.to_string_lossy(), dst.to_string_lossy()));
+                }
+            }
+            (!done.is_empty()).then(|| done.join(", "))
+        }
+    }
+}
+
+impl crate::audio_recover::Supervised for OutputStream {
+    fn mend_routing(&mut self) -> Option<String> {
+        match self {
+            OutputStream::Jack(j) => j.mend_routing(),
+            OutputStream::PipeWire(_) | OutputStream::Alsa(_) => None,
+        }
+    }
 }
 
 unsafe impl Send for JackStream {}
@@ -1018,6 +1093,7 @@ fn open_jack(
             JACK_DEFAULT_AUDIO_TYPE.as_ptr(),
             JACK_PORT_IS_PHYSICAL | JACK_PORT_IS_INPUT,
         );
+        let mut links: Vec<(CString, CString)> = Vec::new();
         if !ports.is_null() {
             let src_l = (api.port_name)(out_l);
             let src_r = (api.port_name)(out_r);
@@ -1025,10 +1101,12 @@ fn open_jack(
             if !dst_0.is_null() {
                 if !src_l.is_null() {
                     (api.connect)(client, src_l, dst_0);
+                    links.push((CStr::from_ptr(src_l).to_owned(), CStr::from_ptr(dst_0).to_owned()));
                 }
                 let dst_1 = *ports.add(1);
                 if !dst_1.is_null() && !src_r.is_null() {
                     (api.connect)(client, src_r, dst_1);
+                    links.push((CStr::from_ptr(src_r).to_owned(), CStr::from_ptr(dst_1).to_owned()));
                 }
             }
             (api.free)(ports as *mut c_void);
@@ -1046,6 +1124,7 @@ fn open_jack(
                 api,
                 client,
                 state: state_ptr,
+                links,
             }),
             backend: ActiveBackend::Jack,
             sample_rate: sr,
@@ -1228,8 +1307,8 @@ fn open_alsa(
             }
             render(data, ch, lat_ns);
         },
-        move |e| {
-            on_error(format!("{e}"));
+        move |e: cpal::Error| {
+            on_error(alsa_fault(e.kind(), format!("{e}")));
         },
         None,
     )?;
@@ -1242,6 +1321,16 @@ fn open_alsa(
         channels: ch,
         device_label: dev_name,
     })
+}
+
+/// Which cpal errors end an ALSA stream: the device or its host is gone.
+/// Everything else (xruns above all) plays on.
+pub(crate) fn alsa_fault(kind: cpal::ErrorKind, msg: String) -> StreamFault {
+    use cpal::ErrorKind as K;
+    match kind {
+        K::DeviceNotAvailable | K::DeviceChanged | K::StreamInvalidated | K::HostUnavailable => StreamFault::Lost(msg),
+        _ => StreamFault::Xrun(msg),
+    }
 }
 
 /// Pin the current (audio render) thread to the fastest CPU cores on
@@ -1388,6 +1477,21 @@ mod tests {
         assert_eq!(AudioBackendChoice::parse("pw-jack"), Some(AudioBackendChoice::Jack));
         assert_eq!(AudioBackendChoice::parse("ALSA"), Some(AudioBackendChoice::Alsa));
         assert_eq!(AudioBackendChoice::parse("unknown"), None);
+    }
+
+    #[test]
+    fn a_server_that_went_away_and_a_gone_device_end_the_stream_and_an_xrun_does_not() {
+        // PipeWire: unconnected after paused/streaming is the server leaving;
+        // unconnected → connecting → paused is an ordinary start.
+        assert!(pw_connection_lost(PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_UNCONNECTED));
+        assert!(pw_connection_lost(PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_UNCONNECTED));
+        assert!(!pw_connection_lost(1, PW_STREAM_STATE_UNCONNECTED), "a connect that failed is reported by open");
+        assert!(!pw_connection_lost(PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED), "a move between sinks pauses");
+        use cpal::ErrorKind as K;
+        assert_eq!(alsa_fault(K::DeviceNotAvailable, "gone".into()), StreamFault::Lost("gone".into()));
+        assert_eq!(alsa_fault(K::StreamInvalidated, "gone".into()), StreamFault::Lost("gone".into()));
+        assert_eq!(alsa_fault(K::Xrun, "xrun".into()), StreamFault::Xrun("xrun".into()));
+        assert_eq!(StreamFault::Lost("JACK server shut down".into()).to_string(), "JACK server shut down");
     }
 
     #[test]

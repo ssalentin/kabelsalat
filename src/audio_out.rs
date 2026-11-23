@@ -881,7 +881,7 @@ pub fn run_test() -> anyhow::Result<()> {
 }
 
 /// Amplitude of the `hz` component of mono 48 kHz samples (Goertzel).
-fn tone_amp(buf: &[f32], hz: f32) -> f32 {
+pub(crate) fn tone_amp(buf: &[f32], hz: f32) -> f32 {
     let w = std::f32::consts::TAU * hz / 48000.0;
     let (mut re, mut im) = (0.0f64, 0.0f64);
     for (i, x) in buf.iter().enumerate() {
@@ -893,7 +893,7 @@ fn tone_amp(buf: &[f32], hz: f32) -> f32 {
 }
 
 /// One second of what a sink plays, read from its monitor (mono, 48 kHz).
-fn capture_sink(sink: &str, secs: f32) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn capture_sink(sink: &str, secs: f32) -> anyhow::Result<Vec<f32>> {
     use std::io::Read;
     let mut child = std::process::Command::new("parec")
         .args([&format!("--device={sink}.monitor"), "--format=float32le", "--rate=48000", "--channels=1",

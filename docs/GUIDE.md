@@ -42,6 +42,7 @@ every keyboard shortcut.
   - [Running backing tracks for a band](#running-backing-tracks-for-a-band)
   - [Record your set](#record-your-set)
   - [Get back on stage after a crash](#get-back-on-stage-after-a-crash)
+  - [Unplug and replug mid-show](#unplug-and-replug-mid-show)
 - [Engine and audio](#engine-and-audio)
   - [Keep an eye on the engine](#keep-an-eye-on-the-engine)
   - [Diagnose latency and xruns with Audio Doctor](#diagnose-latency-and-xruns-with-audio-doctor)
@@ -670,6 +671,32 @@ plugins loaded and the last engine commands, and no folder or file names of
 yours. Nothing is sent anywhere; the restarted app offers to open the folder
 or a GitHub issue with the report filled in, which you send yourself. Set
 `KABELSALAT_WATCHDOG=0` to run without the restart.
+
+### Unplug and replug mid-show
+
+A bumped USB cable never needs a restart:
+
+- **Audio output.** When the stream stops (interface unplugged, PipeWire or
+  JACK restarted, or no audio callback for 2 s), kabelsalat closes it and opens
+  it again, on the same backend and output with the same sample rate and buffer
+  size, about every 2 s until it plays. With PipeWire the output you picked
+  comes back too once it is listed again. If the device returns with another
+  buffer size or sample rate, the notice and the audio settings say so.
+- **JACK routing.** If another client disconnects both of kabelsalat's output
+  ports, they are connected back to the playback ports they had. One
+  remaining connection counts as your own routing and is left alone.
+- **MIDI controllers and foot switches.** An unplugged device keeps its place,
+  so its rig binding, learned CCs and setlist foot switch come back with it,
+  also under a new ALSA client number. Keys and the sustain pedal it was
+  holding are released at once, so nothing drones on.
+- **Audio inputs.** An input whose device went away opens again once the
+  device is listed again. Until then it stays silent and never takes over
+  another input.
+
+Each event shows a notice at the top of the stage for a few seconds. In Show
+mode an indicator says `NO AUDIO OUT · reconnecting` for as long as the output
+is down, and `AUDIO BACK`, `MIDI LOST` or `MIDI BACK` for a few seconds after
+an event.
 
 ## Engine and audio
 

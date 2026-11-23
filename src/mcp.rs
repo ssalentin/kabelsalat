@@ -217,7 +217,7 @@ struct InstallInstrumentArgs {
 /// Arguments for `load_template`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LoadTemplateArgs {
-    /// Template name: cathedral_organ | jazz_organ | rock_organ | ambient_pad | synth_lead | guitar_rig | demo | multi_rig.
+    /// Template name: cathedral_organ | jazz_organ | rock_organ | ambient_pad | synth_lead | guitar_rig | stage_sends (a singer's or guitarist's stage rig from built-in units: Audio In → Tone → Limiter → Master at show level, Hall and Echo aux buses, and a song whose Verse, Chorus and Solo each recall a send scene) | demo | multi_rig.
     name: String,
 }
 
@@ -267,12 +267,14 @@ fn setlist_json(st: &State) -> Value {
                 "node": f.node,
                 "bypass": f.bypass,
             })).collect();
+            let unit_name = |n: NodeId| st.graph.node(n).map_or_else(String::new, |x| name_str(&x.name).to_string());
             json!({
                 "index": pi,
                 "name": p.name,
                 "rigs": rigs,
                 "fx": fx,
                 "buses": p.buses,
+                "scene": p.scene.as_ref().map(|sc| sc.to_json(&unit_name)),
                 "params_count": p.params.len(),
                 "plugin_params_count": p.plugin_params.len(),
             })
@@ -375,6 +377,9 @@ fn apply_setlist_song_headless(st: &mut State, args: &SetSetlistSongArgs) -> Res
                     return Err(format!("node {} is not in the patch", f.node));
                 }
                 part.set_fx(f.node, f.bypass);
+            }
+            if let Some(scene) = &p.scene {
+                part.scene = crate::setlist::part_scene(&json!({ "scene": scene }), &graph)?;
             }
             out.push(part);
         }
@@ -780,6 +785,34 @@ struct SetlistPartArg {
     buses: Option<Vec<NodeId>>,
     /// Snapshot the current knob values and effect bypasses of those rigs into this part.
     capture_knobs: Option<bool>,
+    /// The part's send scene (#415): {sends: [{rig | node, bus, level}], fx: [{node, bypass}], params: [{node, param, value}]}.
+    scene: Option<Value>,
+}
+
+/// Arguments for `set_part_sends` (#415).
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+struct SetPartSendsArgs {
+    /// 0-based song index; leave out with `part` for the active part.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    song: Option<usize>,
+    /// 0-based part index in that song.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    part: Option<usize>,
+    /// Send levels the part recalls: [{rig (0-based) OR node (a source's node id), bus (aux bus node id), level 0..1}].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sends: Option<Vec<Value>>,
+    /// Bypass of effects in the aux buses' chains: [{node, bypass}].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fx: Option<Vec<Value>>,
+    /// Knobs of the buses and their chains: [{node, param, value}].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Vec<Value>>,
+    /// Store what the mixer shows right now as the part's scene.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture: Option<bool>,
+    /// Remove the part's scene: a switch to it leaves the sends alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear: Option<bool>,
 }
 
 /// Arguments for `set_setlist_song`.
@@ -4566,7 +4599,7 @@ impl McpServer {
     }
 
     /// Load a starter template, replacing the patch.
-    #[tool(name = "load_template", description = "Load a starter template, replacing the current patch (Command::LoadGraph + its default knob values). name: cathedral_organ (Aeolus pipe organ, full stops, cathedral reverb) | jazz_organ (setBfree tonewheel 88 8000 000, percussion, slow Leslie) | rock_organ (setBfree through the Guitarix amp + cabinet) | ambient_pad (Surge → delay → reverb) | synth_lead (Surge → slap delay → reverb) | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master: a live guitar/mic input with a tuner on the Audio In unit's face) | demo | multi_rig (the two demo patches exist in the running app only). The result lists any catalog plugins the template needs that are not installed (install them with install_instrument).")]
+    #[tool(name = "load_template", description = "Load a starter template, replacing the current patch (Command::LoadGraph + its default knob values). name: cathedral_organ (Aeolus pipe organ, full stops, cathedral reverb) | jazz_organ (setBfree tonewheel 88 8000 000, percussion, slow Leslie) | rock_organ (setBfree through the Guitarix amp + cabinet) | ambient_pad (Surge → delay → reverb) | synth_lead (Surge → slap delay → reverb) | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master: a live guitar/mic input with a tuner on the Audio In unit's face) | stage_sends (a singer's or guitarist's stage rig from built-in units: Audio In → Tone → Limiter → Master at show level, Hall and Echo aux buses, and a song whose Verse, Chorus and Solo each recall a send scene) | demo | multi_rig (the two demo patches exist in the running app only). The result lists any catalog plugins the template needs that are not installed (install them with install_instrument).")]
     fn load_template(&self, Parameters(args): Parameters<LoadTemplateArgs>) -> Result<CallToolResult, McpError> {
         if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
             return Self::ui_bridge_tool("load_template", json!({"name": args.name}));
@@ -4587,6 +4620,15 @@ impl McpServer {
             let _ = send_cmd(&mut st, Command::SetParam { node: p.node, param: p.param, value: p.value });
         }
         st.graph = s.graph.clone();
+        // What the session holds beside the graph: its sends, and the
+        // setlist of a template that brings one (stage_sends, #415).
+        for x in s.sends() {
+            let _ = send_cmd(&mut st, Command::SetSend { from: x.from, bus: x.bus, level: Some(x.level), pre: Some(x.pre) });
+        }
+        st.setlist = s.setlist.clone();
+        if st.setlist.active.is_some() {
+            let _ = send_show_gates(&mut st);
+        }
         // A single-graph load leaves no rig list (the app's multi-rig path
         // owns rig names; LoadGraph resets the engine's list too).
         if let Ok(mut r) = st.rigs.lock() { r.rigs.clear(); r.active = 0; }
@@ -5025,7 +5067,7 @@ impl McpServer {
     }
 
     /// Add, update, reorder, or remove a song in the setlist (#204).
-    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional backing: absolute path of a WAV backing track the file player starts when the song is selected (null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?, pan?, vel_lo?, vel_hi?, vel_curve?, float?}]), optional fx ([{node, bypass}]), optional buses (aux bus node ids that take signal in the part) and optional capture_knobs. vel_lo/vel_hi make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60), vel_curve is linear | soft | hard, float (0..12 keys) lets the key range's edges follow the hand that plays across them (a floating split).")]
+    #[tool(name = "set_setlist_song", description = "Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature ({numerator, denominator}, null clears). Optional backing: absolute path of a WAV backing track the file player starts when the song is selected (null clears). Optional parts array: each part has name, rigs ([{rig, key_lo?, key_hi?, transpose?, level?, pan?, vel_lo?, vel_hi?, vel_curve?, float?}]), optional fx ([{node, bypass}]), optional buses (aux bus node ids that take signal in the part), optional scene (the part's send scene, see set_part_sends) and optional capture_knobs. vel_lo/vel_hi make a velocity layer (a soft pad under a hard-struck piano: pad vel_hi 90, piano vel_lo 60), vel_curve is linear | soft | hard, float (0..12 keys) lets the key range's edges follow the hand that plays across them (a floating split).")]
     fn set_setlist_song(&self, Parameters(args): Parameters<SetSetlistSongArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -5112,6 +5154,31 @@ impl McpServer {
         ok_json(report.json())
     }
 
+    /// A part's send scene (#415).
+    #[tool(name = "set_part_sends", description = "Give one setlist part a send scene (#415): what a switch to the part sets on the send effects, for a singer or guitarist whose input rig stays at show level (a dry verse, a hall on the chorus, a delay on the solo). sends = [{rig (0-based index, the whole rig) OR node (one source's node id), bus (an aux bus's node id from add_bus / get_sends), level 0..1}]; fx = [{node, bypass}] for effects in the buses' chains; params = [{node, param, value}] for knobs of a bus or of its chain. capture=true stores what the mixer shows now (then sends/fx/params go on top); clear=true removes the scene. song and part (0-based) name the part; leave both out for the active part. The engine ramps each send level over 5 ms and the bus keeps running, so nothing clicks and the reverb or delay tail of the last part rings on. A scene is a full picture: a send that another part's scene names and this one does not is closed on a switch; a part without a scene leaves the sends alone. get_setlist shows each part's scene.")]
+    fn set_part_sends(&self, Parameters(args): Parameters<SetPartSendsArgs>) -> Result<CallToolResult, McpError> {
+        let args = serde_json::to_value(&args).unwrap_or_else(|_| json!({}));
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_part_sends", args);
+        }
+        // Headless keeps no knob or bypass mirror: a capture takes the sends.
+        let sends: Vec<crate::control::AuxSend> = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| g.sends)).iter().flatten()
+            .filter(|s| s.bus != NodeId::MAX).copied().collect();
+        let graph = st.graph.clone();
+        let done = match st.setlist.apply_part_sends(&graph, &args, || crate::setlist::SendScene::capture(&graph, &sends, &[], &[])) {
+            Ok(done) => done,
+            Err(e) => return tool_err(e),
+        };
+        for cmd in st.setlist.recalled_scene(&graph).commands() {
+            let _ = send_cmd(&mut st, cmd);
+        }
+        let mut v = setlist_json(&st);
+        v["changed"] = json!(done);
+        ok_json(v)
+    }
+
     /// Select or step the active setlist song/part without a gap (#204).
     #[tool(name = "select_setlist_part", description = "Switch the active setlist song/part without changing routing: held notes on outgoing rigs keep sounding until released and effect tails ring out, while new notes play only the new part's rigs. Pass action ('next_part' | 'prev_part' | 'next_song' | 'prev_song' | 'clear') OR song (0-based index) with optional part (default 0).")]
     fn select_setlist_part(&self, Parameters(args): Parameters<SelectSetlistPartArgs>) -> Result<CallToolResult, McpError> {
@@ -5157,6 +5224,10 @@ impl McpServer {
             }
             for fx in st.setlist.recalled_fx(&st.graph) {
                 let _ = send_cmd(&mut st, Command::SetStripBypass { node: fx.node, bypass: fx.bypass });
+            }
+            // The part's send scene (#415).
+            for cmd in st.setlist.recalled_scene(&st.graph).commands() {
+                let _ = send_cmd(&mut st, cmd);
             }
         }
         ok_json(setlist_json(&st))
@@ -6531,7 +6602,7 @@ mod tests {
                     rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: Some(36), key_hi: Some(84), transpose: Some(0), level: Some(0.9), pan: Some(-0.25), vel_lo: None, vel_hi: None, vel_curve: None, float: None }]),
                     fx: None,
                     buses: None,
-                    capture_knobs: None,
+                    capture_knobs: None, scene: None,
                 },
                 SetlistPartArg {
                     name: "Chorus".into(),
@@ -6541,7 +6612,7 @@ mod tests {
                     }]),
                     fx: None,
                     buses: None,
-                    capture_knobs: None,
+                    capture_knobs: None, scene: None,
                 },
             ]),
             move_to: None,
@@ -6596,7 +6667,7 @@ mod tests {
                 rigs: Some(vec![SetlistPartRigArg { rig: 0, key_lo: None, key_hi: None, transpose: None, level: None, pan: None, vel_lo: None, vel_hi: None, vel_curve: Some("loud".into()), float: None }]),
                 fx: None,
                 buses: None,
-                capture_knobs: None,
+                capture_knobs: None, scene: None,
             }]),
             move_to: None, remove: None,
         }));

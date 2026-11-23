@@ -14,6 +14,7 @@
 mod controls;
 mod instances;
 mod levels;
+mod scene;
 mod window;
 pub use controls::msg_label;
 #[allow(unused_imports)]
@@ -22,6 +23,7 @@ pub use instances::{
     rig_instrument_signature, FxBypass, InstrumentSig, MatchResult, RigInstances, SharingKind,
     ShowInstances, SoundChange,
 };
+pub use scene::{is_send_fx, part_scene, SendScene};
 pub use levels::{part_buses, source_str, Binding, Gates, Level, Levels, Set, SetId};
 pub use window::{
     is_master_insert, is_plugin_node, SongLoadState, DEFAULT_LOAD_AHEAD, MAX_LOAD_AHEAD,
@@ -165,6 +167,11 @@ pub struct Part {
     /// song level (#273).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buses: Vec<NodeId>,
+    /// What a switch to this part sets on the send effects (#415): send
+    /// levels, and the bypass and knobs of the aux buses' chains, whatever
+    /// level the sending rig lives at. `None` leaves them alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<SendScene>,
 }
 
 impl Part {
@@ -176,6 +183,7 @@ impl Part {
             plugin_params: Vec::new(),
             fx: Vec::new(),
             buses: Vec::new(),
+            scene: None,
         }
     }
 
@@ -822,6 +830,7 @@ impl Setlist {
 
                 part.buses = part.buses.iter().filter_map(|&b| node_map(b)).collect();
                 part.buses.dedup();
+                part.scene = part.scene.as_ref().map(|sc| sc.remap(&rig_map, &node_map));
             }
         }
         out.remap_levels(&rig_map, &node_map);
@@ -839,6 +848,9 @@ impl Setlist {
                 part.plugin_params.retain(|p| graph.node(p.node).is_some());
                 part.fx.retain(|f| graph.node(f.node).is_some());
                 part.buses.retain(|&b| graph.is_bus(b));
+                if let Some(sc) = &mut part.scene {
+                    sc.prune(graph);
+                }
             }
         }
         self.prune_levels(graph);
@@ -877,6 +889,9 @@ impl Setlist {
                 part.plugin_params.dedup_by_key(|p| (p.node, p.param));
                 part.fx.sort_by_key(|f| f.node);
                 part.fx.dedup_by_key(|f| f.node);
+                if let Some(sc) = &mut part.scene {
+                    sc.normalize();
+                }
             }
         }
         self.normalize_controls();
@@ -1011,6 +1026,14 @@ impl Setlist {
                             f.node
                         );
                     }
+                }
+                if let Some(node) = part.scene.as_ref().and_then(|sc| sc.missing_node(graph)) {
+                    bail!(
+                        "Setlist song '{}' part '{}' has a send scene for node {} which is no longer in the patch.",
+                        song.name,
+                        part.name,
+                        node
+                    );
                 }
             }
         }

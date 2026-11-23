@@ -619,6 +619,33 @@ and `set_setlist_set`.
 
 <p align="center"><img src="shots/setlist-levels.png" width="85%" alt="Setlist → Sets & levels: two sets of songs (one skipped) and a level dropdown for each rig, the Hall bus and a CC 11 pedal binding"/></p>
 
+### Give each part its own send effects
+
+A singer or guitarist keeps one input rig running through the whole show
+(show level, above) and wants a dry verse, a hall reverb on the chorus and an
+echo on the solo. Aux buses (see "Share an effect with sends") hold those
+effects; a part's **send scene** holds how much of the rig goes into each.
+
+In the Setlist, **Save sends** on a part stores what the Mixer shows now: every
+open send level, plus the bypass and knobs of the effects in the aux buses'
+chains. The button then reads the scene ("Sends: Hall 50 %"); click it again to
+store the Mixer anew, **Clear sends** removes it. A switch to the part sets all
+of it, also for a rig at show level, whose fader and effects are otherwise
+never touched. Each send level ramps over 5 ms and the buses keep running with
+nothing new sent in, so there is no click and the last part's reverb or echo
+tail rings out. A scene is a full picture: a send another part's scene names
+and this one does not is closed on the switch; a part without a scene leaves
+the sends alone.
+
+**Shift+F8** (or `load_template` `stage_sends`) loads **Stage Sends**: Audio In →
+Tone → Limiter → Master at show level, Hall and Echo buses, and a song with
+Verse, Chorus and Solo that each carry a scene. Pick the input on the Audio In
+unit's face. Agents and MCP use `set_part_sends` (set, merge, `capture` or
+`clear` a part's scene) and see each part's `scene` in `get_setlist`.
+`kabelsalat levels-test` plays the template under a held tone and checks that
+every send lands on its level, that nothing clicks (second difference of the
+held sine) and that the echo's tail rings on.
+
 ### Go on stage with Show mode
 
 Press **F2** or click **Show mode** in the Setlist header (agents: `set_show_mode`) for a

@@ -58,7 +58,7 @@ keyboard.
 
 | Key | What happens |
 |---|---|
-| **F5–F7**, **Shift+F5–F7** | Load a starter rig: pipe organ, jazz organ, rock organ, guitar, ambient pad, synth lead |
+| **F5–F7**, **Shift+F5–F7** | Load a starter rig: pipe organ, jazz organ, rock organ, guitar, ambient pad, synth lead; **Shift+F8**: singer or guitarist with send scenes |
 | **Tab** | Turn the rack around and patch cables on the back |
 | **M** | Open the mixer |
 | **Q** | Open the left rail with your rigs and saved sessions |
@@ -144,6 +144,10 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **A setlist of songs and parts** that switches without cutting held notes
   or reverb tails. → [Setlist](docs/GUIDE.md#play-a-setlist-without-a-gap),
   [show, set and song levels](docs/GUIDE.md#keep-what-stays-through-the-whole-show)
+- **Send scenes for singers and guitarists:** each part recalls its own send levels
+  and send-effect settings (dry verse, hall on the chorus, echo on the solo) with
+  smooth ramps and ringing tails; load the **Stage Sends** template (Shift+F8) to
+  start. → [Send scenes](docs/GUIDE.md#give-each-part-its-own-send-effects)
 - **Show mode (F2):** a stage screen readable from two metres, with editing locked
   and upcoming part preview. → [Show mode](docs/GUIDE.md#go-on-stage-with-show-mode)
 - **Song notes and chord charts:** attach cues, lyrics or ChordPro lead sheets per

@@ -1138,7 +1138,8 @@ fn template_plugins_installed(app: &mut DemoApp) {
     app.catalog_roots = Some(vec![root]);
 }
 
-/// A starter template's hotkey: F5–F7, then the same keys with Shift.
+/// A starter template's hotkey: F5–F7, then the same keys with Shift, then
+/// Shift+F8 (plain F8 is the demo patch).
 fn template_key(t: Template) -> (Key, bool) {
     match t {
         Template::CathedralOrgan => (Key::F5, false),
@@ -1147,6 +1148,7 @@ fn template_key(t: Template) -> (Key, bool) {
         Template::GuitarRig => (Key::F5, true),
         Template::AmbientPad => (Key::F6, true),
         Template::SynthLead => (Key::F7, true),
+        Template::StageSends => (Key::F8, true),
     }
 }
 
@@ -3589,7 +3591,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo", "set_show_mode", "set_rack_locked", "panic",
-    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check", "audio_doctor",
+    "get_setlist", "set_setlist_song", "set_part_sends", "select_setlist_part", "add_song_from_session", "get_show_controls", "set_show_control", "preshow_check", "audio_doctor",
     "set_level", "set_setlist_set", "set_setlist_window",
     "inspect_plugin", "set_param", "reset_params",
     "record_save_last",
@@ -7361,6 +7363,7 @@ impl DemoApp {
             "preshow_check" => "Check the show".into(),
             "audio_doctor" => "Run Audio Doctor".into(),
             "get_show_controls" => "Read show controls".into(),
+            "set_part_sends" => "Part send scene".into(),
             "set_setlist_song" => match args.get("name").and_then(|v| v.as_str()) {
                 Some(n) if !n.trim().is_empty() => format!("Setlist · {n}"),
                 _ if args.get("remove").and_then(|v| v.as_bool()) == Some(true) => "Remove setlist song".into(),
@@ -9347,26 +9350,8 @@ impl DemoApp {
             }
         }
         self.recall_part_fx_and_plugin_params(&graph);
-        let rm = self.reduce_motion;
-        if !part_params.is_empty() {
-            for p in &part_params {
-                let v = (p.value as f32).clamp(0.0, 1.0);
-                if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
-                    for k in &mut u.knobs {
-                        if k.param == Some(p.param) {
-                            k.glide_to(v, rm);
-                            k.sent = Some(v);
-                        }
-                    }
-                }
-            }
-            if let Some(bus) = &self.bus {
-                let mut b = bus.lock().unwrap_or_else(|e| e.into_inner());
-                for p in &part_params {
-                    let _ = b.send(Command::SetParam { node: p.node, param: p.param, value: p.value });
-                }
-            }
-        }
+        self.recall_knob_params(&part_params);
+        self.recall_send_scene(&graph);
         if !part_rigs.is_empty() && !part_rigs.iter().any(|r| r.rig as usize == self.active_rig) {
             let target = part_rigs[0].rig as usize;
             if target < n_rigs {
@@ -9406,6 +9391,87 @@ impl DemoApp {
                 let _ = bus.send(cmd);
             }
         }
+    }
+
+    /// Put stored knob values on the faces and into the engine.
+    fn recall_knob_params(&mut self, params: &[crate::session::ParamValue]) {
+        if params.is_empty() {
+            return;
+        }
+        let rm = self.reduce_motion;
+        for p in params {
+            let v = (p.value as f32).clamp(0.0, 1.0);
+            if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
+                for k in &mut u.knobs {
+                    if k.param == Some(p.param) {
+                        k.glide_to(v, rm);
+                        k.sent = Some(v);
+                    }
+                }
+            }
+        }
+        if let Some(bus) = &self.bus {
+            let mut b = bus.lock().unwrap_or_else(|e| e.into_inner());
+            for p in params {
+                let _ = b.send(Command::SetParam { node: p.node, param: p.param, value: p.value });
+            }
+        }
+    }
+
+    /// Recall the active part's send scene (#415), whatever level its rigs
+    /// live at: send levels (the engine ramps them, so nothing clicks and
+    /// the bus's tail rings on), and the bypass and knobs of the buses'
+    /// chains. Nothing without a scene.
+    fn recall_send_scene(&mut self, graph: &Graph) {
+        let scene = self.setlist.recalled_scene(graph);
+        for s in &scene.sends {
+            if self.send_of(s.from, s.bus).level != s.level {
+                let _ = self.set_send(s.from, s.bus, Some(s.level), None);
+            }
+        }
+        for f in &scene.fx {
+            if self.strip_row(f.node).bypass != f.bypass {
+                self.with_strip_row(f.node, |row| row.bypass = f.bypass);
+                self.send_strip_bypass(f.node);
+            }
+        }
+        self.recall_knob_params(&scene.params);
+    }
+
+    /// The send scene the mixer shows right now (#415): every open send,
+    /// and the bypass and knobs of the aux buses and their chains.
+    pub(super) fn capture_send_scene(&self) -> crate::setlist::SendScene {
+        let graph = self.mirror_graph();
+        let mut fx = Vec::new();
+        let mut params = Vec::new();
+        for u in self.units.iter().filter(|u| crate::setlist::is_send_fx(&graph, u.node_id)) {
+            if graph.node(u.node_id).is_some_and(|n| crate::setlist::is_audio_effect(&graph, n)) {
+                fx.push(crate::setlist::FxBypass { node: u.node_id, bypass: self.strip_row(u.node_id).bypass });
+            }
+            for k in &u.knobs {
+                if let Some(p) = k.param {
+                    params.push(crate::session::ParamValue { node: u.node_id, param: p, value: k.value as f64 });
+                }
+            }
+        }
+        crate::setlist::SendScene::capture(&graph, &self.sends, &fx, &params)
+    }
+
+    /// The `set_part_sends` tool (#415): set, capture or clear one part's
+    /// send scene; a change to the active part is heard at once.
+    fn exec_part_sends(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let graph = self.mirror_graph();
+        let now = self.capture_send_scene();
+        let mut setlist = self.setlist.clone();
+        let done = setlist.apply_part_sends(&graph, args, || now)?;
+        if setlist != self.setlist {
+            self.push_user_undo();
+            self.setlist = setlist;
+            self.recall_send_scene(&graph);
+        }
+        let mut v = self.setlist_json();
+        v["changed"] = serde_json::json!(done);
+        Ok(v)
     }
 
     /// Snapshot current knob values for every unit belonging to any rig in `rigs`.
@@ -9514,6 +9580,7 @@ impl DemoApp {
                     "rigs": rigs,
                     "fx": fx,
                     "buses": p.buses,
+                    "scene": p.scene.as_ref().map(|sc| sc.to_json(&|n| self.unit_display_name(n))),
                     "params_count": p.params.len(),
                     "plugin_params_count": p.plugin_params.len(),
                 })
@@ -9627,6 +9694,7 @@ impl DemoApp {
                     }
                 }
                 part.buses = crate::setlist::part_buses(item, &graph)?;
+                part.scene = crate::setlist::part_scene(item, &graph)?;
                 if item.get("capture_knobs").and_then(|v| v.as_bool()).unwrap_or(false) {
                     let (params, plugin_params, fx) = self.capture_part_state(&part.rigs);
                     part.params = params;
@@ -11589,6 +11657,13 @@ impl DemoApp {
                 }
                 Err(e) => format!("error: {e}"),
             },
+            "set_part_sends" => match self.exec_part_sends(args) {
+                Ok(val) => {
+                    self.agent_activity.record(origin, "Part send scene", Vec::new(), now);
+                    val.to_string()
+                }
+                Err(e) => format!("error: {e}"),
+            },
             "set_setlist_song" => match self.exec_setlist_song(args) {
                 Ok(val) => {
                     self.sync_setlist_window();
@@ -11683,6 +11758,9 @@ impl DemoApp {
                         let mut msg = format!("Loaded template '{}'", t.title());
                         if t == Template::GuitarRig {
                             msg.push_str(" — Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; pick the input device on the Audio In unit's face, the tuner is there too");
+                        }
+                        if t == Template::StageSends {
+                            msg.push_str(" — Audio In → Tone → Limiter → Master at show level, aux buses Hall and Echo, and a song with Verse, Chorus and Solo that each recall a send scene (select_setlist_part steps them; set_part_sends changes a part's scene); pick the input device on the Audio In unit's face");
                         }
                         let missing = self.template_missing(t);
                         if !missing.is_empty() {
@@ -19542,6 +19620,8 @@ impl DemoApp {
         let mut remove_part: Option<(usize, usize)> = None;
         let mut capture_knobs_for: Option<(usize, usize)> = None;
         let mut clear_knobs_for: Option<(usize, usize)> = None;
+        // A part's send scene (#415): (song, part, capture it / clear it).
+        let mut scene_edit: Option<(usize, usize, bool)> = None;
         let mut set_backing: Option<(usize, Option<String>)> = None;
         let mut vary_rig: Option<u8> = None;
         let mut split_rig: Option<(usize, usize, u8)> = None;
@@ -19895,6 +19975,7 @@ impl DemoApp {
                                   remove_part: &mut Option<(usize, usize)>,
                                   capture_knobs_for: &mut Option<(usize, usize)>,
                                   clear_knobs_for: &mut Option<(usize, usize)>,
+                                  scene_edit: &mut Option<(usize, usize, bool)>,
                                   set_backing: &mut Option<(usize, Option<String>)>,
                                   vary_rig: &mut Option<u8>,
                                   split_rig: &mut Option<(usize, usize, u8)>,
@@ -20173,6 +20254,27 @@ impl DemoApp {
                                             {
                                                 *clear_knobs_for = Some((si, pi));
                                             }
+                                            // The part's send scene (#415), offered once the patch has an aux bus.
+                                            if !part_buses.is_empty() {
+                                                let bus_name = |n: u32| part_buses.iter().find(|b| b.0 == n).map_or_else(|| "Bus".to_string(), |b| b.1.clone());
+                                                let scene_lbl = match &part.scene {
+                                                    Some(sc) => format!("Sends: {}", sc.label(&bus_name)),
+                                                    None => "Save sends".to_string(),
+                                                };
+                                                if theme::wrapped_chip_button(ui, &scene_lbl, part.scene.is_some())
+                                                    .on_hover_text("Send scene: store the mixer's send levels and the aux buses' effect bypasses and knobs in this part. A switch to the part ramps the sends there and lets the last part's tail ring out, also for a rig at show level. Click again to store the current mixer.")
+                                                    .clicked()
+                                                {
+                                                    *scene_edit = Some((si, pi, true));
+                                                }
+                                                if part.scene.is_some()
+                                                    && theme::wrapped_chip_button(ui, "Clear sends", false)
+                                                        .on_hover_text("Remove this part's send scene: a switch to it leaves the sends alone")
+                                                        .clicked()
+                                                {
+                                                    *scene_edit = Some((si, pi, false));
+                                                }
+                                            }
                                         });
                                         ui.add_space(6.0);
                                         for (ri, rname) in rig_names.iter().enumerate() {
@@ -20401,6 +20503,7 @@ impl DemoApp {
                                 &mut remove_part,
                                 &mut capture_knobs_for,
                                 &mut clear_knobs_for,
+                                &mut scene_edit,
                                 &mut set_backing,
                                 &mut vary_rig,
                                 &mut split_rig,
@@ -20450,6 +20553,7 @@ impl DemoApp {
                             &mut remove_part,
                             &mut capture_knobs_for,
                             &mut clear_knobs_for,
+                            &mut scene_edit,
                             &mut set_backing,
                             &mut vary_rig,
                             &mut split_rig,
@@ -20566,6 +20670,18 @@ impl DemoApp {
                     part.plugin_params = plugin_knobs;
                     part.fx = fx;
                 }
+            }
+        }
+        if let Some((si, pi, capture)) = scene_edit {
+            self.push_user_undo();
+            let scene = capture.then(|| self.capture_send_scene());
+            if let Some(part) = self.setlist.songs.get_mut(si).and_then(|s| s.parts.get_mut(pi)) {
+                let msg = match &scene {
+                    Some(sc) => format!("Part '{}' recalls {} sends on a switch · Ctrl+Z to undo", part.name, sc.sends.len()),
+                    None => format!("Cleared the send scene of part '{}'", part.name),
+                };
+                part.scene = scene;
+                self.notify_patch(&msg);
             }
         }
         if let Some((si, pi)) = clear_knobs_for {

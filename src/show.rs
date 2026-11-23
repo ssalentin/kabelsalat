@@ -387,6 +387,19 @@ impl Show {
         }
     }
 
+    /// To part `part` because a recorded take switched to it there
+    /// (Virtual Soundcheck, #400): the app follows, as it follows a step.
+    pub fn jump(&mut self, part: Option<usize>) -> Take {
+        match part {
+            Some(p) => self.go(p),
+            None => {
+                self.part = None;
+                self.steps += 1;
+                Take::Consumed
+            }
+        }
+    }
+
     fn go(&mut self, to: usize) -> Take {
         let parts = self.parts.as_ref().map_or(&[][..], |p| &p.0[..]);
         let Some(part) = parts.get(to) else { return Take::Consumed };

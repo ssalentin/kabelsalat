@@ -162,10 +162,13 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   end of a section, on the bar; a marker can switch the song's part.
   → [Markers](docs/GUIDE.md#markers-jump-to-a-section-loop-a-section)
 - **Step songs from a foot switch**, attach WAV backing tracks directly to songs,
-  record the set or save the last two minutes with **Retro**, and restart by
+  record the set (raw inputs, stems, MIDI and part markers) or save the last two
+  minutes with **Retro**, replay a gig take through the rack as a **Virtual
+  Soundcheck** and export its stems, and restart by
   itself after a crash. → [Pedals](docs/GUIDE.md#run-the-show-from-a-pedal),
   [Backing tracks](docs/GUIDE.md#play-along-with-a-backing-track),
   [Recording](docs/GUIDE.md#record-your-set),
+  [Virtual Soundcheck](docs/GUIDE.md#record-the-gig-and-soundcheck-it-again-later),
   [Crash recovery](docs/GUIDE.md#get-back-on-stage-after-a-crash)
 - **Survive a bumped cable:** a lost audio interface or MIDI controller comes
   back by itself mid-show, with its routing and bindings, and a notice says so.

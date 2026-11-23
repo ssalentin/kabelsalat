@@ -820,6 +820,42 @@ plan is not lost. Settings → Audio → **Keep the last** sets how far back (1 
 10 minutes, or off); machines with under 3 GB of memory start with it off.
 The assistant and MCP agents save it with `record_save_last`.
 
+### Record the gig and soundcheck it again later
+
+Every REC take is a whole gig on disk, not only a mix. Beside `master.wav`
+and the armed rig stems, the take folder holds:
+
+- `input-1 <name>.wav`, … the raw signal of every Audio In (up to eight), as
+  it came from the interface, before the unit's channel choice and gain;
+- `events.jsonl`: every MIDI message the rack was played with (notes, CCs,
+  bends, aftertouch, program changes), each at the frame it was applied;
+- `take.json`: which file is what, the length, the MIDI devices by name and
+  a marker at every song and part switch ("Opener · Verse").
+
+All files start together and stay sample-aligned; a take cut off by a crash
+still opens at the length its files reached. Foot-switch presses the setlist
+took are not stored as MIDI: the part markers stand for them.
+
+**Virtual Soundcheck** plays such a take through the live rack while nobody
+is on stage. Each Audio In hears its recorded input instead of the device,
+the recorded MIDI plays the instruments, and every recorded part switch
+steps the setlist to that part, so you tweak presets, EQ, effects and levels
+and hear every change at once, through exactly the signal path of the show.
+Jump to any song or part marker, loop a section (the chorus twenty times,
+with nobody playing it twenty times), and stop to hand the inputs back to the
+stage. Inputs are matched to the rack's Audio In units by the unit they were
+recorded from, else in rack order; MIDI devices by name.
+
+After the gig, **export** the full show mixdown, any rig stems and the raw
+inputs, of the whole take or of one song or part, as 24-bit (default), 16-bit
+or 32-bit float WAV into the take's `export` folder, ready for a DAW.
+
+The assistant and MCP agents do all of it: `list_takes`, `soundcheck_start`
+(take, marker, loop), `soundcheck_seek`, `soundcheck_loop`, `soundcheck_stop`,
+`soundcheck_status` and `export_take`. `kabelsalat gig-test` records a take
+with inputs, MIDI and two part switches, reads every file back, replays it
+and exports it, without a plugin or a device.
+
 ### Get back on stage after a crash
 
 If kabelsalat crashes, it starts again by itself and reopens the session and

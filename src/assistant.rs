@@ -1548,6 +1548,8 @@ pub(crate) fn tools() -> Value {
             },"required":["node"]}
         }}),
     ]);
+    // Gig takes, Virtual Soundcheck and the stem export (#400).
+    list.extend(crate::soundcheck::tool_defs());
     Value::Array(list)
 }
 

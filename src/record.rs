@@ -32,6 +32,16 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use serde::Serialize;
 
 use crate::control::MAX_RIGS;
+use crate::take::{Timed, TakeEv};
+
+/// Audio In nodes one take records the raw input of (#400): each gets a
+/// lane, a ring allocated with the recorder.
+pub const MAX_TAKE_INPUTS: usize = 8;
+/// No node in a lane of a take's input table.
+pub const NO_INPUT: u32 = u32::MAX;
+/// Events (MIDI, part switches) the audio thread can hand the writer between
+/// two of its wakes (5 ms while a take records).
+const EVENT_RING: usize = 8192;
 
 /// The live app's recorder, published once at startup so the control bridge can
 /// answer `record_status` without threading an Arc through every signature.
@@ -58,7 +68,9 @@ pub fn mask_rig(rig: u8) -> u64 {
 enum RecorderMsg {
     /// Begin a take of every target in `mask`; the writer opens one WAV per
     /// target inside a fresh timestamped take folder.
-    Start { mask: u64 },
+    /// `inputs`: the Audio In node each input lane records, `NO_INPUT` from
+    /// the first unused lane on.
+    Start { mask: u64, inputs: [u32; MAX_TAKE_INPUTS] },
     Stop,
 }
 
@@ -109,6 +121,11 @@ pub struct RecordStatus {
     pub armed_master: bool,
     pub armed_rigs: Vec<bool>,
     pub retro: RetroStatus,
+    /// The last/active take's raw input files (#400), one per Audio In.
+    pub inputs: Vec<String>,
+    /// MIDI events and song/part markers of the last/active take.
+    pub midi_events: u64,
+    pub markers: u64,
 }
 
 /// Retrospective recording (#215): what `save_last` can save.
@@ -164,10 +181,22 @@ pub struct RecorderShared {
     /// during another keeps `saving` on until its own take is written.
     retro_asked: AtomicU64,
     retro_done: AtomicU64,
+    /// Frames an input lane's ring, and events the event ring, could not hold.
+    input_dropped: AtomicU64,
+    events_dropped: AtomicU64,
+    /// What the manifest names (#400), set by whoever holds the rack and the
+    /// setlist, never the audio thread: Audio In nodes by id, setlist parts
+    /// by index as (song, part), hardware MIDI devices by scan index.
+    input_names: Mutex<Vec<(u32, String)>>,
+    part_names: Mutex<Vec<(String, String)>>,
+    midi_ports: Mutex<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct WavStatus {
+    inputs: Vec<String>,
+    midi_events: u64,
+    markers: u64,
     folder: Option<String>,
     path: Option<String>,
     seconds: f64,
@@ -221,6 +250,11 @@ impl RecorderShared {
             retro_request: AtomicU64::new(0),
             retro_asked: AtomicU64::new(0),
             retro_done: AtomicU64::new(0),
+            input_dropped: AtomicU64::new(0),
+            events_dropped: AtomicU64::new(0),
+            input_names: Mutex::new(Vec::new()),
+            part_names: Mutex::new(Vec::new()),
+            midi_ports: Mutex::new(Vec::new()),
         }
     }
 
@@ -319,6 +353,29 @@ impl RecorderShared {
         self.unpark_writer(); // a parked writer may owe a take file a name
     }
 
+    /// Display names of the rack's Audio In nodes, by node id: a take names
+    /// its raw input files after them.
+    pub fn set_input_names(&self, names: Vec<(u32, String)>) {
+        if let Ok(mut n) = self.input_names.lock() {
+            *n = names;
+        }
+    }
+
+    /// The setlist's parts in setlist order, as (song, part): a take's
+    /// markers carry these names.
+    pub fn set_part_names(&self, names: Vec<(String, String)>) {
+        if let Ok(mut n) = self.part_names.lock() {
+            *n = names;
+        }
+    }
+
+    /// Hardware MIDI devices by scan index, for the manifest.
+    pub fn set_midi_ports(&self, ports: Vec<String>) {
+        if let Ok(mut n) = self.midi_ports.lock() {
+            *n = ports;
+        }
+    }
+
     /// Preallocate (OFF the audio thread) the stereo ring for rig `rig`'s stem
     /// and queue its consumer for the writer; returns the producer the ENGINE
     /// side holds. Re-arming reuses the parked ring (returns None) — a ring is
@@ -381,6 +438,11 @@ impl RecorderShared {
                 s.error.clone(), s.limit_reached, s.takes, s.stems.clone(), s.retro_last.clone(),
             ))
             .unwrap_or((None, None, 0.0, false, None, false, 0, Vec::new(), None));
+        let (inputs, midi_events, markers) = self
+            .status
+            .lock()
+            .map(|s| (s.inputs.clone(), s.midi_events, s.markers))
+            .unwrap_or_default();
         let names = self.rig_names.lock().map(|n| n.clone()).unwrap_or_default();
         let stems: Vec<StemStatus> = files
             .iter()
@@ -400,7 +462,10 @@ impl RecorderShared {
             path,
             folder,
             seconds,
-            dropped_frames: self.dropped_frames.load(Ordering::Relaxed) + stem_drops,
+            dropped_frames: self.dropped_frames.load(Ordering::Relaxed) + stem_drops + self.input_dropped.load(Ordering::Relaxed),
+            inputs,
+            midi_events,
+            markers,
             finalized,
             error,
             limit_reached,
@@ -430,20 +495,100 @@ pub struct RecorderTap {
     msg_tx: Producer<RecorderMsg>,
     shared: Arc<RecorderShared>,
     retro: crate::retro::Feed,
+    /// The gig lanes (#400): one ring per raw input, the Audio In node each
+    /// records in the running take, the event ring and the take's clock.
+    inputs: Vec<Producer<f32>>,
+    input_nodes: [u32; MAX_TAKE_INPUTS],
+    ev_tx: Option<Producer<Timed>>,
+    take_frames: u64,
+    /// The part the running take logged last (`None`: none yet).
+    last_part: Option<Option<usize>>,
 }
 
 impl RecorderTap {
-    /// Idempotent take begin: only the false→true transition messages the
-    /// writer (with the take's target mask) and resets the drop counters.
+    /// A take of the targets in `mask` alone: no raw inputs.
+    #[cfg(test)]
     pub fn begin(&mut self, mask: u64) {
-        if !self.shared.recording.swap(true, Ordering::Relaxed) {
-            self.active_mask = mask;
-            self.shared.dropped_frames.store(0, Ordering::Relaxed);
-            for d in &self.shared.stem_dropped {
-                d.store(0, Ordering::Relaxed);
+        self.begin_with(mask, &[]);
+    }
+
+    /// Idempotent take begin: only the false→true transition messages the
+    /// writer (with the take's target mask and the Audio In nodes whose raw
+    /// input it records, at most `MAX_TAKE_INPUTS`) and resets the drop
+    /// counters. Returns whether a take began.
+    pub fn begin_with(&mut self, mask: u64, inputs: &[u32]) -> bool {
+        if self.shared.recording.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        self.active_mask = mask;
+        self.take_frames = 0;
+        self.last_part = None;
+        self.input_nodes = [NO_INPUT; MAX_TAKE_INPUTS];
+        let lanes = inputs.len().min(self.inputs.len());
+        self.input_nodes[..lanes].copy_from_slice(&inputs[..lanes]);
+        self.shared.dropped_frames.store(0, Ordering::Relaxed);
+        self.shared.input_dropped.store(0, Ordering::Relaxed);
+        self.shared.events_dropped.store(0, Ordering::Relaxed);
+        for d in &self.shared.stem_dropped {
+            d.store(0, Ordering::Relaxed);
+        }
+        let _ = self.msg_tx.push(RecorderMsg::Start { mask, inputs: self.input_nodes });
+        self.shared.unpark_writer();
+        true
+    }
+
+    /// The Audio In node of each input lane of the running take.
+    pub fn take_inputs(&self) -> [u32; MAX_TAKE_INPUTS] {
+        if self.shared.recording.load(Ordering::Relaxed) { self.input_nodes } else { [NO_INPUT; MAX_TAKE_INPUTS] }
+    }
+
+    /// One block of lane `lane`'s raw stereo input (`None`: its node is gone
+    /// or has no device, so silence keeps the file aligned). RT-safe; a block
+    /// that does not fit is dropped whole frame by whole frame and counted.
+    pub fn push_input(&mut self, lane: usize, data: Option<&[f32]>, frames: usize) {
+        if !self.shared.recording.load(Ordering::Relaxed) || self.input_nodes.get(lane).is_none_or(|n| *n == NO_INPUT) {
+            return;
+        }
+        let Some(ring) = self.inputs.get_mut(lane) else { return };
+        let mut dropped = 0u64;
+        for i in 0..frames {
+            if ring.slots() >= 2 {
+                let (l, r) = data.map_or((0.0, 0.0), |d| (d[i * 2], d[i * 2 + 1]));
+                let _ = ring.push(l);
+                let _ = ring.push(r);
+            } else {
+                dropped += 1;
             }
-            let _ = self.msg_tx.push(RecorderMsg::Start { mask });
-            self.shared.unpark_writer();
+        }
+        if dropped > 0 {
+            self.shared.input_dropped.fetch_add(dropped, Ordering::Relaxed);
+        }
+    }
+
+    /// An event of the running take, at the block it was applied in. RT-safe.
+    pub fn event(&mut self, ev: TakeEv) {
+        if !self.shared.recording.load(Ordering::Relaxed) {
+            return;
+        }
+        let pushed = self.ev_tx.as_mut().is_some_and(|tx| tx.push(Timed { frame: self.take_frames, ev }).is_ok());
+        if !pushed {
+            self.shared.events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The setlist part now, into the running take when it changed (a
+    /// song/part marker). RT-safe.
+    pub fn log_part(&mut self, part: Option<usize>) {
+        if self.shared.recording.load(Ordering::Relaxed) && self.last_part != Some(part) {
+            self.last_part = Some(part);
+            self.event(TakeEv::Part { part });
+        }
+    }
+
+    /// The block is rendered: the take's clock moves on. Once per block.
+    pub fn end_block(&mut self, frames: usize) {
+        if self.shared.recording.load(Ordering::Relaxed) {
+            self.take_frames += frames as u64;
         }
     }
 
@@ -640,10 +785,18 @@ fn start_with_capacity(
     if let Ok(mut tx) = shared.stem_tx.lock() {
         *tx = Some(stem_tx);
     }
+    let (mut input_tx, mut input_rx) = (Vec::new(), Vec::new());
+    for _ in 0..MAX_TAKE_INPUTS {
+        let (tx, rx) = RingBuffer::new(cap.max(2));
+        input_tx.push(tx);
+        input_rx.push(rx);
+    }
+    let (ev_tx, ev_rx) = RingBuffer::new(EVENT_RING);
+    let gig = GigLanes { inputs: input_rx, events: ev_rx };
     let thread_shared = shared.clone();
     let handle = std::thread::Builder::new()
         .name("kabelsalat-recorder".into())
-        .spawn(move || writer_loop(msg_rx, consumer, keeper, dir, sample_rate, channels, thread_shared))
+        .spawn(move || writer_loop(msg_rx, consumer, gig, keeper, dir, sample_rate, channels, thread_shared))
         .expect("spawn recorder thread");
     // Known before anyone can begin/stop: an unpark is never lost to a
     // writer that has not registered itself yet.
@@ -660,6 +813,11 @@ fn start_with_capacity(
             msg_tx,
             shared: shared.clone(),
             retro,
+            inputs: input_tx,
+            input_nodes: [NO_INPUT; MAX_TAKE_INPUTS],
+            ev_tx: Some(ev_tx),
+            take_frames: 0,
+            last_part: None,
         },
         shared,
     )
@@ -670,6 +828,43 @@ fn start_with_capacity(
 enum TargetKind {
     Master,
     Rig(u8),
+    /// A raw input lane (#400).
+    Input(u8),
+}
+
+/// The writer's ends of the gig lanes.
+struct GigLanes {
+    inputs: Vec<Consumer<f32>>,
+    events: Consumer<Timed>,
+}
+
+/// The event file and manifest of the running take.
+struct TakeLog {
+    events: Option<std::io::BufWriter<std::fs::File>>,
+    manifest: crate::take::Manifest,
+    /// The setlist's part names when the take began.
+    part_names: Vec<(String, String)>,
+}
+
+impl TakeLog {
+    /// Append what the audio thread logged since the last wake.
+    fn drain(&mut self, ring: &mut Consumer<Timed>) {
+        while let Ok(t) = ring.pop() {
+            match t.ev {
+                TakeEv::Part { part } => {
+                    let (song, name) = part.and_then(|p| self.part_names.get(p).cloned()).unwrap_or_default();
+                    self.manifest.markers.push(crate::take::Marker { frame: t.frame, part, song, name });
+                }
+                _ => self.manifest.midi_events += 1,
+            }
+            if let Some(w) = &mut self.events {
+                let ok = serde_json::to_writer(&mut *w, &t).is_ok() && w.write_all(b"\n").is_ok();
+                if !ok {
+                    self.events = None; // the audio files go on without it
+                }
+            }
+        }
+    }
 }
 
 /// One open WAV of the running take: its target, file, exact sample count
@@ -686,12 +881,16 @@ struct TakeFile {
 struct Take {
     folder: String,
     files: Vec<TakeFile>,
+    log: TakeLog,
 }
 
 /// What the status shows for a take (the primary file is the master WAV when
 /// the master is armed, else the first stem).
 #[derive(Clone, Default)]
 struct TakeStatusView {
+    inputs: Vec<String>,
+    midi_events: u64,
+    markers: u64,
     folder: Option<String>,
     path: Option<String>,
     seconds: f64,
@@ -702,6 +901,9 @@ fn take_view(t: &Take, sample_rate: u32) -> TakeStatusView {
     let seconds_of = |f: &TakeFile| seconds(f.samples, sample_rate, 2);
     let primary = t.files.iter().find(|f| f.kind == TargetKind::Master).or_else(|| t.files.first());
     TakeStatusView {
+        inputs: t.files.iter().filter(|f| matches!(f.kind, TargetKind::Input(_))).map(|f| f.path.clone()).collect(),
+        midi_events: t.log.manifest.midi_events,
+        markers: t.log.manifest.markers.len() as u64,
         folder: Some(t.folder.clone()),
         path: primary.map(|f| f.path.clone()),
         seconds: primary.map(seconds_of).unwrap_or(0.0),
@@ -714,7 +916,7 @@ fn take_view(t: &Take, sample_rate: u32) -> TakeStatusView {
                     path: Some(f.path.clone()),
                     seconds: seconds_of(f),
                 }),
-                TargetKind::Master => None,
+                TargetKind::Master | TargetKind::Input(_) => None,
             })
             .collect(),
     }
@@ -723,6 +925,7 @@ fn take_view(t: &Take, sample_rate: u32) -> TakeStatusView {
 fn writer_loop(
     mut msg: Consumer<RecorderMsg>,
     mut data: Consumer<f32>,
+    mut gig: GigLanes,
     mut keeper: crate::retro::Keeper,
     dir: PathBuf,
     sample_rate: u32,
@@ -766,13 +969,13 @@ fn writer_loop(
         // is still honored before the shutdown check below ends the loop.
         while let Ok(m) = msg.pop() {
             match m {
-                RecorderMsg::Start { mask } => {
+                RecorderMsg::Start { mask, inputs } => {
                     // Unreachable via the idempotent begin(); handled anyway.
                     if let Some(mut t) = take.take() {
-                        finalize_take(&mut t, &mut data, &mut stems, &mut buf, &mut bytes, max_data_samples);
+                        finalize_take(&mut t, &mut data, &mut stems, &mut gig, &mut buf, &mut bytes, max_data_samples, &shared);
                         set_status(&shared, take_view(&t, sample_rate), true, None, false);
                     }
-                    match begin_take(&dir, sample_rate, channels, mask, &stems, &shared) {
+                    match begin_take(&dir, sample_rate, channels, mask, &inputs, &stems, &mut gig, &shared) {
                         Some(t) => take = Some(t),
                         None => {
                             shared.recording.store(false, Ordering::Relaxed);
@@ -781,7 +984,7 @@ fn writer_loop(
                 }
                 RecorderMsg::Stop => {
                     if let Some(mut t) = take.take() {
-                        finalize_take(&mut t, &mut data, &mut stems, &mut buf, &mut bytes, max_data_samples);
+                        finalize_take(&mut t, &mut data, &mut stems, &mut gig, &mut buf, &mut bytes, max_data_samples, &shared);
                         set_status(&shared, take_view(&t, sample_rate), true, None, false);
                     }
                 }
@@ -789,7 +992,7 @@ fn writer_loop(
         }
         if shared.shutdown.load(Ordering::Acquire) || msg.is_abandoned() {
             if let Some(mut t) = take.take() {
-                finalize_take(&mut t, &mut data, &mut stems, &mut buf, &mut bytes, max_data_samples);
+                finalize_take(&mut t, &mut data, &mut stems, &mut gig, &mut buf, &mut bytes, max_data_samples, &shared);
                 set_status(&shared, take_view(&t, sample_rate), true, None, false);
             }
             break;
@@ -800,8 +1003,10 @@ fn writer_loop(
             let mut capped = false;
             {
                 let t = take.as_mut().expect("checked above");
+                t.log.drain(&mut gig.events);
                 for tf in t.files.iter_mut() {
                     let ring: &mut Consumer<f32> = match tf.kind {
+                        TargetKind::Input(lane) => &mut gig.inputs[lane as usize],
                         TargetKind::Master => &mut data,
                         TargetKind::Rig(r) => match stems[r as usize].as_mut() {
                             Some(c) => c,
@@ -828,6 +1033,11 @@ fn writer_loop(
                     if tf.samples >= tf.next_patch {
                         patch_header(&mut tf.file, tf.samples, max_data_samples);
                         tf.next_patch = tf.samples + patch_every;
+                        // With the first file's header, about once a second:
+                        // a crash keeps the events up to here.
+                        if let Some(w) = &mut t.log.events {
+                            let _ = w.flush();
+                        }
                     }
                     if tf.samples >= max_data_samples {
                         capped = true;
@@ -838,10 +1048,10 @@ fn writer_loop(
                 // Mid-take write error: finalize best-effort and drain the
                 // rings so stale samples don't leak into the next take.
                 if let Some(mut t) = take.take() {
-                    finalize_take(&mut t, &mut data, &mut stems, &mut buf, &mut bytes, max_data_samples);
+                    finalize_take(&mut t, &mut data, &mut stems, &mut gig, &mut buf, &mut bytes, max_data_samples, &shared);
                 }
                 drain_to_empty(&mut data);
-                for c in stems.iter_mut().flatten() {
+                for c in stems.iter_mut().flatten().chain(gig.inputs.iter_mut()) {
                     drain_to_empty(c);
                 }
                 shared.recording.store(false, Ordering::Relaxed);
@@ -852,7 +1062,7 @@ fn writer_loop(
             // of the take keeps the same length.
             if capped {
                 if let Some(mut t) = take.take() {
-                    finalize_take(&mut t, &mut data, &mut stems, &mut buf, &mut bytes, max_data_samples);
+                    finalize_take(&mut t, &mut data, &mut stems, &mut gig, &mut buf, &mut bytes, max_data_samples, &shared);
                     set_status(&shared, take_view(&t, sample_rate), true, None, true);
                 }
                 shared.recording.store(false, Ordering::Relaxed);
@@ -872,16 +1082,20 @@ fn writer_loop(
 
 /// Drain every target's ring to empty and patch each header. A Stop must not
 /// leave pushed-but-unwritten samples behind.
+#[allow(clippy::too_many_arguments)]
 fn finalize_take(
     t: &mut Take,
     data: &mut Consumer<f32>,
     stems: &mut [Option<Consumer<f32>>; MAX_RIGS],
+    gig: &mut GigLanes,
     buf: &mut [f32],
     bytes: &mut Vec<u8>,
     max_data_samples: u64,
+    shared: &Arc<RecorderShared>,
 ) {
     for tf in t.files.iter_mut() {
         let ring: &mut Consumer<f32> = match tf.kind {
+            TargetKind::Input(lane) => &mut gig.inputs[lane as usize],
             TargetKind::Master => data,
             TargetKind::Rig(r) => match stems[r as usize].as_mut() {
                 Some(c) => c,
@@ -906,6 +1120,23 @@ fn finalize_take(
         }
         patch_header(&mut tf.file, tf.samples, max_data_samples);
     }
+    // The events the audio thread logged before the stop, then the manifest
+    // with the take's length: the shortest file, should a ring have dropped.
+    t.log.drain(&mut gig.events);
+    if let Some(mut w) = t.log.events.take() {
+        let _ = w.flush();
+    }
+    t.log.manifest.frames = t.files.iter().map(|f| f.samples / 2).min().unwrap_or(0);
+    t.log.manifest.dropped_frames = shared.dropped_frames.load(Ordering::Relaxed)
+        + shared.input_dropped.load(Ordering::Relaxed)
+        + shared.stem_dropped.iter().map(|d| d.load(Ordering::Relaxed)).sum::<u64>();
+    if let Err(e) = t.log.manifest.write(Path::new(&t.folder)) {
+        eprintln!("record: cannot write the take's manifest: {e}");
+    }
+    let lost = shared.events_dropped.load(Ordering::Relaxed);
+    if lost > 0 {
+        eprintln!("record: {lost} events did not fit the take's event ring");
+    }
 }
 
 fn seconds(samples: u64, sample_rate: u32, channels: usize) -> f64 {
@@ -925,14 +1156,21 @@ fn max_data_bytes(channels: usize) -> u64 {
 /// `<rig name>.wav` per armed rig. One thread decides every name, so all
 /// files of a take group without a naming race; same-second takes retry with
 /// `-2`, `-3`, … on the folder.
+#[allow(clippy::too_many_arguments)]
 fn begin_take(
     dir: &Path,
     sample_rate: u32,
     channels: usize,
     mask: u64,
+    inputs: &[u32; MAX_TAKE_INPUTS],
     stems: &[Option<Consumer<f32>>; MAX_RIGS],
+    gig: &mut GigLanes,
     shared: &Arc<RecorderShared>,
 ) -> Option<Take> {
+    // Never empty the gig lanes here: the engine pushed this take's first
+    // blocks before the writer saw its Start (a stop drains them to empty,
+    // so nothing of an earlier take is left).
+    let _ = &gig;
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!("record: cannot create {}: {e}", dir.display());
         set_status(shared, TakeStatusView::default(), true, Some(format!("cannot create recording dir: {e}")), false);
@@ -949,7 +1187,7 @@ fn begin_take(
     };
     let names = shared.rig_names.lock().map(|n| n.clone()).unwrap_or_default();
     let mut files: Vec<TakeFile> = Vec::new();
-    let mut open = |kind: TargetKind, name: &str, files: &mut Vec<TakeFile>| {
+    let open = |kind: TargetKind, name: &str, files: &mut Vec<TakeFile>| {
         match unique_path(&folder, name) {
             Ok((mut f, path)) => {
                 if write_wav_header(&mut f, sample_rate, channels as u16, 0).is_err() {
@@ -980,12 +1218,46 @@ fn begin_take(
         let name = names.get(rig as usize).map(|n| sanitize_file_name(n, &fallback)).unwrap_or(fallback);
         ok = ok && open(TargetKind::Rig(rig), &name, &mut files);
     }
+    let input_names = shared.input_names.lock().map(|n| n.clone()).unwrap_or_default();
+    let mut manifest = crate::take::Manifest { version: 1, sample_rate, ..Default::default() };
+    for (lane, node) in inputs.iter().enumerate().take_while(|(_, n)| **n != NO_INPUT) {
+        let label = input_names.iter().find(|(id, _)| id == node).map(|(_, n)| n.as_str()).unwrap_or("");
+        let name = sanitize_file_name(&format!("input-{} {label}", lane + 1), "input");
+        ok = ok && open(TargetKind::Input(lane as u8), &name, &mut files);
+        manifest.inputs.push(crate::take::InputFile { node: *node, name: if label.is_empty() { format!("Input {}", lane + 1) } else { label.to_string() }, file: String::new() });
+    }
     if !ok || files.is_empty() {
-        let _ = std::fs::remove_dir(&folder);
+        let _ = std::fs::remove_dir_all(&folder);
         return None;
     }
+    let file_name = |f: &TakeFile| Path::new(&f.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for f in &files {
+        match f.kind {
+            TargetKind::Master => manifest.master = Some(file_name(f)),
+            TargetKind::Rig(rig) => manifest.stems.push(crate::take::StemFile {
+                rig,
+                name: names.get(rig as usize).filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| format!("rig-{}", rig + 1)),
+                file: file_name(f),
+            }),
+            TargetKind::Input(lane) => manifest.inputs[lane as usize].file = file_name(f),
+        }
+    }
+    manifest.midi_ports = shared.midi_ports.lock().map(|n| n.clone()).unwrap_or_default();
+    // The event file and a first manifest now: a take cut off by a crash is
+    // still a take (its length is then read from the files).
+    let events = std::fs::File::create(folder.join(crate::take::EVENTS_FILE)).ok().map(std::io::BufWriter::new);
+    if events.is_some() {
+        manifest.events = Some(crate::take::EVENTS_FILE.into());
+    }
+    if let Err(e) = manifest.write(&folder) {
+        eprintln!("record: cannot write the take's manifest: {e}");
+    }
+    let log = TakeLog { events, manifest, part_names: shared.part_names.lock().map(|n| n.clone()).unwrap_or_default() };
     let folder_str = folder.to_string_lossy().into_owned();
     let view = TakeStatusView {
+        inputs: files.iter().filter(|f| matches!(f.kind, TargetKind::Input(_))).map(|f| f.path.clone()).collect(),
+        midi_events: 0,
+        markers: 0,
         folder: Some(folder_str.clone()),
         path: files.iter().find(|f| f.kind == TargetKind::Master).or_else(|| files.first()).map(|f| f.path.clone()),
         seconds: 0.0,
@@ -993,12 +1265,12 @@ fn begin_take(
             .iter()
             .filter_map(|f| match f.kind {
                 TargetKind::Rig(r) => Some(StemFileStatus { rig: r, path: Some(f.path.clone()), seconds: 0.0 }),
-                TargetKind::Master => None,
+                TargetKind::Master | TargetKind::Input(_) => None,
             })
             .collect(),
     };
     set_status(shared, view, false, None, false);
-    Some(Take { folder: folder_str, files })
+    Some(Take { folder: folder_str, files, log })
 }
 
 /// Write the last `want` frames the retrospective ring kept, for every armed
@@ -1084,7 +1356,7 @@ fn write_retro_take(
             }
         }
         let path = path.or_else(|| stems.first().and_then(|s| s.path.clone()));
-        Ok(TakeStatusView { folder: Some(folder.to_string_lossy().into_owned()), path, seconds, stems })
+        Ok(TakeStatusView { folder: Some(folder.to_string_lossy().into_owned()), path, seconds, stems, ..TakeStatusView::default() })
     })();
     written.inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&folder);
@@ -1173,6 +1445,9 @@ fn set_status(
         s.path = view.path;
         s.seconds = view.seconds;
         s.stems = view.stems;
+        s.inputs = view.inputs;
+        s.midi_events = view.midi_events;
+        s.markers = view.markers;
         s.finalized = finalized;
         s.error = error;
         s.limit_reached = limit_reached;
@@ -1706,6 +1981,11 @@ mod tests {
             msg_tx,
             shared,
             retro: crate::retro::channel(48_000).0,
+            inputs: Vec::new(),
+            input_nodes: [NO_INPUT; MAX_TAKE_INPUTS],
+            ev_tx: None,
+            take_frames: 0,
+            last_part: None,
         }
     }
 
@@ -1785,7 +2065,7 @@ mod tests {
         let mut tap = test_tap(producer, msg_tx, shared.clone());
         tap.begin(MASK_MASTER);
         tap.begin(MASK_MASTER);
-        assert_eq!(msg_rx.pop().ok(), Some(RecorderMsg::Start { mask: MASK_MASTER }));
+        assert_eq!(msg_rx.pop().ok(), Some(RecorderMsg::Start { mask: MASK_MASTER, inputs: [NO_INPUT; MAX_TAKE_INPUTS] }));
         assert!(msg_rx.pop().is_err(), "only one Start sent");
         tap.stop();
         tap.stop();

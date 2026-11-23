@@ -61,7 +61,9 @@ mod rope;
 mod session;
 mod setlist;
 mod show;
+mod soundcheck;
 mod sounds;
+mod take;
 mod theme;
 mod transport;
 mod ui;
@@ -206,6 +208,7 @@ fn run() -> anyhow::Result<()> {
         "meter-test" => engine::meter_test(),
         "target-test" => engine::target_test(),
         "record-test" => record::run_test(),
+        "gig-test" => engine::gig_test::run(std::env::args().any(|a| a == "--keep")),
         "audio-in-test" => audio_in::run_test(),
         "audio-out-test" => audio_out::run_test(),
         "hotplug-test" => audio_recover::run_test(),

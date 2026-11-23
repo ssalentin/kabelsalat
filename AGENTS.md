@@ -2075,3 +2075,12 @@ Learned so far (2026-11-15, UI polish pass):
     `plugin_window::force_x11_egl_platform()` (sets it whenever it is not `x11`
     under Wayland), and `run_editor_test` calls it first. Not reproduced on the
     aarch64 CI-less server (no Wayland GPU session): the bench test checks it.
+232. **A writer never empties a ring at a take's Start:** the audio thread
+    pushes a take's first blocks in the block it sends Start, before the
+    writer pops that message, so `begin_take` draining the input lanes cut
+    2 to 21 blocks off the start of every raw input file (#400; the take
+    then read as long as its shortest file). Leftovers of an earlier take are
+    drained at its stop (`finalize_take`), never at the next begin. A replay
+    test that renders faster than real time paces on the reader
+    (`SoundcheckShared::wait_ahead`), or an underrun shifts the take
+    (`kabelsalat gig-test`).

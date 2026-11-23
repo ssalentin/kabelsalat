@@ -256,6 +256,21 @@ agents are in [AGENTS.md](../AGENTS.md).
   announces each block's end before writing, like a seqlock); lanes hold 2 s
   more than a save may take, so that check fails only when the copy stalls.
   The length is the app setting `retro_minutes` (default 2, off below 3 GiB).
+- `take.rs` / `soundcheck.rs` — gig takes and Virtual Soundcheck (#400). A
+  take begins with the Audio In nodes of the rack as input lanes (rings
+  allocated with the recorder, raw stereo before channel choice and gain) and
+  an event ring: the engine logs every played MIDI message after the show
+  controls had their say, and the setlist part whenever it changed, each at
+  the take frame of the block it was applied in. The writer appends them to
+  `events.jsonl` and writes `take.json` at begin and stop. A replay streams
+  the take on a reader thread into chunks of a pool the engine owns (24 ×
+  1024 frames, allocated at startup) and the engine hands every chunk back;
+  a seek, loop or stop bumps a generation, so stale chunks are recycled and
+  held notes released. The engine applies a chunk's events in the block that
+  contains their frame and feeds the lanes to the Audio In units in place of
+  their devices, so a take replayed at its own block size renders the same
+  samples as the gig (`kabelsalat gig-test`). Exports stream a second at a
+  time on a worker thread.
 - `meter.rs` — master loudness meter for the agent's `measure_mix`: momentary,
   short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
   gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono

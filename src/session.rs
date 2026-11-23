@@ -150,6 +150,10 @@ pub struct Session {
     /// Each rig's hardware MIDI device in rig order (#227); `None` = the
     /// keyboard and every device. Empty while no rig is bound to one.
     pub rig_devices: Vec<Option<u32>>,
+    /// Macros and morph controls (#289, #214), keyed by node like `params`
+    /// (home and targets; `remap_session` carries them, rule 44). Their
+    /// controllers are `CcTarget::Macro` bindings in `matrix`.
+    pub macros: Vec<crate::macros::Macro>,
 }
 
 /// One CLAP synth's input selection (#124): the keyboard switch, the
@@ -290,6 +294,7 @@ impl Session {
             setlist: crate::setlist::Setlist::default(),
             hw_ports: BTreeMap::new(),
             rig_devices: Vec::new(),
+            macros: Vec::new(),
         }
     }
 
@@ -315,6 +320,7 @@ impl Session {
             && self.midi_sources == other.midi_sources
             && self.setlist == other.setlist
             && self.rig_devices == other.rig_devices
+            && self.macros == other.macros
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -564,6 +570,7 @@ impl Session {
         self.strip_order.retain(|n| self.graph.node(*n).is_some());
         self.strip_knobs.retain(|n, _| self.graph.node(*n).is_some());
         self.midi_sources.retain(|m| self.graph.node(m.node).is_some());
+        self.macros = crate::macros::remap(&self.macros, |n| self.graph.node(n).map(|_| n));
         self.prune_sends();
         self.prune_bus_outs();
         self.setlist.prune_to_graph(&self.graph);
@@ -746,6 +753,7 @@ impl Session {
             setlist: self.setlist.clone(),
             hw_ports: self.hw_ports.clone(),
             rig_devices: self.rig_devices.clone(),
+            macros: self.macros.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -777,6 +785,7 @@ impl Session {
         let rig_types = rig_types_of(&manifest);
         let mut setlist = manifest.setlist;
         setlist.normalize();
+        let has_node: Vec<NodeId> = manifest.graph.nodes.iter().map(|n| n.id).collect();
         let session = Session {
             name: manifest.name,
             graph: manifest.graph,
@@ -800,6 +809,8 @@ impl Session {
             setlist,
             hw_ports: manifest.hw_ports,
             rig_devices: manifest.rig_devices,
+            // A macro of a hand-edited file may name a node that is gone.
+            macros: crate::macros::remap(&manifest.macros, |n| has_node.contains(&n).then_some(n)),
         };
         session.validate()?;
         Ok(session)
@@ -950,6 +961,9 @@ struct SessionFile {
     /// Rig devices (#227); older sessions have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rig_devices: Vec<Option<u32>>,
+    /// Macros and morph controls (#289, #214); older sessions have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    macros: Vec<crate::macros::Macro>,
 }
 
 /// A file's rig marks: its own, or an old session's single keyboard pin,
@@ -2319,6 +2333,43 @@ mod tests {
         let older = HwIndexMap::new(&BTreeMap::new(), &[U6, FM1], |_| None);
         assert_eq!(mapped(&older), (0..HW_DEVICES as u32).collect::<Vec<_>>());
         assert_eq!(older.get(40), 40, "beyond the device list an index passes as it is");
+    }
+
+    #[test]
+    fn macros_round_trip_through_the_package_and_follow_a_pruned_graph() {
+        use crate::macros::{Curve, Macro, MacroTarget};
+        use crate::matrix::CcTarget;
+        let dir = std::env::temp_dir().join(format!("ksalat-macros-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::new("macros", Graph::demo_patch());
+        let ids: Vec<NodeId> = s.graph.nodes.iter().map(|n| n.id).collect();
+        let (home, a, b) = (ids[ids.len() - 1], ids[1], ids[2]);
+        let m = Macro {
+            id: 4, name: "Swell".into(), home, value: 0.25, morph: true,
+            targets: vec![
+                MacroTarget { min: 0.2, max: 0.8, curve: Curve::Slow, invert: true, ..MacroTarget::new(a, 3, CcTarget::Knob) },
+                MacroTarget::new(b, 0, CcTarget::Mix),
+            ],
+        };
+        s.macros = vec![m.clone()];
+        let pkg = dir.join("macros.ksalat");
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert_eq!(loaded.macros, vec![m.clone()]);
+        assert!(!loaded.same_content(&Session::new("macros", Graph::demo_patch())), "a macro is content");
+
+        // A target whose node left the patch goes; the macro stays.
+        let mut pruned = loaded.clone();
+        pruned.graph.remove_node(b);
+        pruned.prune_to_graph();
+        assert_eq!(pruned.macros[0].targets, vec![m.targets[0]]);
+
+        // A session without macros writes no key, and an older file loads.
+        let plain = dir.join("plain.ksalat");
+        Session::new("plain", Graph::demo_patch()).save(&plain).unwrap();
+        assert!(!std::fs::read_to_string(plain.join(SESSION_FILE)).unwrap().contains("macros"));
+        assert!(Session::load(&plain).unwrap().macros.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

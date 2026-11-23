@@ -2030,6 +2030,9 @@ pub struct GraphEngine {
     show_gates: show_gates::ShowGates,
     /// Show controls and the setlist parts they step through (#261).
     show: crate::show::Show,
+    /// The session's macros (#289). Shared with the frontend that sent the
+    /// table, so replacing it frees nothing here.
+    macros: Option<crate::macros::MacroTable>,
     /// Tap tempo from a show control (#277), timed by `clock_frames`.
     tap: crate::transport::TapTempo,
     /// Frames rendered before the current block.
@@ -2347,6 +2350,7 @@ impl GraphEngine {
             rig_zones: [RigZone::OPEN; MAX_RIGS],
             show_gates: show_gates::ShowGates::new(),
             show: crate::show::Show::default(),
+            macros: None,
             tap: crate::transport::TapTempo::new(),
             clock_frames: 0,
             zone_hands: Hands::default(),
@@ -5570,6 +5574,50 @@ impl GraphEngine {
         true
     }
 
+    /// Move macro `id` to `v` (0..=1): every target that has a range takes
+    /// its own value (#289, #214). Allocation-free: the table is shared with
+    /// the frontend that sent it. False when there is no such macro.
+    fn apply_macro(&mut self, id: u32, v: f64) -> bool {
+        let Some(table) = self.macros.clone() else { return false };
+        let Some(m) = table.get(id) else { return false };
+        for t in m.targets.iter().filter(|t| t.moves()) {
+            let value = t.value(v);
+            if self.apply_macro_target(t.node, t.param, t.target, value) {
+                #[cfg(test)]
+                self.cc_log.push((t.node, t.param, value));
+            }
+        }
+        true
+    }
+
+    /// One macro target, on the path a CC binding of the same kind takes.
+    fn apply_macro_target(&mut self, node: NodeId, param: ParamId, target: CcTarget, norm: f64) -> bool {
+        let hosted = self.graph.node(node).is_some_and(|n| n.kind.is_hosted_voice());
+        match target {
+            CcTarget::Mix => self.apply_mix_cc(node, param, norm),
+            CcTarget::Knob => self.apply_engine_param(node, param, norm) || hosted,
+            CcTarget::PluginParam => {
+                if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                    s.voice.set_param_normalized_rt(param, norm);
+                    self.wake_node(node);
+                    true
+                } else if hosted {
+                    // Its voice is not hosted yet: nothing to move.
+                    true
+                } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                    s.plugin.set_control_normalized(param as usize, norm as f32);
+                    self.wake_node(node);
+                    true
+                } else {
+                    self.apply_engine_param(node, param, norm)
+                }
+            }
+            // A macro drives parameters; MIDI messages and other macros are
+            // not targets.
+            CcTarget::MidiCc | CcTarget::ChannelPressure | CcTarget::Macro => false,
+        }
+    }
+
     /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
@@ -6915,6 +6963,12 @@ impl GraphEngine {
                     {
                         continue;
                     }
+                    // A macro's controller moves every target of the macro
+                    // (#289); its home node decides whether it is live.
+                    if let Some(CcMapping { param: id, target: CcTarget::Macro, .. }) = mapping {
+                        self.apply_macro(id, norm);
+                        continue;
+                    }
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
                         if self.apply_engine_param(dest, pid, norm) || is_clap_node {
                             #[cfg(test)]
@@ -7071,6 +7125,10 @@ impl GraphEngine {
                 if changed {
                     self.publish_graph();
                 }
+            }
+            Command::SetMacros { macros } => self.macros = Some(macros),
+            Command::SetMacro { id, value } => {
+                self.apply_macro(id, value);
             }
             Command::SetSystemAudio { gain } => self.set_system_gain(gain),
             Command::SetAudioIn { node, device, channels } => {
@@ -8579,6 +8637,8 @@ pub mod setlist_window_test;
 pub(crate) mod gain_ramp;
 pub mod levels_test;
 pub mod gig_test;
+#[cfg(test)]
+mod macros_test;
 
 #[cfg(test)]
 mod master_target_tests {

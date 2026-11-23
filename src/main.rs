@@ -40,6 +40,7 @@ mod keyboard;
 mod listen;
 mod llm;
 mod lv2;
+mod macros;
 mod main_controls;
 mod markers;
 mod matrix;

@@ -97,6 +97,11 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **Play your guitar** through amp, cabinet and stomp boxes, with a tuner on
   the input. → [Play your guitar](docs/GUIDE.md#play-your-guitar)
 
+- **One control, several parameters, and scene morph:** a macro moves any number
+  of parameters over their own ranges and curves; store a rig's knobs as A and
+  B and fade between them with a pedal.
+  → [Macros and scene morph](docs/GUIDE.md#one-control-for-several-parameters-macros-and-scene-morph)
+
 **Build rigs**
 - **Patch with real cables** on the back of the rack; they light up when
   signal flows. Lock the rack once it is dialled in.

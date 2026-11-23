@@ -118,7 +118,7 @@ struct AddNodeArgs {
     kind: String,
     /// Display name (max 31 bytes; defaults to the kind).
     name: Option<String>,
-    /// For kind "dsp": gain, pan, eq3, filter, limiter, saturation, delay, reverb, metronome.
+    /// For kind "dsp": gain, pan, eq3, filter, limiter, saturation, delay, reverb, metronome, crossfade, split.
     dsp: Option<String>,
     /// For kind "clap": CLAP plugin id (defaults to Surge XT).
     plugin_id: Option<String>,
@@ -1773,6 +1773,8 @@ fn dsp_kind_str(k: &DspKind) -> &'static str {
         DspKind::Reverb => "reverb",
         DspKind::Metronome => "metronome",
         DspKind::Bus => "bus",
+        DspKind::Crossfade => "crossfade",
+        DspKind::Split => "split",
     }
 }
 
@@ -1788,6 +1790,8 @@ fn parse_dsp_kind(s: &str) -> Result<DspKind, String> {
         "reverb" => Ok(DspKind::Reverb),
         "metronome" => Ok(DspKind::Metronome),
         "bus" => Ok(DspKind::Bus),
+        "crossfade" | "crossfader" | "ab" | "switch" => Ok(DspKind::Crossfade),
+        "split" | "splitter" => Ok(DspKind::Split),
         other => Err(format!("unknown dsp kind '{other}'")),
     }
 }
@@ -2340,7 +2344,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|vst3|dsp|lv2|midi_fx|audio_in|system_audio|master_out; midi_fx = a MIDI-effect unit in the rig's MIDI chain (AUM MIDI strips: arpeggiator, chord tool, transposer): give uri (an LV2 MIDI plugin from list_midi_fx) or neither for the built-in transposer (semis); it is inserted between the rig's Keys and its instruments; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); vst3 nodes need 'cid' (32-char hex TUID from list_plugins); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, vst3 instrument, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap/vst3 node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|vst3|dsp|lv2|midi_fx|audio_in|system_audio|master_out; midi_fx = a MIDI-effect unit in the rig's MIDI chain (AUM MIDI strips: arpeggiator, chord tool, transposer): give uri (an LV2 MIDI plugin from list_midi_fx) or neither for the built-in transposer (semis); it is inserted between the rig's Keys and its instruments; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome|crossfade|split); crossfade = A/B switch and crossfader with two audio inputs (connect to_port 0 = IN A, to_port 1 = IN B; knobs MIX 0 = A .. 1 = B and MODE 0 equal power | 0.5 linear | 1 A/B switch); split = splitter with two audio outputs that sum back to its input (connect from_port 0 = low/mid/left, from_port 1 = high/side/right; knobs MODE 0 low/high bands | 0.5 mid/side | 1 left/right and FREQ, the crossover 60 Hz..8 kHz); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); vst3 nodes need 'cid' (32-char hex TUID from list_plugins); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, vst3 instrument, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap/vst3 node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -2444,7 +2448,7 @@ impl McpServer {
     }
 
     /// Connect two ports with a cable.
-    #[tool(name = "connect", description = "Connect two ports (Command::Connect). Rejects self-connections, duplicate ids and duplicate endpoints. kind defaults to audio; ports default to 0; id is auto-assigned when omitted. Returns the cable id.")]
+    #[tool(name = "connect", description = "Connect two ports (Command::Connect). Rejects self-connections, duplicate ids and duplicate endpoints. kind defaults to audio; ports default to 0 (a crossfade unit's IN B is to_port 1, a split unit's second output is from_port 1); id is auto-assigned when omitted. Returns the cable id.")]
     fn connect(&self, Parameters(args): Parameters<ConnectArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_port_kind(args.kind.as_deref()) {
             Ok(k) => k,

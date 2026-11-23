@@ -1,0 +1,2 @@
+### Added
+- **A/B switch, crossfader and splitter (#308):** two zero-latency built-in routing units in the Plugins browser. *A/B Crossfade* blends or switches two stereo inputs (equal power, linear or A/B switch, MIDI-learnable MIX, click-free over 5 ms); *Splitter* turns one input into two outputs that sum back to it (low/high bands, mid/side or left/right). The assistant and MCP add and wire them too.

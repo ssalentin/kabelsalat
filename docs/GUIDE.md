@@ -19,6 +19,7 @@ every keyboard shortcut.
   - [Run several rigs at once](#run-several-rigs-at-once)
   - [Route MIDI anywhere](#route-midi-anywhere)
   - [Put MIDI effects in front of an instrument](#put-midi-effects-in-front-of-an-instrument)
+  - [Switch, blend and split audio](#switch-blend-and-split-audio)
 - [Plugins](#plugins)
   - [Browse and install plugins by type](#browse-and-install-plugins-by-type)
   - [Search your own plugin folders](#search-your-own-plugin-folders)
@@ -267,6 +268,28 @@ a knob never hangs. The assistant can add strips too (`list_midi_fx`, `add_node`
 with kind `midi_fx`).
 
 <p align="center"><img src="shots/midi-strip.png" width="85%" alt="The rack with a Transpose MIDI strip between Keys and the two Surge synths"/></p>
+
+### Switch, blend and split audio
+
+Two built-in units in **Plugins → Mixer & routing** (*Add to rig*, then patch
+them on the back with **Tab**), both with no latency:
+
+- **A/B Crossfade** has two stereo inputs, **IN A** and **IN B**, and one
+  output. **MIX** goes from A (left) to B (right); **MODE** picks *power*
+  (equal power, for two different sources), *linear* (for a dry and a wet path
+  of the same sound) or *switch* (A below the middle, B above it). Learn MIX
+  from a pedal, or put it in switch mode and learn a foot switch to flip
+  between two amps or synths. Moves are smoothed over 5 ms, so a switch under
+  a held chord does not click. Delay compensation lines the two inputs up when
+  one of them runs through a latent unit.
+- **Splitter** has one input and two outputs that add back up to the input.
+  **MODE** picks *band* (OUT 1 low, OUT 2 high, split at **FREQ**, 60 Hz to
+  8 kHz, 24 dB/octave Linkwitz-Riley), *M/S* (OUT 1 mid, OUT 2 side) or *L/R*
+  (OUT 1 the left channel, OUT 2 the right). Put an effect on each output and
+  cable both into the same unit to process the bands apart.
+
+The assistant adds them with `add_node` (`dsp` = `crossfade` or `split`) and
+wires the second input or output with `to_port` / `from_port` 1.
 
 ## Plugins
 

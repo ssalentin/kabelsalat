@@ -116,6 +116,12 @@ pub(crate) fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
             0 => Some(0),
             _ => None,
         },
+        // Routing units (#308): mix + mode, mode + crossover frequency.
+        DspKind::Crossfade | DspKind::Split => match p {
+            0 => Some(0),
+            1 => Some(1),
+            _ => None,
+        },
     }
 }
 
@@ -132,6 +138,8 @@ pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
         DspKind::Pan => &[(0, "Pan")],
         DspKind::Metronome => &[],
         DspKind::Bus => &[(0, "Level")],
+        DspKind::Crossfade => &[(0, "Mix"), (1, "Mode")],
+        DspKind::Split => &[(0, "Mode"), (1, "Freq")],
     }
 }
 
@@ -205,6 +213,17 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
             DspKind::Pan => knobs!(ks("PAN", 0.5, Some(0), &[])),
             DspKind::Metronome => &[],
             DspKind::Bus => knobs!(ks("LEVEL", 1.0, Some(0), &["VOLUME", "VOL"])),
+            // Routing units (#308). MIX: 0 = input A, 1 = input B; the
+            // stepped MODE knobs have three positions (`dsp::routing`).
+            DspKind::Crossfade => knobs!(
+                ks("MIX", 0.0, Some(0), &["A/B", "AB", "CROSSFADE", "FADE", "BALANCE"]),
+                ks_steps("MODE", 0.0, Some(1), 3, &["CURVE"]),
+            ),
+            // FREQ's default is 250 Hz (`routing::SPLIT_DEFAULT_HZ`).
+            DspKind::Split => knobs!(
+                ks_steps("MODE", 0.0, Some(0), 3, &["SPLIT"]),
+                ks("FREQ", 0.2917, Some(1), &["CROSSOVER", "XOVER", "FREQUENCY"]),
+            ),
         },
         // setBfree has no control ports: its face drives MIDI CCs (`organ`).
         // Drawbars are hidden knobs, painted as faders.
@@ -333,7 +352,8 @@ pub fn knob_random_bounds(
             },
             DspKind::Pan => Some((0.15, 0.85)),
             DspKind::Bus => Some((0.50, 1.0)),
-            DspKind::Metronome => None,
+            // A routing unit decides where sound goes: never by chance.
+            DspKind::Metronome | DspKind::Crossfade | DspKind::Split => None,
         },
         NodeKind::Lv2 { .. } => {
             if crate::organ::is_organ(kind) {
@@ -515,6 +535,13 @@ struct DspSlot {
     kind: DspKind,
     proc: Box<dyn Processor>,
     buf: Vec<f32>,
+    /// A routing unit's second stereo buffer (#308), empty for every other
+    /// kind: a crossfader's IN B (cables into port 1), a splitter's second
+    /// output (cables out of port 1).
+    aux: Vec<f32>,
+    /// A splitter's two outputs summed, for a destination both are cabled
+    /// into (one source sums into one destination once).
+    both: Vec<f32>,
     /// Dry/wet bypass crossfade (1 = active, 0 = bypassed, 5 ms ramp, #275).
     wet: gain_ramp::GainRamp,
     /// True once `wet` has snapped to the slot's initial bypass state on its first block.
@@ -588,9 +615,38 @@ fn dsp_slot(node: &crate::control::Node, kind: &DspKind, sample_rate: f64) -> Ds
         kind: kind.clone(),
         proc: build_processor(kind, sample_rate),
         buf: vec![0.0; 8192 * 2],
+        aux: if kind.two_inputs() || kind.two_outputs() { vec![0.0; 8192 * 2] } else { Vec::new() },
+        both: if kind.two_outputs() { vec![0.0; 8192 * 2] } else { Vec::new() },
         wet: gain_ramp::GainRamp::UNITY,
         wet_init: false,
         transport,
+    }
+}
+
+impl DspSlot {
+    /// What `dest` hears of this unit: its one output, or for a splitter
+    /// (#308) the output its cable into `dest` leaves from (port 0, port 1,
+    /// or the sum when both are cabled there). Allocation-free.
+    fn out_to(&self, graph: &Graph, dest: NodeId) -> &[f32] {
+        if !self.kind.two_outputs() {
+            return &self.buf;
+        }
+        let (mut first, mut second) = (false, false);
+        for e in &graph.edges {
+            if e.kind == PortKind::Audio && e.from.node == self.node && e.to.node == dest {
+                if e.from.port == 0 { first = true } else { second = true }
+            }
+        }
+        match (first, second) {
+            (true, true) => &self.both,
+            (false, true) => &self.aux,
+            _ => &self.buf,
+        }
+    }
+
+    /// The output a cable from `port` carries.
+    fn out_port(&self, port: u8) -> &[f32] {
+        if self.kind.two_outputs() && port >= 1 { &self.aux } else { &self.buf }
     }
 }
 
@@ -1890,6 +1946,9 @@ pub struct GraphEngine {
     lv2_in: Vec<f32>,
     /// Per-block scratch: which effects already ran (render step 2b).
     fx_done: Vec<bool>,
+    /// One block of scratch for a source cabled into both inputs of a
+    /// crossfader (#308): it passes its compensation delay once.
+    port_scratch: Vec<f32>,
     master_vol: f32,
     master_mute: bool,
     master_warm: f32,
@@ -2228,6 +2287,7 @@ impl GraphEngine {
             lv2_in: vec![0.0; 8192 * 2],
             // Sixteen effect units per rig before a push would allocate.
             fx_done: Vec::with_capacity(16 * MAX_RIGS),
+            port_scratch: vec![0.0; 8192 * 2],
             fx_after_bus: Vec::with_capacity(16 * MAX_RIGS),
             sends: Vec::with_capacity(MAX_SENDS),
             send_fades: Vec::with_capacity(2 * MAX_SENDS),
@@ -3718,6 +3778,8 @@ impl GraphEngine {
             {
                 d.proc.reset();
                 d.buf.fill(0.0);
+                d.aux.fill(0.0);
+                d.both.fill(0.0);
                 d.transport.click_remaining = 0;
             }
         }
@@ -3860,7 +3922,10 @@ impl GraphEngine {
             if (audio & (1u64 << r)) != 0 || (self.rig_sleeping_mask & (1u64 << r)) != 0 {
                 continue;
             }
-            if s.buf[..n2.min(s.buf.len())].iter().any(|x| x.abs() > IDLE_SILENCE_FLOOR) {
+            // A splitter's second output can sound while its first is silent
+            // (a pure side signal, a tone above the crossover).
+            let second = if s.kind.two_outputs() { &s.aux[..n2.min(s.aux.len())] } else { &[][..] };
+            if s.buf[..n2.min(s.buf.len())].iter().chain(second).any(|x| x.abs() > IDLE_SILENCE_FLOOR) {
                 audio |= 1u64 << r;
             }
         }
@@ -4124,7 +4189,7 @@ impl GraphEngine {
             let peak = if let Some(v) = self.voices.iter().find(|v| v.node == src) {
                 block_peak(&v.scratch[..n2])
             } else if let Some(d) = self.dsp.iter().find(|d| d.node == src) {
-                block_peak(&d.buf[..n2])
+                block_peak(&d.out_port(e.from.port)[..n2])
             } else if let Some(l) = self.lv2.iter().find(|l| l.node == src) {
                 block_peak(&l.buf[..n2])
             } else if let Some(a) = self.audio_in.iter().find(|a| a.node == src) {
@@ -4276,7 +4341,15 @@ impl GraphEngine {
             let node_t0 = std::time::Instant::now();
             self.fx_done[f] = true;
             let node = self.fx_node(f);
-            self.sum_audio_into(node, &mut bus[..n2]);
+            if f < n_dsp && self.dsp[f].kind.two_inputs() {
+                // A crossfader (#308): IN A into the bus, IN B into its
+                // second buffer (taken out while the others are read).
+                let mut aux = std::mem::take(&mut self.dsp[f].aux);
+                self.sum_audio_ports(node, &mut bus[..n2], Some(&mut aux[..n2]));
+                self.dsp[f].aux = aux;
+            } else {
+                self.sum_audio_into(node, &mut bus[..n2]);
+            }
             // Bypass (#74): the slot passes its summed input through
             // unchanged; its knobs keep their values for when it returns.
             // Zero-latency effect slots crossfade dry↔wet over 5 ms (#275) so
@@ -4287,10 +4360,28 @@ impl GraphEngine {
                 let d = &mut self.dsp[f];
                 sync_wet(&mut d.wet, &mut d.wet_init, bypassed, ramp);
                 d.buf[..n2].copy_from_slice(&bus[..n2]);
-                if !d.wet.is_silent() {
-                    d.proc.process(&mut d.buf[..n2], frames);
-                    if !d.wet.is_unity() {
-                        d.wet.mix_dry_wet(&bus[..n2], &mut d.buf[..n2]);
+                if d.aux.is_empty() {
+                    if !d.wet.is_silent() {
+                        d.proc.process(&mut d.buf[..n2], frames);
+                        if !d.wet.is_unity() {
+                            d.wet.mix_dry_wet(&bus[..n2], &mut d.buf[..n2]);
+                        }
+                    }
+                } else {
+                    // A routing unit (#308). Bypassed, a crossfader passes
+                    // IN A and a splitter its whole input on its first
+                    // output (the second is silent), so what is summed after
+                    // either stays the dry sound.
+                    let split = d.kind.two_outputs();
+                    if d.wet.is_silent() {
+                        if split { d.aux[..n2].fill(0.0); }
+                    } else {
+                        let mut same = d.wet;
+                        d.proc.process_aux(&mut d.buf[..n2], &mut d.aux[..n2], frames);
+                        if !d.wet.is_unity() {
+                            d.wet.mix_dry_wet(&bus[..n2], &mut d.buf[..n2]);
+                            if split { same.apply(&mut d.aux[..n2]); }
+                        }
                     }
                 }
                 pdc_bypass = d.wet.is_silent();
@@ -4382,6 +4473,21 @@ impl GraphEngine {
                     source_out(strips, &self.graph, solo, &mut [], &mut none, &mut self.pdc, node, None, false, &mut buf[..n2]);
                 }
             }
+            if f < n_dsp && self.dsp[f].kind.two_outputs() {
+                // A splitter's second output takes the unit's own mute and
+                // pan like its first, and both are kept summed for a
+                // destination that hears both.
+                let d = &mut self.dsp[f];
+                if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, node, &[false; MAX_RIGS]) {
+                    for x in d.aux[..n2].chunks_exact_mut(2) {
+                        x[0] *= gl;
+                        x[1] *= gr;
+                    }
+                }
+                for i in 0..n2 {
+                    d.both[i] = d.buf[i] + d.aux[i];
+                }
+            }
             self.node_timer.record(node, node_t0.elapsed());
         }
     }
@@ -4390,7 +4496,20 @@ impl GraphEngine {
     /// interleaved), each through its compensation delay when the plan has
     /// one. Allocation-free.
     fn sum_audio_into(&mut self, dest: NodeId, out: &mut [f32]) {
+        self.sum_audio_ports(dest, out, None);
+    }
+
+    /// `sum_audio_into` by input port (#308): with `second`, a source cabled
+    /// into port 0 of `dest` sums into `out`, one cabled into port 1 into
+    /// `second` (a crossfader's IN A and IN B), one cabled into both into
+    /// both. Each source still passes its compensation delay once.
+    fn sum_audio_ports(&mut self, dest: NodeId, out: &mut [f32], mut second: Option<&mut [f32]>) {
         out.fill(0.0);
+        if let Some(b) = second.as_deref_mut() {
+            b.fill(0.0);
+        }
+        let n = out.len();
+        let scratch = &mut self.port_scratch;
         let (graph, pdc) = (&self.graph, &mut self.pdc);
         // Who is wired into `dest`, from one pass over the cables: asking
         // the graph per source walked all of them for every unit.
@@ -4408,8 +4527,31 @@ impl GraphEngine {
             if n_wired <= wired.len() { wired[..n_wired].contains(&src) } else { graph.has_route(src, dest, PortKind::Audio) }
         };
         let mut add = |src: NodeId, buf: &[f32]| {
-            if src != dest && routed(src) {
+            if src == dest || !routed(src) {
+                return;
+            }
+            let Some(b) = second.as_deref_mut() else {
                 pdc.mix(src, dest, buf, false, (1.0, 1.0), out);
+                return;
+            };
+            let (mut first, mut other) = (false, false);
+            for e in &graph.edges {
+                if e.kind == PortKind::Audio && e.from.node == src && e.to.node == dest {
+                    if e.to.port == 0 { first = true } else { other = true }
+                }
+            }
+            match (first, other) {
+                (true, false) => pdc.mix(src, dest, buf, false, (1.0, 1.0), out),
+                (false, true) => pdc.mix(src, dest, buf, false, (1.0, 1.0), b),
+                _ => {
+                    let s = &mut scratch[..n];
+                    s.fill(0.0);
+                    pdc.mix(src, dest, buf, false, (1.0, 1.0), s);
+                    for i in 0..n {
+                        out[i] += s[i];
+                        b[i] += s[i];
+                    }
+                }
             }
         };
         for v in &self.voices { if v.node != NodeId::MAX { add(v.node, &v.scratch); } }
@@ -4418,7 +4560,7 @@ impl GraphEngine {
         let click_away = self.click_out.is_some();
         for d in &self.dsp {
             if click_away && d.kind == DspKind::Metronome { continue; }
-            add(d.node, &d.buf);
+            add(d.node, d.out_to(graph, dest));
         }
         for l in &self.lv2 { add(l.node, &l.buf); }
     }
@@ -4439,6 +4581,12 @@ impl GraphEngine {
 
     /// The last block an effect or bus node rendered (verification): its
     /// whole buffer, of which the caller reads the frames it asked for.
+    /// The last block of one output of a built-in unit (verification): a
+    /// splitter's port 1 is its second output (#308).
+    pub fn node_out_port(&self, node: NodeId, port: u8) -> Option<&[f32]> {
+        self.dsp.iter().find(|d| d.node == node).map(|d| d.out_port(port))
+    }
+
     pub fn node_out(&self, node: NodeId) -> Option<&[f32]> {
         self.dsp.iter().find(|d| d.node == node).map(|d| d.buf.as_slice())
             .or_else(|| self.lv2.iter().find(|l| l.node == node).map(|l| l.buf.as_slice()))
@@ -7721,7 +7869,7 @@ impl GraphEngine {
                         // A click on channels of its own is in no rig.
                         if click_out.is_some() && d.kind == DspKind::Metronome { continue; }
                         if d.kind != DspKind::Bus && !self.fx_after_bus[i] {
-                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.buf[..n2], rig_buf);
+                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.out_to(&self.graph, master)[..n2], rig_buf);
                         }
                     }
                     for (i, slot) in self.lv2.iter().enumerate() {
@@ -7797,7 +7945,7 @@ impl GraphEngine {
                                 Some(k) => &mut outs_v[k * BUS_SPAN..k * BUS_SPAN + n2],
                                 None => &mut acc[..],
                             };
-                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.buf[..n2], dest);
+                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.out_to(&self.graph, master)[..n2], dest);
                         }
                     }
                     for (i, slot) in self.lv2.iter().enumerate() {
@@ -8308,13 +8456,15 @@ pub(crate) mod latent;
 mod pdc;
 mod probe;
 mod show_gates;
+#[cfg(test)]
+mod routing_test;
 pub(crate) mod bench;
 pub use bench::bench;
 pub mod analysis_test;
 pub mod setlist_test;
 pub mod setlist_switch_test;
 pub mod setlist_window_test;
-mod gain_ramp;
+pub(crate) mod gain_ramp;
 pub mod levels_test;
 
 #[cfg(test)]

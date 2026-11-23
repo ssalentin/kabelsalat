@@ -126,6 +126,7 @@ impl DemoApp {
             BrowserAction::AddInstrument(kind, name) => self.add_instrument_to_active_rig(kind, &name),
             BrowserAction::AddEffect(kind, name) => self.add_effect_to_active_rig(kind, &name),
             BrowserAction::AddMasterEffect(kind, name) => self.add_effect_to_master(kind, &name),
+            BrowserAction::AddUnwired(kind, name) => self.add_unwired_to_active_rig(kind, &name),
             BrowserAction::AddArp => self.add_arp_to_active_rig(),
             BrowserAction::AddMetronome => self.add_metronome_to_active_rig(),
             BrowserAction::AddMidiFx(uri, name) => self.add_midi_fx_to_active_rig(uri.as_deref(), &name),

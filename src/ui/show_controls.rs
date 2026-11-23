@@ -125,7 +125,8 @@ impl DemoApp {
                                     ui.set_min_width(ACTION_W);
                                     ui.add(egui::Label::new(egui::RichText::new(action.label()).size(12.0).color(theme::INK)).truncate());
                                 });
-                                ui.add(egui::Label::new(egui::RichText::new(&text).size(11.5).color(color)).truncate());
+                                ui.add(egui::Label::new(egui::RichText::new(&text).size(11.5).color(color)).truncate())
+                                    .on_hover_text(text.as_str());
                             }
                         });
                     });
@@ -137,7 +138,8 @@ impl DemoApp {
                     draw_row(ui, setlist, learn);
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
-                        ui.add(egui::Label::new(egui::RichText::new(&text).size(11.0).color(color)).truncate());
+                        ui.add(egui::Label::new(egui::RichText::new(&text).size(11.0).color(color)).truncate())
+                            .on_hover_text(text.as_str());
                     });
                     ui.add_space(2.0);
                 });
@@ -167,7 +169,8 @@ impl DemoApp {
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         let color = if *live { theme::INK } else { theme::INK_2 };
-                        ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(color)).truncate());
+                        ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(color)).truncate())
+                            .on_hover_text(name.as_str());
                     });
                 });
             });

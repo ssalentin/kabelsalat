@@ -237,7 +237,8 @@ impl DemoApp {
                         let w = (ui.available_width() - 170.0).max(60.0);
                         ui.allocate_ui_with_layout(egui::vec2(w, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             ui.set_min_width(w);
-                            ui.add(egui::Label::new(egui::RichText::new(label).size(12.0).color(theme::INK)).truncate());
+                            ui.add(egui::Label::new(egui::RichText::new(label.as_str()).size(12.0).color(theme::INK)).truncate())
+                                .on_hover_text(label.as_str());
                         });
                         app.level_dropdown_ui(ui, item, 160.0);
                     });

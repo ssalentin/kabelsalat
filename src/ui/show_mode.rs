@@ -29,16 +29,22 @@ pub(super) struct ShowMode {
     panic_at: Option<f32>,
     /// Where Panic was drawn last.
     pub(super) panic_rect: Option<Rect>,
+    /// Vertical scroll offset (points) for the active song's notes/chart.
+    notes_scroll_y: f32,
+    /// Song index that `notes_scroll_y` belongs to (resets on song switch).
+    notes_song: Option<usize>,
 }
 
 /// What the screen shows, read from the app once a frame.
 struct Board {
+    song_idx: Option<usize>,
     caption: String,
     song: String,
     part: Option<String>,
     next_part: Option<String>,
     next: Option<String>,
     tempo: String,
+    notes: Option<String>,
     loading: bool,
     indicators: Vec<(&'static str, Color32)>,
     /// Live rigs: name and level (`rig_levels`, −48…0 dBFS).
@@ -247,6 +253,20 @@ impl DemoApp {
         if let Some(action) = step {
             let _ = self.step_setlist(action);
         }
+        let scroll_delta = ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                72.0
+            } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                -72.0
+            } else {
+                0.0
+            }
+        });
+        if scroll_delta != 0.0 {
+            if let Some(show) = &mut self.show_mode {
+                show.notes_scroll_y = (show.notes_scroll_y + scroll_delta).max(0.0);
+            }
+        }
         self.update(dt);
         self.publish_patch();
         self.publish_pins();
@@ -303,13 +323,18 @@ impl DemoApp {
         if self.recovery.has_notice() {
             indicators.push(("Restarted after crash", theme::ACCENT_BRIGHT));
         }
+        let (song_idx, notes) = sl.current().map_or((None, None), |(s, _, pos)| {
+            (Some(pos.song), (!s.notes.trim().is_empty()).then(|| s.notes.clone()))
+        });
         Board {
+            song_idx,
             caption,
             song,
             part,
             next_part,
             next: sl.upcoming_song().map(|i| sl.songs[i].name.clone()),
             tempo: format!("{} BPM · {}", self.bpm.round() as u32, self.time_sig),
+            notes,
             loading,
             indicators,
             rigs,
@@ -353,9 +378,29 @@ impl DemoApp {
         }
 
         // The hero: song, part and tempo, as large as the panel allows,
-        // centred in it.
-        let hero = reg.hero;
-        p.rect_filled(hero, 36.0, theme::DARK_PANEL);
+        // centred in it. When the active song has notes/chords, share the
+        // hero band with a scrollable chart card without crowding the title.
+        let (hero, notes_rect) = if board.notes.is_some() {
+            if reg.hero.width() >= 760.0 {
+                let split_gap = 16.0;
+                let hero_w = ((reg.hero.width() - split_gap) * 0.56).round();
+                let h = Rect::from_min_size(reg.hero.min, Vec2::new(hero_w, reg.hero.height()));
+                let n = Rect::from_min_max(Pos2::new(h.right() + split_gap, reg.hero.top()), reg.hero.max);
+                (h, Some(n))
+            } else if reg.hero.height() >= 280.0 {
+                let split_gap = 12.0;
+                let hero_h = ((reg.hero.height() - split_gap) * 0.48).round();
+                let h = Rect::from_min_size(reg.hero.min, Vec2::new(reg.hero.width(), hero_h));
+                let n = Rect::from_min_max(Pos2::new(reg.hero.left(), h.bottom() + split_gap), reg.hero.max);
+                (h, Some(n))
+            } else {
+                (reg.hero, None)
+            }
+        } else {
+            (reg.hero, None)
+        };
+        let hero_radius = if notes_rect.is_some() { 24.0 } else { 36.0 };
+        p.rect_filled(hero, hero_radius, theme::DARK_PANEL);
         let mut scale = (hero.height() / 330.0).clamp(0.5, 1.4);
         let mut block = hero_block(&p, &board, hero, scale);
         if block.height > block.inner.height() {
@@ -382,6 +427,97 @@ impl DemoApp {
             None => Pos2::new(inner.left(), line_top),
         };
         p.galley(tempo_pos, tempo, theme::CREAM_META);
+
+        if let (Some(notes), Some(nrect)) = (&board.notes, notes_rect) {
+            let mut scroll_y = 0.0f32;
+            if let Some(show) = &mut self.show_mode {
+                if show.notes_song != board.song_idx {
+                    show.notes_song = board.song_idx;
+                    show.notes_scroll_y = 0.0;
+                }
+                scroll_y = show.notes_scroll_y;
+            }
+            p.rect_filled(nrect, 24.0, theme::DARK_PANEL);
+            p.rect_stroke(nrect, 24.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            let pad = if nrect.width() < 400.0 || nrect.height() < 180.0 { 16.0 } else { 24.0 };
+            let ninner = nrect.shrink(pad);
+            let hdr_sz = caption(&p, ninner.left_top(), "Song notes", 14.0, theme::CREAM_DIM);
+            let body = Rect::from_min_max(Pos2::new(ninner.left(), ninner.top() + hdr_sz.y + 10.0), ninner.max);
+            if body.width() > 40.0 && body.height() > 24.0 {
+                let lines = crate::setlist::parse_chart(notes);
+                let mut new_scroll_y = scroll_y;
+                ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+                    ui.shrink_clip_rect(body);
+                    let out = egui::ScrollArea::vertical()
+                        .id_salt("show_mode_notes_scroll")
+                        .vertical_scroll_offset(scroll_y)
+                        .max_height(body.height())
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            for line in &lines {
+                                match line {
+                                    crate::setlist::ChartLine::Blank => {
+                                        ui.add_space(8.0);
+                                    }
+                                    crate::setlist::ChartLine::Directive { kind, text } => match kind {
+                                        crate::setlist::ChartDirective::Title => {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(text).font(theme::medium_font(20.0)).color(theme::CREAM),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                        crate::setlist::ChartDirective::Subtitle => {
+                                            ui.add(
+                                                egui::Label::new(egui::RichText::new(text).size(15.0).color(theme::CREAM_META)).wrap(),
+                                            );
+                                        }
+                                        crate::setlist::ChartDirective::Section => {
+                                            ui.add_space(6.0);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(text).font(theme::medium_font(15.0)).color(theme::LIVE_TEAL),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    },
+                                    crate::setlist::ChartLine::Line(segs) => {
+                                        let mut job = egui::text::LayoutJob::default();
+                                        let mut prev_chord = false;
+                                        for seg in segs {
+                                            match seg {
+                                                crate::setlist::ChartSegment::Chord(c) => {
+                                                    if prev_chord {
+                                                        job.append(" ", 0.0, egui::TextFormat::simple(FontId::proportional(18.0), theme::CREAM));
+                                                    }
+                                                    job.append(
+                                                        &format!("[{c}]"),
+                                                        0.0,
+                                                        egui::TextFormat::simple(theme::medium_font(18.0), theme::CABLE_AMBER),
+                                                    );
+                                                    prev_chord = true;
+                                                }
+                                                crate::setlist::ChartSegment::Text(t) => {
+                                                    job.append(t, 0.0, egui::TextFormat::simple(FontId::proportional(18.0), theme::CREAM));
+                                                    prev_chord = false;
+                                                }
+                                            }
+                                        }
+                                        ui.add(egui::Label::new(job).wrap());
+                                    }
+                                }
+                            }
+                        });
+                    new_scroll_y = out.state.clamped_offset().y;
+                });
+                if let Some(show) = &mut self.show_mode {
+                    show.notes_scroll_y = new_scroll_y;
+                }
+            }
+        }
 
         // Next part / next song.
         let next = reg.next;
@@ -487,6 +623,7 @@ impl DemoApp {
             "next_part": b.next_part,
             "next_song": b.next,
             "tempo": b.tempo,
+            "notes": b.notes,
             "loading": b.loading,
             "live_rigs": b.rigs.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
         })
@@ -871,6 +1008,32 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&app.exec_tool("set_show_mode", &serde_json::json!({"on": false}))).unwrap();
         assert_eq!(v["show_mode"], false);
         assert!(app.exec_tool("set_show_mode", &serde_json::json!({})).starts_with("error"));
+    }
+
+    #[test]
+    fn show_mode_renders_song_notes_and_chordpro_without_overlap() {
+        for size in [WIDE, TALL] {
+            let mut app = gig();
+            app.setlist.songs[0].notes = "{c: Verse 1}\n[Am]Let's swim to the [G]moon\n{c: Chorus}\n[F]Tonight we [E7]drive".into();
+            let ctx = egui::Context::default();
+            app.set_show_mode(true);
+            settle(&mut app, &ctx, size);
+            let texts = frame(&mut app, &ctx, size, vec![]);
+            let has_substr = |want: &str| texts.iter().any(|(t, _)| t.contains(want));
+            for want in ["Moonlight Drive", "Verse", "Riders on the Storm", "Panic", "Verse 1", "[Am]", "swim to the", "[G]", "Chorus"] {
+                assert!(has_substr(want), "{size:?}: show mode with notes should show {want:?}, got {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+            }
+            let window = Rect::from_min_size(Pos2::ZERO, size);
+            let inked: Vec<&(String, Rect)> = texts.iter().filter(|(t, _)| !t.trim().is_empty()).collect();
+            for (i, (a, ra)) in inked.iter().enumerate() {
+                assert!(window.contains_rect(*ra), "{size:?}: '{a}' at {ra:?} leaves the window");
+                for (b, rb) in &inked[i + 1..] {
+                    let letters = a.chars().count() == 1 && b.chars().count() == 1;
+                    assert!(letters || !ra.shrink(1.0).intersects(rb.shrink(1.0)), "{size:?}: '{a}' {ra:?} overlaps '{b}' {rb:?}");
+                }
+            }
+            assert_eq!(app.show_mode_json()["notes"].as_str(), Some(app.setlist.songs[0].notes.as_str()));
+        }
     }
 
     #[test]

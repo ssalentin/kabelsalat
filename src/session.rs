@@ -2838,4 +2838,134 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// StageRig #2: two instances of the same plugin (CLAP, VST3, LV2) with
+    /// different states across two songs in a setlist (with shared-instrument
+    /// matching enabled) must keep independent blobs on save & reload without
+    /// overwriting each other.
+    #[test]
+    fn two_instances_of_same_plugin_across_two_songs_keep_distinct_states_on_round_trip() {
+        use crate::control::{merge_rigs, ClapId, Lv2Uri, Rig};
+        use crate::setlist::{find_matching_rig, MatchResult, Part, PartRig, Setlist, Song};
+
+        let dir = test_dir("same-plugin-two-songs");
+        let vst3_cid = "0123456789ABCDEF0123456789ABCDEF";
+        let lv2_uri = "urn:distrho:vitalium";
+
+        let make_rig = |label: &str, kind: NodeKind| -> Rig {
+            let mut g = Graph::default();
+            g.reserve(8, 8);
+            let k = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            let inst = g.add_node(kind, name_bytes(label));
+            let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: k, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
+            g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+            Rig::new(label, g, None)
+        };
+
+        // 6 rigs: two CLAP (Surge), two VST3 (same CID), two LV2 (same URI).
+        // Song 1 uses rigs 0, 2, 4; Song 2 uses rigs 1, 3, 5.
+        let rigs = vec![
+            make_rig("CLAP S1", NodeKind::Clap { plugin_id: ClapId::new(SURGE_ID) }),
+            make_rig("CLAP S2", NodeKind::Clap { plugin_id: ClapId::new(SURGE_ID) }),
+            make_rig("VST3 S1", NodeKind::Vst3 { plugin_id: ClapId::new(vst3_cid) }),
+            make_rig("VST3 S2", NodeKind::Vst3 { plugin_id: ClapId::new(vst3_cid) }),
+            make_rig("LV2 S1", NodeKind::Lv2 { uri: Lv2Uri::new(lv2_uri) }),
+            make_rig("LV2 S2", NodeKind::Lv2 { uri: Lv2Uri::new(lv2_uri) }),
+        ];
+        let merged = merge_rigs(&rigs);
+        let inst_of = |g: &Graph, rig: u8| -> NodeId {
+            g.nodes
+                .iter()
+                .find(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Vst3 { .. } | NodeKind::Lv2 { .. }))
+                .expect("instrument node")
+                .id
+        };
+        let (c1, c2) = (inst_of(&merged, 0), inst_of(&merged, 1));
+        let (v1, v2) = (inst_of(&merged, 2), inst_of(&merged, 3));
+        let (l1, l2) = (inst_of(&merged, 4), inst_of(&merged, 5));
+
+        let mut s = Session::new("Two Songs Same Plugins", merged);
+        s.set_plugin_state(c1, SURGE_ID, b"CLAP-SONG1-LEAD".to_vec());
+        s.set_plugin_state(c2, SURGE_ID, b"CLAP-SONG2-PAD".to_vec());
+        s.set_plugin_state(v1, vst3_cid, b"KSV3-SONG1-BRASS".to_vec());
+        s.set_plugin_state(v2, vst3_cid, b"KSV3-SONG2-STRINGS".to_vec());
+        s.set_plugin_state(l1, lv2_uri, b"LV2-SONG1-PLUCK".to_vec());
+        s.set_plugin_state(l2, lv2_uri, b"LV2-SONG2-BASS".to_vec());
+
+        let mut sl = Setlist::default();
+        sl.songs.push(Song::new(
+            "Song 1",
+            vec![Part::new("Main", vec![PartRig::new(0), PartRig::new(2), PartRig::new(4)])],
+        ));
+        sl.songs.push(Song::new(
+            "Song 2",
+            vec![Part::new("Main", vec![PartRig::new(1), PartRig::new(3), PartRig::new(5)])],
+        ));
+        s.setlist = sl;
+
+        // Shared-instrument matcher (#275): different states must NOT coalesce
+        // into Shared; identical state DOES match as Shared.
+        let make_imp = |kind: NodeKind, plugin_id: &str, blob: &[u8]| -> (Graph, Vec<PluginState>) {
+            let r = make_rig("IMP", kind);
+            let inst_id = r.graph.nodes[1].id;
+            (
+                r.graph,
+                vec![PluginState {
+                    node: inst_id,
+                    plugin_id: plugin_id.to_string(),
+                    data: blob.to_vec(),
+                }],
+            )
+        };
+        let (imp_g1, imp_s1) = make_imp(
+            NodeKind::Clap { plugin_id: ClapId::new(SURGE_ID) },
+            SURGE_ID,
+            b"CLAP-SONG3-OTHER",
+        );
+        assert_eq!(
+            find_matching_rig(&s.graph, s.plugin_states(), &s.setlist, &imp_g1, 0, &imp_s1),
+            MatchResult::DifferentPreset(0),
+        );
+        let (imp_g2, imp_s2) = make_imp(
+            NodeKind::Clap { plugin_id: ClapId::new(SURGE_ID) },
+            SURGE_ID,
+            b"CLAP-SONG2-PAD",
+        );
+        assert_eq!(
+            find_matching_rig(&s.graph, s.plugin_states(), &s.setlist, &imp_g2, 0, &imp_s2),
+            MatchResult::Shared(1),
+        );
+        let (imp_g3, imp_s3) = make_imp(
+            NodeKind::Vst3 { plugin_id: ClapId::new(vst3_cid) },
+            vst3_cid,
+            b"KSV3-SONG2-STRINGS",
+        );
+        assert_eq!(
+            find_matching_rig(&s.graph, s.plugin_states(), &s.setlist, &imp_g3, 0, &imp_s3),
+            MatchResult::Shared(3),
+        );
+
+        let pkg = Session::package_path(&dir, "Two Songs Same Plugins").unwrap();
+        s.save(&pkg).unwrap();
+
+        // Each instance has its own state/node-{id}.bin file.
+        for id in [c1, c2, v1, v2, l1, l2] {
+            assert!(pkg.join(STATE_DIR).join(format!("node-{id}.bin")).is_file());
+        }
+
+        let loaded = Session::load(&pkg).unwrap();
+        assert!(loaded.same_content(&s));
+        let state_of = |node: NodeId| -> &[u8] {
+            loaded.plugin_states().iter().find(|p| p.node == node).expect("state").data.as_slice()
+        };
+        assert_eq!(state_of(c1), b"CLAP-SONG1-LEAD");
+        assert_eq!(state_of(c2), b"CLAP-SONG2-PAD");
+        assert_eq!(state_of(v1), b"KSV3-SONG1-BRASS");
+        assert_eq!(state_of(v2), b"KSV3-SONG2-STRINGS");
+        assert_eq!(state_of(l1), b"LV2-SONG1-PLUCK");
+        assert_eq!(state_of(l2), b"LV2-SONG2-BASS");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

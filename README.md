@@ -129,6 +129,8 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   [show, set and song levels](docs/GUIDE.md#keep-what-stays-through-the-whole-show)
 - **Show mode (F2):** a stage screen readable from two metres, with editing locked
   and upcoming part preview. → [Show mode](docs/GUIDE.md#go-on-stage-with-show-mode)
+- **Song notes and chord charts:** attach cues, lyrics or ChordPro lead sheets per
+  song and read them in Show mode. → [Song notes & chord charts](docs/GUIDE.md#song-notes-and-chord-charts)
 - **Check the show** before the first song: devices, plugins, sound, power, with
   one-click quick-fix links. → [Check show](docs/GUIDE.md#check-the-show-before-the-first-song)
 - **Step songs from a foot switch**, attach WAV backing tracks directly to songs,
@@ -159,7 +161,7 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 | Package | For | Notes |
 |---|---|---|
 | [AppImage x86_64](https://github.com/ssalentin/kabelsalat/releases/latest/download/kabelsalat-x86_64.AppImage) | most PCs and laptops | recommended; finds your system's plugins, realtime audio |
-| [AppImage aarch64](https://github.com/ssalentin/kabelsalat/releases/latest/download/kabelsalat-aarch64.AppImage) | Raspberry Pi 4/5, Asahi, Snapdragon | same as above |
+| [AppImage aarch64](https://github.com/ssalentin/kabelsalat/releases/latest/download/kabelsalat-aarch64.AppImage) | Raspberry Pi 4/5, Asahi, Snapdragon | same as above; see [Raspberry Pi & headless rigs](docs/GUIDE.md#raspberry-pi-and-headless-rigs-arm64) |
 | Arch / Omarchy | Arch-based systems | `git clone https://github.com/ssalentin/kabelsalat.git && cd kabelsalat/packaging && makepkg -si` (launcher entry and icon) |
 | Flatpak, tarball | | on the [releases page](https://github.com/ssalentin/kabelsalat/releases); the Flatpak is sandboxed: no realtime priority yet, and `kabelsalat mcp --attach` cannot reach it |
 

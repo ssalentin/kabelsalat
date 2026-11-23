@@ -219,6 +219,9 @@ pub struct Vst3Voice {
     out_params: ComWrapper<HostParamChanges>,
     valid_param_ids: Vec<u32>,
     midi_cc_map: [Option<u32>; 130],
+    /// VST3 program-change parameter `(param_id, step_count)` declared via
+    /// `ParameterFlags_::kIsProgramChange` (Ardour #111176).
+    program_change_param: Option<(u32, i32)>,
     main_to_audio_rx: rtrb::Consumer<(u32, f64, u64)>,
     audio_to_main_tx: rtrb::Producer<(u32, f64, u64)>,
     last_main_seq: u64,
@@ -372,6 +375,13 @@ impl Vst3Voice {
                         let cc = (b1 & 0x7F) as usize;
                         if let Some(pid) = self.midi_cc_map[cc] {
                             let val = (b2 & 0x7F) as f64 / 127.0;
+                            unsafe { self.in_params.add_point(pid, sample_offset, val) };
+                            let _ = self.audio_to_main_tx.push((pid, val, self.last_main_seq));
+                        }
+                    }
+                    0xC0 => {
+                        if let Some((pid, step_count)) = self.program_change_param {
+                            let val = program_change_to_normalized(b1, step_count);
                             unsafe { self.in_params.add_point(pid, sample_offset, val) };
                             let _ = self.audio_to_main_tx.push((pid, val, self.last_main_seq));
                         }
@@ -582,6 +592,19 @@ pub struct Vst3VoiceMain {
     param_min_seq: std::collections::HashMap<u32, u64>,
     editor: Option<Vst3Editor>,
     pending_latency_poll: bool,
+    pending_param_edits: Vec<(u32, f64)>,
+}
+
+/// Convert a MIDI Program Change number (`0..=127`) into the normalized
+/// `[0.0, 1.0]` parameter value for a VST3 `kIsProgramChange` parameter with
+/// `step_count` steps (Ardour #111176).
+pub(crate) fn program_change_to_normalized(program: u8, step_count: i32) -> f64 {
+    let p = (program & 0x7F) as i32;
+    if step_count > 0 {
+        (p.min(step_count) as f64) / (step_count as f64)
+    } else {
+        (p as f64) / 127.0
+    }
 }
 
 impl Vst3VoiceMain {
@@ -746,6 +769,7 @@ impl Vst3VoiceMain {
         let p_count = unsafe { controller.getParameterCount() }.max(0);
         let mut params = Vec::with_capacity(p_count as usize);
         let mut valid_param_ids = Vec::with_capacity(p_count as usize);
+        let mut program_change_param: Option<(u32, i32)> = None;
         for i in 0..p_count {
             let mut pi: ParameterInfo = unsafe { std::mem::zeroed() };
             if unsafe { controller.getParameterInfo(i, &mut pi) } == kResultOk {
@@ -758,6 +782,9 @@ impl Vst3VoiceMain {
                 let readonly = pi.flags & ParameterFlags_::kIsReadOnly != 0;
                 let hidden = pi.flags & ParameterFlags_::kIsHidden != 0;
                 let stepped = pi.stepCount > 0;
+                if program_change_param.is_none() && (pi.flags & ParameterFlags_::kIsProgramChange) != 0 {
+                    program_change_param = Some((pi.id, pi.stepCount));
+                }
                 let cur = unsafe { controller.getParamNormalized(pi.id) }.clamp(0.0, 1.0);
                 params.push(Vst3ParamMeta {
                     id: pi.id,
@@ -855,6 +882,7 @@ impl Vst3VoiceMain {
             out_params: ComWrapper::new(HostParamChanges::new(PARAM_CHANGES_SLOTS, PARAM_QUEUE_CAP)),
             valid_param_ids,
             midi_cc_map,
+            program_change_param,
             main_to_audio_rx,
             audio_to_main_tx,
             last_main_seq: 0,
@@ -880,6 +908,7 @@ impl Vst3VoiceMain {
             param_min_seq: std::collections::HashMap::new(),
             editor: None,
             pending_latency_poll: false,
+            pending_param_edits: Vec::new(),
         };
 
         Ok((voice, main))
@@ -992,6 +1021,7 @@ impl Vst3VoiceMain {
                 m.value_norm = val;
             }
             let _ = unsafe { self.controller.setParamNormalized(id, val) };
+            self.pending_param_edits.push((id, val));
         }
     }
 
@@ -1007,6 +1037,7 @@ impl Vst3VoiceMain {
                 m.value_norm = val;
             }
             self.push_main_param(id, val);
+            self.pending_param_edits.push((id, val));
             res.param_edits.push((id, val));
         }
         if restart_flags != 0 {
@@ -1041,6 +1072,13 @@ impl Vst3VoiceMain {
 
     pub fn service(&mut self) -> Vec<(u32, f64)> {
         self.pump().param_edits
+    }
+
+    /// Drain parameter edits observed from the plugin editor (`performEdit`)
+    /// or processor `outputParameterChanges` since the last call (GigChain #60).
+    pub fn drain_param_edits(&mut self) -> Vec<(u32, f64)> {
+        self.drain_audio_params();
+        std::mem::take(&mut self.pending_param_edits)
     }
 
     pub fn poll_latency(&mut self) -> Option<u32> {
@@ -1415,6 +1453,48 @@ mod tests {
         assert!((m.resolve_param_text(&wave, "Tri").unwrap() - 0.5).abs() < 1e-4);
         let gain = m.param_desc(0).unwrap();
         assert!((m.resolve_param_text(&gain, "50%").unwrap() - 0.5).abs() < 1e-4);
+        m.retire();
+        let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
+    }
+
+    #[test]
+    fn vst3_program_change_normalization_matches_step_count() {
+        // 4 programs => step_count = 3 (0..=3)
+        assert!((program_change_to_normalized(0, 3) - 0.0).abs() < 1e-9);
+        assert!((program_change_to_normalized(1, 3) - (1.0 / 3.0)).abs() < 1e-9);
+        assert!((program_change_to_normalized(2, 3) - (2.0 / 3.0)).abs() < 1e-9);
+        assert!((program_change_to_normalized(3, 3) - 1.0).abs() < 1e-9);
+        // Out-of-range program clamps to the last step
+        assert!((program_change_to_normalized(99, 3) - 1.0).abs() < 1e-9);
+        // Continuous / unspecified step_count (0) maps 0..=127 -> 0..=1
+        assert!((program_change_to_normalized(0, 0) - 0.0).abs() < 1e-9);
+        assert!((program_change_to_normalized(127, 0) - 1.0).abs() < 1e-9);
+    }
+
+    /// Ardour #111176: MIDI Program Change (0xC0) translates to the plugin's
+    /// `kIsProgramChange` VST3 parameter and propagates to host state.
+    #[test]
+    fn vst3_midi_program_change_translates_to_program_change_param() {
+        let (bundle, synth_cid, _) = build_fixture_bundle("progchg").unwrap();
+        let (mut v, mut m) = Vst3VoiceMain::load(&synth_cid, 48_000.0).unwrap();
+        let mut out = vec![0.0f32; BLOCK * 2];
+        let tr = Transport::default();
+
+        let init_val = m.param_value(2).unwrap();
+        assert_eq!(m.param_text(2, init_val), "Init");
+
+        // Program 2 ("Pad") on channel 0 -> normalized 2/3.
+        v.render_block(BLOCK, None, &mut out, &tr, &[VoiceCmd::Midi([0xC0, 2, 0])]);
+        let val = m.param_value(2).unwrap();
+        assert!((val - (2.0 / 3.0)).abs() < 1e-4, "expected program 2 -> 2/3, got {val}");
+        assert_eq!(m.param_text(2, val), "Pad");
+
+        // Program 3 ("Lead") on channel 4 -> normalized 1.0.
+        v.render_block(BLOCK, None, &mut out, &tr, &[VoiceCmd::Midi([0xC4, 3, 0])]);
+        let val3 = m.param_value(2).unwrap();
+        assert!((val3 - 1.0).abs() < 1e-4, "expected program 3 -> 1.0, got {val3}");
+        assert_eq!(m.param_text(2, val3), "Lead");
+
         m.retire();
         let _ = std::fs::remove_dir_all(bundle.parent().unwrap());
     }

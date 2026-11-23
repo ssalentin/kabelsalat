@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -738,11 +739,16 @@ fn run_scan_subprocess(
     if !status.success() {
         let (err, truncated) = stderr.unwrap_or_default();
         let err_tail = String::from_utf8_lossy(&err).trim().to_string();
-        if err_tail.is_empty() {
-            return Err(ScanFail::Verdict(format!("scanner exited with {status}")));
-        }
         let more = if truncated { "…" } else { "" };
-        return Err(ScanFail::Verdict(format!("scanner exited with {status}: {more}{err_tail}")));
+        let msg = if err_tail.is_empty() {
+            format!("scanner exited with {status}")
+        } else {
+            format!("scanner exited with {status}: {more}{err_tail}")
+        };
+        if status.signal().is_some_and(is_external_kill_signal) {
+            return Err(ScanFail::Setup(msg));
+        }
+        return Err(ScanFail::Verdict(msg));
     }
     let Ok((stdout, stdout_truncated)) = stdout else {
         return Err(timed_out());
@@ -751,6 +757,13 @@ fn run_scan_subprocess(
         return Err(ScanFail::Verdict(format!("scanner stdout exceeded {SCAN_STDOUT_MAX} bytes")));
     }
     parse_scan_output(&stdout).map_err(|e| ScanFail::Verdict(format!("{e:#}")))
+}
+
+/// Signals caused by external termination (app shutdown, user kill, OOM)
+/// rather than a plugin crash. A scanner killed by one of these must NOT be
+/// negatively cached / blocklisted (GigChain #55).
+fn is_external_kill_signal(sig: i32) -> bool {
+    matches!(sig, libc::SIGKILL | libc::SIGTERM | libc::SIGINT | libc::SIGHUP)
 }
 
 fn scan_one_bundle(
@@ -1079,6 +1092,64 @@ mod tests {
         assert_eq!(res2[0].as_ref().unwrap()[0].name, "FakeGood");
         assert!(res2[1].is_none());
         assert_eq!(errs2.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GigChain #55: external kill signals (SIGTERM/SIGKILL, e.g. app killed
+    /// during scan or OOM) must NOT blocklist/cache-fail a VST3 bundle, while
+    /// genuine crash signals (SIGSEGV) still get cached.
+    #[test]
+    fn external_kill_signal_is_not_blocklisted_while_crash_signal_is() {
+        let base = std::env::temp_dir().join(format!("kabelsalat-vst3-kill-vs-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let killed_bundle = base.join("Killed.vst3");
+        let crashed_bundle = base.join("Crashed.vst3");
+        let cache_file = base.join("cache.json");
+
+        #[cfg(target_arch = "x86_64")]
+        const NATIVE_EM: u16 = 62;
+        #[cfg(target_arch = "aarch64")]
+        const NATIVE_EM: u16 = 183;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        const NATIVE_EM: u16 = 62;
+
+        std::fs::write(&killed_bundle, crate::binarch::fake_elf(NATIVE_EM)).unwrap();
+        std::fs::write(&crashed_bundle, crate::binarch::fake_elf(NATIVE_EM)).unwrap();
+
+        let sh = |body: &str| ScannerCommand::Custom {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), body.into(), "_".into()],
+        };
+
+        // First pass: Killed.vst3 dies from SIGTERM, Crashed.vst3 dies from SIGSEGV.
+        let kill_or_crash = sh(r#"case "$1" in *Killed.vst3) kill -TERM $$ ;; *) kill -SEGV $$ ;; esac"#);
+        let (first, _) = scan_bundles_with(
+            &[killed_bundle.clone(), crashed_bundle.clone()],
+            &kill_or_crash,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            2,
+            false,
+        );
+        assert!(first[0].is_none());
+        assert!(first[1].is_none());
+
+        // Second pass with a healthy scanner (same bundle files, untouched):
+        // Killed.vst3 was NOT cached so it rescans and succeeds;
+        // Crashed.vst3 WAS cached so it remains blocklisted.
+        let healthy = sh(r#"printf '[{"cid":"00000000000000000000000000000002","name":"Recovered","vendor":"Test","version":"1.0","sub_categories":["Fx"],"bundle_path":"'"$1"'","is_yabridge":false}]\n'"#);
+        let (second, _) = scan_bundles_with(
+            &[killed_bundle, crashed_bundle],
+            &healthy,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            2,
+            false,
+        );
+        assert_eq!(second[0].as_ref().map(|v| v[0].name.as_str()), Some("Recovered"), "SIGTERM must not blocklist bundle");
+        assert!(second[1].is_none(), "SIGSEGV crash must remain negatively cached");
 
         let _ = std::fs::remove_dir_all(&base);
     }

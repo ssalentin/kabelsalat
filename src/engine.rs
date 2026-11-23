@@ -384,6 +384,10 @@ pub struct VoiceSlot {
     wet: gain_ramp::GainRamp,
     /// True once `wet` has snapped to the slot's initial bypass state on its first block.
     wet_init: bool,
+    /// Bitmask of MIDI notes currently sounding on this voice (GigChain #53):
+    /// a repeated Note On for an already-held note emits Note Off first so
+    /// synths that allocate per Note On never leak an orphan voice.
+    held_notes: u128,
 }
 
 impl VoiceSlot {
@@ -401,7 +405,30 @@ impl VoiceSlot {
             latency,
             wet: gain_ramp::GainRamp::UNITY,
             wet_init: false,
+            held_notes: 0,
         }
+    }
+
+    /// Send Note On to the underlying voice, emitting Note Off first if `note`
+    /// is already held so a repeated Note On never orphans a voice (GigChain #53).
+    fn note_on(&mut self, note: u8, vel: f64) {
+        let n = note & 0x7F;
+        let bit = 1u128 << n;
+        if (self.held_notes & bit) != 0 {
+            self.voice.note_off(n as u16);
+        }
+        self.held_notes |= bit;
+        self.voice.note_on(n as u16, vel);
+    }
+
+    fn note_off(&mut self, note: u8) {
+        let n = note & 0x7F;
+        self.held_notes &= !(1u128 << n);
+        self.voice.note_off(n as u16);
+    }
+
+    fn clear_held_notes(&mut self) {
+        self.held_notes = 0;
     }
 
     pub fn voice_id(&self) -> u64 {
@@ -425,6 +452,7 @@ impl VoiceSlot {
         self.rig_device = None;
         self.wet = gain_ramp::GainRamp::UNITY;
         self.wet_init = false;
+        self.held_notes = 0;
     }
 }
 
@@ -591,6 +619,33 @@ struct Lv2Slot {
     wet: gain_ramp::GainRamp,
     /// True once `wet` has snapped to the slot's initial bypass state on its first block.
     wet_init: bool,
+    /// Per-channel held note bitmasks (GigChain #53): retrigger emits Note Off
+    /// before Note On so no orphan voice is left sounding.
+    held_notes: [u128; 16],
+}
+
+impl Lv2Slot {
+    fn note_on_ch(&mut self, note: u8, vel: u8, ch: u8) {
+        let c = (ch & 0x0F) as usize;
+        let n = note & 0x7F;
+        let bit = 1u128 << n;
+        if (self.held_notes[c] & bit) != 0 {
+            self.plugin.note_off_ch(n, ch);
+        }
+        self.held_notes[c] |= bit;
+        self.plugin.note_on_ch(n, vel, ch);
+    }
+
+    fn note_off_ch(&mut self, note: u8, ch: u8) {
+        let c = (ch & 0x0F) as usize;
+        let n = note & 0x7F;
+        self.held_notes[c] &= !(1u128 << n);
+        self.plugin.note_off_ch(n, ch);
+    }
+
+    fn clear_held_notes(&mut self) {
+        self.held_notes = [0; 16];
+    }
 }
 
 /// Input events a MIDI-FX unit may hold between blocks (a full queue drops,
@@ -788,7 +843,7 @@ const LV2_RING: usize = 2 * LV2_SLOT_CAP;
 
 fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
     match crate::lv2::Lv2Plugin::load(uri, sample_rate, 8192) {
-        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false }),
+        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false, held_notes: [0; 16] }),
         Err(e) => {
             eprintln!("lv2 node {node}: {e}");
             None
@@ -875,7 +930,7 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
         .iter()
         .filter_map(|n| match &n.kind {
             NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sample_rate, 8192) {
-                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false }),
+                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2], latency: 0, wet: gain_ramp::GainRamp::UNITY, wet_init: false, held_notes: [0; 16] }),
                 Err(e) => {
                     eprintln!("lv2 node {}: {e}", n.id);
                     None
@@ -4236,18 +4291,18 @@ impl GraphEngine {
                 let mut wake = false;
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                     if is_on {
-                        s.voice.note_on(note as u16, m.data[1] as f64 / 127.0);
+                        s.note_on(note, m.data[1] as f64 / 127.0);
                     } else {
-                        s.voice.note_off(note as u16);
+                        s.note_off(note);
                     }
                     wake = is_on || live;
                 }
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                     if s.plugin.is_instrument() {
                         if is_on {
-                            s.plugin.note_on_ch(note, m.data[1], m.channel);
+                            s.note_on_ch(note, m.data[1], m.channel);
                         } else {
-                            s.plugin.note_off_ch(note, m.channel);
+                            s.note_off_ch(note, m.channel);
                         }
                         wake = is_on || live;
                     }
@@ -4781,9 +4836,9 @@ impl GraphEngine {
         if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
             if source.is_none_or(|src| source_accepted(s, src)) {
                 if on {
-                    s.voice.note_on(out as u16, vel);
+                    s.note_on(out, vel);
                 } else {
-                    s.voice.note_off(out as u16);
+                    s.note_off(out);
                 }
                 wake = on || zone.live;
             }
@@ -4791,9 +4846,9 @@ impl GraphEngine {
         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
             if s.plugin.is_instrument() {
                 if on {
-                    s.plugin.note_on_ch(out, m.data[1], m.channel);
+                    s.note_on_ch(out, m.data[1], m.channel);
                 } else {
-                    s.plugin.note_off_ch(out, m.channel);
+                    s.note_off_ch(out, m.channel);
                 }
                 wake = on || zone.live;
             }
@@ -4951,11 +5006,13 @@ impl GraphEngine {
 
     /// Note-off for all 128 notes on one instrument (voice or LV2).
     fn release_instrument(&mut self, dest: NodeId) {
-        if let Some(s) = self.voices.iter().find(|s| s.node == dest) {
+        if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
             for n in 0..128u16 { s.voice.note_off(n); }
+            s.clear_held_notes();
         }
         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
             for n in 0..128u8 { s.plugin.note_off(n); }
+            s.clear_held_notes();
         }
         if self.is_midi_fx(dest) {
             let Some(fx) = self.midi_fx.iter_mut().find(|s| s.node == dest) else { return };
@@ -5074,18 +5131,18 @@ impl GraphEngine {
             let mut wake = false;
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                 if on {
-                    s.voice.note_on(note as u16, vel as f64);
+                    s.note_on(note, vel as f64);
                 } else {
-                    s.voice.note_off(note as u16);
+                    s.note_off(note);
                 }
                 wake = on || live;
             }
             if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                 if s.plugin.is_instrument() {
                     if on {
-                        s.plugin.note_on(note, 127);
+                        s.note_on_ch(note, 127, 0);
                     } else {
-                        s.plugin.note_off(note);
+                        s.note_off_ch(note, 0);
                     }
                     wake = on || live;
                 }
@@ -7997,6 +8054,76 @@ mod tests {
         assert!(hw_device_allowed(Some(2), 2)); // only device 2
         assert!(!hw_device_allowed(Some(2), 0));
         assert!(!hw_device_allowed(Some(2), 3));
+    }
+
+    /// GigChain #53: a second Note On for an already-held note must emit Note
+    /// Off before retriggering Note On so a single Note Off or song/rig switch
+    /// leaves zero orphan voices sounding.
+    #[test]
+    fn repeated_note_on_for_held_note_retriggers_cleanly_without_orphan_voices() {
+        use crate::control::{command_bus, name_bytes, ClapId, Command, Graph, NodeKind, PortKind, PortRef, RigZone, MAX_RIGS};
+        let (voice, main, probe) = crate::host::probe::host_probe();
+
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(
+            NodeKind::Clap { plugin_id: ClapId::new("org.kabelsalat.test-probe") },
+            name_bytes("PROBE"),
+        );
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(g, drain, 48_000.0, vec![(synth, voice)]);
+        let mut buf = vec![0.0f32; 64 * 2];
+
+        // 1. Repeated Note On(60) followed by a single Note Off(60).
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
+        engine.render(&mut buf, 2);
+        assert_eq!(
+            probe.note_events(),
+            vec![(60, true), (60, false), (60, true)],
+            "repeated Note On must emit Note Off before retriggering"
+        );
+        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
+        engine.render(&mut buf, 2);
+        let evs = probe.note_events();
+        let active: i32 = evs.iter().map(|&(_, on)| if on { 1 } else { -1 }).sum();
+        assert_eq!(active, 0, "single Note Off must leave zero active voices: {evs:?}");
+
+        // 2. Repeated Note On(64), then song switch taking rig 0 offline, then single Note Off(64).
+        probe.clear_note_events();
+        bus.send(Command::NoteOn { note: 64, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+        bus.send(Command::NoteOn { note: 64, velocity: 0.7, source: SourceId::Keys, channel: 0 });
+        let mut zones = [RigZone::OPEN; MAX_RIGS];
+        zones[0].live = false;
+        bus.send(Command::SetRigZones { zones });
+        bus.send(Command::NoteOff { note: 64, source: SourceId::Keys, channel: 0 });
+        engine.render(&mut buf, 2);
+        let evs2 = probe.note_events();
+        assert_eq!(evs2, vec![(64, true), (64, false), (64, true), (64, false)]);
+        let active2: i32 = evs2.iter().map(|&(_, on)| if on { 1 } else { -1 }).sum();
+        assert_eq!(active2, 0, "song switch + single Note Off must leave zero orphan voices");
+
+        // 3. Repeated Note On(67), then song switch changing transpose (triggers release_all).
+        probe.clear_note_events();
+        let mut zones_on = [RigZone::OPEN; MAX_RIGS];
+        zones_on[0].live = true;
+        bus.send(Command::SetRigZones { zones: zones_on });
+        bus.send(Command::NoteOn { note: 67, velocity: 0.8, source: SourceId::Keys, channel: 0 });
+        bus.send(Command::NoteOn { note: 67, velocity: 0.9, source: SourceId::Keys, channel: 0 });
+        let mut zones_tr = zones_on;
+        zones_tr[0].transpose = 12;
+        bus.send(Command::SetRigZones { zones: zones_tr });
+        engine.render(&mut buf, 2);
+        let evs3: Vec<(u16, bool)> = probe.note_events().into_iter().filter(|&(n, _)| n == 67).collect();
+        assert_eq!(evs3, vec![(67, true), (67, false), (67, true), (67, false)]);
+
+        let [slot]: [super::VoiceSlot; 1] = std::mem::take(&mut engine.voices).try_into().ok().expect("1 voice");
+        main.retire(slot.into_voice());
     }
 
     #[test]

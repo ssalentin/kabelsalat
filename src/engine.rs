@@ -794,6 +794,8 @@ pub struct AudioInSlot {
     /// Counters for the UI status readout (test observability too).
     dropped: u64,
     starved: u64,
+    /// `raw` holds this block's input (a device or the soundcheck take).
+    fed: bool,
 }
 
 impl AudioInSlot {
@@ -812,6 +814,7 @@ impl AudioInSlot {
             drift: crate::audio_in::Drift::new(block.max(2)),
             dropped: 0,
             starved: 0,
+            fed: false,
         }
     }
 }
@@ -2193,6 +2196,8 @@ pub struct GraphEngine {
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
     recorder: Option<RecorderTap>,
+    /// Virtual Soundcheck (#400): a recorded take in place of the stage.
+    soundcheck: Option<crate::soundcheck::Feed>,
     // Record-arm state: master mix + one stem per rig.
     arm_master: bool,
     arm_rigs: [bool; MAX_RIGS],
@@ -2401,6 +2406,7 @@ impl GraphEngine {
             rig_cross_in: [0; MAX_RIGS],
             rig_pre_audio_mask: 0,
             recorder: None,
+            soundcheck: None,
             arm_master: true,
             arm_rigs: [false; MAX_RIGS],
             record_pending: None,
@@ -3408,6 +3414,67 @@ impl GraphEngine {
         self.recorder = Some(tap);
     }
 
+    /// Attach the Virtual Soundcheck feed (`soundcheck::channel`).
+    pub fn set_soundcheck(&mut self, feed: crate::soundcheck::Feed) {
+        self.soundcheck = Some(feed);
+    }
+
+    /// A played event into the running take, after the part it was played
+    /// in (#400). RT-safe.
+    fn log_played(&mut self, ev: crate::take::TakeEv) {
+        self.log_part();
+        if let Some(rec) = &mut self.recorder {
+            rec.event(ev);
+        }
+    }
+
+    /// The setlist part into the running take when it changed. RT-safe.
+    fn log_part(&mut self) {
+        let part = self.show.part();
+        if let Some(rec) = &mut self.recorder {
+            rec.log_part(part);
+        }
+    }
+
+    /// This block of the soundcheck take: the lanes mapped to the rack's
+    /// Audio In nodes, a jump released, the events applied as live.
+    fn soundcheck_block(&mut self, frames: usize) {
+        use crate::soundcheck::LANES;
+        let Some(feed) = self.soundcheck.as_mut() else { return };
+        let info = feed.begin_block(frames);
+        if info.remap {
+            let mut live = [crate::record::NO_INPUT; LANES];
+            let mut n = 0;
+            for a in &self.audio_in {
+                if n < LANES {
+                    live[n] = a.node;
+                    n += 1;
+                }
+            }
+            feed.lane_dest = crate::soundcheck::map_lanes(&feed.lane_nodes, &live[..n]);
+        }
+        let n = feed.n_events;
+        if info.release {
+            self.panic();
+        }
+        for i in 0..n {
+            let Some(t) = self.soundcheck.as_ref().and_then(|f| f.events[i]) else { continue };
+            match t.ev {
+                crate::take::TakeEv::Part { part } => {
+                    if let crate::show::Take::Part(zones) = self.show.jump(part) {
+                        self.set_rig_zones(zones);
+                    }
+                    self.mix_dirty = true;
+                }
+                ev => {
+                    if let Some(cmd) = ev.command() {
+                        self.apply(cmd);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn set_listen_tap(&mut self, tap: crate::listen::Tap) {
         self.listen = Some(tap);
     }
@@ -3425,10 +3492,16 @@ impl GraphEngine {
     fn record_start_now(&mut self) {
         self.record_pending = None;
         let mask = self.record_mask();
+        // Every Audio In's raw input goes into the take (#400).
+        let mut inputs = [crate::record::NO_INPUT; crate::record::MAX_TAKE_INPUTS];
+        let n = self.audio_in.len().min(inputs.len());
+        for (d, a) in inputs.iter_mut().zip(&self.audio_in) {
+            *d = a.node;
+        }
         if let Some(rec) = &mut self.recorder {
             rec.set_pending(false);
-            if mask != 0 {
-                rec.begin(mask);
+            if mask != 0 && rec.begin_with(mask, &inputs[..n]) {
+                rec.log_part(self.show.part());
             }
         }
     }
@@ -6496,6 +6569,7 @@ impl GraphEngine {
                 if self.show_takes(source, channel, crate::show::ShowMsg::Note(note & 0x7F), value) {
                     return;
                 }
+                self.log_played(crate::take::TakeEv::NoteOn { note, velocity, source, channel });
                 let msg = MidiMsg::note_on(channel & 0x0F, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 let mut heard = 0u64;
@@ -6526,6 +6600,7 @@ impl GraphEngine {
                 if self.show_takes(source, channel, crate::show::ShowMsg::Note(note & 0x7F), 0) {
                     return;
                 }
+                self.log_played(crate::take::TakeEv::NoteOff { note, source, channel });
                 let msg = MidiMsg::note_off(channel & 0x0F, note, 0);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 let bit = 1u128 << (note & 0x7F);
@@ -6735,6 +6810,7 @@ impl GraphEngine {
                 if self.show_takes(source, channel, crate::show::ShowMsg::Cc(cc), value) {
                     return;
                 }
+                self.log_played(crate::take::TakeEv::Cc { source, channel, cc, value });
                 let msg = MidiMsg::cc(channel, cc, value);
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 if cc == 64 {
@@ -6949,9 +7025,11 @@ impl GraphEngine {
                 }
             }
             Command::PitchBend { source, channel, value } => {
+                self.log_played(crate::take::TakeEv::PitchBend { source, channel, value });
                 self.pass_to_instruments(source, MidiMsg::pitch_bend(channel, value));
             }
             Command::Pressure { source, channel, note, value } => {
+                self.log_played(crate::take::TakeEv::Pressure { source, channel, note, value });
                 let msg = match note {
                     None => MidiMsg::channel_aftertouch(channel, value),
                     Some(n) => MidiMsg::poly_aftertouch(channel, n, value),
@@ -6961,6 +7039,7 @@ impl GraphEngine {
             Command::Program { source, channel, program } => {
                 let program = program & 0x7F;
                 if !self.show_takes(source, channel, crate::show::ShowMsg::Program(program), 0) {
+                    self.log_played(crate::take::TakeEv::Program { source, channel, program });
                     self.pass_to_instruments(source, MidiMsg::program_change(channel, program));
                 }
             }
@@ -7309,23 +7388,37 @@ impl GraphEngine {
             for x in s.buf[..n2].iter_mut() {
                 *x = 0.0;
             }
-            let Some(consumer) = s.consumer.as_mut() else {
+            // Virtual Soundcheck (#400): the take's raw input in place of
+            // the device's, through the same channel choice and gain.
+            let fed = self.soundcheck.as_ref().and_then(|f| f.input_for(s.node, frames));
+            s.fed = fed.is_some() || s.consumer.is_some();
+            if let Some(d) = fed {
+                s.raw[..n2].copy_from_slice(d);
+            }
+            let mut consumer = if fed.is_some() { None } else { s.consumer.as_mut() };
+            if fed.is_none() && consumer.is_none() {
                 // No capture opened for this node yet: silent, no level.
                 continue;
-            };
+            }
             for i in 0..frames {
-                let l = match consumer.pop() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        s.starved += 1;
-                        s.last[0]
-                    }
-                };
-                let r = match consumer.pop() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        s.starved += 1;
-                        s.last[1]
+                let (l, r) = match consumer.as_mut() {
+                    None => (s.raw[i * 2], s.raw[i * 2 + 1]),
+                    Some(consumer) => {
+                        let l = match consumer.pop() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                s.starved += 1;
+                                s.last[0]
+                            }
+                        };
+                        let r = match consumer.pop() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                s.starved += 1;
+                                s.last[1]
+                            }
+                        };
+                        (l, r)
                     }
                 };
                 s.last = [l, r];
@@ -7340,6 +7433,10 @@ impl GraphEngine {
                 s.buf[i * 2] = ol * g;
                 s.buf[i * 2 + 1] = or * g;
             }
+            let Some(consumer) = consumer else {
+                self.audio_in_levels.store(s.node, block_peak(&s.raw[..n2]));
+                continue;
+            };
             // A backlog (capture ahead of its consumer) is cut to the target
             // fill in one go; the ring holds interleaved stereo, so every
             // discard is a whole frame (one sample would swap L and R).
@@ -7401,6 +7498,8 @@ impl GraphEngine {
                 }
             }
         }
+        self.soundcheck_block(data.len() / ch.max(1));
+        self.log_part();
         self.drain_voice_msgs();
         self.publish_voices();
         self.publish_lv2();
@@ -7559,6 +7658,18 @@ impl GraphEngine {
         // 1a. Audio In nodes: pull the input ring into each node's stereo
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
+        // The take's raw input lanes: what each Audio In took from its
+        // device (or the soundcheck take), before channel choice and gain.
+        if let Some(rec) = &mut self.recorder {
+            let lanes = rec.take_inputs();
+            for (lane, node) in lanes.iter().enumerate() {
+                if *node == crate::record::NO_INPUT {
+                    break;
+                }
+                let raw = self.audio_in.iter().find(|s| s.node == *node).filter(|s| s.fed).map(|s| &s.raw[..n2]);
+                rec.push_input(lane, raw, frames);
+            }
+        }
         // A generator plays no notes, so a rig that is not live (#204) mutes
         // it here, at its own output: its effects ring out.
         for i in 0..self.audio_in.len() {
@@ -8128,6 +8239,7 @@ impl GraphEngine {
         }
         if let Some(rec) = &mut self.recorder {
             rec.retro_block(data, ch);
+            rec.end_block(frames);
         }
         // The stage output matrix (#399), last: the taps above heard the
         // master on the first two channels, wherever it plays.
@@ -8466,6 +8578,7 @@ pub mod setlist_switch_test;
 pub mod setlist_window_test;
 pub(crate) mod gain_ramp;
 pub mod levels_test;
+pub mod gig_test;
 
 #[cfg(test)]
 mod master_target_tests {

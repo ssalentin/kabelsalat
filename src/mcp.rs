@@ -1035,6 +1035,44 @@ struct RecordSaveLastArgs {
     seconds: Option<f64>,
 }
 
+/// Arguments of the gig-take tools (#400): `list_takes`, `soundcheck_*`,
+/// `export_take`. Each tool reads the fields it names.
+#[derive(Debug, Default, Deserialize, JsonSchema, serde::Serialize)]
+struct TakeArgs {
+    /// Take folder: a name under ~/Music/kabelsalat or a full path (default: the newest take).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    take: Option<String>,
+    /// 0-based song/part marker (soundcheck_status lists them): its section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marker: Option<u64>,
+    /// Position in the take, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seconds: Option<f64>,
+    /// A range instead of a marker: its start and end in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    end_seconds: Option<f64>,
+    /// soundcheck_start: loop the marker's section (or the whole take).
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    looped: Option<bool>,
+    /// soundcheck_loop: true plays on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    off: Option<bool>,
+    /// export_take: the full show mixdown (default true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mixdown: Option<bool>,
+    /// export_take: "all" (default), "none", or 0-based rigs like "0,2".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stems: Option<String>,
+    /// export_take: the raw inputs too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inputs: Option<bool>,
+    /// export_take: pcm24 (default), pcm16 or float32.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
+}
+
 /// Arguments for `set_master_target`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetMasterTargetArgs {
@@ -5546,6 +5584,55 @@ impl McpServer {
     }
 
     /// Recording status: path, folder, elapsed seconds, dropped frames, stems, armed targets.
+    /// A gig-take tool: on the engine here, or the attached app's.
+    fn take_tool(&self, name: &str, args: TakeArgs, remote: impl FnOnce(Value) -> Result<CallToolResult, McpError>) -> Result<CallToolResult, McpError> {
+        let args = serde_json::to_value(&args).unwrap_or(Value::Null);
+        let local = !matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if !local {
+            return remote(args);
+        }
+        let v = crate::soundcheck::tool(name, &args, crate::soundcheck::LIVE.get(), &crate::record::record_dir());
+        match v.get("error").and_then(Value::as_str) {
+            Some(e) => tool_err(e.to_string()),
+            None => ok_json(v),
+        }
+    }
+
+    #[tool(name = "list_takes", description = "List recorded gig takes under ~/Music/kabelsalat, newest first: folder, seconds, stems, raw inputs, song/part markers and MIDI events of each.")]
+    fn list_takes(&self, Parameters(args): Parameters<TakeArgs>) -> Result<CallToolResult, McpError> {
+        self.take_tool("list_takes", args, |a| Self::ui_bridge_tool("list_takes", a))
+    }
+
+    #[tool(name = "soundcheck_start", description = "Virtual Soundcheck: play a recorded take through the live rack. Every Audio In hears its recorded raw input instead of the stage, the recorded MIDI plays the instruments and the recorded song/part switches step the setlist; knob, fader and preset changes are heard at once. take (default newest), marker (start at its section) or seconds, loop=true loops the section (or the whole take).")]
+    fn soundcheck_start(&self, Parameters(args): Parameters<TakeArgs>) -> Result<CallToolResult, McpError> {
+        self.take_tool("soundcheck_start", args, |a| Self::ui_bridge_tool("soundcheck_start", a))
+    }
+
+    #[tool(name = "soundcheck_seek", description = "Jump the Virtual Soundcheck take to a song/part marker (0-based) or to seconds.")]
+    fn soundcheck_seek(&self, Parameters(args): Parameters<TakeArgs>) -> Result<CallToolResult, McpError> {
+        self.take_tool("soundcheck_seek", args, |a| Self::ui_bridge_tool("soundcheck_seek", a))
+    }
+
+    #[tool(name = "soundcheck_loop", description = "Loop a marker's section (marker) or a range (start_seconds, end_seconds) of the Virtual Soundcheck take; off=true plays on.")]
+    fn soundcheck_loop(&self, Parameters(args): Parameters<TakeArgs>) -> Result<CallToolResult, McpError> {
+        self.take_tool("soundcheck_loop", args, |a| Self::ui_bridge_tool("soundcheck_loop", a))
+    }
+
+    #[tool(name = "soundcheck_stop", description = "End Virtual Soundcheck: the inputs hear the stage again.")]
+    fn soundcheck_stop(&self, Parameters(args): Parameters<TakeArgs>) -> Result<CallToolResult, McpError> {
+        self.take_tool("soundcheck_stop", args, |a| Self::ui_bridge_tool("soundcheck_stop", a))
+    }
+
+    #[tool(name = "soundcheck_status", description = "Virtual Soundcheck state: take, position, current marker, markers with times, loop, inputs, underruns; also last_export of export_take.")]
+    fn soundcheck_status(&self, Parameters(args): Parameters<TakeArgs>) -> Result<CallToolResult, McpError> {
+        self.take_tool("soundcheck_status", args, |a| Self::ui_bridge_tool("soundcheck_status", a))
+    }
+
+    #[tool(name = "export_take", description = "Export a take after the gig: the full show mixdown (mixdown, default true), rig stems (stems: all, none or 0-based rigs like \"0,2\") and raw inputs (inputs), of the whole take, a marker's section or a seconds range, as 24-bit (default), 16-bit or float32 WAV into <take>/export. Runs in the background; soundcheck_status shows last_export.")]
+    fn export_take(&self, Parameters(args): Parameters<TakeArgs>) -> Result<CallToolResult, McpError> {
+        self.take_tool("export_take", args, |a| Self::ui_bridge_tool("export_take", a))
+    }
+
     #[tool(name = "record_status", description = "Get recording status: recording (bool), pending (bool), path, folder, seconds, dropped_frames, finalized, stems, armed_master, armed_rigs, retro (retrospective recording: length_seconds, kept_seconds, saving, last_folder).")]
     fn record_status(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
@@ -5704,6 +5791,9 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     record.set_retro_seconds(crate::record::retro_minutes_setting() * 60);
     engine.set_recorder(recorder_tap);
+    let (soundcheck_feed, soundcheck) = crate::soundcheck::channel(sample_rate as u32);
+    engine.set_soundcheck(soundcheck_feed);
+    let _ = crate::soundcheck::LIVE.set(soundcheck);
     let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
     engine.set_listen_tap(listen_tap);
     crate::listen::install(listen_capture);
@@ -5742,6 +5832,9 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     record.set_retro_seconds(crate::record::retro_minutes_setting() * 60);
     engine.set_recorder(recorder_tap);
+    let (soundcheck_feed, soundcheck) = crate::soundcheck::channel(sample_rate as u32);
+    engine.set_soundcheck(soundcheck_feed);
+    let _ = crate::soundcheck::LIVE.set(soundcheck);
     let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
     engine.set_listen_tap(listen_tap);
     crate::listen::install(listen_capture);

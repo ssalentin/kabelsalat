@@ -3619,6 +3619,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "inspect_plugin", "set_param", "reset_params",
     "record_save_last",
     "list_plugin_folders", "add_plugin_folder", "remove_plugin_folder",
+    "list_takes", "soundcheck_start", "soundcheck_seek", "soundcheck_loop", "soundcheck_stop", "soundcheck_status", "export_take",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3630,6 +3631,7 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_") || name.starts_with("inspect_")
         || matches!(name, "record_status" | "measure_mix" | "listen" | "preshow_check" | "audio_doctor" | "undo" | "redo")
+        || crate::soundcheck::is_read_only(name)
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
@@ -3654,6 +3656,11 @@ fn tool_changes_only_system(name: &str) -> bool {
             | "record_save_last"
             | "add_plugin_folder"
             | "remove_plugin_folder"
+            | "soundcheck_start"
+            | "soundcheck_seek"
+            | "soundcheck_loop"
+            | "soundcheck_stop"
+            | "export_take"
     )
 }
 
@@ -11601,6 +11608,10 @@ impl DemoApp {
                     Err(e) => format!("not saved: {e}"),
                 }
             }
+            t if crate::soundcheck::TOOLS.contains(&t) => {
+                self.sync_recorder_rig_names(); // the device names a replay maps by
+                crate::soundcheck::tool(t, args, crate::soundcheck::LIVE.get(), &crate::record::record_dir()).to_string()
+            }
             "record_status" => match &self.recorder {
                 Some(r) => serde_json::to_value(r.snapshot())
                     .map(|v| v.to_string())
@@ -15983,6 +15994,21 @@ impl DemoApp {
             let n = self.rig_count();
             let names: Vec<String> = (0..n).map(|i| self.rig_name(i)).collect();
             rec.set_rig_names(names);
+            // What a gig take's manifest names (#400): its inputs, its
+            // song/part markers and its MIDI devices.
+            let inputs = self.units.iter()
+                .filter(|u| matches!(u.node_kind, UnitKind::AudioIn))
+                .map(|u| (u.node_id, sentence_case(&u.name)))
+                .collect();
+            rec.set_input_names(inputs);
+            let parts = self.setlist.songs.iter()
+                .flat_map(|s| s.parts.iter().map(move |p| (s.name.clone(), p.name.clone())))
+                .collect();
+            rec.set_part_names(parts);
+            rec.set_midi_ports(self.hw_devices.clone());
+        }
+        if let Some(sc) = crate::soundcheck::LIVE.get() {
+            sc.set_ports(self.hw_devices.clone());
         }
     }
 
@@ -37345,6 +37371,11 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
     let _ = crate::record::LIVE_RECORDER.set(recorder.clone());
+    // Virtual Soundcheck (#400): its chunk pool is allocated here, off the
+    // audio thread.
+    let (soundcheck_feed, soundcheck) = crate::soundcheck::channel(sample_rate as u32);
+    engine.set_soundcheck(soundcheck_feed);
+    let _ = crate::soundcheck::LIVE.set(soundcheck);
     let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
     engine.set_listen_tap(listen_tap);
     crate::listen::install(listen_capture);

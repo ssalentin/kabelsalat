@@ -46,10 +46,12 @@ use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
 use crate::matrix::{CcTarget, MixControl, SourceId};
 use crate::plugins::{
     clap_hostable, clap_id_is_effect, clap_is_audio_insert, clap_is_instrument, clap_subtitle,
-    classify_clap, classify_dsp, classify_lv2, format_list_plugins, lv2_class_label,
-    lv2_is_audio_insert, lv2_subtitle, matches_query, BuiltinAction, PluginFormat,
+    classify_clap, classify_dsp, classify_lv2, classify_vst3, format_list_plugins, lv2_class_label,
+    lv2_is_audio_insert, lv2_subtitle, matches_query, vst3_hostable, vst3_id_is_effect,
+    vst3_is_audio_insert, vst3_is_instrument, vst3_subtitle, BuiltinAction, PluginFormat,
     PluginListFilter, PluginSubtype, PluginType,
 };
+use crate::vst3::Vst3PluginInfo;
 use crate::rope::{self, Rope};
 use crate::session::Template;
 use crate::theme;
@@ -1785,6 +1787,7 @@ enum UnitCompatKey {
     Arp,
     Dsp(crate::control::DspKind),
     Clap(String),
+    Vst3(String),
     Lv2(String),
     MidiFxBuiltin,
     MidiFxLv2(String),
@@ -2609,6 +2612,11 @@ fn make_unit(node: &Node) -> Unit {
             vec![PortKind::Midi], vec![PortKind::Audio],
             vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
+        NodeKind::Vst3 { .. } => (
+            UnitKind::Clap, "vst3 instrument".into(),
+            vec![PortKind::Midi], vec![PortKind::Audio],
+            vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
+        ),
         NodeKind::MasterOut => (
             UnitKind::Master, "stereo + mono bus".into(),
             vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![PortKind::Audio],
@@ -3154,6 +3162,7 @@ impl PluginCategory {
 /// list is drawn.
 enum BrowserAction {
     NewClapRig(String, String),
+    NewVst3Rig(String, String),
     NewLv2Rig(String, String),
     AddInstrument(NodeKind, String),
     AddEffect(NodeKind, String),
@@ -3220,6 +3229,21 @@ impl BrowserCard {
                     "CLAP audio effects not hostable yet"
                 };
                 (clap_subtitle(p), p.id.clone(), Some(note), Vec::new())
+            }
+            Source::Vst3(p) if vst3_hostable(p) => {
+                let kind = NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(&p.cid) };
+                let actions = match e.ty() {
+                    PluginType::Instrument => vec![
+                        ("New rig", NEW_RIG, BrowserAction::NewVst3Rig(p.cid.clone(), name.clone())),
+                        ("Layer in rig", RIG, BrowserAction::AddInstrument(kind, name.clone())),
+                    ],
+                    PluginType::Effect | PluginType::Utility => effect(kind),
+                    PluginType::MidiFx => Vec::new(),
+                };
+                (vst3_subtitle(p), p.cid.clone(), None, actions)
+            }
+            Source::Vst3(p) => {
+                (vst3_subtitle(p), p.cid.clone(), Some("VST3 plugin not hostable"), Vec::new())
             }
             Source::Lv2(p) => {
                 let kind = NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) };
@@ -3710,13 +3734,14 @@ struct DemoApp {
     /// Top-bar groups (tests): the View segment and the Bottom panel toggles.
     view_group_rect: Rect,
     dock_group_rect: Rect,
-    // Plugin browser (task-18): add hosted LV2/CLAP plugins to a rig.
+    // Plugin browser (task-18): add hosted LV2/CLAP/VST3 plugins to a rig.
     plugins_loaded: bool,
     plugins_clap: Vec<ClapPluginInfo>,
     plugins_lv2: Vec<Lv2PluginInfo>,
-    /// Plugin discovery running on a background thread (CLAP scan + LV2
+    plugins_vst3: Vec<Vst3PluginInfo>,
+    /// Plugin discovery running on a background thread (CLAP/VST3 scan + LV2
     /// lilv load take seconds); adopted by `poll_plugin_scan`.
-    plugin_scan: Option<std::sync::mpsc::Receiver<(Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>, Vec<String>)>>,
+    plugin_scan: Option<std::sync::mpsc::Receiver<(Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>, Vec<Vst3PluginInfo>, Vec<String>)>>,
     /// Installed plugins that can never load here (built for another CPU or
     /// system, #135): one sentence each, shown in the Plugins view.
     plugins_unloadable: Vec<String>,
@@ -4414,6 +4439,8 @@ struct DemoApp {
     /// Per-setlist windowed plugin loading state (#207).
     setlist_window: window_load::SetlistWindowState,
     lv2_editor_request: Option<(u32, String, String)>,
+    /// Open native LV2 plugin GUI windows, keyed by node id.
+    lv2_guis: Vec<(u32, crate::lv2::ui::Lv2UiHandle)>,
     editor_status: String,
     /// Why the open editor's plugin window did not open.
     plugin_window_error: Option<String>,
@@ -4488,6 +4515,7 @@ impl DemoApp {
             plugins_loaded: false,
             plugins_clap: Vec::new(),
             plugins_lv2: Vec::new(),
+            plugins_vst3: Vec::new(),
             plugin_scan: None,
             plugins_unloadable: Vec::new(),
             plugin_filter: String::new(),
@@ -4876,6 +4904,7 @@ impl DemoApp {
             lv2_states: HashMap::new(),
             setlist_window: window_load::SetlistWindowState::default(),
             lv2_editor_request: None,
+            lv2_guis: Vec::new(),
             editor_status: String::new(),
             plugin_window_error: None,
             last_unit_click: None,
@@ -4915,7 +4944,7 @@ impl DemoApp {
         // background scan: a discovery here took 1.3 s on every agent edit
         // adopted through build_rack. A scan still running reclassifies the
         // units when it lands (poll_plugin_scan).
-        if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. } | NodeKind::Clap { .. })) {
+        if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. }) || n.kind.is_hosted_voice()) {
             if !self.plugins_loaded
                 && graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. }))
             {
@@ -7624,6 +7653,7 @@ impl DemoApp {
             NodeKind::Arp => UnitCompatKey::Arp,
             NodeKind::Dsp(dk) => UnitCompatKey::Dsp(dk.clone()),
             NodeKind::Clap { plugin_id } => UnitCompatKey::Clap(plugin_id.as_str().to_string()),
+            NodeKind::Vst3 { plugin_id } => UnitCompatKey::Vst3(plugin_id.as_str().to_ascii_uppercase()),
             NodeKind::Lv2 { uri } => UnitCompatKey::Lv2(uri.as_str().to_string()),
             NodeKind::MidiFx { plugin } => match plugin {
                 crate::control::MidiFxPlugin::Builtin { .. } => UnitCompatKey::MidiFxBuiltin,
@@ -7742,7 +7772,7 @@ impl DemoApp {
             return Err(format!("no node {node_id} in graph"));
         };
         let is_inst = match &src_node.kind {
-            NodeKind::Clap { .. } => !self.units[ui].clap_fx,
+            NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => !self.units[ui].clap_fx,
             NodeKind::Lv2 { .. } => self.units[ui].lv2_inst,
             _ => false,
         };
@@ -7990,6 +8020,7 @@ impl DemoApp {
             if let Some(rig) = self.rig_of_unit(ui) {
                 if let Some(idx) = self.clap_pool_idx(rig) {
                     let pid = self.clap_plugin_ids.get(idx).cloned().unwrap_or_else(|| SURGE_ID.to_string());
+                    let pid = crate::vst3::strip_vst3_key(&pid).unwrap_or(&pid).to_string();
                     if let Some(m) = self._surge_main.get_mut(idx) {
                         if let Ok(blob) = m.save_state() {
                             plugin_state = Some((pid, blob));
@@ -8122,8 +8153,20 @@ impl DemoApp {
         Ok(disp)
     }
 
-    /// Returns `Some(is_open)` if `node_id` has a hosted CLAP plugin GUI window.
+    /// Returns `Some(is_open)` if `node_id` has a hosted CLAP/VST3/LV2 native GUI window.
     fn unit_native_gui_state(&mut self, node_id: u32) -> Option<bool> {
+        if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
+            if self.lv2_guis.iter().any(|(n, _)| *n == node_id) {
+                return Some(true);
+            }
+            let has_ui = self
+                .plugins_lv2
+                .iter()
+                .find(|p| p.uri == uri.as_str())
+                .is_some_and(|p| p.has_ui)
+                || crate::lv2::has_ui_cached(uri.as_str()) == Some(true);
+            return has_ui.then_some(false);
+        }
         let ui = self.units.iter().position(|u| u.node_id == node_id)?;
         if !matches!(self.units[ui].node_kind, UnitKind::Clap) { return None; }
         let rig = self.rig_of_unit(ui)?;
@@ -8133,6 +8176,65 @@ impl DemoApp {
     }
 
     fn toggle_unit_native_gui(&mut self, node_id: u32) {
+        if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| n.kind.clone()) {
+            self.plugin_window_error = None;
+            if let Some(pos) = self.lv2_guis.iter().position(|(n, _)| *n == node_id) {
+                let (_, mut handle) = self.lv2_guis.swap_remove(pos);
+                handle.close();
+                return;
+            }
+            let Some(info) = crate::lv2::discover_ui_for_uri(uri.as_str()) else {
+                let msg = "this LV2 plugin has no native GUI".to_string();
+                self.plugin_window_error = Some(msg.clone());
+                self.session_msg = msg;
+                return;
+            };
+            let controls = crate::lv2::control_descs_for_uri(uri.as_str());
+            let port_symbols = crate::lv2::port_symbols_for_uri(uri.as_str());
+            let sym_to_port: HashMap<&str, u32> = port_symbols
+                .iter()
+                .map(|(idx, sym)| (sym.as_str(), *idx))
+                .collect();
+            let editor_ctrls = (self.lv2_editor_node == Some(node_id)).then_some(&self.lv2_editor_controls);
+            let unit_knobs = self.units.iter().find(|u| u.node_id == node_id);
+            let mut initial = Vec::with_capacity(controls.len());
+            for c in &controls {
+                let Some(&port_idx) = sym_to_port.get(c.symbol.as_str()) else { continue };
+                let hi = if c.max > c.min { c.max } else { c.min + 1.0 };
+                let val = editor_ctrls
+                    .and_then(|list| list.iter().find(|ec| ec.index == c.index))
+                    .map(|ec| ec.value)
+                    .or_else(|| {
+                        unit_knobs
+                            .and_then(|u| u.knobs.iter().find(|k| k.param == Some(c.index as u32)))
+                            .map(|k| c.min + k.value.clamp(0.0, 1.0) * (hi - c.min))
+                    })
+                    .or_else(|| {
+                        self.node_params
+                            .get(&(node_id, c.index as u32))
+                            .map(|&norm| c.min + norm.clamp(0.0, 1.0) * (hi - c.min))
+                    })
+                    .unwrap_or(c.default);
+                initial.push((port_idx, val.clamp(c.min, hi)));
+            }
+            let title = format!("{} · kabelsalat", self.unit_display_name(node_id));
+            match crate::lv2::ui::Lv2UiHandle::open(
+                uri.as_str(),
+                &title,
+                self.sample_rate.max(1.0),
+                &initial,
+                &controls,
+                &port_symbols,
+                &info,
+            ) {
+                Ok(handle) => self.lv2_guis.push((node_id, handle)),
+                Err(e) => {
+                    self.plugin_window_error = Some(format!("{e:#}"));
+                    self.session_msg = format!("Plugin GUI failed: {e:#}");
+                }
+            }
+            return;
+        }
         let Some(ui) = self.units.iter().position(|u| u.node_id == node_id) else { return };
         let Some(rig) = self.rig_of_unit(ui) else { return };
         let Some(idx) = self.clap_pool_idx(rig) else { return };
@@ -8148,8 +8250,112 @@ impl DemoApp {
         }
     }
 
+    fn notify_lv2_gui_norm(&mut self, node_id: u32, param: u32, norm: f32) {
+        if let Some((_, handle)) = self.lv2_guis.iter_mut().find(|(n, _)| *n == node_id) {
+            handle.notify_control_nth(param as usize, norm);
+        }
+    }
+
+    fn pump_lv2_guis(&mut self) {
+        if self.lv2_guis.is_empty() {
+            return;
+        }
+        let mut idx = 0;
+        let mut ctrl_updates: Vec<(u32, usize, f32, f32)> = Vec::new();
+        let mut midi_updates: Vec<[u8; 3]> = Vec::new();
+        while idx < self.lv2_guis.len() {
+            let node_id = self.lv2_guis[idx].0;
+            if !self
+                .base_graph
+                .node(node_id)
+                .is_some_and(|n| matches!(n.kind, NodeKind::Lv2 { .. }))
+            {
+                let (_, mut h) = self.lv2_guis.swap_remove(idx);
+                h.close();
+                continue;
+            }
+            let res = self.lv2_guis[idx].1.pump();
+            for (nth, native, norm) in res.control_writes {
+                ctrl_updates.push((node_id, nth, native, norm));
+            }
+            midi_updates.extend(res.midi_events);
+            if res.closed {
+                let (_, mut h) = self.lv2_guis.swap_remove(idx);
+                h.close();
+            } else {
+                idx += 1;
+            }
+        }
+        let rm = self.reduce_motion;
+        for (node_id, nth, native, norm) in ctrl_updates {
+            let param = nth as u32;
+            self.node_params.insert((node_id, param), norm);
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetParam {
+                    node: node_id,
+                    param,
+                    value: norm as f64,
+                });
+            }
+            if let Some(ui_idx) = self.units.iter().position(|u| u.node_id == node_id) {
+                let dragging = matches!(self.drag, Drag::Knob { unit, .. } if unit == ui_idx);
+                if !dragging {
+                    for k in &mut self.units[ui_idx].knobs {
+                        if k.param == Some(param) {
+                            k.glide_to(norm, rm);
+                            k.sent = Some(norm);
+                        }
+                    }
+                }
+            }
+            if self.lv2_editor_node == Some(node_id) {
+                if let Some(c) = self.lv2_editor_controls.iter_mut().find(|c| c.index == nth) {
+                    c.value = native;
+                }
+            }
+        }
+        if !midi_updates.is_empty() {
+            if let Some(bus) = &self.bus {
+                if let Ok(mut b) = bus.lock() {
+                    for ev in midi_updates {
+                        let status = ev[0] & 0xF0;
+                        let ch = ev[0] & 0x0F;
+                        match status {
+                            0x90 if ev[2] > 0 => {
+                                let _ = b.send(Command::NoteOn {
+                                    note: ev[1] & 0x7F,
+                                    velocity: (ev[2] & 0x7F) as f32 / 127.0,
+                                    source: SourceId::Keys,
+                                    channel: ch,
+                                });
+                            }
+                            0x80 | 0x90 => {
+                                let _ = b.send(Command::NoteOff {
+                                    note: ev[1] & 0x7F,
+                                    source: SourceId::Keys,
+                                    channel: ch,
+                                });
+                            }
+                            0xB0 => {
+                                let _ = b.send(Command::Cc {
+                                    source: SourceId::Keys,
+                                    channel: ch,
+                                    cc: ev[1] & 0x7F,
+                                    value: ev[2] & 0x7F,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn unit_has_param_editor(&self, node_id: u32) -> bool {
-        self.base_graph.node(node_id).is_some_and(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }))
+        self.base_graph.node(node_id).is_some_and(|n| {
+            n.kind.is_hosted_voice() || matches!(n.kind, NodeKind::Lv2 { .. })
+        })
     }
 
     fn open_unit_param_editor(&mut self, node_id: u32) {
@@ -8327,6 +8533,7 @@ impl DemoApp {
                 let mut saved = false;
                 if let Some(idx) = self.clap_pool_idx(rig) {
                     let pid = self.clap_plugin_ids.get(idx).cloned().unwrap_or_else(|| SURGE_ID.to_string());
+                    let pid = crate::vst3::strip_vst3_key(&pid).unwrap_or(&pid).to_string();
                     if let Some(m) = self._surge_main.get_mut(idx) {
                         if let Ok(blob) = m.save_state() {
                             self.setlist_window.clap_states.insert(u.node_id, (pid.clone(), blob.clone()));
@@ -8530,10 +8737,7 @@ impl DemoApp {
         }
         self.free_returned_voices();
         let nodes: Vec<(u32, String)> = graph.nodes.iter()
-            .filter_map(|n| match &n.kind {
-                NodeKind::Clap { plugin_id } => Some((n.id, crate::control::clap_plugin_key(plugin_id.as_str()).to_string())),
-                _ => None,
-            })
+            .filter_map(|n| n.kind.voice_plugin_key().map(|k| (n.id, k)))
             .collect();
         // The node every hosted voice plays.
         let mut plays: Vec<Option<u32>> = vec![None; self.clap_voice_ids.len()];
@@ -8621,7 +8825,10 @@ impl DemoApp {
         self.ui_transport_grace = self.ui_time + 0.6;
         self.load_graph_into_engine(&s.graph);
         self.voice_hold_rev = Some(self.last_graph_rev);
-        // The editor referenced the old voice mapping; close it.
+        // The editor and any LV2 native plugin GUI referenced the old graph; close them.
+        for (_, mut handle) in self.lv2_guis.drain(..) {
+            handle.close();
+        }
         if std::mem::take(&mut self.editor_open) {
             self.editor_status = "editor closed (rack reloaded)".into();
         }
@@ -10588,7 +10795,21 @@ impl DemoApp {
                         };
                         (NodeKind::Clap { plugin_id: crate::control::ClapId::new(pid) }, name.unwrap_or(label))
                     }
-                    _ => return "add_insert needs kind=dsp (with dsp=…), kind=lv2 (with uri=…), or kind=clap (with plugin_id=…)".into(),
+                    "vst3" => {
+                        let raw = args.get("cid").or_else(|| args.get("plugin_id")).and_then(|v| v.as_str()).unwrap_or("");
+                        let cid = crate::vst3::strip_vst3_key(raw).unwrap_or(raw);
+                        if cid.is_empty() { return "add_insert needs a cid (or plugin_id) for kind=vst3 (see list_plugins)".into(); }
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_insert again in a few seconds".into();
+                        }
+                        let known = self.plugins_vst3.iter().find(|p| p.cid.eq_ignore_ascii_case(cid) && vst3_is_audio_insert(p));
+                        let (cid_canon, label) = match known {
+                            Some(p) => (p.cid.clone(), p.name.clone()),
+                            None => return format!("add_insert: '{cid}' is not an installed VST3 audio effect (see list_plugins)"),
+                        };
+                        (NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(&cid_canon) }, name.unwrap_or(label))
+                    }
+                    _ => return "add_insert needs kind=dsp (with dsp=…), kind=lv2 (with uri=…), kind=clap (with plugin_id=…), or kind=vst3 (with cid=…)".into(),
                 };
                 let res = match source {
                     Some(s) => self.strip_insert_edit(s, StripInsertEdit::Add { kind, name: label.clone() }),
@@ -10781,7 +11002,7 @@ impl DemoApp {
                     return "scanning installed plugins in the background (first run) — ask again in a few seconds".into();
                 }
                 match PluginListFilter::from_args(args) {
-                    Ok(filter) => format_list_plugins(&self.plugins_clap, &self.plugins_lv2, &filter),
+                    Ok(filter) => format_list_plugins(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3, &filter),
                     Err(e) => format!("list_plugins: {e}"),
                 }
             }
@@ -11115,6 +11336,10 @@ impl DemoApp {
                     "clap" => args.get("plugin_id").and_then(|v| v.as_str())
                         .and_then(|id| self.plugins_clap.iter().find(|p| p.id == id).map(|p| p.name.as_str()))
                         .unwrap_or(&kind_str),
+                    "vst3" => args.get("cid").or_else(|| args.get("plugin_id")).and_then(|v| v.as_str())
+                        .map(|s| crate::vst3::strip_vst3_key(s).unwrap_or(s))
+                        .and_then(|cid| self.plugins_vst3.iter().find(|p| p.cid.eq_ignore_ascii_case(cid)).map(|p| p.name.as_str()))
+                        .unwrap_or(&kind_str),
                     "lv2" => args.get("uri").and_then(|v| v.as_str())
                         .and_then(|u| self.plugins_lv2.iter().find(|p| p.uri == u).map(|p| p.name.as_str()))
                         .unwrap_or(&kind_str),
@@ -11124,6 +11349,13 @@ impl DemoApp {
                 let kind = match kind_str.as_str() {
                     "keys" => Some(NodeKind::Keys),
                     "clap" => Some(NodeKind::Clap { plugin_id: crate::control::ClapId::new(args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("org.surge-synth-team.surge-xt")) }),
+                    "vst3" => args.get("cid").or_else(|| args.get("plugin_id")).and_then(|v| v.as_str()).map(|s| {
+                        let raw = crate::vst3::strip_vst3_key(s).unwrap_or(s);
+                        let canonical = self.plugins_vst3.iter()
+                            .find(|p| p.cid.eq_ignore_ascii_case(raw))
+                            .map_or_else(|| raw.to_ascii_uppercase(), |p| p.cid.clone());
+                        NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(&canonical) }
+                    }),
                     "arp" | "arpeggiator" => Some(NodeKind::Arp),
                     "dsp" => match args.get("dsp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().as_str() {
                         "gain" => Some(NodeKind::Dsp(DspKind::Gain)),
@@ -11164,6 +11396,9 @@ impl DemoApp {
                 let wire = match &kind {
                     Some(NodeKind::Clap { plugin_id }) => {
                         !clap_id_is_effect(plugin_id.as_str(), &self.plugins_clap)
+                    }
+                    Some(NodeKind::Vst3 { plugin_id }) => {
+                        !vst3_id_is_effect(plugin_id.as_str(), &self.plugins_vst3)
                     }
                     Some(NodeKind::Lv2 { uri }) => {
                         if !self.plugin_lists_ready() {
@@ -11257,23 +11492,50 @@ impl DemoApp {
                 let n = self.rig_count();
                 if n >= Self::MAX_RIGS { return format!("at most {} rigs", Self::MAX_RIGS); }
                 let name = args.get("name").and_then(|v| v.as_str());
-                match args.get("plugin_id").and_then(|v| v.as_str()) {
-                    Some(id) => {
-                        if !self.plugin_lists_ready() {
-                            return "scanning installed plugins in the background (first run) — try add_rig again in a few seconds".into();
-                        }
-                        let known = self.plugins_clap.iter().find(|p| p.id == id);
-                        let Some(plugin) = known else {
-                            return format!("add_rig failed: no installed CLAP plugin with id '{id}' (see list_plugins)");
-                        };
-                        if !clap_is_instrument(plugin) {
-                            let ty = classify_clap(plugin).plugin_type().singular().to_ascii_lowercase();
-                            return format!("add_rig failed: '{}' ({id}) is a CLAP {ty}, not a CLAP instrument", plugin.name);
-                        }
-                        let label = plugin.name.clone();
-                        self.edit_rigs_with(None, Some(name.unwrap_or(&label)), Some((id, &label)));
+                let raw_cid = args.get("cid").and_then(|v| v.as_str());
+                let raw_pid = args.get("plugin_id").and_then(|v| v.as_str());
+                if let Some(raw) = raw_cid.or_else(|| {
+                    raw_pid.filter(|id| {
+                        crate::vst3::is_vst3_key(id)
+                            || (!self.plugins_clap.iter().any(|p| p.id == *id)
+                                && self.plugins_vst3.iter().any(|p| p.cid.eq_ignore_ascii_case(id)))
+                    })
+                }) {
+                    if !self.plugin_lists_ready() {
+                        return "scanning installed plugins in the background (first run) — try add_rig again in a few seconds".into();
                     }
-                    None => self.edit_rigs_named(None, name),
+                    let cid = crate::vst3::strip_vst3_key(raw).unwrap_or(raw);
+                    let Some(plugin) = self.plugins_vst3.iter().find(|p| p.cid.eq_ignore_ascii_case(cid)) else {
+                        return format!("add_rig failed: no installed VST3 plugin with cid '{cid}' (see list_plugins)");
+                    };
+                    if !vst3_is_instrument(plugin) {
+                        let ty = classify_vst3(plugin).plugin_type().singular().to_ascii_lowercase();
+                        return format!("add_rig failed: '{}' ({cid}) is a VST3 {ty}, not a VST3 instrument", plugin.name);
+                    }
+                    let label = plugin.name.clone();
+                    let cid_canon = plugin.cid.clone();
+                    let rig_label = name.unwrap_or(&label).to_string();
+                    let graph = crate::control::vst3_rig_graph(&cid_canon, &rig_label);
+                    self.edit_rigs_with_graph(None, Some(&rig_label), Some(graph));
+                } else {
+                    match raw_pid {
+                        Some(id) => {
+                            if !self.plugin_lists_ready() {
+                                return "scanning installed plugins in the background (first run) — try add_rig again in a few seconds".into();
+                            }
+                            let known = self.plugins_clap.iter().find(|p| p.id == id);
+                            let Some(plugin) = known else {
+                                return format!("add_rig failed: no installed CLAP plugin with id '{id}' (see list_plugins)");
+                            };
+                            if !clap_is_instrument(plugin) {
+                                let ty = classify_clap(plugin).plugin_type().singular().to_ascii_lowercase();
+                                return format!("add_rig failed: '{}' ({id}) is a CLAP {ty}, not a CLAP instrument", plugin.name);
+                            }
+                            let label = plugin.name.clone();
+                            self.edit_rigs_with(None, Some(name.unwrap_or(&label)), Some((id, &label)));
+                        }
+                        None => self.edit_rigs_named(None, name),
+                    }
                 }
                 if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
                 let new_rig = self.active_rig;
@@ -11572,6 +11834,8 @@ impl DemoApp {
             let mut open = self.editor_open;
             let mut chosen_preset: Option<crate::lv2::Lv2Preset> = None;
             let mut chosen_patch: Option<crate::sounds::Sound> = None;
+            let gui_state = self.unit_native_gui_state(lv2_node);
+            let mut toggle_native_gui = false;
             // Vital patches (`sounds::Source::VitalPatches`) list above the LV2
             // presets; None while the library is scanned.
             let patches: Option<Vec<crate::sounds::Sound>> = match self.base_graph.node(lv2_node).map(|n| &n.kind) {
@@ -11592,6 +11856,19 @@ impl DemoApp {
                 .collapsible(false)
                 .fixed_size(max_ed)
                 .show(ctx, |ui| {
+                    if let Some(gui_open) = gui_state {
+                        let label = if gui_open { "Close plugin window" } else { "Open plugin window" };
+                        if theme::chip_button(ui, label, gui_open)
+                            .on_hover_text("the LV2 plugin's own native GUI window")
+                            .clicked()
+                        {
+                            toggle_native_gui = true;
+                        }
+                        if let Some(err) = &self.plugin_window_error {
+                            ui.label(egui::RichText::new(err).size(11.5).color(theme::ACCENT));
+                        }
+                        ui.separator();
+                    }
                     theme::section_label(ui, "Presets");
                     let current = self.lv2_preset_name.clone().unwrap_or_else(|| "Default".into());
                     ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
@@ -11695,22 +11972,32 @@ impl DemoApp {
                         c.value = val.clamp(c.min, hi);
                     }
                 }
+                if let Some((_, handle)) = self.lv2_guis.iter_mut().find(|(n, _)| *n == lv2_node) {
+                    for c in &self.lv2_editor_controls {
+                        handle.notify_control_nth_native(c.index, c.value);
+                    }
+                }
                 self.mirror_lv2_editor_on_face(lv2_node);
             }
             let moved = !ctrl_changes.is_empty();
             for (ci, val, norm) in ctrl_changes {
                 if let Some(c) = self.lv2_editor_controls.get_mut(ci) {
                     c.value = val;
+                    let c_index = c.index;
                     if let Some(bus) = &self.bus {
                         bus.lock().unwrap().send(Command::SetParam {
                             node: lv2_node,
-                            param: c.index as u32,
+                            param: c_index as u32,
                             value: norm as f64,
                         });
+                    }
+                    if let Some((_, handle)) = self.lv2_guis.iter_mut().find(|(n, _)| *n == lv2_node) {
+                        handle.notify_control_nth_native(c_index, val);
                     }
                 }
             }
             if moved { self.mirror_lv2_editor_on_face(lv2_node); }
+            if toggle_native_gui { self.toggle_unit_native_gui(lv2_node); }
             return;
         }
         let rig = self.editor_rig;
@@ -12730,6 +13017,7 @@ impl DemoApp {
                 value: v as f64,
             });
         }
+        self.notify_lv2_gui_norm(node, param, v);
     }
 
     fn node_plugin_summary(&self, node: u32) -> serde_json::Value {
@@ -12763,6 +13051,20 @@ impl DemoApp {
                     "features": info.map(|p| p.features.clone()).unwrap_or_default(),
                     "summary": cat.map(|c| c.description),
                     "about": cat.map(|c| c.about),
+                })
+            }
+            NodeKind::Vst3 { plugin_id } => {
+                let cid = plugin_id.as_str();
+                let info = self.plugins_vst3.iter().find(|p| p.cid.eq_ignore_ascii_case(cid));
+                serde_json::json!({
+                    "name": info.map(|p| p.name.as_str()).unwrap_or(unit_name.as_str()),
+                    "unit": unit_name,
+                    "format": "vst3",
+                    "cid": info.map(|p| p.cid.as_str()).unwrap_or(cid),
+                    "vendor": info.map(|p| p.vendor.as_str()),
+                    "version": info.map(|p| p.version.as_str()),
+                    "sub_categories": info.map(|p| p.sub_categories.clone()).unwrap_or_default(),
+                    "is_yabridge": info.is_some_and(|p| p.is_yabridge),
                 })
             }
             NodeKind::Lv2 { uri } => {
@@ -12872,7 +13174,7 @@ impl DemoApp {
         let mut params_json: Vec<serde_json::Value> = Vec::new();
 
         match node_kind {
-            Some(NodeKind::Clap { .. }) => {
+            Some(NodeKind::Clap { .. } | NodeKind::Vst3 { .. }) => {
                 if let Some(pool_idx) = self.rig_of_unit(u_idx).and_then(|slot| self.clap_pool_idx(slot)) {
                     if let Some(main) = self._surge_main.get_mut(pool_idx) {
                         let raw: Vec<ParamDesc> = main
@@ -13241,6 +13543,7 @@ impl DemoApp {
                 "catalog": catalog,
                 "installed_counts": {
                     "clap": self.plugins_clap.len(),
+                    "vst3": self.plugins_vst3.len(),
                     "lv2": self.plugins_lv2.len(),
                 },
                 "hint": "Pass query='<name, id, or uri>' or node=<id> to inspect full parameters and architecture.",
@@ -13410,6 +13713,47 @@ impl DemoApp {
             }
         }
 
+        // 5. Installed VST3 plugins
+        if matches!(format.as_str(), "all" | "vst3" | "vst") {
+            for p in &self.plugins_vst3 {
+                let hay = format!("{} {} {} {}", p.cid, p.name, p.vendor, p.sub_categories.join(" ")).to_lowercase();
+                if words.iter().all(|w| hay.contains(w)) {
+                    let mut entry = serde_json::json!({
+                        "format": "vst3",
+                        "cid": p.cid,
+                        "name": p.name,
+                        "vendor": p.vendor,
+                        "version": p.version,
+                        "sub_categories": p.sub_categories,
+                        "is_yabridge": p.is_yabridge,
+                        "is_instrument": vst3_is_instrument(p),
+                        "is_effect": vst3_is_audio_insert(p),
+                    });
+                    let key = crate::vst3::voice_key(&p.cid);
+                    if let Some(pool_idx) = self.clap_plugin_ids.iter().position(|id| id == &key) {
+                        if let Some(main) = self._surge_main.get_mut(pool_idx) {
+                            let list: Vec<ParamDesc> = main
+                                .param_list()
+                                .into_iter()
+                                .filter(|x| x.automatable && !x.hidden && !x.readonly)
+                                .collect();
+                            let mut mods: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                            for item in &list {
+                                let k = if item.module.is_empty() { "(Global)".to_string() } else { item.module.clone() };
+                                *mods.entry(k).or_insert(0) += 1;
+                            }
+                            entry["param_count"] = serde_json::json!(list.len());
+                            entry["modules"] = serde_json::Value::Array(
+                                mods.into_iter().map(|(m, n)| serde_json::json!({"module": m, "count": n})).collect(),
+                            );
+                        }
+                    }
+                    matches.push(entry);
+                    if matches.len() >= 20 { break; }
+                }
+            }
+        }
+
         serde_json::json!({
             "query": query,
             "count": matches.len(),
@@ -13469,7 +13813,7 @@ impl DemoApp {
         let node_kind = self.base_graph.node(node).map(|n| n.kind.clone());
 
         match node_kind {
-            Some(NodeKind::Clap { .. }) => {
+            Some(NodeKind::Clap { .. } | NodeKind::Vst3 { .. }) => {
                 // Explicit target="knob" or name="LEVEL" edits the rack LEVEL knob (engine param 0).
                 let want_level = explicit_target == Some(CcTarget::Knob)
                     && (param_id.is_none() || param_id == Some(P_LEVEL))
@@ -14003,7 +14347,7 @@ impl DemoApp {
         let mut reset_names: Vec<String> = Vec::new();
 
         match node_kind {
-            Some(NodeKind::Clap { .. }) => {
+            Some(NodeKind::Clap { .. } | NodeKind::Vst3 { .. }) => {
                 let slot = self.rig_of_unit(u_idx);
                 let Some(idx) = slot.and_then(|s| self.clap_pool_idx(s)) else {
                     return format!("error: {unit_name} (node {node}) has no running CLAP voice");
@@ -15516,6 +15860,11 @@ impl DemoApp {
                     .unwrap_or_else(|| sentence_case(&u.name));
                 Some((label, "CLAP"))
             }
+            NodeKind::Vst3 { plugin_id } => {
+                let label = self.plugin_display_name(&plugin_id.as_str())
+                    .unwrap_or_else(|| sentence_case(&u.name));
+                Some((label, "VST3"))
+            }
             NodeKind::Lv2 { .. } => Some((sentence_case(&u.name), "LV2")),
             NodeKind::Dsp(_) | NodeKind::Arp | NodeKind::SystemAudio => Some((sentence_case(&u.name), "built-in")),
             NodeKind::MidiFx { plugin } => Some((
@@ -15659,7 +16008,7 @@ impl DemoApp {
         let u = &self.units[ti];
         let patch = self.voice_slot_of_node(u.node_id).and_then(|s| self.patch_names.get(s)).cloned().flatten();
         let plugin = match self.base_graph.node(u.node_id).map(|n| &n.kind) {
-            Some(NodeKind::Clap { plugin_id }) => self.plugin_display_name(plugin_id.as_str()),
+            Some(NodeKind::Clap { plugin_id } | NodeKind::Vst3 { plugin_id }) => self.plugin_display_name(plugin_id.as_str()),
             _ => None,
         }.or_else(|| Some(sentence_case(&u.name)));
         Some(crate::demo::kind_for(ty, patch.as_deref(), plugin.as_deref()))
@@ -20214,16 +20563,22 @@ impl DemoApp {
         self.poll_plugin_scan();
     }
 
-    /// Discover CLAP + LV2 plugins off the UI thread (inline under test).
+    /// Discover CLAP + LV2 + VST3 plugins off the UI thread (inline under test).
     fn start_plugin_scan(&mut self, retry_failed: bool) {
         let scan = move || {
             let clap = if retry_failed { crate::host::list_clap_plugins_retry_failed() } else { list_clap_plugins() };
             let (lv2, mut unloadable) = crate::lv2::discover_with_unloadable();
+            let (vst3, vst3_err) = if retry_failed {
+                (crate::vst3::list_vst3_plugins_retry_failed(), Vec::new())
+            } else {
+                crate::vst3::list_vst3_plugins_with_errors()
+            };
             unloadable.splice(0..0, crate::host::unloadable_clap_bundles());
-            (clap, lv2, unloadable)
+            unloadable.extend(vst3_err);
+            (clap, lv2, vst3, unloadable)
         };
         if cfg!(test) {
-            (self.plugins_clap, self.plugins_lv2, self.plugins_unloadable) = scan();
+            (self.plugins_clap, self.plugins_lv2, self.plugins_vst3, self.plugins_unloadable) = scan();
             self.plugins_loaded = true;
             return;
         }
@@ -20251,9 +20606,10 @@ impl DemoApp {
     fn poll_plugin_scan(&mut self) {
         let Some(rx) = &self.plugin_scan else { return };
         match rx.try_recv() {
-            Ok((clap, lv2, unloadable)) => {
+            Ok((clap, lv2, vst3, unloadable)) => {
                 self.plugins_clap = clap;
                 self.plugins_lv2 = lv2;
+                self.plugins_vst3 = vst3;
                 self.plugins_unloadable = unloadable;
                 self.plugins_loaded = true;
                 self.plugin_scan = None;
@@ -20265,7 +20621,7 @@ impl DemoApp {
     }
 
     /// Mark the rack's LV2 units that the plugin scan calls instruments, and
-    /// the CLAP units that are audio effects (either by plugin scan / suffix
+    /// the CLAP/VST3 units that are audio effects (either by plugin scan / suffix
     /// or because an audio edge feeds them).
     fn classify_lv2_units(&mut self) {
         for u in &mut self.units {
@@ -20287,6 +20643,17 @@ impl DemoApp {
                     });
                     let fx = clap_id_is_effect(plugin_id.as_str(), &self.plugins_clap) || fed_by_audio;
                     set_unit_clap_fx(u, fx);
+                }
+                Some(NodeKind::Vst3 { plugin_id }) => {
+                    let fed_by_audio = self.base_graph.edges.iter().any(|e| {
+                        e.kind == CPortKind::Audio && e.to.node == u.node_id
+                    });
+                    let fx = vst3_id_is_effect(plugin_id.as_str(), &self.plugins_vst3) || fed_by_audio;
+                    set_unit_clap_fx(u, fx);
+                    if fx && u.sub == "clap effect" {
+                        u.sub = "vst3 effect".into();
+                        u.sub_g = None;
+                    }
                 }
                 _ => {}
             }
@@ -20424,6 +20791,23 @@ impl DemoApp {
         }
         let before = self.rig_count();
         let graph = crate::control::instrument_rig_graph(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name);
+        self.edit_rigs_with_graph(None, Some(name), Some(graph));
+        if self.rig_count() > before {
+            self.plugin_msg = format!("New {name} rig — Keys→{name}→Master");
+            self.stage_view = StageView::Rack;
+        } else {
+            self.plugin_msg = format!("Add failed: {}", self.session_msg);
+        }
+    }
+
+    /// Add a new VST3 instrument rig alongside existing rigs.
+    fn add_vst3_rig(&mut self, cid: &str, name: &str) {
+        if self.rig_count() >= Self::MAX_RIGS {
+            self.plugin_msg = format!("At most {} rigs", Self::MAX_RIGS);
+            return;
+        }
+        let before = self.rig_count();
+        let graph = crate::control::vst3_rig_graph(cid, name);
         self.edit_rigs_with_graph(None, Some(name), Some(graph));
         if self.rig_count() > before {
             self.plugin_msg = format!("New {name} rig — Keys→{name}→Master");
@@ -20899,7 +21283,7 @@ impl DemoApp {
                 // Counts on the chips follow the format filter; the
                 // subcategory chips belong to the type in view.
                 let (type_counts, sub_counts) = {
-                    let all = crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2);
+                    let all = crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3);
                     let shown: Vec<&crate::plugins::Entry> =
                         all.iter().filter(|e| self.plugin_format.is_none_or(|f| f == e.format())).collect();
                     let type_counts = PluginType::ALL.map(|ty| shown.iter().filter(|e| e.ty() == ty).count());
@@ -21387,7 +21771,7 @@ impl DemoApp {
                             limit: None,
                         };
                         let mut entries: Vec<crate::plugins::Entry> =
-                            crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2)
+                            crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3)
                                 .into_iter()
                                 .filter(|e| wanted.matches(e))
                                 .collect();
@@ -21442,10 +21826,12 @@ impl DemoApp {
                                     for e in row {
                                         let card = BrowserCard::of(e);
                                         Self::plugin_card(ui, card_w, |ui, iw| {
-                                            let fmt = match e.format() {
-                                                PluginFormat::BuiltIn => "BUILT-IN",
-                                                PluginFormat::Clap => "CLAP",
-                                                PluginFormat::Lv2 => "LV2",
+                                            let fmt = match e.source {
+                                                crate::plugins::Source::Builtin(_) => "BUILT-IN",
+                                                crate::plugins::Source::Clap(_) => "CLAP",
+                                                crate::plugins::Source::Vst3(p) if p.is_yabridge => "VST3 · YABRIDGE",
+                                                crate::plugins::Source::Vst3(_) => "VST3",
+                                                crate::plugins::Source::Lv2(_) => "LV2",
                                             };
                                             // An instrument always names its type (#198).
                                             let badge = if show_sub_badge || e.instrument_type().is_some() { format!("{fmt} · {}", e.badge()) } else { fmt.to_string() };
@@ -21541,6 +21927,7 @@ impl DemoApp {
                     } else {
                         match act {
                             BrowserAction::NewClapRig(id, name) => self.add_clap_rig(&id, &name),
+                            BrowserAction::NewVst3Rig(cid, name) => self.add_vst3_rig(&cid, &name),
                             BrowserAction::NewLv2Rig(uri, name) => self.add_lv2_instrument_rig(&uri, &name),
                             BrowserAction::AddInstrument(kind, name) => self.add_instrument_to_active_rig(kind, &name),
                             BrowserAction::AddEffect(kind, name) => self.add_effect_to_active_rig(kind, &name),
@@ -23673,6 +24060,17 @@ impl DemoApp {
                 let feats = self.plugins_clap.iter().find(|p| p.id == pid).map(|p| p.features.clone()).unwrap_or_default();
                 (name, feats)
             }
+            NodeKind::Vst3 { plugin_id } => {
+                let cid = plugin_id.as_str();
+                let name = self.plugin_display_name(cid);
+                let cats = self
+                    .plugins_vst3
+                    .iter()
+                    .find(|p| p.cid.eq_ignore_ascii_case(cid))
+                    .map(|p| p.sub_categories.clone())
+                    .unwrap_or_default();
+                (name, cats)
+            }
             NodeKind::Lv2 { uri } => {
                 let name = self.plugins_lv2.iter().find(|p| p.uri == uri.as_str()).map(|p| p.name.clone())
                     .or_else(|| Some(sentence_case(&u.name)));
@@ -25148,23 +25546,24 @@ impl DemoApp {
         if let Some(p) = self.plugins_clap.iter().find(|p| p.id == plugin_id) {
             return Some(p.name.clone());
         }
+        let target = crate::vst3::strip_vst3_key(plugin_id).unwrap_or(plugin_id);
+        if let Some(p) = self.plugins_vst3.iter().find(|p| p.cid.eq_ignore_ascii_case(target)) {
+            return Some(p.name.clone());
+        }
         (plugin_id == SURGE_ID || plugin_id == "Surge XT").then(|| "Surge XT".to_string())
     }
 
-    /// Clap unit subtitles name what is really loaded: "Surge XT · Wurli"
-    /// (plugin · patch), not the generic "clap instrument" (user). Cheap per
+    /// Clap/VST3 unit subtitles name what is really loaded: "Surge XT · Wurli"
+    /// (plugin · patch), not the generic subtitle (user). Cheap per
     /// frame: a few string compares; the galley is rebuilt only on change.
     fn refresh_instrument_subs(&mut self) {
-        if self.plugins_clap.is_empty() && !self.plugins_loaded && !cfg!(test)
+        if (self.plugins_clap.is_empty() || self.plugins_vst3.is_empty()) && !self.plugins_loaded && !cfg!(test)
             && self.units.iter().any(|u| matches!(u.node_kind, UnitKind::Clap))
         {
             self.start_plugin_scan(false); // background (rule 46); fills names when done
         }
         let ids: Vec<(u32, String)> = self.base_graph.nodes.iter()
-            .filter_map(|n| match &n.kind {
-                NodeKind::Clap { plugin_id } => Some((n.id, plugin_id.as_str().to_string())),
-                _ => None,
-            })
+            .filter_map(|n| n.kind.hosted_plugin_id().map(|pid| (n.id, pid.to_string())))
             .collect();
         for (slot, node) in self.clap_rigs() {
             let Some(pid) = ids.iter().find(|(id, _)| *id == node).map(|(_, p)| p.clone()) else { continue };
@@ -25671,6 +26070,9 @@ impl DemoApp {
                         if k.sent.map_or(true, |s| (k.value - s).abs() > 1e-6) {
                             if b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
                                 k.sent = Some(k.value);
+                                if let Some((_, h)) = self.lv2_guis.iter_mut().find(|(n, _)| *n == u.node_id) {
+                                    h.notify_control_nth(p as usize, k.value);
+                                }
                             }
                         }
                     }
@@ -28240,6 +28642,7 @@ impl DemoApp {
                 if let Some(k) = self.units.get_mut(unit).and_then(|u| u.knobs.get_mut(knob)) {
                     k.sent = Some(val);
                 }
+                self.notify_lv2_gui_norm(node_id, p, val);
             }
         }
         if let Some(pin) = clap_pin {
@@ -29629,6 +30032,36 @@ impl DemoApp {
                                             ))
                                         })
                                         .chain(
+                                            self.plugins_vst3
+                                                .iter()
+                                                .filter(|p| vst3_is_audio_insert(p))
+                                                .filter_map(|p| {
+                                                    let sub = classify_vst3(p);
+                                                    if self.insert_subtype.is_some_and(|s| s != sub) { return None; }
+                                                    if !matches_query(
+                                                        &[
+                                                            &p.name,
+                                                            &p.vendor,
+                                                            &p.cid,
+                                                            &p.sub_categories.join(" "),
+                                                            sub.plugin_type().label(),
+                                                            sub.label(),
+                                                            "vst3",
+                                                            if p.is_yabridge { "yabridge" } else { "" },
+                                                        ],
+                                                        &filter,
+                                                    ) {
+                                                        return None;
+                                                    }
+                                                    Some((
+                                                        sub,
+                                                        p.name.clone(),
+                                                        vst3_subtitle(p),
+                                                        NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(&p.cid) },
+                                                    ))
+                                                }),
+                                        )
+                                        .chain(
                                             self.plugins_lv2
                                                 .iter()
                                                 .filter(|p| lv2_is_audio_insert(p))
@@ -29665,7 +30098,7 @@ impl DemoApp {
                                     }
                                 } else if filter.is_empty() {
                                     ui.add_space(4.0);
-                                    ui.label(egui::RichText::new("scanning installed CLAP and LV2 effects in the background…").size(11.0).color(theme::INK_2));
+                                    ui.label(egui::RichText::new("scanning installed CLAP, VST3 and LV2 effects in the background…").size(11.0).color(theme::INK_2));
                                 }
                             }
                             if shown == 0 {
@@ -34560,6 +34993,7 @@ impl DemoApp {
             }
             main.pump();
         }
+        self.pump_lv2_guis();
         self.adopt_hw_devices();
         self.sync_instrument_maps();
         self.poll_plugin_scan();
@@ -34660,7 +35094,7 @@ impl DemoApp {
         // animation / agent run is active; ~30 fps when unfocused and idle.
         if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
-        } else if self._surge_main.iter().any(|m| m.editor_open()) {
+        } else if self._surge_main.iter().any(|m| m.editor_open()) || !self.lv2_guis.is_empty() {
             // Plugin editors paint from timers this frame loop runs.
             ctx.request_repaint_after(std::time::Duration::from_millis(15));
         } else {
@@ -34703,7 +35137,13 @@ impl eframe::App for DemoApp {
         if self.autosave.enabled {
             self.autosave_now(&Self::sessions_dir());
         }
-        // Native editor holds no plugin GUI; just drop its cached state.
+        // Close any open native plugin GUI windows before teardown.
+        for (_, mut handle) in self.lv2_guis.drain(..) {
+            handle.close();
+        }
+        for main in &mut self._surge_main {
+            main.close_editor();
+        }
         self.editor_open = false;
         self.editor_params.clear();
         // Drain + finalize any take in flight and join the writer thread, so a
@@ -39477,6 +39917,7 @@ mod split_bpm_tests {
                 num_ports: 4,
                 is_instrument: true,
                 is_midi_fx: false,
+                ..Default::default()
             }];
             app.catalog_roots = Some(vec![]);
             app.stage_view = StageView::Plugins;
@@ -39553,6 +39994,7 @@ mod split_bpm_tests {
                 num_ports: 4,
                 is_instrument: true,
                 is_midi_fx: false,
+                ..Default::default()
             }];
             app.catalog_roots = Some(vec![]);
             app.stage_view = StageView::Plugins;
@@ -40205,7 +40647,7 @@ mod split_bpm_tests {
         assert!(!app.units[organ(&app)].lv2_inst, "classified from the scan list, which says effect");
 
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send((Vec::new(), vec![info(true)], Vec::new())).unwrap();
+        tx.send((Vec::new(), vec![info(true)], Vec::new(), Vec::new())).unwrap();
         app.plugin_scan = Some(rx);
         app.poll_plugin_scan();
         let u = &app.units[organ(&app)];
@@ -41643,6 +42085,7 @@ mod stage_views_tests {
                 num_ports: 4,
                 is_instrument: true,
                 is_midi_fx: false,
+                ..Default::default()
             },
             Lv2PluginInfo {
                 uri: "http://lsp-plug.in/plugins/lv2/compressor_lr".into(),
@@ -41652,6 +42095,7 @@ mod stage_views_tests {
                 num_ports: 12,
                 is_instrument: false,
                 is_midi_fx: false,
+                ..Default::default()
             },
             Lv2PluginInfo {
                 uri: "http://guitarix.sourceforge.net/plugins/gx_zita_rev1_stereo".into(),
@@ -41661,6 +42105,7 @@ mod stage_views_tests {
                 num_ports: 8,
                 is_instrument: false,
                 is_midi_fx: false,
+                ..Default::default()
             },
             Lv2PluginInfo {
                 uri: "http://kxstudio.sf.net/carla/plugins/miditranspose".into(),
@@ -41670,6 +42115,7 @@ mod stage_views_tests {
                 num_ports: 3,
                 is_instrument: false,
                 is_midi_fx: true,
+                ..Default::default()
             },
             Lv2PluginInfo {
                 uri: "http://guitarix.sourceforge.net/plugins/gxtuner#tuner".into(),
@@ -41679,6 +42125,7 @@ mod stage_views_tests {
                 num_ports: 4,
                 is_instrument: false,
                 is_midi_fx: false,
+                ..Default::default()
             },
         ];
         app.stage_view = StageView::Plugins;
@@ -41770,6 +42217,7 @@ mod stage_views_tests {
                 num_ports: 12,
                 is_instrument: false,
                 is_midi_fx: false,
+                ..Default::default()
             },
             Lv2PluginInfo {
                 uri: "http://kxstudio.sf.net/carla/plugins/miditranspose".into(),
@@ -41779,6 +42227,7 @@ mod stage_views_tests {
                 num_ports: 3,
                 is_instrument: false,
                 is_midi_fx: true,
+                ..Default::default()
             },
         ];
         app.stage_view = StageView::Mixer;
@@ -42171,7 +42620,7 @@ mod ui_polish_agent_tests {
         use crate::sounds::{Instrument, Library, Load, Sound};
         let sound = |category: &str, name: &str, load| Sound { category: category.into(), name: name.into(), preferred: true, load };
         match instrument {
-            Instrument::Clap(_) => Library {
+            Instrument::Clap(_) | Instrument::Vst3(_) => Library {
                 kind: "Surge patches".into(),
                 sounds: vec![sound("Basses", "Deep Bass", Load::SurgePatch("/nowhere/Deep Bass.fxp".into())), sound("Pads", "Warm Pad", Load::SurgePatch("/nowhere/Warm Pad.fxp".into()))],
                 params: vec![],
@@ -53895,5 +54344,50 @@ mod precision_knob_tests {
         for (i, n) in names.iter().enumerate() { let _ = app.rename_rig(i, n); }
         app.stage_view = StageView::Mixer;
         super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("pinned-mixer-6rigs.png"));
+    }
+
+    #[test]
+    fn lv2_native_gui_state_follows_has_ui_and_vst3_unit_wires_compat_and_editor() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        let uri_with_ui = "urn:test:lv2:with-ui";
+        let uri_no_ui = "urn:test:lv2:no-ui";
+        app.plugins_lv2 = vec![
+            Lv2PluginInfo {
+                uri: uri_with_ui.into(),
+                name: "With UI".into(),
+                author: "Test".into(),
+                lv2_class: "ReverbPlugin".into(),
+                num_ports: 2,
+                is_instrument: false,
+                is_midi_fx: false,
+                has_ui: true,
+            },
+            Lv2PluginInfo {
+                uri: uri_no_ui.into(),
+                name: "No UI".into(),
+                author: "Test".into(),
+                lv2_class: "ReverbPlugin".into(),
+                num_ports: 2,
+                is_instrument: false,
+                is_midi_fx: false,
+                has_ui: false,
+            },
+        ];
+        let cid = "0123456789ABCDEF0123456789ABCDEF";
+        let mut g = Graph::demo_patch();
+        let n_ui = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri_with_ui) }, name_bytes("LV2 UI"));
+        let n_plain = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri_no_ui) }, name_bytes("LV2 NO"));
+        let n_vst3_a = g.add_node(NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(cid) }, name_bytes("VST3 A"));
+        let n_vst3_b = g.add_node(NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(cid) }, name_bytes("VST3 B"));
+        app.build_rack(&g, &[]);
+
+        assert_eq!(app.unit_native_gui_state(n_ui), Some(false), "LV2 unit with has_ui exposes native GUI");
+        assert_eq!(app.unit_native_gui_state(n_plain), None, "LV2 unit without UI returns None");
+        assert!(app.unit_has_param_editor(n_vst3_a));
+        assert_eq!(app.unit_compat_key(n_vst3_a), Some(UnitCompatKey::Vst3(cid.to_string())));
+        assert_eq!(app.unit_compat_key(n_vst3_a), app.unit_compat_key(n_vst3_b));
+        let u_idx = app.units.iter().position(|u| u.node_id == n_vst3_a).unwrap();
+        assert_eq!(app.node_plugin_info(u_idx).map(|(_, k)| k), Some("VST3"));
     }
 }

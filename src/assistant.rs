@@ -659,15 +659,15 @@ fn system_prompt() -> String {
     "You are the built-in assistant of kabelsalat, a live audio/MIDI wiring app for Linux \
      (AUM-style routing, Reason-style rack flip, written in Rust). You help with setup, \
      routing, sound design, and troubleshooting (PipeWire, ALSA MIDI, latency, xruns).\n\n\
-     The app is a graph of nodes — Keys, CLAP/LV2 instruments (Surge XT, Unsampled Piano, \
+     The app is a graph of nodes — Keys, CLAP/VST3/LV2 instruments (Surge XT, Unsampled Piano, \
      Dexed, setBfree, …), built-in DSP (delay/reverb/EQ/\
-     filter/limiter/etc.), LV2 effects, an Audio In unit (live mic/guitar/interface with \
+     filter/limiter/etc.), CLAP/VST3/LV2 effects, an Audio In unit (live mic/guitar/interface with \
      a tuner), system-audio capture, file player, Master — wired \
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
      list_channels (rigs, source channels with colours, and their plugin chains), \
-     get_status, list_plugins, inspect_plugin (deep profile of any built-in DSP, CLAP, \
+     get_status, list_plugins, inspect_plugin (deep profile of any built-in DSP, CLAP, VST3, \
      LV2, or catalog plugin — architecture, signal role, modules, parameters, units, and \
      scale points, either by plugin name/id/uri or live node id), list_params (live node \
      parameters with current values, formatted musical text, min/max/default, units, \
@@ -678,7 +678,7 @@ fn system_prompt() -> String {
      \"why does it crackle\" or \"what uses the CPU\"; reset_engine_peaks restarts its maxima; \
      set_buffer_size changes the audio buffer size in frames live — smaller for lower latency, \
      larger to stop dropouts/xruns).\n\
-     - Shape & configure plugins: set_param dials ANY parameter on a CLAP synth/FX, LV2 \
+     - Shape & configure plugins: set_param dials ANY parameter on a CLAP/VST3 synth or FX, LV2 \
      plugin, setBfree tonewheel organ, built-in DSP unit, Audio In, or Master — by exact \
      param id OR parameter name (+ optional module), accepting musical text (e.g. \"300 ms\", \
      \"1.2 kHz\", \"+4 dB\", \"Ping-Pong\", \"Highpass\", \"FAST\", \"6/8\"), plain native \
@@ -824,10 +824,10 @@ fn system_prompt() -> String {
      INSTRUMENTS VS SOUNDS: when the user asks for a specific instrument plugin by name \
      (e.g. Unsampled Piano, Dexed, Odin 2, Six Sines, Starbreath, OneTrick KEYS, setBfree, \
      Aeolus, Vitalium, YANES), NEVER substitute a Surge patch — check \
-     list_plugins(type=\"instrument\") for its plugin_id (CLAP) or uri (LV2) (or \
+     list_plugins(type=\"instrument\") for its plugin_id (CLAP), cid (VST3), or uri (LV2) (or \
      list_instruments if not installed, and offer install_instrument). Put it on a new rig \
-     with add_rig(plugin_id=…), or switch the rig in view to it with \
-     add_node(kind=\"clap\", plugin_id=…, name=…) (or kind=\"lv2\", uri=…) — which \
+     with add_rig(plugin_id=…) / add_rig(cid=…), or switch the rig in view to it with \
+     add_node(kind=\"clap\", plugin_id=…, name=…), add_node(kind=\"vst3\", cid=…, name=…), or add_node(kind=\"lv2\", uri=…) — which \
      auto-wires Keys -> it -> Master — and remove_node on the old synth it replaces unless \
      the user asked to layer them. \
      Every instrument has its OWN sound library, and load_sound / list_sounds \
@@ -1161,8 +1161,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_insert",
-            "description":"Add an effect at the end of a strip's insert chain (#74) — the chain is the rack cables, so the rack re-wires with it. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb), kind=lv2 with uri= (an installed LV2 effect from list_plugins), or kind=clap with plugin_id= (an installed CLAP audio effect from list_plugins). source = the strip's source node id; omit source to add a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain.",
-            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"kind":{"type":"string","enum":["dsp","lv2","clap"]},"dsp":{"type":"string","enum":["gain","pan","eq3","filter","limiter","saturation","delay","reverb"]},"uri":{"type":"string","description":"LV2 effect URI (list_plugins)"},"plugin_id":{"type":"string","description":"CLAP effect plugin_id (list_plugins)"},"name":{"type":"string"}},"required":["kind"]}
+            "description":"Add an effect at the end of a strip's insert chain (#74) — the chain is the rack cables, so the rack re-wires with it. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb), kind=lv2 with uri= (an installed LV2 effect from list_plugins), kind=clap with plugin_id= (an installed CLAP audio effect from list_plugins), or kind=vst3 with cid= (an installed VST3 audio effect from list_plugins). source = the strip's source node id; omit source to add a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"kind":{"type":"string","enum":["dsp","lv2","clap","vst3"]},"dsp":{"type":"string","enum":["gain","pan","eq3","filter","limiter","saturation","delay","reverb"]},"uri":{"type":"string","description":"LV2 effect URI (list_plugins)"},"plugin_id":{"type":"string","description":"CLAP effect plugin_id (list_plugins)"},"cid":{"type":"string","description":"VST3 32-char CID (list_plugins)"},"name":{"type":"string"}},"required":["kind"]}
         }},
         {"type":"function","function":{
             "name":"remove_insert",
@@ -1201,13 +1201,13 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_channels",
-            "description":"List every rig's mixer channels and plugin chains (Navigator view: rigs, source channels with strip colours, and each channel's instrument + linear insert chain with kind CLAP / LV2 / built-in).",
+            "description":"List every rig's mixer channels and plugin chains (Navigator view: rigs, source channels with strip colours, and each channel's instrument + linear insert chain with kind CLAP / VST3 / LV2 / built-in).",
             "parameters":{"type":"object","properties":{"filter":{"type":"string","enum":["channels","plugins","all"],"description":"Default all"}}}
         }},
         {"type":"function","function":{
             "name":"list_plugins",
-            "description":"List built-in units and installed CLAP/LV2 plugins organized by type (Instruments, Effects, MIDI FX, Utilities) and effect subcategory (Delay & Reverb, EQ & Filter, Dynamics, Drive & Amp, Modulation, Pitch & Spatial, Multi-FX, Analyzers, …). Pass optional type, category, format, or query to narrow large LV2 lists.",
-            "parameters":{"type":"object","properties":{"type":{"type":"string","enum":["all","instrument","effect","midi_fx","utility"],"description":"Filter by plugin type (default all)"},"category":{"type":"string","description":"Filter by subcategory (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"},"format":{"type":"string","enum":["all","builtin","clap","lv2"],"description":"Filter by plugin format (default all)"},"query":{"type":"string","description":"Optional search words matching name, author/vendor, uri/id, or category"},"limit":{"type":"integer","description":"Max items per section (default 24 unfiltered, 60 filtered)"}}}
+            "description":"List built-in units and installed CLAP/VST3/LV2 plugins organized by type (Instruments, Effects, MIDI FX, Utilities) and effect subcategory (Delay & Reverb, EQ & Filter, Dynamics, Drive & Amp, Modulation, Pitch & Spatial, Multi-FX, Analyzers, …). Pass optional type, category, format, or query to narrow large lists.",
+            "parameters":{"type":"object","properties":{"type":{"type":"string","enum":["all","instrument","effect","midi_fx","utility"],"description":"Filter by plugin type (default all)"},"category":{"type":"string","description":"Filter by subcategory (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"},"format":{"type":"string","enum":["all","builtin","clap","vst3","lv2"],"description":"Filter by plugin format (default all)"},"query":{"type":"string","description":"Optional search words matching name, author/vendor, cid/uri/id, or category"},"limit":{"type":"integer","description":"Max items per section (default 24 unfiltered, 60 filtered)"}}}
         }},
         {"type":"function","function":{
             "name":"list_instruments",
@@ -1351,8 +1351,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_node",
-            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|arp|midi_fx|audio_in|system_audio|master_out. kind arp adds an arpeggiator/chord unit between the rig's Keys and its synth (wired for you; tune it with set_arp). kind midi_fx = a MIDI effect in the rig's MIDI chain (list_midi_fx): uri = an LV2 MIDI plugin (transpose, filter, …), no uri = the built-in transposer (semis -24..24); it is inserted between the rig's Keys and its instruments for you (result says so, do not connect it). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
-            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"semis":{"type":"integer"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+            "description":"Add a node to the patch. kind: keys|clap|vst3|dsp|lv2|arp|midi_fx|audio_in|system_audio|master_out. kind arp adds an arpeggiator/chord unit between the rig's Keys and its synth (wired for you; tune it with set_arp). kind midi_fx = a MIDI effect in the rig's MIDI chain (list_midi_fx): uri = an LV2 MIDI plugin (transpose, filter, …), no uri = the built-in transposer (semis -24..24); it is inserted between the rig's Keys and its instruments for you (result says so, do not connect it). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; vst3 needs 'cid' (32-char hex TUID from list_plugins); audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, vst3 instrument, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/vst3/lv2 effect nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
+            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"cid":{"type":"string"},"semis":{"type":"integer"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
         }},
         {"type":"function","function":{
             "name":"list_midi_fx",
@@ -1422,7 +1422,7 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"add_rig",
             "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional sound query loaded into the new rig's instrument from its own library (e.g. 'flute' for Surge, 'rhodes' or 'e.piano' for Dexed, 'bass' for YANES). For Dexed, always pass a playable sound (or follow up with list_sounds/load_sound) — Dexed's factory default 'Say Again.' is an octave-bouncing echo FX patch. Returns get_rigs.",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional sound query for the new rig's instrument, e.g. 'flute' for Surge, 'rhodes' or 'e.piano' for Dexed"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional sound query for the new rig's instrument, e.g. 'flute' for Surge, 'rhodes' or 'e.piano' for Dexed"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"},"cid":{"type":"string","description":"Optional VST3 32-char hex CID from list_plugins: the rig is Keys -> that VST3 instrument -> Master"}}}
         }},
         {"type":"function","function":{
             "name":"clone_rig",
@@ -1481,10 +1481,10 @@ pub(crate) fn tools() -> Value {
     list.extend([
         json!({"type":"function","function":{
             "name":"inspect_plugin",
-            "description":"Deep technical and musical inspection of any plugin — built-in DSP (delay, reverb, eq3, filter, limiter, saturation, gain, pan, bus, metronome), installed CLAP/LV2 plugins, catalog instruments (even before installing), or a live rack node. Returns role/category, description, module architecture, and full parameter specifications (ids, ranges, defaults, units, scale points). Pass either node=<id> (inspect a loaded unit) or query=<name, id, or URI>.",
+            "description":"Deep technical and musical inspection of any plugin — built-in DSP (delay, reverb, eq3, filter, limiter, saturation, gain, pan, bus, metronome), installed CLAP/VST3/LV2 plugins, catalog instruments (even before installing), or a live rack node. Returns role/category, description, module architecture, and full parameter specifications (ids, ranges, defaults, units, scale points). Pass either node=<id> (inspect a loaded unit) or query=<name, cid, id, or URI>.",
             "parameters":{"type":"object","properties":{
-                "query":{"type":"string","description":"Plugin name, CLAP id, LV2 URI, built-in DSP kind, or catalog id (e.g. 'delay', 'eq3', 'setbfree', 'surge')"},
-                "format":{"type":"string","enum":["all","builtin","clap","lv2","catalog"],"description":"Optional format filter (default all)"},
+                "query":{"type":"string","description":"Plugin name, CLAP id, VST3 CID, LV2 URI, built-in DSP kind, or catalog id (e.g. 'delay', 'eq3', 'setbfree', 'surge')"},
+                "format":{"type":"string","enum":["all","builtin","clap","vst3","lv2","catalog"],"description":"Optional format filter (default all)"},
                 "node":{"type":"integer","description":"Optional live node id from get_graph to inspect its active plugin and configuration"}
             }}
         }}),
@@ -1861,7 +1861,9 @@ fn chain_end(g: &Graph, rig: u64, f: &Facts) -> Option<(NodeId, Vec<Edge>)> {
     let feeds: Vec<Edge> = g.edges.iter().filter(is_audio)
         .filter(|e| e.to.node == master && kind_of(e) != Some(&NodeKind::Dsp(DspKind::Metronome)))
         .cloned().collect();
-    let only_sources = feeds.iter().all(|e| matches!(kind_of(e), Some(NodeKind::Clap { .. } | NodeKind::AudioIn { .. })));
+    let only_sources = feeds.iter().all(|e| {
+        matches!(kind_of(e), Some(NodeKind::Clap { .. } | NodeKind::Vst3 { .. } | NodeKind::AudioIn { .. }))
+    });
     let names_a_place = f.words().iter().any(|w| ["after", "before", "between", "behind", "front"].contains(&w.as_str()));
     (!feeds.is_empty() && (only_sources || !names_a_place)).then_some((master, feeds))
 }

@@ -22,6 +22,8 @@ pub const ODIN_ID: &str = "com.thewavewarden.odin2";
 pub enum Instrument {
     /// A CLAP plugin, by plugin id.
     Clap(String),
+    /// A VST3 plugin, by 32-char uppercase hex CID.
+    Vst3(String),
     /// An LV2 plugin, by URI.
     Lv2(String),
 }
@@ -37,6 +39,14 @@ impl Instrument {
                 }
                 // Graphs written before plugin ids name Surge by its label.
                 Some(Instrument::Clap(if id.is_empty() || id == "Surge XT" { SURGE_ID.to_string() } else { id.to_string() }))
+            }
+            NodeKind::Vst3 { plugin_id } => {
+                let raw = plugin_id.as_str();
+                let cid = crate::vst3::strip_vst3_key(raw).unwrap_or(raw).to_ascii_uppercase();
+                if crate::plugins::vst3_id_is_effect(&cid, &[]) {
+                    return None;
+                }
+                Some(Instrument::Vst3(cid))
             }
             NodeKind::Lv2 { uri } => Some(Instrument::Lv2(uri.as_str().to_string())),
             _ => None,
@@ -122,9 +132,9 @@ pub enum Source {
 }
 
 impl Instrument {
-    /// The CLAP plugin id or the LV2 URI.
+    /// The CLAP plugin id, VST3 CID, or LV2 URI.
     pub fn id(&self) -> &str {
-        let (Instrument::Clap(id) | Instrument::Lv2(id)) = self;
+        let (Instrument::Clap(id) | Instrument::Vst3(id) | Instrument::Lv2(id)) = self;
         id
     }
 
@@ -135,7 +145,7 @@ impl Instrument {
             Instrument::Clap(id) if id == ODIN_ID => Source::OdinSoundbanks,
             Instrument::Clap(id) if id == crate::aeolus::AEOLUS_ID => Source::AeolusRegistrations,
             Instrument::Clap(id) if id == crate::unsampled_piano::PLUGIN_ID => Source::UnsampledPianoProfiles,
-            Instrument::Clap(_) => Source::PresetParameter,
+            Instrument::Clap(_) | Instrument::Vst3(_) => Source::PresetParameter,
             Instrument::Lv2(uri) if uri == crate::vital::URI => Source::VitalPatches,
             Instrument::Lv2(_) => Source::Lv2Bundles,
         }

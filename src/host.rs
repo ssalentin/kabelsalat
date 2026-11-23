@@ -566,7 +566,9 @@ pub struct ClapVoice {
     is_effect: bool,
     /// None while a restart has the set on the main thread: silence.
     live: Option<Box<Live>>,
-    /// Out-of-process worker backend (#209). When `Some`, `live` is `None`.
+    /// Direct VST3 audio processor backend (when plugin_id is `vst3:<cid>`).
+    vst3: Option<Box<crate::vst3::Vst3Voice>>,
+    /// Out-of-process worker backend (#209). When `Some`, `live` and `vst3` are `None`.
     sandbox: Option<Box<sandbox::SandboxVoice>>,
     link: AudioLink,
     cmds_tx: Arc<Mutex<rtrb::Producer<VoiceCmd>>>,
@@ -633,9 +635,17 @@ impl ClapVoice {
         Self::instantiate_entry(entry, plugin_id, sample_rate)
     }
 
-    /// Load any CLAP plugin by `plugin_id` from the CLAP search paths,
+    /// Load any CLAP or VST3 plugin (`vst3:<cid>`) from search paths,
     /// instantiate, activate and start processing at `sample_rate`.
     pub fn new_plugin(sample_rate: f64, plugin_id: &str) -> Result<(ClapVoice, ClapVoiceMain)> {
+        if crate::vst3::is_vst3_key(plugin_id) {
+            let (voice, main) = crate::vst3::Vst3VoiceMain::load(plugin_id, sample_rate)?;
+            let lat = voice.shared_latency();
+            return Ok((
+                Self::from_vst3(plugin_id.to_string(), sample_rate, lat, voice),
+                ClapVoiceMain::from_vst3(main),
+            ));
+        }
         let (entry, cid) = discover_plugin(plugin_id)?;
         Self::instantiate_entry(entry, cid, sample_rate)
     }
@@ -736,6 +746,7 @@ impl ClapVoice {
             plugin_id: id_str.clone(),
             is_effect,
             live: Some(live),
+            vst3: None,
             sandbox: None,
             link: audio_link,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
@@ -756,7 +767,7 @@ impl ClapVoice {
             tail_queried: false,
         };
         let main_id = id_str;
-        let mut main = ClapVoiceMain {
+        let mut main = ClapVoiceMain::from_clap(ClapMainInner {
             instance: plugin,
             exts,
             main_controls: MainControls::default(),
@@ -770,12 +781,47 @@ impl ClapVoice {
             served: Served::default(),
             sample_rate,
             _entry: entry,
-        };
-        main.refresh_main_controls();
+        });
+        main.as_clap_mut().unwrap().refresh_main_controls();
         if let Some(state) = crate::aeolus::initial_state(&main_id) {
             main.load_state(&state).with_context(|| format!("starting {main_id} with a registration"))?;
         }
         Ok((voice, main))
+    }
+
+    pub(crate) fn from_vst3(
+        plugin_id: String,
+        sample_rate: f64,
+        latency: Arc<AtomicU32>,
+        vst3: crate::vst3::Vst3Voice,
+    ) -> Self {
+        let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let (link, _main_link) = restart_link();
+        Self {
+            voice_id: NEXT_VOICE_ID.fetch_add(1, Ordering::Relaxed),
+            plugin_id,
+            is_effect: vst3.is_effect(),
+            live: None,
+            vst3: Some(Box::new(vst3)),
+            sandbox: None,
+            link,
+            cmds_tx: Arc::new(Mutex::new(cmds_tx)),
+            cmds_rx,
+            rt_cmds: Vec::with_capacity(EVENT_CAP as usize),
+            schedule: Vec::new(),
+            sched_idx: 0,
+            frame: 0,
+            sample_rate,
+            ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
+            ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
+            process_errors: 0,
+            gate: Arc::new(StateGate::default()),
+            latency,
+            tail_ext: None,
+            last_status: ProcessStatus::Continue,
+            tail_length: TailLength::Finite(0),
+            tail_queried: false,
+        }
     }
 
     /// Construct a `ClapVoice` backed by an isolated `plugin-worker` process (#209).
@@ -793,6 +839,7 @@ impl ClapVoice {
             plugin_id,
             is_effect,
             live: None,
+            vst3: None,
             sandbox: Some(Box::new(sandbox)),
             link,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
@@ -851,6 +898,9 @@ impl ClapVoice {
         if let Some(sb) = &self.sandbox {
             return sb.param_range(id);
         }
+        if let Some(v) = &self.vst3 {
+            return v.param_range(id);
+        }
         let ranges = &self.live.as_ref()?.param_ranges;
         ranges.binary_search_by_key(&id, |&(pid, _, _)| pid).ok().map(|idx| (ranges[idx].1, ranges[idx].2))
     }
@@ -902,6 +952,9 @@ impl ClapVoice {
         if let Some(sb) = &self.sandbox {
             return sb.last_process_status();
         }
+        if self.vst3.is_some() {
+            return ProcessStatus::Continue;
+        }
         self.last_status
     }
 
@@ -910,6 +963,10 @@ impl ClapVoice {
     pub fn tail_length(&self) -> Option<TailLength> {
         if let Some(sb) = &self.sandbox {
             return sb.tail_length();
+        }
+        if let Some(v) = &self.vst3 {
+            let t = v.tail_samples();
+            return Some(if t == u32::MAX { TailLength::Infinite } else { TailLength::Finite(t) });
         }
         self.tail_ext.map(|_| self.tail_length)
     }
@@ -920,6 +977,12 @@ impl ClapVoice {
     pub fn take_wake_request(&mut self) -> bool {
         if let Some(sb) = &mut self.sandbox {
             return sb.take_wake_request()
+                || !self.rt_cmds.is_empty()
+                || !self.cmds_rx.is_empty()
+                || self.sched_idx < self.schedule.len();
+        }
+        if let Some(v) = &mut self.vst3 {
+            return v.take_wake_request()
                 || !self.rt_cmds.is_empty()
                 || !self.cmds_rx.is_empty()
                 || self.sched_idx < self.schedule.len();
@@ -944,6 +1007,12 @@ impl ClapVoice {
                 || !self.cmds_rx.is_empty()
                 || self.sched_idx < self.schedule.len();
         }
+        if let Some(v) = &self.vst3 {
+            return v.has_pending_work()
+                || !self.rt_cmds.is_empty()
+                || !self.cmds_rx.is_empty()
+                || self.sched_idx < self.schedule.len();
+        }
         self.live.is_none()
             || self.link.stop.load(Ordering::Acquire)
             || !self.rt_cmds.is_empty()
@@ -954,6 +1023,11 @@ impl ClapVoice {
     /// Advance the sample clock across a sleeping block without calling
     /// `process()`, keeping pending restart handoffs responsive. Allocation- and lock-free.
     pub fn sleep_skip(&mut self, frames: usize) {
+        if let Some(v) = &mut self.vst3 {
+            v.sleep_skip(frames);
+            self.frame += frames as u64;
+            return;
+        }
         if self.sandbox.is_none() {
             self.hand_over();
         }
@@ -1007,6 +1081,25 @@ impl ClapVoice {
                 self.sched_idx += 1;
             }
             sb.render_block(n, inp, out, transport, &self.rt_cmds);
+            self.rt_cmds.clear();
+            self.frame += n as u64;
+            return;
+        }
+        if let Some(v) = &mut self.vst3 {
+            while let Ok(cmd) = self.cmds_rx.pop() {
+                if self.rt_cmds.len() < self.rt_cmds.capacity() {
+                    self.rt_cmds.push(cmd);
+                }
+            }
+            while self.sched_idx < self.schedule.len()
+                && self.schedule[self.sched_idx].0 < self.frame + n as u64
+            {
+                if self.rt_cmds.len() < self.rt_cmds.capacity() {
+                    self.rt_cmds.push(self.schedule[self.sched_idx].1);
+                }
+                self.sched_idx += 1;
+            }
+            v.render_block(n, inp, out, transport, &self.rt_cmds);
             self.rt_cmds.clear();
             self.frame += n as u64;
             return;
@@ -1526,7 +1619,7 @@ mod host_request_tests {
         assert!(!voice.take_wake_request(), "wake flag resets when consumed");
 
         // Main-thread wake triggers (`gate.request_wake`, `request_flush`, and `request_restart`) wake sleeping voices.
-        main.gate.request_wake();
+        main.as_clap_mut().unwrap().gate.request_wake();
         assert!(voice.take_wake_request(), "gate.request_wake() requests wake");
         assert!(!voice.take_wake_request(), "gate wake flag resets when consumed");
 
@@ -1744,22 +1837,44 @@ fn ready_fds(fds: &[(i32, FdFlags)]) -> Vec<(i32, FdFlags)> {
         .collect()
 }
 
-/// `kabelsalat editor-test [plugin-id...]`: open every installed CLAP
-/// plugin's own editor (or the named ones), run its main-thread callbacks for
-/// a while, and check that the editor attached to the host window. Hold each
-/// open longer with `KABELSALAT_EDITOR_HOLD=<seconds>` (for screenshots).
+/// `kabelsalat editor-test [plugin-id...]`: open every installed CLAP, VST3, and
+/// LV2 plugin's own editor (or the named ones), run its main-thread callbacks
+/// for a while, and check that the editor attached to the host window. Hold
+/// each open longer with `KABELSALAT_EDITOR_HOLD=<seconds>` (for screenshots).
 pub fn run_editor_test(ids: &[String]) -> Result<()> {
-    let ids: Vec<String> = if ids.is_empty() {
-        let mut all: Vec<String> = list_clap_plugins().into_iter().map(|p| p.id).collect();
-        all.sort();
-        all.dedup();
-        all
+    let mut lv2_uris = Vec::new();
+    let mut voice_ids = Vec::new();
+    if ids.is_empty() {
+        for p in list_clap_plugins() {
+            voice_ids.push(p.id);
+        }
+        for p in crate::vst3::list_vst3_plugins() {
+            voice_ids.push(crate::vst3::voice_key(&p.cid));
+        }
+        for p in crate::lv2::discover() {
+            if p.has_ui {
+                lv2_uris.push(p.uri);
+            }
+        }
+        voice_ids.sort();
+        voice_ids.dedup();
+        lv2_uris.sort();
+        lv2_uris.dedup();
     } else {
-        ids.to_vec()
-    };
+        for raw in ids {
+            if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with("urn:") {
+                lv2_uris.push(raw.clone());
+            } else if crate::vst3::scan::parse_tuid(raw).is_some() && !crate::vst3::is_vst3_key(raw) {
+                voice_ids.push(crate::vst3::voice_key(raw));
+            } else {
+                voice_ids.push(raw.clone());
+            }
+        }
+    }
+
     let hold = std::env::var("KABELSALAT_EDITOR_HOLD").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.0);
     let mut failed = Vec::new();
-    for id in &ids {
+    for id in &voice_ids {
         let (voice, mut main) = match ClapVoice::new_plugin(48_000.0, id) {
             Ok(v) => v,
             Err(e) => {
@@ -1809,6 +1924,12 @@ pub fn run_editor_test(ids: &[String]) -> Result<()> {
             }
         }
         main.retire(voice);
+    }
+    if !lv2_uris.is_empty() {
+        if let Err(e) = crate::lv2::ui::run_lv2_ui_test(&lv2_uris) {
+            println!("editor-test LV2 FAIL: {e:#}");
+            failed.push("lv2".to_string());
+        }
     }
     if failed.is_empty() {
         println!("=== editor-test PASS ===");
@@ -1910,7 +2031,8 @@ pub fn parked_clap_count(plugin_id: &str) -> usize {
 /// Main-thread side of a [`ClapVoice`]: the CLAP plugin instance (which is
 /// `!Send`), state save/restore and deactivation. Must stay on the
 /// thread that called `ClapVoice::new`.
-pub struct ClapVoiceMain {
+/// CLAP backend state held inside [`ClapVoiceMain`].
+struct ClapMainInner {
     instance: PluginInstance<TestHost>,
     exts: Exts,
     /// Resolved when the instance is created, and again only when the plugin
@@ -1943,13 +2065,13 @@ struct ClapEditor {
     resizable: bool,
 }
 
-impl Drop for ClapVoiceMain {
+impl Drop for ClapMainInner {
     fn drop(&mut self) {
         self.close_editor();
     }
 }
 
-impl ClapVoiceMain {
+impl ClapMainInner {
     fn select_gui_config(&mut self) -> Option<(PluginGui, GuiConfiguration<'static>)> {
         let gui = self.exts.gui?;
         let handle = self.instance.plugin_handle();
@@ -2521,6 +2643,229 @@ impl ClapVoiceMain {
     }
 }
 
+enum VoiceMainBackend {
+    Clap(Box<ClapMainInner>),
+    Vst3(Box<crate::vst3::Vst3VoiceMain>),
+}
+
+/// Main-thread side of a [`ClapVoice`]: hosts either a CLAP or VST3 plugin
+/// instance (`!Send`), handling state save/restore, parameter queries, native
+/// editors, and deactivation.
+pub struct ClapVoiceMain {
+    backend: Option<VoiceMainBackend>,
+}
+
+impl Drop for ClapVoiceMain {
+    fn drop(&mut self) {
+        self.close_editor();
+    }
+}
+
+impl ClapVoiceMain {
+    fn from_clap(inner: ClapMainInner) -> Self {
+        Self { backend: Some(VoiceMainBackend::Clap(Box::new(inner))) }
+    }
+
+    pub(crate) fn from_vst3(inner: crate::vst3::Vst3VoiceMain) -> Self {
+        Self { backend: Some(VoiceMainBackend::Vst3(Box::new(inner))) }
+    }
+
+    fn as_clap_mut(&mut self) -> Option<&mut ClapMainInner> {
+        match self.backend.as_mut()? {
+            VoiceMainBackend::Clap(c) => Some(c),
+            VoiceMainBackend::Vst3(_) => None,
+        }
+    }
+
+    /// Whether the plugin has its own editor kabelsalat can open.
+    pub fn has_editor(&mut self) -> bool {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.has_editor(),
+            VoiceMainBackend::Vst3(v) => v.has_editor(),
+        }
+    }
+
+    pub fn editor_open(&self) -> bool {
+        match self.backend.as_ref().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.editor_open(),
+            VoiceMainBackend::Vst3(v) => v.editor_open(),
+        }
+    }
+
+    pub fn open_editor(&mut self, title: &str) -> Result<()> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.open_editor(title),
+            VoiceMainBackend::Vst3(v) => v.open_editor(title),
+        }
+    }
+
+    pub fn close_editor(&mut self) {
+        match self.backend.as_mut() {
+            Some(VoiceMainBackend::Clap(c)) => c.close_editor(),
+            Some(VoiceMainBackend::Vst3(v)) => v.close_editor(),
+            None => {}
+        }
+    }
+
+    pub fn pump(&mut self) {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.pump(),
+            VoiceMainBackend::Vst3(v) => {
+                let _ = v.pump();
+            }
+        }
+    }
+
+    pub fn service(&mut self) {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.service(),
+            VoiceMainBackend::Vst3(v) => {
+                let _ = v.service();
+            }
+        }
+    }
+
+    pub fn served(&self) -> Served {
+        match self.backend.as_ref().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.served(),
+            VoiceMainBackend::Vst3(_) => Served::default(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        match self.backend.as_ref().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.is_active(),
+            VoiceMainBackend::Vst3(_) => true,
+        }
+    }
+
+    pub fn editor_children(&self) -> Option<usize> {
+        match self.backend.as_ref().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.editor_children(),
+            VoiceMainBackend::Vst3(v) => v.editor_children(),
+        }
+    }
+
+    pub fn instance_mut(&mut self) -> &mut PluginInstance<TestHost> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.instance_mut(),
+            VoiceMainBackend::Vst3(_) => panic!("instance_mut() is CLAP-only"),
+        }
+    }
+
+    pub fn latency(&mut self) -> u32 {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.latency(),
+            VoiceMainBackend::Vst3(v) => v.latency(),
+        }
+    }
+
+    pub fn poll_latency(&mut self) -> u32 {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.poll_latency(),
+            VoiceMainBackend::Vst3(v) => {
+                v.poll_latency();
+                v.latency()
+            }
+        }
+    }
+
+    pub fn save_state(&mut self) -> Result<Vec<u8>> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.save_state(),
+            VoiceMainBackend::Vst3(v) => v.save_state(),
+        }
+    }
+
+    pub fn load_state(&mut self, data: &[u8]) -> Result<()> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.load_state(data),
+            VoiceMainBackend::Vst3(v) => v.load_state(data),
+        }
+    }
+
+    pub fn retire(mut self, voice: ClapVoice) {
+        match self.backend.take() {
+            Some(VoiceMainBackend::Clap(c)) => c.retire(voice),
+            Some(VoiceMainBackend::Vst3(v)) => {
+                v.retire();
+                drop(voice);
+            }
+            None => drop(voice),
+        }
+    }
+
+    pub fn param_list(&mut self) -> Vec<ParamDesc> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.param_list(),
+            VoiceMainBackend::Vst3(v) => v.param_list(),
+        }
+    }
+
+    pub fn main_controls(&self) -> &MainControls {
+        match self.backend.as_ref().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.main_controls(),
+            VoiceMainBackend::Vst3(v) => v.main_controls(),
+        }
+    }
+
+    pub fn poll_main_controls(&mut self) -> bool {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.poll_main_controls(),
+            VoiceMainBackend::Vst3(v) => v.poll_main_controls(),
+        }
+    }
+
+    pub fn param_desc(&mut self, id: u32) -> Option<ParamDesc> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.param_desc(id),
+            VoiceMainBackend::Vst3(v) => v.param_desc(id),
+        }
+    }
+
+    pub fn param_value(&mut self, id: u32) -> Option<f64> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.param_value(id),
+            VoiceMainBackend::Vst3(v) => v.param_value(id),
+        }
+    }
+
+    pub fn param_text(&mut self, id: u32, value: f64) -> String {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.param_text(id, value),
+            VoiceMainBackend::Vst3(v) => v.param_text(id, value),
+        }
+    }
+
+    pub fn param_text_opt(&mut self, id: u32, value: f64) -> Option<String> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.param_text_opt(id, value),
+            VoiceMainBackend::Vst3(v) => v.param_text_opt(id, value),
+        }
+    }
+
+    pub fn param_text_to_value(&mut self, id: u32, text: &str) -> Option<f64> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.param_text_to_value(id, text),
+            VoiceMainBackend::Vst3(v) => v.param_text_to_value(id, text),
+        }
+    }
+
+    pub fn param_options(&mut self, p: &ParamDesc) -> Vec<(f64, String)> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.param_options(p),
+            VoiceMainBackend::Vst3(v) => v.param_options(p),
+        }
+    }
+
+    pub fn resolve_param_text(&mut self, p: &ParamDesc, text: &str) -> Option<f64> {
+        match self.backend.as_mut().expect("active plugin") {
+            VoiceMainBackend::Clap(c) => c.resolve_param_text(p, text),
+            VoiceMainBackend::Vst3(v) => v.resolve_param_text(p, text),
+        }
+    }
+}
+
 /// A plugin parameter description for the native editor (no X11 / plugin GUI).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ParamDesc {
@@ -2565,7 +2910,7 @@ pub fn run_test() -> Result<()> {
     let (mut voice, mut main) = ClapVoice::new(sample_rate)?;
 
     // 3. Parameters: print a sample, pick one automatable param to modulate.
-    let params_ext = main.exts.params;
+    let params_ext = main.as_clap_mut().unwrap().exts.params;
     let mod_param = inspect_params(main.instance_mut(), params_ext)?;
 
     // 4. State round-trip, part 1: snapshot the pristine state.
@@ -2636,7 +2981,7 @@ pub fn run_test() -> Result<()> {
     //    real host restoring a session during playback. Surge applies loaded
     //    state on the audio thread, so we give it a few blocks to settle.
     if let Some(mp) = &mod_param {
-        let params = main.exts.params.ok_or_else(|| anyhow!("no params extension"))?;
+        let params = main.as_clap_mut().unwrap().exts.params.ok_or_else(|| anyhow!("no params extension"))?;
         let tol = (mp.max - mp.min) * 1e-3 + 1e-9;
         let v = params
             .get_value(&main.instance_mut().plugin_handle(), mp.id)

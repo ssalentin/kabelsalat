@@ -258,6 +258,8 @@ pub enum NodeKind {
     Keys,
     /// Hosted CLAP plugin (e.g. Surge XT).
     Clap { plugin_id: ClapId },
+    /// Hosted VST3 plugin (native or yabridge), identified by 32-char hex TUID.
+    Vst3 { plugin_id: ClapId },
     /// Built-in processing node.
     Dsp(DspKind),
     /// Hosted LV2 plugin (audio effect), identified by URI.
@@ -291,6 +293,47 @@ impl NodeKind {
     /// a new transport-capable kind needs only its engine render gate.
     pub fn supports_transport(&self) -> bool {
         matches!(self, NodeKind::Dsp(DspKind::Metronome))
+    }
+
+    /// True for plugin formats hosted through the unified `ClapVoice` / sandbox
+    /// host (CLAP and VST3).
+    pub fn is_hosted_voice(&self) -> bool {
+        matches!(self, NodeKind::Clap { .. } | NodeKind::Vst3 { .. })
+    }
+
+    /// The stored plugin id (CLAP reverse-DNS id or 32-char VST3 CID).
+    pub fn hosted_plugin_id(&self) -> Option<&str> {
+        match self {
+            NodeKind::Clap { plugin_id } | NodeKind::Vst3 { plugin_id } => Some(plugin_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Unified host lookup key passed to `ClapVoice::new_plugin` (`"vst3:<CID>"` for VST3).
+    pub fn voice_plugin_key(&self) -> Option<String> {
+        match self {
+            NodeKind::Clap { plugin_id } => Some(clap_plugin_key(plugin_id.as_str()).to_string()),
+            NodeKind::Vst3 { plugin_id } => {
+                let raw = plugin_id.as_str();
+                let cid = crate::vst3::strip_vst3_key(raw).unwrap_or(raw);
+                Some(crate::vst3::voice_key(&cid.to_ascii_uppercase()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Allocation-free check whether a live voice's `plugin_id()` matches this node.
+    pub fn voice_matches(&self, voice_plugin_id: &str) -> bool {
+        match self {
+            NodeKind::Clap { plugin_id } => voice_plugin_id == clap_plugin_key(plugin_id.as_str()),
+            NodeKind::Vst3 { plugin_id } => {
+                let raw = plugin_id.as_str();
+                let target = crate::vst3::strip_vst3_key(raw).unwrap_or(raw);
+                crate::vst3::strip_vst3_key(voice_plugin_id)
+                    .is_some_and(|cid| cid.eq_ignore_ascii_case(target))
+            }
+            _ => false,
+        }
     }
 }
 
@@ -444,7 +487,7 @@ impl Graph {
         let Some(keys) = keys else { return 0 };
         // The rig's Keys→instrument MIDI cables this arp takes over.
         let claps: Vec<NodeId> = self.nodes.iter()
-            .filter(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. }))
+            .filter(|n| n.rig == rig && n.kind.is_hosted_voice())
             .map(|n| n.id)
             .collect();
         let take_over: Vec<(u8, NodeId)> = self.edges.iter()
@@ -714,7 +757,7 @@ impl Graph {
             .iter()
             .filter(|n| {
                 n.rig == rig
-                    && matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. })
+                    && (n.kind.is_hosted_voice() || matches!(n.kind, NodeKind::Lv2 { .. }))
                     && !has_in(self, n.id)
                     && self.edges.iter().any(|e| e.kind == PortKind::Audio && e.from.node == n.id)
             })
@@ -889,18 +932,15 @@ pub fn bind_voices(graph: &Graph, voices: &[(u64, &str)]) -> Vec<(NodeId, Option
     graph
         .nodes
         .iter()
-        .filter_map(|n| match &n.kind {
-            NodeKind::Clap { plugin_id } => Some((n.id, clap_plugin_key(plugin_id.as_str()))),
-            _ => None,
-        })
-        .map(|(node, key)| {
+        .filter(|n| n.kind.is_hosted_voice())
+        .map(|n| {
             let free = (0..voices.len())
-                .filter(|&i| !taken[i] && voices[i].1 == key)
+                .filter(|&i| !taken[i] && n.kind.voice_matches(voices[i].1))
                 .min_by_key(|&i| voices[i].0);
             if let Some(i) = free {
                 taken[i] = true;
             }
-            (node, free.map(|i| voices[i].0))
+            (n.id, free.map(|i| voices[i].0))
         })
         .collect()
 }
@@ -951,6 +991,13 @@ pub fn standard_rig_graph(with_synth: bool) -> Graph {
 /// L/R). `name` labels the synth unit.
 pub fn plugin_rig_graph(plugin_id: &str, name: &str) -> Graph {
     instrument_rig_graph(NodeKind::Clap { plugin_id: ClapId::new(plugin_id) }, name)
+}
+
+/// A rig around one VST3 instrument: Keys → plugin → Master (MIDI + stereo
+/// L/R). `cid` is the 32-char uppercase hex TUID; `name` labels the synth unit.
+pub fn vst3_rig_graph(cid: &str, name: &str) -> Graph {
+    let raw = crate::vst3::strip_vst3_key(cid).unwrap_or(cid);
+    instrument_rig_graph(NodeKind::Vst3 { plugin_id: ClapId::new(&raw.to_ascii_uppercase()) }, name)
 }
 
 /// Single-instrument rig for any instrument node (CLAP or LV2): Keys →
@@ -1456,6 +1503,7 @@ impl Command {
                 NodeKind::Arp | NodeKind::MidiFx { .. } => Ends,
                 NodeKind::Keys
                 | NodeKind::Clap { .. }
+                | NodeKind::Vst3 { .. }
                 | NodeKind::Lv2 { .. }
                 | NodeKind::Dsp(_)
                 | NodeKind::MasterOut

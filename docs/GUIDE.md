@@ -18,7 +18,9 @@ every keyboard shortcut.
   - [Put MIDI effects in front of an instrument](#put-midi-effects-in-front-of-an-instrument)
 - [Plugins](#plugins)
   - [Browse and install plugins by type](#browse-and-install-plugins-by-type)
+  - [VST3 plugins and native plugin GUIs](#vst3-plugins-and-native-plugin-guis)
   - [Install instruments from the catalog](#install-instruments-from-the-catalog)
+  - [Plugin crash isolation](#plugin-crash-isolation)
 - [Mix](#mix)
   - [Mix](#mix)
   - [Share an effect with sends](#share-an-effect-with-sends)
@@ -186,7 +188,7 @@ Click the **padlock** button next to the view tabs (or press **Ctrl+L**) to **lo
 bass on one keyboard and pads on another. A session holds up to 32 rigs, enough
 to keep every sound of a gig loaded. All rigs play together; switch the one you
 are looking at with **1–9** or **← →**, or pick any rig from the Left Rail or
-the top bar, which scroll when there are many. Any installed CLAP or LV2 instrument works
+the top bar, which scroll when there are many. Any installed CLAP, VST3 or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
 it has loaded. Every rig row in the Left Rail (**Q**) has a **▶** demo button
 that loops a live musical phrase suited to its sound (keys, bass, lead, pad,
@@ -223,13 +225,32 @@ rather than by plugin format: **Instruments**, **Effects**, **MIDI FX**,
 **Utilities** and the **Install** catalog. Narrow **Effects** by subcategory
 (**Delay & Reverb**, **EQ & Filter**, **Dynamics**, **Drive & Amp**,
 **Modulation**, **Pitch & Spatial**, **Multi-FX**) or filter by format
-(**Built-in**, **CLAP**, **LV2**). Add an instrument as a **New rig** alongside
+(**Built-in**, **CLAP**, **VST3**, **LV2**). Add an instrument as a **New rig** alongside
 your existing rigs or layer it into the active rig, insert any effect onto the
 active rig or straight onto the **Master FX** bus, and filter the mixer's
 **+ insert** picker by the same effect categories. The assistant and MCP agents
 search the same taxonomy with `list_plugins`.
 
 <p align="center"><img src="shots/plugins.png" width="85%" alt="The Plugins view organized by type (Instruments, Effects, MIDI FX, Utilities) with effect subcategory and format filters"/></p>
+
+### VST3 plugins and native plugin GUIs
+
+kabelsalat discovers Linux-native and yabridge-bridged Windows `.vst3` plugins
+in `~/.vst3`, `/usr/lib/vst3`, `/usr/local/lib/vst3`, `/usr/lib64/vst3`, and
+`$VST3_PATH` (out of process via `kabelsalat scan-vst3`). Bridged Windows
+plugins show a `VST3 · YABRIDGE` badge in the plugin browser. VST3 instruments
+and effects run inside the same per-plugin shared-memory sandbox as CLAP plugins,
+save state into sessions, map MIDI CCs (`IMidiMapping`), and open their native
+`IPlugView` X11 editor window.
+
+LV2 instruments, audio effects, and MIDI strips that ship a native
+`ui:X11UI` or `ui:showInterface` editor also expose **Open plugin window** in
+both the rack unit's right-click menu and the LV2 preset/parameter window.
+Controls moved inside the native LV2 GUI stay synchronized with the rack knobs
+and engine parameters (and vice versa). Note that yabridge and native X11
+plugin UIs run in XWayland windows on Linux; while verified against C probe
+fixtures (`vst3-test`, `lv2-ui-test`), specific third-party Windows/desktop
+bundles can be checked against your installed plugins.
 
 ### Install instruments from the catalog
 
@@ -252,16 +273,17 @@ which plugins have been tested, what works, and what is still untested.
 
 ### Plugin crash isolation
 
-Every hosted CLAP plugin runs in its own isolated `kabelsalat plugin-worker`
-helper process, communicating with the audio engine over an anonymous Linux
-shared-memory block (`memfd_create` + cross-process futex) and a control socket
-for parameters, state and the plugin's X11 editor window. If a plugin crashes
-(`SIGSEGV`, `SIGABRT`) or hangs past its per-block deadline, the engine plays
-silence for that strip while every other rig keeps sounding without an xrun.
-kabelsalat automatically restarts the dead helper with the unit's last saved
-state and shows a `RESTARTED` badge on the strip so you know what happened.
+Every hosted CLAP and VST3 plugin runs in its own isolated
+`kabelsalat plugin-worker` helper process, communicating with the audio engine
+over an anonymous Linux shared-memory block (`memfd_create` + cross-process
+futex) and a control socket for parameters, state and the plugin's X11 editor
+window. If a plugin crashes (`SIGSEGV`, `SIGABRT`) or hangs past its per-block
+deadline, the engine plays silence for that strip while every other rig keeps
+sounding without an xrun. kabelsalat automatically restarts the dead helper
+with the unit's last saved state and shows a `RESTARTED` badge on the strip so
+you know what happened.
 
-Set `KABELSALAT_SANDBOX=0` to host CLAP plugins in-process instead. Run
+Set `KABELSALAT_SANDBOX=0` to host CLAP and VST3 plugins in-process instead. Run
 `kabelsalat sandbox-test` to verify `SIGSEGV` recovery across two live rigs and
 measure the shared-memory IPC round-trip time at 64 and 256 frames.
 

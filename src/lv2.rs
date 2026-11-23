@@ -7,6 +7,9 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_uint, c_void};
 
+#[path = "lv2_ui.rs"]
+pub mod ui;
+
 // Opaque lilv types.
 #[repr(C)]
 struct LilvWorld {
@@ -46,6 +49,14 @@ struct LilvScalePoints {
 }
 #[repr(C)]
 struct LilvScalePoint {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct LilvUIs {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct LilvUI {
     _private: [u8; 0],
 }
 
@@ -362,6 +373,22 @@ extern "C" {
     fn lilv_plugin_get_latency_port_index(plugin: *const LilvPlugin) -> u32;
     fn lilv_new_file_uri(world: *mut LilvWorld, host: *const c_char, path: *const c_char) -> *mut LilvNode;
     fn lilv_world_load_bundle(world: *mut LilvWorld, bundle_uri: *const LilvNode);
+    fn lilv_world_ask(
+        world: *mut LilvWorld,
+        subject: *const LilvNode,
+        predicate: *const LilvNode,
+        object: *const LilvNode,
+    ) -> bool;
+    fn lilv_plugin_get_uis(plugin: *const LilvPlugin) -> *mut LilvUIs;
+    fn lilv_uis_begin(collection: *const LilvUIs) -> *mut LilvIter;
+    fn lilv_uis_is_end(collection: *const LilvUIs, iter: *const LilvIter) -> bool;
+    fn lilv_uis_get(collection: *const LilvUIs, iter: *const LilvIter) -> *const LilvUI;
+    fn lilv_uis_next(collection: *const LilvUIs, iter: *mut LilvIter) -> *mut LilvIter;
+    fn lilv_uis_free(collection: *mut LilvUIs);
+    fn lilv_ui_get_uri(ui: *const LilvUI) -> *const LilvNode;
+    fn lilv_ui_is_a(ui: *const LilvUI, class_uri: *const LilvNode) -> bool;
+    fn lilv_ui_get_bundle_uri(ui: *const LilvUI) -> *const LilvNode;
+    fn lilv_ui_get_binary_uri(ui: *const LilvUI) -> *const LilvNode;
 }
 
 /// One MIDI event a MIDI-FX plugin wrote to its output port.
@@ -386,6 +413,18 @@ pub struct Lv2PluginInfo {
     pub is_instrument: bool,
     /// A MIDI-only unit: events in, events out, no audio port at all.
     pub is_midi_fx: bool,
+    /// True when the plugin declares a native UI we can host (`ui:X11UI` or `ui:showInterface`).
+    pub has_ui: bool,
+}
+
+/// Discovered native LV2 GUI metadata for one plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lv2UiInfo {
+    pub ui_uri: String,
+    pub bundle_path: String,
+    pub binary_path: String,
+    pub is_x11: bool,
+    pub resizable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -594,11 +633,10 @@ unsafe fn read_port_facts(world: *mut LilvWorld, plugin: *const LilvPlugin, port
 pub fn main_controls_for_uri(uri: &str) -> crate::main_controls::MainControls {
     let _lilv = lilv_guard();
     unsafe {
-        let world = lilv_world_new();
+        let world = new_world_with_extras();
         if world.is_null() {
             return Default::default();
         }
-        lilv_world_load_all(world);
         let plugin = find_plugin(world, uri);
         let candidates: Vec<_> = if plugin.is_null() {
             Vec::new()
@@ -703,11 +741,10 @@ pub(crate) fn set_control_descs_for_test(uri: &str, found: Vec<Lv2ControlDesc>) 
 pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
     let _lilv = lilv_guard();
     unsafe {
-        let world = lilv_world_new();
+        let world = new_world_with_extras();
         if world.is_null() {
             return Vec::new();
         }
-        lilv_world_load_all(world);
         let plugin = find_plugin(world, uri);
         let descs = if plugin.is_null() {
             Vec::new()
@@ -1250,14 +1287,195 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
 pub fn discover_with_unloadable() -> (Vec<Lv2PluginInfo>, Vec<String>) {
     let _lilv = lilv_guard();
     unsafe {
-        let world = lilv_world_new();
+        let world = new_world_with_extras();
         if world.is_null() {
             return (Vec::new(), Vec::new());
         }
-        lilv_world_load_all(world);
         let found = collect_plugins(world);
         lilv_world_free(world);
         found
+    }
+}
+
+unsafe fn new_world_with_extras() -> *mut LilvWorld {
+    let world = lilv_world_new();
+    if world.is_null() {
+        return std::ptr::null_mut();
+    }
+    lilv_world_load_all(world);
+    for dir in EXTRA_BUNDLES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let bundle = lilv_new_file_uri(world, std::ptr::null(), dir.as_ptr());
+        lilv_world_load_bundle(world, bundle);
+        lilv_node_free(bundle);
+    }
+    world
+}
+
+unsafe fn parse_file_node_path(node: *const LilvNode) -> Option<String> {
+    if node.is_null() {
+        return None;
+    }
+    let uri = lilv_node_as_uri(node);
+    if uri.is_null() {
+        return None;
+    }
+    let path = lilv_file_uri_parse(uri, std::ptr::null_mut());
+    if path.is_null() {
+        return None;
+    }
+    let out = CStr::from_ptr(path).to_string_lossy().into_owned();
+    lilv_free(path as *mut c_void);
+    Some(out)
+}
+
+unsafe fn inspect_plugin_ui(world: *mut LilvWorld, plugin: *const LilvPlugin) -> Option<Lv2UiInfo> {
+    let uis = lilv_plugin_get_uis(plugin);
+    if uis.is_null() {
+        return None;
+    }
+    let x11_ui = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#X11UI\0".as_ptr() as *const c_char);
+    let show_ui = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#showInterface\0".as_ptr() as *const c_char);
+    let lv2_ext = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#extensionData\0".as_ptr() as *const c_char);
+    let ui_ext = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#extensionData\0".as_ptr() as *const c_char);
+    let opt_feat = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#optionalFeature\0".as_ptr() as *const c_char);
+    let req_feat = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#requiredFeature\0".as_ptr() as *const c_char);
+    let fixed_size = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#fixedSize\0".as_ptr() as *const c_char);
+    let no_user_resize = lilv_new_uri(world, b"http://lv2plug.in/ns/extensions/ui#noUserResize\0".as_ptr() as *const c_char);
+
+    let mut best_x11: Option<Lv2UiInfo> = None;
+    let mut best_show: Option<Lv2UiInfo> = None;
+
+    let mut it = lilv_uis_begin(uis);
+    while !it.is_null() && !lilv_uis_is_end(uis, it) {
+        let ui = lilv_uis_get(uis, it);
+        if !ui.is_null() {
+            let ui_node = lilv_ui_get_uri(ui);
+            let is_x11 = lilv_ui_is_a(ui, x11_ui);
+            let has_show = lilv_world_ask(world, ui_node, lv2_ext, show_ui)
+                || lilv_world_ask(world, ui_node, ui_ext, show_ui)
+                || lilv_ui_is_a(ui, show_ui);
+            if is_x11 || has_show {
+                let ui_uri = node_borrowed(ui_node);
+                let mut bundle_path = parse_file_node_path(lilv_ui_get_bundle_uri(ui)).unwrap_or_default();
+                if !bundle_path.is_empty() && !bundle_path.ends_with('/') {
+                    bundle_path.push('/');
+                }
+                let binary_path = parse_file_node_path(lilv_ui_get_binary_uri(ui)).unwrap_or_default();
+                if !ui_uri.is_empty() && !binary_path.is_empty() {
+                    let fixed = lilv_world_ask(world, ui_node, opt_feat, fixed_size)
+                        || lilv_world_ask(world, ui_node, req_feat, fixed_size)
+                        || lilv_world_ask(world, ui_node, opt_feat, no_user_resize)
+                        || lilv_world_ask(world, ui_node, req_feat, no_user_resize);
+                    let info = Lv2UiInfo {
+                        ui_uri,
+                        bundle_path,
+                        binary_path,
+                        is_x11,
+                        resizable: !fixed,
+                    };
+                    if is_x11 && best_x11.is_none() {
+                        best_x11 = Some(info);
+                    } else if has_show && best_show.is_none() {
+                        best_show = Some(info);
+                    }
+                }
+            }
+        }
+        it = lilv_uis_next(uis, it);
+    }
+
+    lilv_node_free(x11_ui);
+    lilv_node_free(show_ui);
+    lilv_node_free(lv2_ext);
+    lilv_node_free(ui_ext);
+    lilv_node_free(opt_feat);
+    lilv_node_free(req_feat);
+    lilv_node_free(fixed_size);
+    lilv_node_free(no_user_resize);
+    lilv_uis_free(uis);
+
+    best_x11.or(best_show)
+}
+
+/// Discover native GUI metadata (`ui:X11UI` preferred, `ui:showInterface` fallback) for a plugin URI.
+pub fn discover_ui_for_uri(uri: &str) -> Option<Lv2UiInfo> {
+    let _lilv = lilv_guard();
+    unsafe {
+        let world = new_world_with_extras();
+        if world.is_null() {
+            return None;
+        }
+        let plugin = find_plugin(world, uri);
+        let found = if plugin.is_null() { None } else { inspect_plugin_ui(world, plugin) };
+        lilv_world_free(world);
+        found
+    }
+}
+
+type UiInfoCache = std::sync::Mutex<Vec<(String, Option<Option<Lv2UiInfo>>)>>;
+static UI_INFO_CACHE: UiInfoCache = std::sync::Mutex::new(Vec::new());
+
+/// Cached non-blocking [`discover_ui_for_uri`] lookup for the UI thread.
+/// Returns `None` while resolving on a worker thread, `Some(None)` when the
+/// plugin declares no hostable native UI, or `Some(Some(info))`.
+pub fn discover_ui_cached(uri: &str) -> Option<Option<Lv2UiInfo>> {
+    let mut cache = UI_INFO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, found)) = cache.iter().find(|(u, _)| u == uri) {
+        return found.clone();
+    }
+    if cfg!(test) {
+        return None;
+    }
+    cache.push((uri.to_string(), None));
+    drop(cache);
+    let uri = uri.to_string();
+    std::thread::spawn(move || {
+        let found = discover_ui_for_uri(&uri);
+        store_ui_info(&uri, found);
+    });
+    None
+}
+
+/// Non-blocking check for whether an LV2 plugin has a native UI (`None` while resolving).
+pub fn has_ui_cached(uri: &str) -> Option<bool> {
+    discover_ui_cached(uri).map(|opt| opt.is_some())
+}
+
+fn store_ui_info(uri: &str, found: Option<Lv2UiInfo>) {
+    let mut cache = UI_INFO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(u, _)| u != uri);
+    cache.push((uri.to_string(), Some(found)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_ui_info_for_test(uri: &str, found: Option<Lv2UiInfo>) {
+    store_ui_info(uri, found);
+}
+
+/// Return `(port_index, port_symbol)` pairs for every LV2 port of `uri`.
+pub fn port_symbols_for_uri(uri: &str) -> Vec<(u32, String)> {
+    let _lilv = lilv_guard();
+    unsafe {
+        let world = new_world_with_extras();
+        if world.is_null() {
+            return Vec::new();
+        }
+        let plugin = find_plugin(world, uri);
+        let mut out = Vec::new();
+        if !plugin.is_null() {
+            let n = lilv_plugin_get_num_ports(plugin);
+            for idx in 0..n {
+                let port = lilv_plugin_get_port_by_index(plugin, idx);
+                if !port.is_null() {
+                    let sym = node_borrowed(lilv_port_get_symbol(plugin, port));
+                    if !sym.is_empty() {
+                        out.push((idx, sym));
+                    }
+                }
+            }
+        }
+        lilv_world_free(world);
+        out
     }
 }
 
@@ -1289,6 +1507,8 @@ unsafe fn collect_plugins(world: *mut LilvWorld) -> (Vec<Lv2PluginInfo>, Vec<Str
                         let (atom_in, atom_out, audio) = midi_shape(world, plugin);
                         atom_in && atom_out && audio == 0
                     };
+                    let ui_info = inspect_plugin_ui(world, plugin);
+                    let has_ui = ui_info.is_some();
                     out.push(Lv2PluginInfo {
                         uri: node_borrowed(lilv_plugin_get_uri(plugin)),
                         name: node_owned(lilv_plugin_get_name(plugin)),
@@ -1297,6 +1517,7 @@ unsafe fn collect_plugins(world: *mut LilvWorld) -> (Vec<Lv2PluginInfo>, Vec<Str
                         num_ports: lilv_plugin_get_num_ports(plugin),
                         is_instrument,
                         is_midi_fx,
+                        has_ui,
                     });
                 }
                 iter = lilv_plugins_next(plugins, iter);

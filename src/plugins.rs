@@ -9,6 +9,7 @@ use crate::control::DspKind;
 use crate::keyboard::{KeyboardType, PluginRef};
 use crate::host::ClapPluginInfo;
 use crate::lv2::Lv2PluginInfo;
+use crate::vst3::Vst3PluginInfo;
 
 /// Top-level musical role of a plugin.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -326,16 +327,23 @@ impl PluginSubtype {
 pub enum PluginFormat {
     BuiltIn,
     Clap,
+    Vst3,
     Lv2,
 }
 
 impl PluginFormat {
-    pub const ALL: [PluginFormat; 3] = [PluginFormat::BuiltIn, PluginFormat::Clap, PluginFormat::Lv2];
+    pub const ALL: [PluginFormat; 4] = [
+        PluginFormat::BuiltIn,
+        PluginFormat::Clap,
+        PluginFormat::Vst3,
+        PluginFormat::Lv2,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             PluginFormat::BuiltIn => "Built-in",
             PluginFormat::Clap => "CLAP",
+            PluginFormat::Vst3 => "VST3",
             PluginFormat::Lv2 => "LV2",
         }
     }
@@ -344,6 +352,7 @@ impl PluginFormat {
         match s.trim().to_ascii_lowercase().as_str() {
             "builtin" | "built-in" | "built_in" | "dsp" => Some(PluginFormat::BuiltIn),
             "clap" => Some(PluginFormat::Clap),
+            "vst3" | "vst" => Some(PluginFormat::Vst3),
             "lv2" => Some(PluginFormat::Lv2),
             _ => None,
         }
@@ -475,6 +484,133 @@ pub fn clap_instrument_type(p: &ClapPluginInfo) -> KeyboardType {
 /// [`clap_instrument_type`] for an LV2 plugin.
 pub fn lv2_instrument_type(p: &Lv2PluginInfo) -> KeyboardType {
     crate::keyboard::classify_plugin(Some(PluginRef::Lv2(&p.uri)), Some(&p.name), &[])
+}
+
+/// [`clap_instrument_type`] for a VST3 plugin.
+pub fn vst3_instrument_type(p: &Vst3PluginInfo) -> KeyboardType {
+    crate::keyboard::classify_plugin(Some(PluginRef::Vst3(&p.cid)), Some(&p.name), &p.sub_categories)
+}
+
+/// The subcategory of a scanned VST3 plugin from its `sub_categories` and name.
+pub fn classify_vst3(p: &Vst3PluginInfo) -> PluginSubtype {
+    let mut tokens: Vec<String> = Vec::new();
+    for raw in &p.sub_categories {
+        let low = raw.trim().to_ascii_lowercase();
+        if !low.is_empty() {
+            tokens.push(low.clone());
+            for part in low.split(|c: char| !c.is_ascii_alphanumeric() && c != '-') {
+                if !part.is_empty() {
+                    tokens.push(part.to_string());
+                }
+            }
+        }
+    }
+    let has = |needle: &str| tokens.iter().any(|t| t == needle);
+    let any = |needles: &[&str]| needles.iter().any(|n| has(n));
+    let name_low = p.name.to_ascii_lowercase();
+    let words = NameWords::new(&name_low);
+
+    let is_inst = has("instrument")
+        || (any(&["synth", "synthesizer", "sampler", "drum", "drums"]) && !has("fx"));
+    if is_inst {
+        let sampler = has("sampler") || words.any(&["sampler", "sfizz", "kontakt"]);
+        return instrument_subtype(vst3_instrument_type(p), sampler);
+    }
+    if any(&[
+        "fx", "effect", "spatial", "reverb", "delay", "eq", "filter", "dynamics", "distortion",
+        "modulation", "pitch", "restoration",
+    ]) {
+        return if any(&["multi", "multifx", "multi-effects"]) {
+            PluginSubtype::MultiFx
+        } else if any(&["reverb", "delay"]) || words.any(&["reverb", "delay", "echo"]) {
+            PluginSubtype::DelayReverb
+        } else if any(&["eq", "equalizer", "filter"]) || words.any(&["eq", "equalizer", "filter"]) {
+            PluginSubtype::EqFilter
+        } else if any(&["dynamics", "compressor", "limiter", "gate", "expander", "mastering"])
+            || words.any(&["compressor", "limiter", "gate", "dynamics"])
+        {
+            PluginSubtype::Dynamics
+        } else if any(&["distortion", "saturation", "overdrive", "amp"])
+            || words.any(&["dist", "distortion", "overdrive", "amp", "saturator"])
+        {
+            PluginSubtype::DriveAmp
+        } else if any(&["modulation", "chorus", "flanger", "phaser", "tremolo", "rotary"])
+            || words.any(&["chorus", "flanger", "phaser", "tremolo"])
+        {
+            PluginSubtype::Modulation
+        } else if any(&["spatial", "surround", "pitch", "pitch shift", "granular", "stereo"])
+            || words.any(&["pitch", "spatial", "width", "stereo"])
+        {
+            PluginSubtype::PitchSpatial
+        } else if has("restoration") {
+            PluginSubtype::UtilityOther
+        } else {
+            PluginSubtype::EffectOther
+        };
+    }
+    if any(&["analyzer", "analyser", "meter", "scope"])
+        || words.any(&["analyzer", "analyser", "tuner", "meter", "scope"])
+    {
+        return PluginSubtype::Analyzer;
+    }
+    if any(&["tools", "utility", "network"]) {
+        return PluginSubtype::UtilityOther;
+    }
+    if has("generator") {
+        return PluginSubtype::Generator;
+    }
+    instrument_subtype(vst3_instrument_type(p), false)
+}
+
+/// Is this VST3 plugin an instrument (synth, organ, sampler, drum machine)?
+pub fn vst3_is_instrument(p: &Vst3PluginInfo) -> bool {
+    classify_vst3(p).plugin_type() == PluginType::Instrument
+}
+
+/// Can this VST3 plugin go into an audio insert slot?
+pub fn vst3_is_audio_insert(p: &Vst3PluginInfo) -> bool {
+    matches!(classify_vst3(p).plugin_type(), PluginType::Effect | PluginType::Utility)
+}
+
+/// Can kabelsalat host this VST3 plugin on the rack?
+pub fn vst3_hostable(p: &Vst3PluginInfo) -> bool {
+    vst3_is_instrument(p) || vst3_is_audio_insert(p)
+}
+
+/// Is `cid` a scanned VST3 audio effect/utility rather than an instrument?
+pub fn vst3_id_is_effect(cid: &str, scanned: &[Vst3PluginInfo]) -> bool {
+    let target = crate::vst3::strip_vst3_key(cid).unwrap_or(cid);
+    scanned
+        .iter()
+        .find(|p| p.cid.eq_ignore_ascii_case(target))
+        .is_some_and(vst3_is_audio_insert)
+}
+
+/// Card subtitle for a VST3 plugin: vendor, subcategory, and yabridge tag when bridged.
+pub fn vst3_subtitle(p: &Vst3PluginInfo) -> String {
+    let vendor = p.vendor.trim();
+    let detail = p
+        .sub_categories
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| {
+            !s.is_empty()
+                && !matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "instrument" | "fx" | "stereo" | "mono" | "onlyrt"
+                )
+        })
+        .unwrap_or_else(|| classify_vst3(p).label());
+    let base = if vendor.is_empty() {
+        detail.to_string()
+    } else {
+        format!("{vendor} · {detail}")
+    };
+    if p.is_yabridge {
+        format!("YABRIDGE · {base}")
+    } else {
+        base
+    }
 }
 
 /// An instrument's browser group: its type's, except that a sampler (a
@@ -712,6 +848,7 @@ pub fn matches_query(fields: &[&str], query: &str) -> bool {
 pub enum Source<'a> {
     Builtin(&'static BuiltinPlugin),
     Clap(&'a ClapPluginInfo),
+    Vst3(&'a Vst3PluginInfo),
     Lv2(&'a Lv2PluginInfo),
 }
 
@@ -732,6 +869,7 @@ impl Entry<'_> {
         match self.source {
             Source::Builtin(_) => PluginFormat::BuiltIn,
             Source::Clap(_) => PluginFormat::Clap,
+            Source::Vst3(_) => PluginFormat::Vst3,
             Source::Lv2(_) => PluginFormat::Lv2,
         }
     }
@@ -740,6 +878,7 @@ impl Entry<'_> {
         match self.source {
             Source::Builtin(b) => b.name,
             Source::Clap(p) => &p.name,
+            Source::Vst3(p) => &p.name,
             Source::Lv2(p) => &p.name,
         }
     }
@@ -752,6 +891,7 @@ impl Entry<'_> {
         match self.source {
             Source::Builtin(_) => None,
             Source::Clap(p) => Some(clap_instrument_type(p)),
+            Source::Vst3(p) => Some(vst3_instrument_type(p)),
             Source::Lv2(p) => Some(lv2_instrument_type(p)),
         }
     }
@@ -769,6 +909,7 @@ impl Entry<'_> {
     pub fn hostable(&self) -> bool {
         match self.source {
             Source::Clap(p) => clap_hostable(p),
+            Source::Vst3(p) => vst3_hostable(p),
             Source::Builtin(_) | Source::Lv2(_) => true,
         }
     }
@@ -780,6 +921,13 @@ impl Entry<'_> {
             Source::Clap(p) => {
                 matches_query(&[&p.name, &p.vendor, &p.id, &p.features.join(" "), ty, sub, "clap"], query)
             }
+            Source::Vst3(p) => {
+                let bridge = if p.is_yabridge { "yabridge" } else { "" };
+                matches_query(
+                    &[&p.name, &p.vendor, &p.cid, &p.sub_categories.join(" "), ty, sub, "vst3", bridge],
+                    query,
+                )
+            }
             Source::Lv2(p) => matches_query(
                 &[&p.name, &p.author, &p.uri, lv2_class_label(&p.lv2_class), ty, sub, "lv2"],
                 query,
@@ -788,13 +936,18 @@ impl Entry<'_> {
     }
 }
 
-/// Every built-in unit, then the CLAP and LV2 plugins in scan order (the LV2
-/// scan lists instruments first, rule 154), each classified.
-pub fn entries<'a>(clap: &'a [ClapPluginInfo], lv2: &'a [Lv2PluginInfo]) -> Vec<Entry<'a>> {
+/// Every built-in unit, then the CLAP, VST3, and LV2 plugins in scan order (the
+/// LV2 scan lists instruments first, rule 154), each classified.
+pub fn entries<'a>(
+    clap: &'a [ClapPluginInfo],
+    lv2: &'a [Lv2PluginInfo],
+    vst3: &'a [Vst3PluginInfo],
+) -> Vec<Entry<'a>> {
     let builtins = BUILTIN_PLUGINS.iter().map(|b| Entry { source: Source::Builtin(b), sub: b.subtype });
     let claps = clap.iter().map(|p| Entry { source: Source::Clap(p), sub: classify_clap(p) });
+    let vst3s = vst3.iter().map(|p| Entry { source: Source::Vst3(p), sub: classify_vst3(p) });
     let lv2s = lv2.iter().map(|p| Entry { source: Source::Lv2(p), sub: classify_lv2(p) });
-    builtins.chain(claps).chain(lv2s).collect()
+    builtins.chain(claps).chain(vst3s).chain(lv2s).collect()
 }
 
 /// Browsing order: by subcategory (which orders the types too), what can be
@@ -839,7 +992,10 @@ impl PluginListFilter {
             })
             .transpose()?;
         let format = arg(&["format"])
-            .map(|raw| PluginFormat::parse(raw).ok_or_else(|| format!("unknown format '{raw}' (use builtin | clap | lv2 | all)")))
+            .map(|raw| {
+                PluginFormat::parse(raw)
+                    .ok_or_else(|| format!("unknown format '{raw}' (use builtin | clap | vst3 | lv2 | all)"))
+            })
             .transpose()?;
         Ok(Self {
             plugin_type,
@@ -861,15 +1017,25 @@ impl PluginListFilter {
             && e.matches_query(&self.query)
     }
 
-    fn apply<'a>(&self, clap: &'a [ClapPluginInfo], lv2: &'a [Lv2PluginInfo]) -> Vec<Entry<'a>> {
-        entries(clap, lv2).into_iter().filter(|e| self.matches(e)).collect()
+    fn apply<'a>(
+        &self,
+        clap: &'a [ClapPluginInfo],
+        lv2: &'a [Lv2PluginInfo],
+        vst3: &'a [Vst3PluginInfo],
+    ) -> Vec<Entry<'a>> {
+        entries(clap, lv2, vst3).into_iter().filter(|e| self.matches(e)).collect()
     }
 }
 
 /// The in-app assistant's `list_plugins` answer: plugins grouped by type,
 /// each section capped, with how to narrow what was cut.
-pub fn format_list_plugins(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filter: &PluginListFilter) -> String {
-    let hits = filter.apply(clap, lv2);
+pub fn format_list_plugins(
+    clap: &[ClapPluginInfo],
+    lv2: &[Lv2PluginInfo],
+    vst3: &[Vst3PluginInfo],
+    filter: &PluginListFilter,
+) -> String {
+    let hits = filter.apply(clap, lv2, vst3);
     let count = |ty: PluginType| hits.iter().filter(|e| e.ty() == ty).count();
     let mut out = format!(
         "Plugins by type — Instruments: {}, Effects: {}, MIDI FX: {}, Utilities: {} (filter with type/category/format/query)\n",
@@ -906,6 +1072,11 @@ pub fn format_list_plugins(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filte
                     let note = if clap_hostable(p) { "" } else { " (not hostable yet)" };
                     format!("[CLAP · {sub}] {} [{}]{note}", p.name, p.id)
                 }
+                Source::Vst3(p) => {
+                    let kind = if p.is_yabridge { "VST3 · YABRIDGE" } else { "VST3" };
+                    let note = if vst3_hostable(p) { "" } else { " (not hostable yet)" };
+                    format!("[{kind} · {sub}] {} [{}]{note}", p.name, p.cid)
+                }
                 Source::Lv2(p) if p.is_instrument => format!("{} [instrument] — {} (LV2 · {sub})", p.name, p.uri),
                 Source::Lv2(p) if p.is_midi_fx => format!("{} [midi_fx] — {} (LV2 · {sub})", p.name, p.uri),
                 Source::Lv2(p) => format!("{} [{sub}] — {} (LV2)", p.name, p.uri),
@@ -925,10 +1096,15 @@ pub fn format_list_plugins(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filte
 }
 
 /// MCP's `list_plugins` answer. Keeps the earlier `clap`, `lv2` and
-/// `lv2_count` fields and adds `builtin`, `counts`, `effect_categories` and a
-/// `type`/`category` on every item.
-pub fn list_plugins_json(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filter: &PluginListFilter) -> serde_json::Value {
-    let hits = filter.apply(clap, lv2);
+/// `lv2_count` fields and adds `builtin`, `vst3`, `vst3_count`, `counts`,
+/// `effect_categories` and a `type`/`category` on every item.
+pub fn list_plugins_json(
+    clap: &[ClapPluginInfo],
+    lv2: &[Lv2PluginInfo],
+    vst3: &[Vst3PluginInfo],
+    filter: &PluginListFilter,
+) -> serde_json::Value {
+    let hits = filter.apply(clap, lv2, vst3);
     let limit = filter.limit.unwrap_or(60);
     let counts: serde_json::Map<_, _> = PluginType::ALL
         .iter()
@@ -952,6 +1128,8 @@ pub fn list_plugins_json(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filter:
     };
     let mut builtin = Vec::new();
     let mut clap_json = Vec::new();
+    let mut vst3_json = Vec::new();
+    let mut vst3_count = 0;
     let mut lv2_json = Vec::new();
     let mut lv2_count = 0;
     for e in &hits {
@@ -964,6 +1142,23 @@ pub fn list_plugins_json(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filter:
                 serde_json::json!({"id": p.id, "name": p.name, "vendor": p.vendor, "features": p.features, "hostable": clap_hostable(p)}),
             )),
             Source::Clap(_) => {}
+            Source::Vst3(p) => {
+                vst3_count += 1;
+                if vst3_json.len() < limit {
+                    vst3_json.push(tagged(
+                        e,
+                        serde_json::json!({
+                            "cid": p.cid,
+                            "name": p.name,
+                            "vendor": p.vendor,
+                            "version": p.version,
+                            "sub_categories": p.sub_categories,
+                            "is_yabridge": p.is_yabridge,
+                            "hostable": vst3_hostable(p),
+                        }),
+                    ));
+                }
+            }
             Source::Lv2(p) => {
                 lv2_count += 1;
                 if lv2_json.len() < limit {
@@ -988,6 +1183,8 @@ pub fn list_plugins_json(clap: &[ClapPluginInfo], lv2: &[Lv2PluginInfo], filter:
         "effect_categories": effect_categories,
         "builtin": builtin,
         "clap": clap_json,
+        "vst3_count": vst3_count,
+        "vst3": vst3_json,
         "lv2_count": lv2_count,
         "lv2": lv2_json,
     })
@@ -1006,6 +1203,7 @@ mod tests {
             num_ports: 4,
             is_instrument,
             is_midi_fx,
+            has_ui: false,
         }
     }
 
@@ -1015,6 +1213,18 @@ mod tests {
             name: name.into(),
             vendor: "Vendor".into(),
             features: features.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn vst3(cid: &str, name: &str, cats: &[&str], is_yabridge: bool) -> Vst3PluginInfo {
+        Vst3PluginInfo {
+            cid: cid.into(),
+            name: name.into(),
+            vendor: "Vendor".into(),
+            version: "1.0".into(),
+            sub_categories: cats.iter().map(|s| (*s).to_string()).collect(),
+            bundle_path: std::path::PathBuf::from("/tmp/test.vst3"),
+            is_yabridge,
         }
     }
 
@@ -1069,14 +1279,14 @@ mod tests {
         for (p, sub, badge) in cases {
             assert_eq!(classify_clap(&p), sub, "{}", p.name);
             let all = [p.clone()];
-            let e = entries(&all, &[]).into_iter().find(|e| e.name() == p.name).unwrap();
+            let e = entries(&all, &[], &[]).into_iter().find(|e| e.name() == p.name).unwrap();
             assert_eq!(e.badge(), badge, "{}", p.name);
         }
         let organ = lv2("http://gareus.org/oss/lv2/b_synth", "setBfree DSP Tonewheel Organ", "InstrumentPlugin", true, false);
         let lv2s = [organ];
-        let e = entries(&[], &lv2s).into_iter().find(|e| e.format() == PluginFormat::Lv2).unwrap();
+        let e = entries(&[], &lv2s, &[]).into_iter().find(|e| e.format() == PluginFormat::Lv2).unwrap();
         assert_eq!((e.sub, e.badge(), e.instrument_type()), (PluginSubtype::Organ, "JAZZ ORGAN", Some(KeyboardType::JazzOrgan)));
-        let json = list_plugins_json(&[], &lv2s, &PluginListFilter::default());
+        let json = list_plugins_json(&[], &lv2s, &[], &PluginListFilter::default());
         assert_eq!(json["lv2"][0]["instrument_type"], "jazz_organ", "{json}");
     }
 
@@ -1191,14 +1401,14 @@ mod tests {
         ];
 
         let f_inst = PluginListFilter::from_args(&serde_json::json!({"type": "instruments"})).unwrap();
-        let txt = format_list_plugins(&claps, &lv2s, &f_inst);
+        let txt = format_list_plugins(&claps, &lv2s, &[], &f_inst);
         assert!(txt.contains("Surge XT"), "{txt}");
         assert!(txt.contains("Vitalium"), "{txt}");
         assert!(!txt.contains("Lush Verb"), "{txt}");
         assert!(!txt.contains("Surge XT Effects"), "{txt}");
 
         let f_dyn = PluginListFilter::from_args(&serde_json::json!({"category": "dynamics", "format": "lv2"})).unwrap();
-        let json = list_plugins_json(&claps, &lv2s, &f_dyn);
+        let json = list_plugins_json(&claps, &lv2s, &[], &f_dyn);
         assert_eq!(json["lv2_count"], 1, "{json}");
         assert_eq!(json["lv2"][0]["name"], "Glue Comp");
         assert_eq!(json["lv2"][0]["type"], "effect");
@@ -1207,9 +1417,35 @@ mod tests {
         assert_eq!(json["clap"].as_array().unwrap().len(), 0);
 
         let f_q = PluginListFilter::from_args(&serde_json::json!({"query": "stage analyzer"})).unwrap();
-        let json_q = list_plugins_json(&claps, &lv2s, &f_q);
+        let json_q = list_plugins_json(&claps, &lv2s, &[], &f_q);
         assert_eq!(json_q["lv2_count"], 1, "{json_q}");
         assert_eq!(json_q["lv2"][0]["name"], "Stage Tuner");
+    }
+
+    #[test]
+    fn vst3_plugins_classify_filter_and_surface_yabridge() {
+        let vst3s = vec![
+            vst3("00112233445566778899AABBCCDDEEFF", "Pianoteq Stage", &["Instrument", "Synth"], false),
+            vst3("112233445566778899AABBCCDDEEFF00", "Valhalla VintageVerb", &["Fx", "Reverb"], true),
+            vst3("2233445566778899AABBCCDDEEFF0011", "Pro-Q 3", &["Fx", "EQ"], false),
+        ];
+        assert!(vst3_is_instrument(&vst3s[0]));
+        assert_eq!(classify_vst3(&vst3s[0]), PluginSubtype::Piano);
+        assert!(vst3_is_audio_insert(&vst3s[1]));
+        assert_eq!(classify_vst3(&vst3s[1]), PluginSubtype::DelayReverb);
+        assert!(vst3_subtitle(&vst3s[1]).contains("YABRIDGE"));
+        assert!(vst3_id_is_effect("vst3:112233445566778899aabbccddeeff00", &vst3s));
+        assert!(!vst3_id_is_effect("00112233445566778899AABBCCDDEEFF", &vst3s));
+
+        let f_vst3 = PluginListFilter::from_args(&serde_json::json!({"format": "vst3"})).unwrap();
+        let txt = format_list_plugins(&[], &[], &vst3s, &f_vst3);
+        assert!(txt.contains("[VST3 · Pianos · type piano] Pianoteq Stage"), "{txt}");
+        assert!(txt.contains("[VST3 · YABRIDGE · Delay & Reverb] Valhalla VintageVerb"), "{txt}");
+
+        let json = list_plugins_json(&[], &[], &vst3s, &f_vst3);
+        assert_eq!(json["vst3_count"], 3, "{json}");
+        assert_eq!(json["vst3"][1]["is_yabridge"], true);
+        assert_eq!(json["vst3"][2]["category"], "eq_filter");
     }
 
     #[test]

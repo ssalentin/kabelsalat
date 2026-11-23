@@ -192,7 +192,7 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
     match kind {
         NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
         // The plugin's main controls join LEVEL on the face (`main_controls`).
-        NodeKind::Clap { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
+        NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
         NodeKind::MasterOut => knobs!(ks("VOLUME", 0.75, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
         NodeKind::Dsp(dk) => match dk {
             DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),
@@ -296,7 +296,7 @@ pub fn knob_random_bounds(
             Some(P_AUDIO_IN_GAIN) => Some((0.35, 0.80)),
             _ => None, // Never toggle MON randomly
         },
-        NodeKind::Clap { .. } => {
+        NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => {
             if param == Some(P_LEVEL) {
                 if has_other_knobs { None } else { Some((0.55, 0.95)) }
             } else {
@@ -1788,7 +1788,7 @@ impl GraphEngine {
         // Routes belong to the Clap node, not to the voice that plays it: a
         // voice hosted after startup finds its node already routed.
         // An arp is a MIDI destination like an instrument (issue #90).
-        for n in graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Arp)) {
+        for n in graph.nodes.iter().filter(|n| n.kind.is_hosted_voice() || matches!(n.kind, NodeKind::Arp)) {
             matrix.connect(SourceId::Keys, n.id);
             // Cover hardware device ids 0..MAX so any connected device routes;
             // the per-rig `rig_device` filter then selects which one is heard.
@@ -2260,28 +2260,30 @@ impl GraphEngine {
         self.voices.capacity()
     }
 
-    /// Give every voiceless Clap node, in graph order, the free voice of its
-    /// plugin with the lowest id (`control::bind_voices` is the same rule for
-    /// a host that has to know the outcome before the engine answers).
-    /// Allocation-free.
+    /// Give every voiceless hosted plugin node (CLAP or VST3), in graph order,
+    /// the free voice of its plugin with the lowest id (`control::bind_voices`
+    /// is the same rule for a host that has to know the outcome before the
+    /// engine answers). Allocation-free.
     fn bind_free_voices(&mut self) {
         let n_nodes = self.graph.nodes.len();
         for i in 0..n_nodes {
-            let (id, key) = match &self.graph.nodes[i].kind {
-                NodeKind::Clap { plugin_id } => (self.graph.nodes[i].id, *plugin_id),
-                _ => continue,
-            };
-            if !self.node_is_hosted(id) || self.voices.iter().any(|v| v.node == id) {
+            let id = self.graph.nodes[i].id;
+            if !self.graph.nodes[i].kind.is_hosted_voice()
+                || !self.node_is_hosted(id)
+                || self.voices.iter().any(|v| v.node == id)
+            {
                 continue;
             }
-            let key = crate::control::clap_plugin_key(key.as_str());
+            let kind = &self.graph.nodes[i].kind;
             let free = self
                 .voices
-                .iter_mut()
-                .filter(|v| v.node == NodeId::MAX && v.voice.plugin_id() == key)
-                .min_by_key(|v| v.voice.voice_id());
-            if let Some(v) = free {
-                v.bind(id);
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.node == NodeId::MAX && kind.voice_matches(v.voice.plugin_id()))
+                .min_by_key(|(_, v)| v.voice.voice_id())
+                .map(|(vi, _)| vi);
+            if let Some(vi) = free {
+                self.voices[vi].bind(id);
                 self.wake_node(id);
             }
         }
@@ -2343,7 +2345,7 @@ impl GraphEngine {
                 }
                 VoiceMsg::AddBound { node, mut slot } => {
                     let ok = self.voices.len() < self.voices.capacity()
-                        && self.graph.node(node).is_some_and(|n| matches!(n.kind, NodeKind::Clap { .. }))
+                        && self.graph.node(node).is_some_and(|n| n.kind.is_hosted_voice())
                         && !self.voices.iter().any(|v| v.node == node);
                     if ok {
                         slot.bind(node);
@@ -3932,7 +3934,7 @@ impl GraphEngine {
                 wake = !rest || live;
                 #[cfg(test)]
                 self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
-            } else if self.graph.node(dest).map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. })) {
+            } else if self.graph.node(dest).map_or(false, |n| n.kind.is_hosted_voice()) {
                 // A Clap node whose voice is not hosted yet: nothing to
                 // reach (same shape as the CC path; logged under test).
                 #[cfg(test)]
@@ -4382,7 +4384,7 @@ impl GraphEngine {
             if z.transpose != self.rig_zones[rig].transpose {
                 for i in 0..self.graph.nodes.len() {
                     let n = &self.graph.nodes[i];
-                    let dest = matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. } | NodeKind::Arp | NodeKind::MidiFx { .. });
+                    let dest = n.kind.is_hosted_voice() || matches!(n.kind, NodeKind::Lv2 { .. } | NodeKind::Arp | NodeKind::MidiFx { .. });
                     if dest && n.rig as usize == rig {
                         let id = n.id;
                         self.release_all(id);
@@ -4838,7 +4840,7 @@ impl GraphEngine {
                     if !self.has_midi_cable(dest) {
                         continue;
                     }
-                    let is_clap = matches!(self.graph.nodes[i].kind, NodeKind::Clap { .. });
+                    let is_clap = self.graph.nodes[i].kind.is_hosted_voice();
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         s.voice.send_cc_rt(0, 2, val);
                         s.voice.send_midi_rt(at_wire);
@@ -5021,7 +5023,7 @@ impl GraphEngine {
             let n = &self.graph.nodes[i];
             let id = n.id;
             match n.kind {
-                NodeKind::Clap { .. } | NodeKind::Lv2 { .. } => self.release_instrument(id),
+                NodeKind::Clap { .. } | NodeKind::Vst3 { .. } | NodeKind::Lv2 { .. } => self.release_instrument(id),
                 NodeKind::Arp => self.release_arp(id),
                 _ => {}
             }
@@ -5136,7 +5138,7 @@ impl GraphEngine {
                             {
                                 let (dest, eid) = (e.to.node, e.id);
                                 self.release_all(dest);
-                                let synth = self.graph.node(dest).is_some_and(|d| matches!(d.kind, NodeKind::Clap { .. }));
+                                let synth = self.graph.node(dest).is_some_and(|d| d.kind.is_hosted_voice());
                                 if synth && taken < self.arp_taken.len() {
                                     self.arp_taken[taken] = eid;
                                     taken += 1;
@@ -5181,7 +5183,7 @@ impl GraphEngine {
                     NodeKind::AudioIn { device, channels } => {
                         self.audio_in.push(AudioInSlot::new(id, *channels, device.clone()));
                     }
-                    NodeKind::Clap { .. } => {
+                    NodeKind::Clap { .. } | NodeKind::Vst3 { .. } => {
                         self.matrix.connect(SourceId::Keys, id);
                         for dev in 0..MAX_HW_DEVICES {
                             self.matrix.connect(SourceId::Hardware(dev), id);
@@ -5412,7 +5414,7 @@ impl GraphEngine {
                     .graph
                     .nodes
                     .iter()
-                    .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
+                    .filter(|n| n.kind.is_hosted_voice())
                     .map(|n| n.id)
                     .collect();
                 let arp_ids: Vec<NodeId> = self
@@ -5502,7 +5504,7 @@ impl GraphEngine {
                             .graph
                             .nodes
                             .iter()
-                            .filter(|n| n.rig == tag && matches!(n.kind, NodeKind::Clap { .. }))
+                            .filter(|n| n.rig == tag && n.kind.is_hosted_voice())
                             .map(|n| n.id)
                             .collect();
                         for s in &self.lv2 {
@@ -5653,7 +5655,7 @@ impl GraphEngine {
                 if strip_bypassed(&self.strips, node) != bypass {
                     let needs_release = self.arp.iter().any(|a| a.node == node)
                         || self.is_midi_fx(node)
-                        || matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Clap { .. }))
+                        || matches!(self.graph.node(node).map(|n| &n.kind), Some(k) if k.is_hosted_voice())
                         || self.lv2.iter().any(|s| s.node == node && s.plugin.is_instrument());
                     if needs_release {
                         self.release_all(node);
@@ -5820,7 +5822,7 @@ impl GraphEngine {
                     let is_clap_node = self
                         .graph
                         .node(dest)
-                        .map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. }));
+                        .map_or(false, |n| n.kind.is_hosted_voice());
                     let norm = mapping.map_or(m.data[1] as f64 / 127.0, |b| b.scale.norm(m.data[1]));
                     let live = zone_of(&self.rig_zones, &self.graph, dest).live;
                     let rest = at_rest(&m);
@@ -10727,6 +10729,7 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
     let kind = match instrument {
         Instrument::Clap(id) => NodeKind::Clap { plugin_id: crate::control::ClapId::new(id) },
+        Instrument::Vst3(id) => NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(id) },
         Instrument::Lv2(uri) => NodeKind::Lv2 { uri: Lv2Uri::new(uri) },
     };
     let node = g.add_node(kind, name_bytes("INSTRUMENT"));
@@ -10738,6 +10741,12 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
     let (mut engine, mut clap) = match instrument {
         Instrument::Clap(id) => {
             let (voice, main) = crate::host::ClapVoice::new_plugin(sr, id)?;
+            let controller = voice.controller();
+            (GraphEngine::new(g, drain, sr, vec![(node, voice)]), Some((crate::host::HostedClapMain::Local(main), controller)))
+        }
+        Instrument::Vst3(id) => {
+            let key = crate::vst3::voice_key(crate::vst3::strip_vst3_key(id).unwrap_or(id));
+            let (voice, main) = crate::host::ClapVoice::new_plugin(sr, &key)?;
             let controller = voice.controller();
             (GraphEngine::new(g, drain, sr, vec![(node, voice)]), Some((crate::host::HostedClapMain::Local(main), controller)))
         }

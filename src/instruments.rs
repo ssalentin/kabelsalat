@@ -171,6 +171,7 @@ fn target(kind: &NodeKind, role: Role) -> Option<(ParamId, CcTarget, CcScale)> {
             NodeKind::Clap { plugin_id } if plugin_id.as_str() != crate::aeolus::AEOLUS_ID => {
                 Some((0, CcTarget::ChannelPressure, CcScale::IDENTITY))
             }
+            NodeKind::Vst3 { .. } => Some((0, CcTarget::ChannelPressure, CcScale::IDENTITY)),
             NodeKind::Lv2 { .. } if !organ::is_organ(kind) => {
                 Some((0, CcTarget::ChannelPressure, CcScale::IDENTITY))
             }

@@ -93,10 +93,11 @@ pub struct Facts {
     pub power: Option<Power>,
 }
 
-/// The plugin scan: CLAP ids and LV2 URIs (with "is an instrument").
+/// The plugin scan: CLAP ids, VST3 CIDs, and LV2 URIs (with "is an instrument").
 #[derive(Clone, Debug, Default)]
 pub struct Installed {
     pub clap: Vec<String>,
+    pub vst3: Vec<String>,
     pub lv2: Vec<(String, bool)>,
 }
 
@@ -104,6 +105,10 @@ impl Installed {
     fn has(&self, need: &Plugin) -> bool {
         match need {
             Plugin::Clap(id) => self.clap.iter().any(|c| c == id),
+            Plugin::Vst3(cid) => {
+                let target = crate::vst3::strip_vst3_key(cid).unwrap_or(cid);
+                self.vst3.iter().any(|c| c.eq_ignore_ascii_case(target))
+            }
             Plugin::Lv2(uri) => self.lv2.iter().any(|(u, _)| u == uri),
         }
     }
@@ -377,12 +382,18 @@ fn audio_inputs(s: &Session, f: &Facts) -> Outcome {
 #[derive(Clone, Debug, PartialEq)]
 enum Plugin {
     Clap(String),
+    Vst3(String),
     Lv2(String),
 }
 
 fn needed_plugin(n: &Node) -> Option<Plugin> {
     match &n.kind {
         NodeKind::Clap { plugin_id } => Some(Plugin::Clap(clap_plugin_key(plugin_id.as_str()).to_string())),
+        NodeKind::Vst3 { plugin_id } => Some(Plugin::Vst3(
+            crate::vst3::strip_vst3_key(plugin_id.as_str())
+                .unwrap_or(plugin_id.as_str())
+                .to_string(),
+        )),
         NodeKind::Lv2 { uri } | NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { uri } } => Some(Plugin::Lv2(uri.as_str().to_string())),
         _ => None,
     }
@@ -680,7 +691,7 @@ pub(crate) mod tests {
             chosen_output: Some(M2.into()),
             audio_running: Some(true),
             inputs: Some(vec![InputDevice { raw: "alsa_input.usb-MOTU_M2".into(), name: "M2".into(), channels: 2, default: true }]),
-            plugins: Some(Installed { clap: vec![SURGE.into()], lv2: vec![(crate::organ::B_SYNTH.into(), true)] }),
+            plugins: Some(Installed { clap: vec![SURGE.into()], vst3: vec![], lv2: vec![(crate::organ::B_SYNTH.into(), true)] }),
             probe: Some(Probe { rigs: (0..rig_count(s) as u8).map(|r| (r, 0.3)).collect(), failed: vec![] }),
             files: vec![("/gig/intro.wav".into(), FileFact::Audio { seconds: 245.0 })],
             disk: Some(Disk { dir: "~/Music/kabelsalat".into(), free_bytes: 80_000_000_000 }),

@@ -96,7 +96,7 @@ impl DemoApp {
             }
         }
         for st in s.plugin_states() {
-            if s.graph.node(st.node).is_some_and(|n| matches!(n.kind, NodeKind::Clap { .. })) {
+            if s.graph.node(st.node).is_some_and(|n| n.kind.is_hosted_voice()) {
                 self.setlist_window
                     .clap_states
                     .insert(st.node, (st.plugin_id.clone(), st.data.clone()));
@@ -296,17 +296,17 @@ impl DemoApp {
             }
         }
 
-        // Priority-ordered CLAP nodes: window songs first (current song first),
+        // Priority-ordered CLAP/VST3 nodes: window songs first (current song first),
         // then any draining rigs so we don't retire them mid-tail.
         let mut wanted_clap: Vec<NodeId> = self
             .setlist
             .window_plugin_nodes(&graph)
             .unwrap_or_default()
             .into_iter()
-            .filter(|&id| graph.node(id).is_some_and(|n| matches!(n.kind, NodeKind::Clap { .. })))
+            .filter(|&id| graph.node(id).is_some_and(|n| n.kind.is_hosted_voice()))
             .collect();
         for n in &graph.nodes {
-            if matches!(n.kind, NodeKind::Clap { .. })
+            if n.kind.is_hosted_voice()
                 && self.setlist_window.draining_rigs.contains_key(&n.rig)
                 && !wanted_clap.contains(&n.id)
             {
@@ -338,7 +338,7 @@ impl DemoApp {
             None => graph
                 .nodes
                 .iter()
-                .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
+                .filter(|n| n.kind.is_hosted_voice())
                 .map(|n| n.id)
                 .collect(),
         };
@@ -358,15 +358,26 @@ impl DemoApp {
             {
                 continue;
             }
-            let Some(NodeKind::Clap { plugin_id }) = graph.node(node).map(|n| &n.kind) else {
+            let Some(n) = graph.node(node) else {
                 continue;
             };
-            let key = crate::control::clap_plugin_key(plugin_id.as_str()).to_string();
+            let Some(key) = n.kind.voice_plugin_key() else {
+                continue;
+            };
             let state = self
                 .setlist_window
                 .clap_states
                 .get(&node)
-                .filter(|(pid, _)| crate::control::clap_plugin_key(pid) == key)
+                .filter(|(pid, _)| {
+                    if matches!(n.kind, NodeKind::Vst3 { .. }) {
+                        let norm = crate::vst3::voice_key(
+                            &crate::vst3::strip_vst3_key(pid).unwrap_or(pid).to_ascii_uppercase(),
+                        );
+                        norm == key
+                    } else {
+                        crate::control::clap_plugin_key(pid) == key
+                    }
+                })
                 .map(|(_, data)| data.clone());
             to_load.push((node, key, state));
         }
@@ -508,7 +519,7 @@ impl DemoApp {
                     let wanted_now = self
                         .base_graph
                         .node(node)
-                        .is_some_and(|n| matches!(n.kind, NodeKind::Clap { .. }))
+                        .is_some_and(|n| n.kind.is_hosted_voice())
                         && self
                             .setlist
                             .window_plugin_nodes(&self.base_graph)

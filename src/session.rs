@@ -593,6 +593,17 @@ impl Session {
                         s.plugin_id,
                         plugin_id.as_str()
                     ),
+                    NodeKind::Vst3 { plugin_id }
+                        if plugin_id
+                            .as_str()
+                            .eq_ignore_ascii_case(crate::vst3::strip_vst3_key(&s.plugin_id).unwrap_or(&s.plugin_id)) => {}
+                    NodeKind::Vst3 { plugin_id } => bail!(
+                        "The state blob for node {} was saved by '{}' but the node now \
+                         hosts '{}'.",
+                        s.node,
+                        s.plugin_id,
+                        plugin_id.as_str()
+                    ),
                     NodeKind::Lv2 { uri } if uri.as_str() == s.plugin_id => {}
                     NodeKind::Lv2 { uri } => bail!(
                         "The state blob for node {} was saved by '{}' but the node now \
@@ -1227,8 +1238,8 @@ impl RigPreset {
         }
         for m in &self.clap_meta {
             match self.session.graph.node(m.node) {
-                Some(n) if matches!(n.kind, NodeKind::Clap { .. }) => {}
-                _ => bail!("Rig preset metadata references node {} which is not a CLAP synth.", m.node),
+                Some(n) if n.kind.is_hosted_voice() => {}
+                _ => bail!("Rig preset metadata references node {} which is not a hosted synth.", m.node),
             }
         }
         Ok(())
@@ -2794,6 +2805,36 @@ mod tests {
         let plain_pkg = RigPreset::package_path(&dir, "Plain Preset").unwrap();
         plain.save(&plain_pkg).unwrap();
         assert!(!fs::read_to_string(plain_pkg.join(RIG_PRESET_FILE)).unwrap().contains("midi_sources"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vst3_session_state_round_trip_and_mismatch_rejection() {
+        let dir = test_dir("vst3-state");
+        let cid = "0123456789ABCDEF0123456789ABCDEF";
+        let mut g = Graph::default();
+        let keys = g.add_node(NodeKind::Keys, crate::control::name_bytes("KEYS"));
+        let synth = g.add_node(
+            NodeKind::Vst3 { plugin_id: crate::control::ClapId::new(cid) },
+            crate::control::name_bytes("VST3"),
+        );
+        let master = g.add_node(NodeKind::MasterOut, crate::control::name_bytes("MASTER"));
+        g.connect_with_id(1, crate::control::PortRef { node: keys, port: 0 }, crate::control::PortRef { node: synth, port: 0 }, crate::control::PortKind::Midi);
+        g.connect_with_id(2, crate::control::PortRef { node: synth, port: 0 }, crate::control::PortRef { node: master, port: 0 }, crate::control::PortKind::Audio);
+
+        let mut s = Session::new("VST3 Test", g);
+        s.set_plugin_state(synth, cid, b"KSV3testpayload".to_vec());
+
+        let pkg = Session::package_path(&dir, "VST3 Test").unwrap();
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert!(loaded.same_content(&s));
+
+        // Mismatched CID state blob is rejected by validate().
+        let mut bad = loaded;
+        bad.states[0].plugin_id = "FEDCBA9876543210FEDCBA9876543210".into();
+        assert!(bad.validate().is_err());
 
         let _ = fs::remove_dir_all(&dir);
     }

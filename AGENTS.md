@@ -1980,4 +1980,15 @@ Learned so far (2026-11-15, UI polish pass):
     and `host::sandbox::run_plugin_worker` must run `m.pump()` after `Ok(req)`
     RPCs too (and give `OpenEditor` a 15 s timeout) — otherwise frame-rate
     `EditorOpen` polls prevent `recv_msg` timeouts and freeze the editor.
+224. **VST3 audio-to-main parameter echoes must carry monotonic sequence numbers
+    (#285):** `Vst3Voice::render_block` never echoes `main_to_audio` back over
+    `audio_to_main` as authoritative over newer main-thread writes; tag
+    parameter ring messages with `param_seq`/`last_main_seq` (`(ParamID, f64,
+    u64)`) and drain stale queues under `GateMainGuard` in `load_state`.
+225. **LV2 native GUIs separate `control_nth` from LV2 port index and tear down
+    before `PluginWindow` drops (#70):** map `control_nth -> (lv2_port_index,
+    min, max)` once at `Lv2UiHandle::open` (`notify_control_nth`), never call
+    blocking `lilv` world discovery in `frame_feeds`, never `dlclose` UI `.so`
+    handles, and run `hide`/`cleanup` before dropping the parent X11
+    `PluginWindow`.
 

@@ -404,6 +404,7 @@ pub fn pipe_piston_registration(index: usize) -> Option<&'static aeolus::Registr
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginRef<'a> {
     Clap(&'a str),
+    Vst3(&'a str),
     Lv2(&'a str),
 }
 
@@ -411,6 +412,7 @@ impl<'a> PluginRef<'a> {
     pub fn of_node(kind: &'a NodeKind) -> Option<Self> {
         match kind {
             NodeKind::Clap { plugin_id } => Some(PluginRef::Clap(plugin_id.as_str())),
+            NodeKind::Vst3 { plugin_id } => Some(PluginRef::Vst3(plugin_id.as_str())),
             NodeKind::Lv2 { uri } => Some(PluginRef::Lv2(uri.as_str())),
             _ => None,
         }
@@ -422,6 +424,7 @@ impl<'a> PluginRef<'a> {
 pub fn catalog_type(plugin: PluginRef<'_>) -> Option<KeyboardType> {
     crate::catalog::CATALOG.iter().find(|e| match plugin {
         PluginRef::Clap(id) => e.clap_id == Some(id),
+        PluginRef::Vst3(_) => false,
         PluginRef::Lv2(uri) => e.lv2_uris.contains(&uri),
     })?.instrument
 }

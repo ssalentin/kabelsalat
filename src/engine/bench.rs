@@ -351,6 +351,8 @@ fn bench_unit(kind: DspKind, reps: usize, print_human: bool) -> UnitRow {
     let mut runs = Vec::with_capacity(reps);
     let mut hash = 0u64;
     let mut buf = vec![0.0f32; frames * 2];
+    // A routing unit's second buffer (#308): IN B, or its second output.
+    let mut aux = vec![0.0f32; frames * 2];
     for _ in 0..reps {
         let mut proc = crate::dsp::build_processor(&kind, SR);
         hash = 0xcbf29ce484222325;
@@ -358,10 +360,20 @@ fn bench_unit(kind: DspKind, reps: usize, print_human: bool) -> UnitRow {
         for block in input.chunks_exact(frames * 2) {
             buf.copy_from_slice(block);
             let t = std::time::Instant::now();
-            proc.process(std::hint::black_box(&mut buf), frames);
+            if kind.two_inputs() || kind.two_outputs() {
+                aux.copy_from_slice(block);
+                proc.process_aux(std::hint::black_box(&mut buf), &mut aux, frames);
+            } else {
+                proc.process(std::hint::black_box(&mut buf), frames);
+            }
             spent += t.elapsed();
             for &s in &buf {
                 fnv(&mut hash, s);
+            }
+            if kind.two_outputs() {
+                for &s in &aux {
+                    fnv(&mut hash, s);
+                }
             }
         }
         runs.push(spent.as_nanos() as f64 / (blocks * frames) as f64);
@@ -676,7 +688,7 @@ fn bench_with_args(args: &[String]) -> anyhow::Result<()> {
     }
     if opts.wants("units") {
         let mut units = Vec::new();
-        for kind in [DspKind::Gain, DspKind::Pan, DspKind::Eq3, DspKind::Filter, DspKind::Limiter, DspKind::Saturation, DspKind::Delay, DspKind::Reverb, DspKind::Bus] {
+        for kind in [DspKind::Gain, DspKind::Pan, DspKind::Eq3, DspKind::Filter, DspKind::Limiter, DspKind::Saturation, DspKind::Delay, DspKind::Reverb, DspKind::Bus, DspKind::Crossfade, DspKind::Split] {
             units.push(bench_unit(kind, opts.reps, print_human));
         }
         report.units = Some(units);

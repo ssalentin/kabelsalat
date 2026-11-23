@@ -109,6 +109,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   [MIDI matrix](docs/GUIDE.md#route-midi-anywhere)
 - **MIDI effects** (transpose, arpeggiator, chord) in front of any instrument.
   → [MIDI effects](docs/GUIDE.md#put-midi-effects-in-front-of-an-instrument)
+- **Routing units:** an A/B switch and crossfader (foot-switchable) and a
+  splitter (low/high bands, mid/side, left/right), zero-latency, in the
+  Plugins browser. → [Switch, blend and split audio](docs/GUIDE.md#switch-blend-and-split-audio)
 
 **Plugins**
 - **Browse by what a plugin does**, not by its format: instruments, effects,

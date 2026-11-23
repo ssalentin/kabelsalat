@@ -2701,6 +2701,18 @@ fn make_unit(node: &Node) -> Unit {
             vec![], vec![PortKind::Audio],
             vec![(Dir::Out, 0, 0.62, "OUT")],
         ),
+        // Routing units (#308): the port of a jack is the engine's (IN A =
+        // port 0, IN B = port 1; a splitter's outputs likewise).
+        NodeKind::Dsp(DspKind::Crossfade) => (
+            UnitKind::Dsp(DspKind::Crossfade), "a/b switch · crossfader".into(),
+            vec![PortKind::Audio, PortKind::Audio], vec![PortKind::Audio],
+            vec![(Dir::In, 0, 0.20, "IN A"), (Dir::In, 1, 0.46, "IN B"), (Dir::Out, 0, 0.78, "OUT")],
+        ),
+        NodeKind::Dsp(DspKind::Split) => (
+            UnitKind::Dsp(DspKind::Split), "splitter · two outputs".into(),
+            vec![PortKind::Audio], vec![PortKind::Audio, PortKind::Audio],
+            vec![(Dir::In, 0, 0.20, "IN"), (Dir::Out, 0, 0.50, "LO·MID"), (Dir::Out, 1, 0.80, "HI·SIDE")],
+        ),
         NodeKind::Dsp(kind) => {
             let sub: &str = match kind {
                 DspKind::Reverb => "reverb",
@@ -2711,7 +2723,7 @@ fn make_unit(node: &Node) -> Unit {
                 DspKind::Saturation => "saturation",
                 DspKind::Pan => "panner",
                 DspKind::Metronome => "metronome · transport click",
-                DspKind::Delay | DspKind::Bus => unreachable!(),
+                DspKind::Delay | DspKind::Bus | DspKind::Crossfade | DspKind::Split => unreachable!(),
             };
             (
                 UnitKind::Dsp(kind.clone()), sub.into(),
@@ -3229,6 +3241,8 @@ enum BrowserAction {
     AddInstrument(NodeKind, String),
     AddEffect(NodeKind, String),
     AddMasterEffect(NodeKind, String),
+    /// A unit that is patched by hand (a routing unit, #308).
+    AddUnwired(NodeKind, String),
     AddArp,
     AddMetronome,
     AddMidiFx(Option<String>, String),
@@ -3266,6 +3280,11 @@ impl BrowserCard {
             Source::Builtin(b) => {
                 let actions = match &b.action {
                     BuiltinAction::Dsp(DspKind::Metronome) => vec![("Add to rig", RIG, BrowserAction::AddMetronome)],
+                    // A routing unit has two inputs or two outputs: it is
+                    // no insert of a linear chain, it is patched on the back.
+                    BuiltinAction::Dsp(kind) if kind.two_inputs() || kind.two_outputs() => {
+                        vec![("Add to rig", "add it to the active rig, to patch on the back", BrowserAction::AddUnwired(NodeKind::Dsp(kind.clone()), name.clone()))]
+                    }
                     BuiltinAction::Dsp(kind) => effect(NodeKind::Dsp(kind.clone())),
                     BuiltinAction::Arp => vec![("Add MIDI strip", STRIP, BrowserAction::AddArp)],
                     BuiltinAction::MidiTranspose => {
@@ -11864,6 +11883,8 @@ impl DemoApp {
                         "delay" => Some(NodeKind::Dsp(DspKind::Delay)),
                         "reverb" => Some(NodeKind::Dsp(DspKind::Reverb)),
                         "metronome" => Some(NodeKind::Dsp(DspKind::Metronome)),
+                        "crossfade" | "crossfader" | "ab" | "switch" => Some(NodeKind::Dsp(DspKind::Crossfade)),
+                        "split" | "splitter" => Some(NodeKind::Dsp(DspKind::Split)),
                         _ => None,
                     },
                     "lv2" => args.get("uri").and_then(|v| v.as_str()).map(|u| NodeKind::Lv2 { uri: Lv2Uri::new(u) }),
@@ -21528,6 +21549,13 @@ impl DemoApp {
             }
             return;
         }
+        self.add_unwired_to_active_rig(kind, name);
+    }
+
+    /// Add a unit to the active rig without cables: a routing unit (#308),
+    /// or an effect in a rig that has no linear chain to append to.
+    fn add_unwired_to_active_rig(&mut self, kind: NodeKind, name: &str) {
+        let rig = self.active_rig as u8;
         let mut g = self.mirror_graph();
         let node = g.add_node(kind, name_bytes(&name.to_uppercase()));
         g.set_rig(node, rig);
@@ -32948,6 +32976,14 @@ impl DemoApp {
                     _ => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
                 },
                 DspKind::Pan => KnobFormat::Pan,
+                DspKind::Crossfade => match param {
+                    Some(1) => KnobFormat::Choice(&crate::dsp::routing::FadeMode::LABELS),
+                    _ => KnobFormat::AbMix,
+                },
+                DspKind::Split => match param {
+                    Some(0) => KnobFormat::Choice(&crate::dsp::routing::SplitMode::LABELS),
+                    _ => KnobFormat::LogHz { lo: crate::dsp::routing::SPLIT_MIN_HZ, hi: crate::dsp::routing::SPLIT_MAX_HZ },
+                },
                 DspKind::Bus => KnobFormat::LinearDb,
                 DspKind::Metronome => KnobFormat::Percent { lo: 0.0, hi: 100.0, clamp_min: None },
             },
@@ -34927,6 +34963,10 @@ enum KnobFormat {
     Semitones(i8),
     /// Percentage `lo..=hi` (optional floor clamp on normalized `v`, e.g. Arp GATE ≥ 5%).
     Percent { lo: f32, hi: f32, clamp_min: Option<f32> },
+    /// A stepped knob whose positions have names (a routing unit's MODE).
+    Choice(&'static [&'static str]),
+    /// A crossfader's MIX: `A`, `35% B`, `B`.
+    AbMix,
     /// Stepped Arp MODE (`UP`, `DOWN`, `U-D`, `CHORD`, `RAND`).
     ArpMode,
     /// Stepped Arp RATE (`1/4`..`1/32`).
@@ -35023,6 +35063,16 @@ impl KnobFormat {
                 let eff = clamp_min.map_or(v, |m| v.max(m));
                 let pct = lo + (hi - lo) * eff;
                 format!("{}%", pct.round() as i32)
+            }
+            KnobFormat::Choice(names) => names[crate::arp::step_index(v as f64, names.len())].into(),
+            KnobFormat::AbMix => {
+                if v <= 0.0 {
+                    "A".into()
+                } else if v >= 1.0 {
+                    "B".into()
+                } else {
+                    format!("{}% B", ((v * 100.0).round() as i32).clamp(1, 99))
+                }
             }
             KnobFormat::ArpMode => {
                 crate::arp::ArpMode::ALL[crate::arp::step_index(v as f64, crate::arp::ArpMode::ALL.len())].label().into()
@@ -35167,6 +35217,21 @@ impl KnobFormat {
                 if !num.is_finite() { return None; }
                 let n = ((num - lo) / (hi - lo)).clamp(0.0, 1.0);
                 Some(clamp_min.map_or(n, |m| n.max(m)))
+            }
+            KnobFormat::Choice(names) => {
+                let idx = names.iter().position(|n| n.eq_ignore_ascii_case(s.trim()))?;
+                Some(crate::arp::step_value(idx, names.len()))
+            }
+            KnobFormat::AbMix => {
+                match lower.as_str() {
+                    "a" => return Some(0.0),
+                    "b" => return Some(1.0),
+                    _ => {}
+                }
+                let num = lower.strip_suffix('b').unwrap_or(&lower).trim();
+                let num = num.strip_suffix('%').unwrap_or(num).trim().parse::<f32>().ok()?;
+                if !num.is_finite() { return None; }
+                Some((num / 100.0).clamp(0.0, 1.0))
             }
             KnobFormat::ArpMode => {
                 let m = crate::arp::ArpMode::from_name(s)?;
@@ -52349,6 +52414,38 @@ mod offline_shots {
             app.plugin_category = *cat;
             app.plugin_subtype = *sub;
             shot(&mut app, *size, &dir.join(file));
+        }
+    }
+
+    /// The routing units (#308) are addable from the Plugins browser's path
+    /// and show their two inputs or two outputs, each on its own port.
+    #[test]
+    fn routing_units_show_their_two_inputs_and_outputs() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Crossfade), "A/B Crossfade");
+        app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Split), "Splitter");
+        let jacks = |kind: DspKind| -> Vec<(bool, usize, &'static str)> {
+            let u = app.units.iter().find(|u| matches!(&u.node_kind, UnitKind::Dsp(k) if *k == kind)).expect("unit");
+            u.jacks.iter().map(|j| (matches!(j.dir, Dir::In), j.port, j.label)).collect()
+        };
+        assert_eq!(jacks(DspKind::Crossfade), vec![(true, 0, "IN A"), (true, 1, "IN B"), (false, 0, "OUT")]);
+        let split = jacks(DspKind::Split);
+        assert_eq!(split.iter().filter(|j| !j.0).map(|j| j.1).collect::<Vec<_>>(), vec![0, 1]);
+        let x = app.units.iter().find(|u| matches!(&u.node_kind, UnitKind::Dsp(DspKind::Crossfade))).unwrap();
+        assert_eq!(x.knobs.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(), vec!["MIX", "MODE"]);
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat routing_unit_shots -- --ignored"]
+    fn routing_unit_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, back) in [("front", false), ("back", true)] {
+            let mut app = DemoApp::new_with_sink(None);
+            app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Crossfade), "A/B Crossfade");
+            app.add_unwired_to_active_rig(NodeKind::Dsp(DspKind::Split), "Splitter");
+            if back { app.side = Side::Back; }
+            super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join(format!("routing-{name}.png")));
         }
     }
 

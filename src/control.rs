@@ -134,6 +134,25 @@ pub enum DspKind {
     /// its insert chain, and whatever reaches a master from there returns to
     /// the main mix past the rig faders. Param 0 = its fader (linear gain).
     Bus,
+    /// A/B switch and crossfader (issue #308): two stereo inputs (audio port
+    /// 0 = IN A, port 1 = IN B), one output. Param 0 = mix (0 = A, 1 = B),
+    /// param 1 = mode (equal power, linear, switch). `dsp::routing`.
+    Crossfade,
+    /// Splitter (issue #308): one stereo input, two stereo outputs (audio
+    /// port 0 = LOW / MID / LEFT, port 1 = HIGH / SIDE / RIGHT) that sum back
+    /// to the input. Param 0 = mode, param 1 = crossover frequency.
+    Split,
+}
+
+impl DspKind {
+    /// A routing unit with two audio inputs: a cable's `to.port` says which.
+    pub fn two_inputs(&self) -> bool {
+        matches!(self, DspKind::Crossfade)
+    }
+    /// A routing unit with two audio outputs: a cable's `from.port` says which.
+    pub fn two_outputs(&self) -> bool {
+        matches!(self, DspKind::Split)
+    }
 }
 
 /// Where a send taps its signal (issue #5): a whole rig at its rig bus, or

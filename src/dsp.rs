@@ -13,6 +13,8 @@
 
 use crate::control::DspKind;
 
+pub mod routing;
+
 /// Common interface for built-in nodes; the engine wires these into the graph.
 pub trait Processor: Send {
     /// Process `frames` stereo-interleaved frames in place.
@@ -20,6 +22,12 @@ pub trait Processor: Send {
     fn set_param(&mut self, id: u32, value: f32);
     fn param_count(&self) -> u32;
     fn param_name(&self, id: u32) -> &'static str;
+    /// Process with the second stereo buffer of a routing unit (#308): a
+    /// crossfader reads its IN B from `aux`, a splitter writes its second
+    /// output there. Every other processor ignores it.
+    fn process_aux(&mut self, io: &mut [f32], _aux: &mut [f32], frames: usize) {
+        self.process(io, frames);
+    }
     /// Frames the output lags the input (a lookahead); the engine delays
     /// parallel paths to match (`engine::pdc`).
     fn latency_frames(&self) -> usize {
@@ -49,6 +57,8 @@ pub fn build_processor(kind: &DspKind, sample_rate: f64) -> Box<dyn Processor> {
         DspKind::Reverb => Box::new(Reverb::new(sample_rate)),
         DspKind::Metronome => Box::new(Metronome),
         DspKind::Bus => Box::new(BusFader::new(sample_rate)),
+        DspKind::Crossfade => Box::new(routing::Crossfade::new(sample_rate)),
+        DspKind::Split => Box::new(routing::Split::new(sample_rate)),
     }
 }
 
@@ -1431,6 +1441,52 @@ const BUS_PARAMS: &[DspParamSpec] = &[DspParamSpec {
     description: "Aux bus return level into Master.",
 }];
 
+const CROSSFADE_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 0,
+        native_param: routing::P_XFADE_MIX,
+        name: "mix",
+        label: "Mix",
+        unit: "%",
+        range: "0..100 % B (0 = input A alone, 1.0 = input B alone)",
+        default: 0.0,
+        description: "Position between input A and input B. Bind a pedal or foot switch to it.",
+    },
+    DspParamSpec {
+        engine_param: 1,
+        native_param: routing::P_XFADE_MODE,
+        name: "mode",
+        label: "Mode",
+        unit: "mode",
+        range: "0 = equal power, 0.5 = linear, 1.0 = A/B switch",
+        default: 0.0,
+        description: "Equal power for two different sources, linear for dry/wet paths of one sound, A/B switch to select instead of blend.",
+    },
+];
+
+const SPLIT_PARAMS: &[DspParamSpec] = &[
+    DspParamSpec {
+        engine_param: 0,
+        native_param: routing::P_SPLIT_MODE,
+        name: "mode",
+        label: "Mode",
+        unit: "mode",
+        range: "0 = low/high bands, 0.5 = mid/side, 1.0 = left/right",
+        default: 0.0,
+        description: "What the two outputs carry: OUT 1 low, mid or left; OUT 2 high, side or right.",
+    },
+    DspParamSpec {
+        engine_param: 1,
+        native_param: routing::P_SPLIT_FREQ,
+        name: "freq",
+        label: "Freq",
+        unit: "Hz",
+        range: "60..8000 Hz (logarithmic; 0.292 = 250 Hz)",
+        default: 0.2917,
+        description: "Crossover frequency of the low/high split (24 dB/octave Linkwitz-Riley).",
+    },
+];
+
 const DSP_CATALOG: &[DspNodeSpec] = &[
     DspNodeSpec {
         kind: "gain",
@@ -1512,6 +1568,22 @@ const DSP_CATALOG: &[DspNodeSpec] = &[
         latency_ms: 0.0,
         params: BUS_PARAMS,
     },
+    DspNodeSpec {
+        kind: "crossfade",
+        name: "A/B Crossfade",
+        category: "Mix & Gain",
+        summary: "A/B switch and crossfader: two stereo inputs (IN A, IN B) into one output, click-free.",
+        latency_ms: 0.0,
+        params: CROSSFADE_PARAMS,
+    },
+    DspNodeSpec {
+        kind: "split",
+        name: "Splitter",
+        category: "Mix & Gain",
+        summary: "One stereo input into two outputs that sum back to it: low/high bands, mid/side or left/right.",
+        latency_ms: 0.0,
+        params: SPLIT_PARAMS,
+    },
 ];
 
 pub fn dsp_catalog() -> &'static [DspNodeSpec] {
@@ -1530,6 +1602,8 @@ pub fn dsp_spec(kind: &DspKind) -> &'static DspNodeSpec {
         DspKind::Reverb => 7,
         DspKind::Metronome => 8,
         DspKind::Bus => 9,
+        DspKind::Crossfade => 10,
+        DspKind::Split => 11,
     };
     &DSP_CATALOG[idx]
 }
@@ -1552,6 +1626,8 @@ pub fn dsp_kind_from_str(s: &str) -> Option<DspKind> {
         "reverb" | "verb" => Some(DspKind::Reverb),
         "metronome" | "metro" | "click" => Some(DspKind::Metronome),
         "bus" | "aux" | "aux bus" => Some(DspKind::Bus),
+        "crossfade" | "crossfader" | "xfade" | "ab" | "a/b" | "a/b switch" | "ab switch" | "switch" | "a/b crossfade" => Some(DspKind::Crossfade),
+        "split" | "splitter" | "band split" | "band splitter" | "crossover" | "mid/side" | "ms split" => Some(DspKind::Split),
         _ => None,
     }
 }
@@ -1625,6 +1701,18 @@ pub fn format_dsp_value_with_mode(
                 format!("{:+.1} dB ({:.2}x)", 20.0 * amp.log10(), amp)
             }
         }
+        (DspKind::Crossfade, 0) => {
+            if v <= 0.0 {
+                "A".into()
+            } else if v >= 1.0 {
+                "B".into()
+            } else {
+                format!("{:.0}% B", v * 100.0)
+            }
+        }
+        (DspKind::Crossfade, 1) => routing::FadeMode::from_norm(v).name().into(),
+        (DspKind::Split, 0) => routing::SplitMode::from_norm(v).name().into(),
+        (DspKind::Split, 1) => fmt_hz(routing::split_hz(v)),
         (DspKind::Pan, 0) => {
             if (v - 0.5).abs() < 0.02 {
                 "Center".into()
@@ -1706,6 +1794,39 @@ pub fn parse_dsp_text_value(kind: &DspKind, native_param: u32, text: &str) -> Op
                 return Some(0.0);
             }
         }
+        (DspKind::Crossfade, 0) => {
+            if lower == "a" || lower == "input a" || lower == "in a" {
+                return Some(0.0);
+            }
+            if lower == "b" || lower == "input b" || lower == "in b" {
+                return Some(1.0);
+            }
+            if lower == "center" || lower == "centre" || lower == "middle" || lower == "both" {
+                return Some(0.5);
+            }
+        }
+        (DspKind::Crossfade, 1) => {
+            if lower.contains("switch") || lower == "a/b" || lower == "ab" {
+                return Some(1.0);
+            }
+            if lower.contains("lin") {
+                return Some(0.5);
+            }
+            if lower.contains("power") || lower.contains("fade") {
+                return Some(0.0);
+            }
+        }
+        (DspKind::Split, 0) => {
+            if lower.contains("mid") || lower.contains("side") || lower == "m/s" || lower == "ms" {
+                return Some(0.5);
+            }
+            if lower.contains("left") || lower.contains("right") || lower == "l/r" || lower == "lr" {
+                return Some(1.0);
+            }
+            if lower.contains("band") || lower.contains("low") || lower.contains("high") || lower.contains("cross") {
+                return Some(0.0);
+            }
+        }
         (DspKind::Pan, 0) => {
             if lower == "left" || lower == "l" || lower == "hard left" {
                 return Some(0.0);
@@ -1756,6 +1877,7 @@ pub fn parse_dsp_text_value(kind: &DspKind, native_param: u32, text: &str) -> Op
             (DspKind::Eq3, 5) => Some(log_norm(hz, 2000.0, 16000.0)),
             (DspKind::Filter, 0) => Some(log_norm(hz, 20.0, 20000.0)),
             (DspKind::Delay, 4) => Some(1.0 - log_norm(hz, 500.0, 20000.0)),
+            (DspKind::Split, 1) => Some(routing::split_norm(hz)),
             _ => None,
         };
     }
@@ -2296,6 +2418,8 @@ pub(crate) mod tests {
             (DspKind::Reverb, 4),
             (DspKind::Metronome, 0),
             (DspKind::Bus, 1),
+            (DspKind::Crossfade, 2),
+            (DspKind::Split, 2),
         ];
         for (kind, count) in kinds {
             let mut p = build_processor(&kind, SR);
@@ -2471,12 +2595,15 @@ pub(crate) mod tests {
             DspKind::Reverb,
             DspKind::Metronome,
             DspKind::Bus,
+            DspKind::Crossfade,
+            DspKind::Split,
         ];
         // Everything (nodes + buffers) is built before the measurement window.
         let mut nodes: Vec<Box<dyn Processor>> =
             kinds.iter().map(|k| build_processor(k, SR)).collect();
         let io = noise(1024, 0.5);
         let mut scratch = vec![0.0f32; 1024 * 2];
+        let mut aux = vec![0.0f32; 1024 * 2];
 
         let before = rt_alloc::count();
         for block in 0..64 {
@@ -2487,6 +2614,9 @@ pub(crate) mod tests {
                 }
                 scratch.copy_from_slice(&io);
                 p.process(&mut scratch, 1024);
+                // The routing units' real path: with their second buffer.
+                aux.copy_from_slice(&io);
+                p.process_aux(&mut scratch, &mut aux, 1024);
             }
         }
         let after = rt_alloc::count();
@@ -2497,7 +2627,7 @@ pub(crate) mod tests {
 
     #[test]
     fn dsp_catalog_and_musical_text_roundtrip() {
-        assert_eq!(dsp_catalog().len(), 10);
+        assert_eq!(dsp_catalog().len(), 12);
         // Delay 50..2000 ms matches DELAY_MIN_S..DELAY_MAX_S.
         let t = find_dsp_param(&DspKind::Delay, "time").expect("delay time");
         assert_eq!(t.engine_param, 1);

@@ -1321,6 +1321,7 @@ mod font_coverage_tests {
             ("ui/audio_doctor.rs", include_str!("ui/audio_doctor.rs")),
             ("ui/show_controls.rs", include_str!("ui/show_controls.rs")),
             ("ui/show_mode.rs", include_str!("ui/show_mode.rs")),
+            ("ui/plugin_folders.rs", include_str!("ui/plugin_folders.rs")),
             ("ui/window_load.rs", include_str!("ui/window_load.rs")),
             ("ui/quick_add.rs", include_str!("ui/quick_add.rs")),
         ] {

@@ -45,8 +45,17 @@ agents are in [AGENTS.md](../AGENTS.md).
   and the first new note's onset at three block sizes. Nothing loads on a
   switch, so the first note waits only for the next block: one device buffer
   plus the instrument's own onset (Surge's saw: 0 to 1 ms).
-- `show.rs` — show controls (#261, #277): `ShowControl` (a CC, note or
-  program change from a device, consumed by a `ShowAction`) in one fixed
+- `config.rs` — permanent app configuration (`~/.config/kabelsalat/config.json`,
+  #437): `ShowModeConfig`, port-keyed `ShowControlsConfig`, startup/display
+  flags (`reopen_last_session`, `last_session`, `record_sync`, `ui_scale`,
+  `system_ime`), and process-wide flags (`plugin_sandbox`, `midi_through`) using
+  thread-local storage in `cfg(test)` (rule 183) and path-parameterized helpers
+  (rule 37). `ShowControlsConfig::merge_with_session` combines global bindings
+  with legacy/per-session `Setlist::controls` overrides so permanent foot
+  controls survive templates and session loads while offline ports wait safely.
+- `show.rs` — show controls (#261, #277, #437): `ShowControl` (a CC, note or
+  program change from a device, consumed by a `ShowAction`, including `ShowMode`)
+  in one fixed
   table the engine checks before the matrix, so a learned control never
   reaches an instrument. Its size is one slot per learned action plus the
   program devices (`MAX_SHOW_CONTROLS`); the session keeps the same list in
@@ -71,7 +80,8 @@ agents are in [AGENTS.md](../AGENTS.md).
   played around each key-range edge. The engine moves it once per live
   note-on; releases are never gated, so a layer or a floated split cannot
   strand a note.
-- `ui/show_mode.rs` — Show mode (#210), the locked stage screen. The lock is
+- `ui/show_mode.rs` — Show mode (#210, #437), the locked stage screen, driven by
+  `ShowModeConfig` (exit hold time, 12/24h clock, notes & rig meter visibility). The lock is
   one gate at the top of `frame_ui`: while it is open the frame runs
   `show_frame` instead of the editing frame, so no panel, view, shortcut or
   rack handler reads input. Both frames share `frame_feeds` (agents, the

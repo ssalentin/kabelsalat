@@ -44,6 +44,7 @@ every keyboard shortcut.
   - [Song notes and chord charts](#song-notes-and-chord-charts)
   - [Check the show before the first song](#check-the-show-before-the-first-song)
   - [Run the show from a pedal](#run-the-show-from-a-pedal)
+  - [Permanent settings and Show controls](#permanent-settings-and-show-controls)
   - [Play along with a backing track](#play-along-with-a-backing-track)
   - [Markers: jump to a section, loop a section](#markers-jump-to-a-section-loop-a-section)
   - [Running backing tracks for a band](#running-backing-tracks-for-a-band)
@@ -417,8 +418,9 @@ sounding without an xrun. kabelsalat automatically restarts the dead helper
 with the unit's last saved state (and live control port values for LV2) and
 shows a `RESTARTED` badge on the strip so you know what happened.
 
-Set `KABELSALAT_SANDBOX=0` to host CLAP, VST3, and LV2 plugins in-process
-instead. Run `kabelsalat sandbox-test` to verify `SIGSEGV` recovery across
+Toggle **Plugin sandboxing** under **Settings → Plugins** (or set
+`KABELSALAT_SANDBOX=0`) to host CLAP, VST3, and LV2 plugins in-process instead.
+Run `kabelsalat sandbox-test` to verify `SIGSEGV` recovery across
 live rigs (CLAP and LV2) and measure the shared-memory IPC round-trip time at
 64 and 256 frames.
 
@@ -766,8 +768,10 @@ Use **← / →** or **PageUp / PageDown** (**Shift** for songs) and foot switch
 to step the setlist, **↑ / ↓** to scroll song notes, **Space** to start/stop the
 click and transport, **Shift+T** for tap tempo, and **Ctrl+T** for the tuner
 (short **Esc** closes it). **Panic** sends all notes off on every rig (agents:
-`panic`), and to leave you hold **Esc** until its line fills (a second), then
-let go.
+`panic`), and to leave you hold **Esc** until its line fills (default 1 s), then
+let go. **Settings → Show** customizes the hold duration, 12/24-hour stage clock,
+song notes and per-rig meter visibility, launching directly into Show mode, and
+MIDI foot controls (including a **Show mode** toggle).
 
 <p align="center"><img src="shots/show-mode.png" width="85%" alt="Show mode: the song Moonlight Drive in large type with its part Chorus and 118 BPM 4/4, the next song Riders on the Storm, meters for the master and the organ, a clock, the Panic button and the hint to hold Esc to leave"/></p>
 
@@ -841,6 +845,37 @@ close it. Agents list and set the controls with `get_show_controls` and
 <p align="center"><img src="shots/show-controls.png" width="85%" alt="Setlist → Show controls: every show action with its learned control (a note, a CC or a program change from a device), Learn and Clear, one row waiting for a press, and the row that lets a device's program change pick the song"/></p>
 
 <p align="center"><img src="shots/show-tuner.png" width="85%" alt="Show mode with the tuner open: A4, +8 cents, its needle right of centre, under the caption TUNER"/></p>
+
+### Permanent settings and Show controls
+
+Rig-wide and live-stage preferences live in `~/.config/kabelsalat/config.json`,
+independently of any single `.ksalat` session or starter template:
+
+- **Settings → Show** holds Show mode options (**Exit hold time**, 24-hour or
+  12-hour **Clock format**, **Song notes & charts**, **Rig meters**, and
+  **Start in Show mode**), the **ALSA Midi Through** toggle, and permanent MIDI
+  Show controls (including **Show mode** to enter/leave Show mode from a switch).
+  Each action offers **Learn** as well as inline **Edit** (CC, Note or Program
+  Change number, optional MIDI channel `1–16` or any, and target hardware port).
+  Bindings save by MIDI port name, stay inactive if a controller is unplugged,
+  and reconnect even if USB ports enumerate in a different order; any legacy
+  per-session override in `Setlist → Show controls` can be promoted to
+  `config.json` or cleared, and **Settings →** jumps straight between views.
+- **Settings → Session** adds **Reopen last session** (reloads your last saved
+  or opened session on startup when not recovering from a crash) and **Sync
+  recording with transport** (also toggled on the top-bar `SYNC` / `REC` menu).
+- **Settings → Display** makes **UI scale** configurable (**Auto** or fixed
+  `1.00×`–`2.50×`), alongside **Rack CPU overlay** (`F3`) and **System input
+  method (IME)**.
+- **Settings → Plugins** exposes **Plugin sandboxing** for newly loaded plugins.
+
+Environment variables (`KABELSALAT_UI_SCALE`, `KABELSALAT_IME`,
+`KABELSALAT_SANDBOX`, `KABELSALAT_MIDI_THROUGH`) still override the stored
+values when set. Agents read and change every option with `get_config`,
+`set_config`, `get_show_controls`, and `set_show_control` (`show_mode`,
+`channel`, `device_port`, and `scope`: `"global"` by default or `"session"`).
+
+<p align="center"><img src="shots/settings-show.png" width="85%" alt="Settings → Show: Show mode exit hold time, clock format, notes and rig meters, start in Show mode, permanent MIDI Show controls with Edit and Learn, program change song selection, and ALSA Midi Through"/></p>
 
 ### Play along with a backing track
 

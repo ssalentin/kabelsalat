@@ -170,11 +170,13 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
 - **Backing-track markers:** jump to the chorus, loop the solo or stop at the
   end of a section, on the bar; a marker can switch the song's part.
   → [Markers](docs/GUIDE.md#markers-jump-to-a-section-loop-a-section)
-- **Step songs from a foot switch**, attach WAV backing tracks directly to songs,
-  record the set (raw inputs, stems, MIDI and part markers) or save the last two
-  minutes with **Retro**, replay a gig take through the rack as a **Virtual
-  Soundcheck** and export its stems, and restart by
-  itself after a crash. → [Pedals](docs/GUIDE.md#run-the-show-from-a-pedal),
+- **Step songs and toggle Show mode from a pedal**, keep permanent settings
+  and port-named show controls across sessions in **Settings → Show**, attach
+  WAV backing tracks directly to songs, record the set (raw inputs, stems, MIDI
+  and part markers) or save the last two minutes with **Retro**, replay a gig
+  take through the rack as a **Virtual Soundcheck** and export its stems, and
+  restart by itself after a crash. → [Pedals](docs/GUIDE.md#run-the-show-from-a-pedal),
+  [Permanent settings](docs/GUIDE.md#permanent-settings-and-show-controls),
   [Backing tracks](docs/GUIDE.md#play-along-with-a-backing-track),
   [Recording](docs/GUIDE.md#record-your-set),
   [Virtual Soundcheck](docs/GUIDE.md#record-the-gig-and-soundcheck-it-again-later),
@@ -240,7 +242,8 @@ Packaging details: [docs/PACKAGING.md](docs/PACKAGING.md).
   `/usr/local/lib/{clap,vst3,lv2}`. Add other folders under **Settings →
   Plugins** (or with `CLAP_PATH`, `VST3_PATH` or `LV2_PATH`). A plugin built
   for another CPU says so instead of loading.
-- **Typing Chinese, Japanese or Korean:** start with `KABELSALAT_IME=1`; text
+- **Typing Chinese, Japanese or Korean:** enable **System input method (IME)**
+  under **Settings → Display** (or start with `KABELSALAT_IME=1`); text
   fields otherwise read the keyboard directly.
 - **It crashed:** it restarts by itself and reopens your session. The report
   is in `~/.local/state/kabelsalat/crashes/`, and nothing is sent anywhere.

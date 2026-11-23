@@ -19,6 +19,7 @@ mod levels;
 mod scene;
 mod window;
 pub use controls::msg_label;
+pub(crate) use controls::{control_json, parse_show_control_args, ParsedShowControl};
 #[allow(unused_imports)]
 pub use instances::{
     find_matching_rig, is_audio_effect, is_instrument_node, merge_rig_effects_into,
@@ -588,8 +589,24 @@ impl Setlist {
     /// in place of its control. Another action that took the same message
     /// lets go of it, so one press never does two things. Returns that action.
     pub fn learn(&mut self, action: ShowAction, device: Option<u32>, msg: ShowMsg) -> Option<ShowAction> {
-        let control = ShowControl { device, channel: None, msg, action };
-        let overlaps = |c: &ShowControl| c.msg == msg && (c.device.is_none() || device.is_none() || c.device == device);
+        self.learn_with_channel(action, device, None, msg)
+    }
+
+    /// Learn `msg` from `(device, channel)` for `action`.
+    pub fn learn_with_channel(
+        &mut self,
+        action: ShowAction,
+        device: Option<u32>,
+        channel: Option<u8>,
+        msg: ShowMsg,
+    ) -> Option<ShowAction> {
+        let channel = channel.map(|c| c & 0x0F);
+        let control = ShowControl { device, channel, msg, action };
+        let overlaps = |c: &ShowControl| {
+            c.msg == msg
+                && (c.device.is_none() || device.is_none() || c.device == device)
+                && (c.channel.is_none() || channel.is_none() || c.channel == channel)
+        };
         let taken = self.controls.iter().find(|c| c.action != action && c.action != ShowAction::SongOfProgram && overlaps(c)).map(|c| c.action);
         self.controls.retain(|c| c.action == ShowAction::SongOfProgram || (c.action != action && !overlaps(c)));
         self.controls.push(control);

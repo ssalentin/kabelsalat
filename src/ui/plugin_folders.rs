@@ -161,6 +161,19 @@ impl DemoApp {
             Self::settings_gap(ui);
             self.plugin_folder_section(ui, format, dirs.of(format), actions);
         }
+        Self::settings_gap(ui);
+        let sandbox_on = self.plugin_sandbox_pref;
+        let sb_env = std::env::var_os("KABELSALAT_SANDBOX").is_some();
+        let sb_desc = if sb_env {
+            "Runs each CLAP, VST3 and LV2 plugin in an isolated helper process (overridden by KABELSALAT_SANDBOX). Applies to newly loaded plugins."
+        } else {
+            "Runs each CLAP, VST3 and LV2 plugin in an isolated helper process so a plugin crash restarts that strip without stopping audio. Applies to newly loaded plugins."
+        };
+        Self::settings_row(ui, "Plugin sandboxing", sb_desc, |ui| {
+            if theme::chip_button(ui, if sandbox_on { "On" } else { "Off" }, sandbox_on).clicked() {
+                actions.push(SettingsAction::TogglePluginSandbox);
+            }
+        });
     }
 
     fn plugin_folder_section(&mut self, ui: &mut egui::Ui, format: Format, list: &[PathBuf], actions: &mut Vec<SettingsAction>) {

@@ -1256,6 +1256,19 @@ struct ResetParamsArgs {
     query: Option<String>,
 }
 
+/// Arguments of the macro tools: one JSON object, checked by the app
+/// (`macro`, `node`, `name`, `value`, `target_node`, `param`, `knob`, `mix`,
+/// `min`, `max`, `curve`, `invert`, `rig`, `store`).
+#[derive(Debug, Deserialize)]
+struct MacroToolArgs(Value);
+
+impl JsonSchema for MacroToolArgs {
+    fn schema_name() -> std::borrow::Cow<'static, str> { "MacroToolArgs".into() }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"type": "object", "additionalProperties": true})
+    }
+}
+
 /// Arguments for `learn_cc`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LearnCcArgs {
@@ -3314,6 +3327,9 @@ impl McpServer {
             Ok(t) => t,
             Err(e) => return tool_err(e),
         };
+        if target == crate::matrix::CcTarget::Macro {
+            return tool_err("macros live in the running app: use kabelsalat mcp --attach");
+        }
         let mut st = self.state.lock().unwrap();
         if let Err(e) = refresh_remote(&mut st) {
             return tool_err(e);
@@ -3862,6 +3878,27 @@ impl McpServer {
                 "cancel": args.cancel,
             }),
         )
+    }
+
+    /// Macros and rig morphs (#289, #214): served by the running app.
+    #[tool(name = "list_macros", description = "List macros and rig morphs: each is one named control with any number of targets (parameter, rack knob or mixer control), each with min, max, curve and invert. Needs --attach.")]
+    fn list_macros(&self) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("list_macros", json!({}))
+    }
+
+    #[tool(name = "set_macro", description = "Create or edit a macro (node + name to create, macro = id or name to edit); one target per call: target_node + param/knob/mix, min, max (0..1), curve (linear|slow|fast|smooth|switch), invert, remove_target; value (0..1) moves the macro. Bind a controller with set_cc_map target='macro'. Needs --attach.")]
+    fn set_macro(&self, Parameters(args): Parameters<MacroToolArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("set_macro", args.0)
+    }
+
+    #[tool(name = "delete_macro", description = "Delete a macro (id or name) and its controller bindings. Needs --attach.")]
+    fn delete_macro(&self, Parameters(args): Parameters<MacroToolArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("delete_macro", args.0)
+    }
+
+    #[tool(name = "set_morph", description = "Scene morph of one rig (0-based): store='a'|'b' stores the rig's knobs as state A or B; value 0..1 fades A to B (stepped knobs switch at the middle). Needs --attach.")]
+    fn set_morph(&self, Parameters(args): Parameters<MacroToolArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("set_morph", args.0)
     }
 
     /// Per-rig mixer (the overview strip's vol/pan/mute/solo).

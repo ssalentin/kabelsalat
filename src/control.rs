@@ -1454,6 +1454,12 @@ pub enum Command {
         #[serde(default)]
         scale: crate::matrix::CcScale,
     },
+    /// The session's macros (#289): replaces the engine's table. A CC bound
+    /// to one (`CcTarget::Macro`) moves every target it lists.
+    SetMacros { macros: crate::macros::MacroTable },
+    /// Move macro `id` to `value` (0..=1): every target follows, as on a
+    /// bound controller (the face knob, an agent).
+    SetMacro { id: u32, value: f64 },
     /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
     /// 0 mutes it. The capture source is started at app startup.
     SetSystemAudio { gain: f32 },
@@ -1666,6 +1672,8 @@ impl Command {
             | Command::Pressure { .. }
             | Command::Program { .. }
             | Command::MatrixCcMap { .. }
+            | Command::SetMacros { .. }
+            | Command::SetMacro { .. }
             | Command::SetSystemAudio { .. }
             | Command::SetAudioIn { .. }
             | Command::SetPlayer { .. }

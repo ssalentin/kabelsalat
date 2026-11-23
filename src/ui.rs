@@ -181,6 +181,7 @@ mod console;
 mod levels;
 mod markers_ui;
 mod show_controls;
+mod macros_ui;
 mod show_mode;
 mod preshow;
 mod stage_outputs;
@@ -685,6 +686,9 @@ struct Knob {
     /// refreshed lazily while hovered, dragged, or open in the knob menu (#304).
     cached_text: Option<(f32, String)>,
     label_g: Option<Arc<theme::TrackedLabel>>,
+    /// The macro this knob is the control of (#289): it drives no engine
+    /// param of its own, `ui/macros_ui.rs` moves the macro's targets.
+    macro_id: Option<u32>,
 }
 
 /// A knob's origin. Plugin knobs carry the parameter's full name, which
@@ -751,7 +755,9 @@ impl Knob {
 
     /// Engine or plugin target this knob controls, if bindable to MIDI CC.
     fn cc_target(&self) -> Option<(u32, crate::matrix::CcTarget)> {
-        if let Some(pin) = self.clap {
+        if let Some(id) = self.macro_id {
+            Some((id, crate::matrix::CcTarget::Macro))
+        } else if let Some(pin) = self.clap {
             Some((pin.id, crate::matrix::CcTarget::PluginParam))
         } else {
             self.param.map(|p| (p, crate::matrix::CcTarget::Knob))
@@ -917,6 +923,7 @@ fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
         source: KnobSource::BuiltIn,
         cached_text: None,
         label_g: None,
+        macro_id: None,
     }
 }
 
@@ -966,6 +973,7 @@ fn main_knob(c: &crate::main_controls::MainControl, value: f64, target: MainTarg
         source: KnobSource::Main(c.name.clone()),
         cached_text: None,
         label_g: None,
+        macro_id: None,
     }
 }
 
@@ -1178,6 +1186,7 @@ fn remap_session(
     ns.rig_types = s.rig_types.clone(); // marks follow their rig like names (#198)
     ns.time_sig = s.time_sig; // session-level too (#87)
     ns.rig_devices = s.rig_devices.clone(); // and devices (#227)
+    ns.macros = crate::macros::remap(&s.macros, &remap); // macros follow their nodes (#289)
     ns.set_hw_ports(s.hw_ports().clone());
     for p in s.params() {
         if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
@@ -3595,6 +3604,7 @@ fn sentence_first(s: &str) -> String {
 /// `ui_bridge_tool("…")` must be listed — `ui_bridge_tools_cover_mcp` checks.
 const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "set_param", "list_cc_maps", "set_cc_map", "clear_cc_map",
+    "list_macros", "set_macro", "delete_macro", "set_morph",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "set_audio_backend", "list_app_streams", "set_app_stream", "add_rig", "clone_rig", "delete_rig",
     "save_rig", "load_rig", "list_rig_presets", "load_template",
@@ -4247,6 +4257,9 @@ struct DemoApp {
     show_learn: Option<crate::show::ShowAction>,
     /// The engine's copy of the setlist's show controls and parts (#261).
     show_sent: crate::show::ShowSent,
+    /// Macros and rig morphs (#289, #214), and what the engine has of them.
+    macros: Vec<crate::macros::Macro>,
+    macros_sent: crate::macros::MacrosSent,
     /// `GraphPub::show_steps` last followed.
     show_steps_seen: u64,
     /// `GraphPub::show_presses` last followed.
@@ -4934,6 +4947,8 @@ impl DemoApp {
             setlist: crate::setlist::Setlist::default(),
             show_learn: None,
             show_sent: crate::show::ShowSent::default(),
+            macros: Vec::new(),
+            macros_sent: crate::macros::MacrosSent::default(),
             show_steps_seen: 0,
             show_presses_seen: [0; crate::show::ShowAction::ALL.len()],
             tuner_on: false,
@@ -7373,6 +7388,10 @@ impl DemoApp {
             "clear_cc_map" => "Clear MIDI CC".into(),
             "list_cc_maps" => "List MIDI CCs".into(),
             "learn_cc" => "Learn MIDI CC".into(),
+            "list_macros" => "List macros".into(),
+            "set_macro" => "Set macro".into(),
+            "delete_macro" => "Delete macro".into(),
+            "set_morph" => "Morph rig".into(),
             "list_sounds" => "Search patches".into(),
             "load_sound" => format!("Load '{}'", args.get("query").and_then(|v| v.as_str()).unwrap_or("patch")),
             "add_rig" => match args.get("name").and_then(|v| v.as_str()) {
@@ -8911,6 +8930,7 @@ impl DemoApp {
             );
         }
         let mut s = crate::session::Session::new(name, graph);
+        s.macros = self.macros.clone();
         for (&(node, param), &value) in &self.node_params {
             if s.graph.node(node).is_some() {
                 s.set_param(node, param, value as f64);
@@ -9198,6 +9218,8 @@ impl DemoApp {
         self.session_rig_names = s.rig_names.clone();
         self.session_rig_devices = s.rig_devices.clone();
         self.build_rack(&s.graph, s.params());
+        self.macros = s.macros.clone();
+        self.sync_macro_knobs();
         self.begin_load_fade();
         // Restore the setlist and prime any per-setlist load window BEFORE
         // hosting plugins or loading the graph so opening a long windowed gig
@@ -10986,11 +11008,19 @@ impl DemoApp {
                                 crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param),
                                 crate::matrix::CcTarget::ChannelPressure => Some("Channel pressure (breath)".to_string()),
                                 crate::matrix::CcTarget::MidiCc => Some(format!("{} (MIDI CC)", crate::matrix::midi_cc_label(m.param))),
+                                crate::matrix::CcTarget::Macro => self.macros.iter().find(|x| x.id == m.param).map(|x| format!("{} (macro)", x.name)),
                             };
-                            serde_json::json!({
+                            let mut b = serde_json::json!({
                                 "cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name,
                                 "range": m.scale.range_json(), "input_range": m.scale.input_range_json(),
-                            })
+                            });
+                            // A macro binding lists every parameter the macro drives (#289).
+                            if m.target == crate::matrix::CcTarget::Macro {
+                                if let Some(x) = self.macros.iter().find(|x| x.id == m.param) {
+                                    b["macro"] = x.json();
+                                }
+                            }
+                            b
                         }).collect();
                         entries.push(serde_json::json!({
                             "source": Self::source_str(src),
@@ -11007,6 +11037,7 @@ impl DemoApp {
                     })),
                 }).to_string()
             }
+            "list_macros" | "set_macro" | "delete_macro" | "set_morph" => self.exec_macro_tool(name, args, origin, now),
             "list_params" => self.exec_list_params(args),
             "inspect_plugin" => self.exec_inspect_plugin(args),
             "set_param" => self.exec_set_param(args, origin, now),
@@ -15019,6 +15050,19 @@ impl DemoApp {
     /// `mix` and `knob` also decide the target.
     fn tool_cc_param(&self, node: u32, args: &serde_json::Value, target: &mut CcTarget) -> Result<Option<u32>, String> {
         let text = |key: &str| args.get(key).and_then(|v| v.as_str());
+        if *target == CcTarget::Macro {
+            let id = args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32);
+            let key = match (id, args.get("macro")) {
+                (_, Some(k)) => k.clone(),
+                (Some(id), None) => serde_json::json!(id),
+                (None, None) => return Err("target 'macro' needs 'macro' (its id or name) or 'param' (its id)".into()),
+            };
+            let m = crate::macros::find(&self.macros, &key)?;
+            if m.home != node {
+                return Err(format!("macro '{}' lives on node {}: bind it there", m.name, m.home));
+            }
+            return Ok(Some(m.id));
+        }
         let param = if let Some(m) = text("mix") {
             *target = CcTarget::Mix;
             Some(self.resolve_mix_control(node, m)?)
@@ -15064,6 +15108,10 @@ impl DemoApp {
                 None => sentence_case(&u.name),
             };
             return Some(format!("{strip} · {}", ctl.label()));
+        }
+        if target == CcTarget::Macro {
+            let m = self.macros.iter().find(|m| m.id == param)?;
+            return Some(format!("{} · macro {}", sentence_case(&u.name), m.name));
         }
         if target == CcTarget::MidiCc {
             return Some(format!("{} · {}", sentence_case(&u.name), crate::matrix::midi_cc_label(param)));
@@ -15310,8 +15358,8 @@ impl DemoApp {
         // Mixer controls, standard MIDI CCs, and channel-pressure bindings share
         // their node with the unit's knobs and params, and their param numbers
         // with them: only their own target is the same binding.
-        if matches!(m.target, CcTarget::Mix | CcTarget::MidiCc | CcTarget::ChannelPressure)
-            || matches!(target, CcTarget::Mix | CcTarget::MidiCc | CcTarget::ChannelPressure)
+        if matches!(m.target, CcTarget::Mix | CcTarget::MidiCc | CcTarget::ChannelPressure | CcTarget::Macro)
+            || matches!(target, CcTarget::Mix | CcTarget::MidiCc | CcTarget::ChannelPressure | CcTarget::Macro)
         {
             return m.target == target && m.param == param;
         }
@@ -15385,6 +15433,7 @@ impl DemoApp {
         let kb_target_node = kb_target.map(|u| self.units[u].node_id);
         let mut mixer: Vec<(u32, MixControl, f64)> = Vec::new();
         let mut midi_ccs: Vec<(u32, u8, f32)> = Vec::new();
+        let mut macro_moves: Vec<(u32, f64)> = Vec::new();
         // A binding the engine does not apply in this part (#273) moves no
         // on-screen control either, or the screen and the sound part ways.
         let gated = self.setlist.active.is_some() && !crate::engine::cc_at_rest(cc, val);
@@ -15400,6 +15449,10 @@ impl DemoApp {
             for m in &edit.cc_map {
                 if m.cc != cc || !works(*dest, m.target) { continue; }
                 if m.target == CcTarget::ChannelPressure {
+                    continue;
+                }
+                if m.target == CcTarget::Macro {
+                    macro_moves.push((m.param, m.scale.norm(val)));
                     continue;
                 }
                 if m.target == CcTarget::Mix {
@@ -15439,6 +15492,16 @@ impl DemoApp {
         }
         for (node, ctl, norm) in mixer {
             self.apply_mix_cc(node, ctl, norm, resend);
+        }
+        for (id, norm) in macro_moves {
+            self.mirror_macro(id, norm, resend);
+            if resend {
+                // The CC that completed the learn reached the engine before
+                // the binding did (rule 51).
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().map(|mut b| b.send(Command::SetMacro { id, value: norm }));
+                }
+            }
         }
         let mut synced_kb_target = false;
         let mut resend_midi_cc = false;
@@ -15815,6 +15878,8 @@ impl DemoApp {
                     .unwrap_or_else(|| format!("Mixer {}", m.param)),
                 crate::matrix::CcTarget::ChannelPressure => "Channel pressure (breath)".to_string(),
                 crate::matrix::CcTarget::MidiCc => format!("{} (MIDI CC)", crate::matrix::midi_cc_label(m.param)),
+                crate::matrix::CcTarget::Macro => self.macros.iter().find(|x| x.id == m.param)
+                    .map_or_else(|| format!("Macro {}", m.param), |x| format!("{} (macro)", x.name)),
             };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("CC {:>3}", m.cc)).size(12.0).color(theme::MIDI_BLUE));
@@ -26711,7 +26776,7 @@ impl DemoApp {
             if dest != node_id { continue; }
             let sk = Self::source_sort_key(src);
             for m in &edit.cc_map {
-                if m.target == CcTarget::Mix { continue; }
+                if matches!(m.target, CcTarget::Mix | CcTarget::Macro) { continue; }
                 if is_clap && m.target != CcTarget::PluginParam { continue; }
                 items.push((sk, m.cc, m.param));
             }
@@ -26872,6 +26937,7 @@ impl DemoApp {
                 source: KnobSource::Midi { name, resolved },
                 cached_text: None,
                 label_g: None,
+                macro_id: None,
             };
             let insert_at = self.units[ui]
                 .knobs
@@ -26951,7 +27017,7 @@ impl DemoApp {
             default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
             param: None, hidden: false, sent: Some(norm), steps: 0,
             clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm, hold_until: 0.0 }),
-            source: KnobSource::Pinned(p.name.clone()), cached_text: None, label_g: None,
+            source: KnobSource::Pinned(p.name.clone()), cached_text: None, label_g: None, macro_id: None,
         });
         format!("pinned {} to the face", p.name)
     }
@@ -33641,6 +33707,9 @@ impl DemoApp {
             Randomize,
             Copy,
             Paste,
+            NewMacro,
+            StoreMorphA,
+            StoreMorphB,
             UnplugAll,
             NativeGui,
             ParamEditor,
@@ -33742,6 +33811,9 @@ impl DemoApp {
                             None => "Paste settings".to_string(),
                         };
                         if menu_row(ui, "paste", &paste_lbl, "", paste_from.is_some(), false) { chosen = Some(Action::Paste); }
+                        if menu_row(ui, "new_macro", "New macro on this unit", "", true, false) { chosen = Some(Action::NewMacro); }
+                        if menu_row(ui, "morph_a", "Store rig as morph A", "", true, false) { chosen = Some(Action::StoreMorphA); }
+                        if menu_row(ui, "morph_b", "Store rig as morph B", "", true, false) { chosen = Some(Action::StoreMorphB); }
 
                         ui.add_space(2.0);
                         Self::stage_hairline(ui);
@@ -33785,6 +33857,19 @@ impl DemoApp {
             Action::Randomize => self.randomize_unit_params(node_id, 1.0, None, true).map(|_| ()),
             Action::Copy => self.copy_unit_settings(node_id).map(|_| ()),
             Action::Paste => self.paste_unit_settings(node_id, true).map(|_| ()),
+            Action::NewMacro => {
+                self.push_user_undo();
+                let r = self.exec_macro_tool("set_macro", &serde_json::json!({"node": node_id}), AgentOrigin::Assistant, self.ui_time);
+                if r.starts_with("error") { Err(r) } else { Ok(()) }
+            }
+            Action::StoreMorphA | Action::StoreMorphB => {
+                self.push_user_undo();
+                let rig = self.units[ui_idx].rig;
+                let state = if matches!(action, Action::StoreMorphA) { macros_ui::MorphState::A } else { macros_ui::MorphState::B };
+                self.store_morph(rig, state).map(|n| {
+                    self.notify_patch(&format!("Morph {}: {n} parameters stored", if state == macros_ui::MorphState::A { "A" } else { "B" }));
+                })
+            }
             Action::UnplugAll => self.unplug_unit_cables(node_id, true).map(|_| ()),
             Action::NativeGui => {
                 self.toggle_unit_native_gui(node_id);
@@ -35962,6 +36047,7 @@ impl DemoApp {
         self.update(dt);
 
         self.publish_patch();
+        self.publish_macros();
         self.publish_pins();
         self.refresh_knob_readouts();
 
@@ -54867,6 +54953,7 @@ mod precision_knob_tests {
             source: KnobSource::Main("Filter Cutoff".into()),
             cached_text: Some((0.5, "1320.0 Hz".into())),
             label_g: None,
+            macro_id: None,
         });
         assert_eq!(app.knob_value_text(surge_ui, 0), "1320.0 Hz");
     }

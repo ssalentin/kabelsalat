@@ -590,6 +590,28 @@ told it too, and it is saved with the session.
 
 <p align="center"><img src="shots/time-signature.png" width="85%" alt="The rack with a Metronome unit showing PLAY, tempo steppers, TAP, COUNT-IN and the 6/8 time-signature chip"/></p>
 
+### One control for several parameters: macros and scene morph
+
+A **macro** is one named knob that drives any number of parameters, each over
+its own range: one expression pedal opens the filter from 20 to 80 %, brings
+the delay mix in on a slow curve and pulls the rig fader down. Right-click a
+unit and choose **New macro on this unit**; its knob appears on that unit's
+face, and a right-click on it starts MIDI learn like on any knob (CC range
+and "Clear MIDI map" work the same). The agent adds the targets: `set_macro`
+takes a target unit and parameter (a plugin parameter, a rack knob or a mixer
+control), its **min** and **max** (0 to 1: the value at the macro's heel and
+toe), a **curve** (linear, slow, fast, smooth or switch) and **invert**.
+`list_macros` and `list_cc_maps` report every target. Macros are saved with the
+session and come back after an undo.
+
+**Scene morph** is the same mechanism for a whole rig. Right-click any unit of
+the rig, choose **Store rig as morph A**, change the knobs, then **Store rig as
+morph B**. The rig's Master out unit now has a **MORPH** knob (or bind a pedal
+to it): from A to B every stored knob moves together, and stepped knobs (MODE,
+RATE, OCT) switch at the middle. Knobs that A and B agree on stay where your hand
+puts them. The agent does the same with `set_morph` (`store` a or b, `value`
+0 to 1).
+
 ### Be the clock
 
 Switch on MIDI Clock Send in the matrix view and kabelsalat becomes the master

@@ -1107,17 +1107,37 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"set_cc_map",
             "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Optional min/max (0..1, default 0 and 1) limit how far the controller moves the parameter: its whole travel spans min..max (e.g. a pedal on organ drive that must not go past 60 %: max 0.6). Optional in_min/in_max (0..127, default 0 and 127) set the controller's active CC input range mapped onto min..max (e.g. a wind controller's bite sensor spanning 64..104). A MIXER control binds with mix: 'vol' | 'pan' | 'mute' | 'solo' instead: on a rig's Master out node it is that rig's bus (fader, pan, mute, solo); on a source node it is the source strip's pan, mute or solo (a source's fader is knob 'LEVEL', the master fader knob 'VOLUME' on a Master out node). Mute and solo are on in the upper half of the controller's travel. Omit param/knob/mix to unbind that CC.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]},"min":{"type":"number"},"max":{"type":"number"},"in_min":{"type":"integer"},"in_max":{"type":"integer"}},"required":["node","source","cc"]}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix","macro"]},"macro":{"type":["integer","string"],"description":"A macro (id or name) as the bound control: pass with target 'macro' on the macro's home node"},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]},"min":{"type":"number"},"max":{"type":"number"},"in_min":{"type":"integer"},"in_max":{"type":"integer"}},"required":["node","source","cc"]}
         }},
         {"type":"function","function":{
             "name":"clear_cc_map",
             "description":"Clear one CC binding (when cc is given) or matching bindings (filtered by optional target/knob, or ALL when omitted) on source → node.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]}},"required":["node","source"]}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix","macro"]},"macro":{"type":["integer","string"],"description":"A macro (id or name) as the bound control: pass with target 'macro' on the macro's home node"},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]}},"required":["node","source"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_macros",
+            "description":"List the macros and rig morphs: each is one named control with any number of targets (a parameter, a rack knob or a mixer control), every target with its own min, max (0..1), curve and invert. A morph (morph=true) holds a rig's two stored knob states: min is state A, max is state B.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_macro",
+            "description":"Create or edit a macro. Create: node (the unit whose face shows the macro's knob) and name. Edit: macro (id or name). Add or change ONE target per call: target_node plus param, knob or mix (as set_cc_map), optional target ('plugin'|'knob'|'mix'), min and max (0..1: the value at the macro's 0 and 1; min may be above max), curve ('linear'|'slow'|'fast'|'smooth'|'switch'), invert (runs against the control); remove_target=true removes it. value (0..1) moves the macro and so every target. Bind a controller with set_cc_map target 'macro' on the macro's node (or learn_cc).",
+            "parameters":{"type":"object","properties":{"macro":{"type":["integer","string"]},"node":{"type":"integer"},"name":{"type":"string"},"value":{"type":"number"},"target_node":{"type":"integer"},"param":{"type":"integer"},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]},"target":{"type":"string","enum":["plugin","knob","mix"]},"min":{"type":"number"},"max":{"type":"number"},"curve":{"type":"string","enum":["linear","slow","fast","smooth","switch"]},"invert":{"type":"boolean"},"remove_target":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"delete_macro",
+            "description":"Delete a macro (id or name) and its controller bindings. Ask the user first.",
+            "parameters":{"type":"object","properties":{"macro":{"type":["integer","string"]}},"required":["macro"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_morph",
+            "description":"Scene morph of one rig (rig is 0-based): store='a' or 'b' stores every knob of the rig's units as state A or B; value (0..1) fades from A (0) to B (1), stepped knobs switching at the middle. Bind a pedal to the morph with set_cc_map target 'macro' on the rig's Master out node. Returns the morph macro.",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"store":{"type":"string","enum":["a","b"]},"value":{"type":"number"}},"required":["rig"]}
         }},
         {"type":"function","function":{
             "name":"learn_cc",
             "description":"Arm MIDI-learn for (node, param/target or knob) on source ('keys' = default, any hardware device, records sender | 'hw:<d>') so the next incoming hardware CC binds to it. Pass cancel=true to disarm.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]},"cancel":{"type":"boolean"}}}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix","macro"]},"macro":{"type":["integer","string"],"description":"A macro (id or name) as the bound control: pass with target 'macro' on the macro's home node"},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]},"cancel":{"type":"boolean"}}}
         }},
         {"type":"function","function":{
             "name":"set_rig_mix",

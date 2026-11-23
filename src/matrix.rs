@@ -206,6 +206,12 @@ pub enum CcTarget {
     /// CC 1 Mod Wheel, CC 64 Sustain, CC 67 Soft); `param` is the output CC (0..=127).
     #[serde(alias = "cc", alias = "midi_cc")]
     MidiCc,
+    /// A macro (#289) whose home is the destination node; `param` is the
+    /// macro's id. The engine moves every target of the macro. Like
+    /// `ChannelPressure`, it does not turn `cc_map` into a whitelist: the
+    /// home node keeps its other controllers.
+    #[serde(alias = "macro")]
+    Macro,
 }
 
 impl CcTarget {
@@ -216,6 +222,7 @@ impl CcTarget {
             CcTarget::Mix => "mix",
             CcTarget::ChannelPressure => "channel_pressure",
             CcTarget::MidiCc => "cc",
+            CcTarget::Macro => "macro",
         }
     }
 
@@ -227,7 +234,8 @@ impl CcTarget {
             Some("mix") => Ok(CcTarget::Mix),
             Some("channel_pressure") | Some("pressure") | Some("aftertouch") => Ok(CcTarget::ChannelPressure),
             Some("cc") | Some("midi_cc") | Some("midicc") => Ok(CcTarget::MidiCc),
-            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin', 'knob', 'mix', 'cc' or 'channel_pressure')")),
+            Some("macro") => Ok(CcTarget::Macro),
+            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin', 'knob', 'mix', 'cc', 'macro' or 'channel_pressure')")),
         }
     }
 }
@@ -721,7 +729,7 @@ impl Rule {
             CONTROL_CHANGE => {
                 // Parameter bindings whitelist CCs; ChannelPressure (breath)
                 // leaves other performance CCs (glide, sustain, mod) passing.
-                let whitelists = self.cc_map.iter().any(|m| !matches!(m.target, CcTarget::ChannelPressure));
+                let whitelists = self.cc_map.iter().any(|m| !matches!(m.target, CcTarget::ChannelPressure | CcTarget::Macro));
                 if whitelists && self.param_for_cc(ev.data[0]).is_none() {
                     return None;
                 }

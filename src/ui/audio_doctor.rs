@@ -472,7 +472,7 @@ impl DemoApp {
         egui::Frame::new()
             .fill(theme::PAPER_SINK)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-            .corner_radius(2.0)
+            .corner_radius(theme::RADIUS_CARD)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -556,7 +556,7 @@ impl DemoApp {
         egui::Frame::new()
             .fill(theme::PAPER_SINK)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-            .corner_radius(2.0)
+            .corner_radius(theme::RADIUS_CARD)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());

@@ -2094,3 +2094,10 @@ Learned so far (2026-11-15, UI polish pass):
     buffers allocate `resize-port:minimumSize` in 8-byte-aligned `Vec<u64>`,
     and `raw_input_hook` yields `Key::Tab` while `quick_add.is_some()` so
     filter cycling never flips the rack.
+236. **Measure width before nesting `left_to_right` inside `right_to_left`:**
+    `ui.scope(|ui| ui.with_layout(Layout::left_to_right(...)))` inside a
+    `Layout::right_to_left` toolbar consumes all remaining horizontal slack and
+    paints an empty container across the bar (`dgroup` in the top bar). Always
+    compute the exact group width up front and wrap it in
+    `ui.allocate_ui_with_layout(vec2(w, h), Layout::left_to_right(...), ...)`
+    (e.g. `theme::segmented_tray_width`).

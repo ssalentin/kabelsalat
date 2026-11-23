@@ -619,7 +619,7 @@ impl DemoApp {
                     } else {
                         "Program N selects song N+1; this device's program changes no longer reach its instruments".to_string()
                     };
-                    let chip = ui.add_enabled_ui(!full, |ui| theme::chip_button(ui, if *on { "On" } else { "Off" }, *on)).inner;
+                    let chip = ui.add_enabled_ui(!full, |ui| theme::live_toggle_chip(ui, if *on { "On" } else { "Off" }, *on)).inner;
                     if chip.on_hover_text(hint).clicked() {
                         actions.push(ShowControlAction::ToggleProgramPort {
                             device: *d,
@@ -778,7 +778,7 @@ impl DemoApp {
             egui::Frame::new()
                 .fill(theme::DARK_PANEL_HI)
                 .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                .corner_radius(3.0)
+                .corner_radius(theme::RADIUS_CARD)
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -965,7 +965,7 @@ impl DemoApp {
         egui::Frame::new()
             .fill(theme::DARK_PANEL_HI)
             .stroke(Stroke::new(1.0, theme::HAIRLINE))
-            .corner_radius(3.0)
+            .corner_radius(theme::RADIUS_CARD)
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -987,7 +987,7 @@ impl DemoApp {
                     let field = egui::Frame::new()
                         .fill(theme::PAPER_SINK)
                         .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                        .corner_radius(2.0)
+                        .corner_radius(theme::RADIUS_CONTROL)
                         .inner_margin(egui::Margin::symmetric(8, 5))
                         .show(ui, |ui| {
                             ui.add(
@@ -1215,14 +1215,9 @@ impl DemoApp {
         let res = area.show(ctx, |ui| {
             egui::Frame::new()
                 .fill(theme::PAPER_SINK)
-                .stroke(Stroke::new(1.5, theme::MUTED))
-                .corner_radius(8.0)
-                .shadow(egui::Shadow {
-                    offset: [0, 8],
-                    blur: 24,
-                    spread: 2,
-                    color: Color32::from_black_alpha(120),
-                })
+                .stroke(Stroke::new(1.0, theme::MUTED))
+                .corner_radius(theme::RADIUS_CARD)
+                .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 2, color: Color32::from_black_alpha(120) })
                 .show(ui, |ui| {
                     let (rect, resp) = ui.allocate_exact_size(TUNER_SIZE, egui::Sense::click());
                     let p = ui.painter_at(rect);

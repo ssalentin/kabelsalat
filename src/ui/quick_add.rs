@@ -405,21 +405,21 @@ impl DemoApp {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                         let mut changed = false;
-                        if theme::wrapped_chip_button(ui, "All", qa.view.is_none() && qa.ty.is_none()).clicked() {
+                        if theme::wrapped_quiet_filter_chip(ui, "All", qa.view.is_none() && qa.ty.is_none()).clicked() {
                             qa.view = None;
                             qa.ty = None;
                             changed = true;
                         }
                         for (view, label) in [(ShelfView::Favorites, "★ Favorites"), (ShelfView::Recent, "Recent")] {
                             let on = qa.view == Some(view);
-                            if theme::wrapped_chip_button(ui, label, on).clicked() {
+                            if theme::wrapped_quiet_filter_chip(ui, label, on).clicked() {
                                 qa.view = if on { None } else { Some(view) };
                                 changed = true;
                             }
                         }
                         for ty in PluginType::ALL {
                             let on = qa.ty == Some(ty);
-                            if theme::wrapped_chip_button(ui, ty.label(), on).clicked() {
+                            if theme::wrapped_quiet_filter_chip(ui, ty.label(), on).clicked() {
                                 qa.ty = if on { None } else { Some(ty) };
                                 changed = true;
                             }

@@ -936,7 +936,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_show_mode",
-            "description":"Open (on=true) or leave (on=false) Show mode: the locked full-window stage screen with the current song and part in large type, the next song, tempo, the master meter, one meter per live rig, a clock and a Panic button. While it is open no click or key edits the patch, the mix or the setlist; PageUp/PageDown and foot switches still step parts, and the user leaves by holding Esc for a second and letting go. Returns what the screen shows.",
+            "description":"Open (on=true) or leave (on=false) Show mode: the locked full-window stage screen with the current song and part in large type, the next song, tempo, the master meter, one meter per live rig, a clock and a Panic button. While it is open no click or key edits the patch, the mix or the setlist; ←/→ and PageUp/PageDown step parts (Shift for songs), ↑/↓ scrolls song notes, Space toggles click/transport, Shift+T taps tempo, Ctrl+T toggles the tuner (short Esc closes it), foot switches still work, and the user leaves by holding Esc for a second and letting go. Returns what the screen shows.",
             "parameters":{"type":"object","properties":{"on":{"type":"boolean"}},"required":["on"]}
         }},
         {"type":"function","function":{

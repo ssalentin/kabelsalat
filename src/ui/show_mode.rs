@@ -2,10 +2,13 @@
 //! which song and part this is, what comes next and whether sound goes out,
 //! and Panic silences every rig. While it is open `frame_ui` runs
 //! [`DemoApp::show_frame`] in place of the editing frame, so no key, click or
-//! dropped file reaches the patch, the mix or the setlist. Its own input is
-//! PageUp / PageDown (a page-turner pedal; Shift for songs), the Panic button
-//! and Esc, held until its line fills and then let go, which leaves. Hardware MIDI, the engine and agents keep
-//! running: a foot switch still steps the part, and the screen follows.
+//! dropped file reaches the patch, the mix or the setlist. Its own keyboard
+//! controls are `←` / `→` and `PageUp` / `PageDown` for parts (`Shift` for
+//! songs), `↑` / `↓` to scroll song notes, `Space` for master transport /
+//! click, `Shift+T` for tap tempo, `Ctrl+T` for the tuner (short `Esc` closes
+//! it), the Panic button, and `Esc` held until its line fills and then let go
+//! to leave. Hardware MIDI, the engine and agents keep running: a foot switch
+//! still steps the part, and the screen follows.
 
 use super::*;
 
@@ -239,29 +242,53 @@ impl DemoApp {
         self.sync_main_knobs();
         self.sync_midi_knobs();
         self.sync_aeolus_faces();
-        let step = ctx.input_mut(|i| {
-            [
+        // Shift variants are checked before NONE (rule 143), and plain/command
+        // controls reject extra Alt/Shift modifiers so stray chords stay locked.
+        let (step, toggle_play, tap_tempo, toggle_tuner, scroll_delta) = ctx.input_mut(|i| {
+            if i.modifiers.alt {
+                return (None, false, false, false, 0.0);
+            }
+            let step = [
                 (Modifiers::SHIFT, Key::PageUp, "prev_song"),
                 (Modifiers::SHIFT, Key::PageDown, "next_song"),
+                (Modifiers::SHIFT, Key::ArrowLeft, "prev_song"),
+                (Modifiers::SHIFT, Key::ArrowRight, "next_song"),
                 (Modifiers::NONE, Key::PageUp, "prev_part"),
                 (Modifiers::NONE, Key::PageDown, "next_part"),
+                (Modifiers::NONE, Key::ArrowLeft, "prev_part"),
+                (Modifiers::NONE, Key::ArrowRight, "next_part"),
             ]
             .into_iter()
             .find(|&(m, k, _)| i.consume_key(m, k))
-            .map(|(_, _, a)| a)
+            .map(|(_, _, a)| a);
+            let play = !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Space);
+            let tap = i.consume_key(Modifiers::SHIFT, Key::T);
+            let tuner = !i.modifiers.shift && i.consume_key(Modifiers::COMMAND, Key::T);
+            let scroll = if !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                72.0
+            } else if !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                -72.0
+            } else {
+                0.0
+            };
+            (step, play, tap, tuner, scroll)
         });
         if let Some(action) = step {
             let _ = self.step_setlist(action);
         }
-        let scroll_delta = ctx.input_mut(|i| {
-            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                72.0
-            } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                -72.0
-            } else {
-                0.0
+        if toggle_play {
+            self.toggle_play();
+        }
+        if tap_tempo {
+            self.ui_transport_grace = self.ui_time + 0.6;
+            self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
+        }
+        if toggle_tuner {
+            self.tuner_on = !self.tuner_on;
+            if !self.tuner_on {
+                self.tuner_rect = Rect::NOTHING;
             }
-        });
+        }
         if scroll_delta != 0.0 {
             if let Some(show) = &mut self.show_mode {
                 show.notes_scroll_y = (show.notes_scroll_y + scroll_delta).max(0.0);
@@ -274,14 +301,24 @@ impl DemoApp {
         self.tuner_panel(&ctx);
         // Leaving waits for the release: an Esc still held, and its key
         // repeats, would otherwise reach the editing frame and close the
-        // view Show mode was opened from.
-        let esc = ctx.input(|i| i.key_down(Key::Escape));
+        // view Show mode was opened from. A short Esc press closes an open
+        // tuner without leaving Show mode.
+        let (esc, esc_released) = ctx.input(|i| (i.key_down(Key::Escape), i.key_released(Key::Escape)));
         let now = self.ui_time;
+        let mut close_tuner = false;
         let leave = self.show_mode.as_mut().is_some_and(|show| {
+            let was_down = show.esc_since.is_some();
             let held_out = show.esc_since.is_some_and(|t| now - t >= LEAVE_HOLD_SECS);
             show.esc_since = if esc { Some(show.esc_since.unwrap_or(now)) } else { None };
+            if !esc && (was_down || esc_released) && !held_out && self.tuner_on {
+                close_tuner = true;
+            }
             !esc && held_out
         });
+        if close_tuner {
+            self.tuner_on = false;
+            self.tuner_rect = Rect::NOTHING;
+        }
         if leave {
             self.set_show_mode(false);
         }
@@ -303,7 +340,7 @@ impl DemoApp {
                 (caption, s.name.clone(), Some(p.name.clone()))
             }
             None if sl.songs.is_empty() => ("No setlist".into(), "Every rig plays".into(), None),
-            None => ("Setlist not started · PageDown starts".into(), "Every rig plays".into(), None),
+            None => ("Setlist not started · → or PageDown starts".into(), "Every rig plays".into(), None),
         };
         let rigs = (0..self.rig_count())
             .filter(|&r| self.rig_zones.get(r).is_none_or(|z| z.live))
@@ -455,15 +492,14 @@ impl DemoApp {
         };
         p.galley(tempo_pos, tempo, theme::CREAM_META);
 
-        if let (Some(notes), Some(nrect)) = (&board.notes, notes_rect) {
-            let mut scroll_y = 0.0f32;
-            if let Some(show) = &mut self.show_mode {
-                if show.notes_song != board.song_idx {
-                    show.notes_song = board.song_idx;
-                    show.notes_scroll_y = 0.0;
-                }
-                scroll_y = show.notes_scroll_y;
+        if let Some(show) = &mut self.show_mode {
+            if show.notes_song != board.song_idx || board.notes.is_none() {
+                show.notes_song = board.song_idx;
+                show.notes_scroll_y = 0.0;
             }
+        }
+        if let (Some(notes), Some(nrect)) = (&board.notes, notes_rect) {
+            let scroll_y = self.show_mode.as_ref().map_or(0.0, |s| s.notes_scroll_y);
             p.rect_filled(nrect, 24.0, theme::DARK_PANEL);
             p.rect_stroke(nrect, 24.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
             let pad = if nrect.width() < 400.0 || nrect.height() < 180.0 { 16.0 } else { 24.0 };
@@ -776,12 +812,21 @@ pub(super) mod tests {
         app.exec_tool("set_show_mode", &serde_json::json!({"on": true}));
         frame(&mut app, &ctx, WIDE, vec![]);
         let (before, order, mix, active) = (protected(&mut app), song_order(&app), format!("{:?}", app.rig_mix), app.setlist.active);
+        let (playing, tuner, bpm) = (app.playing, app.tuner_on, app.bpm);
         let screen = (app.stage_view, app.dock, app.kb_expanded, app.nav_open, app.show_help);
 
-        let own = |k: Key| matches!(k, Key::PageUp | Key::PageDown);
+        let own = |k: Key, m: Modifiers| {
+            let plain_or_shift = m == Modifiers::NONE || m == Modifiers::SHIFT;
+            match k {
+                Key::PageUp | Key::PageDown | Key::ArrowLeft | Key::ArrowRight => plain_or_shift,
+                Key::ArrowUp | Key::ArrowDown | Key::Space => m == Modifiers::NONE,
+                Key::T => m == Modifiers::SHIFT || m == Modifiers::COMMAND,
+                _ => false,
+            }
+        };
         let mods = [Modifiers::NONE, Modifiers::SHIFT, Modifiers::CTRL, Modifiers::ALT, Modifiers::CTRL | Modifiers::SHIFT, Modifiers::COMMAND];
         for &m in &mods {
-            for &k in Key::ALL.iter().filter(|&&k| !own(k)) {
+            for &k in Key::ALL.iter().filter(|&&k| !own(k, m)) {
                 tap(&mut app, &ctx, k, m);
             }
         }
@@ -825,6 +870,9 @@ pub(super) mod tests {
         assert_eq!(song_order(&app), order, "the setlist order");
         assert_eq!(format!("{:?}", app.rig_mix), mix, "the mix");
         assert_eq!(app.setlist.active, active, "no key but its own steps the part");
+        assert_eq!(app.playing, playing, "no key other than Space toggles transport");
+        assert_eq!(app.tuner_on, tuner, "no key other than Ctrl+T toggles tuner");
+        assert!((app.bpm - bpm).abs() < 1e-6, "no key other than Shift+T changes tempo");
         assert!(protected(&mut app) == before, "the patch, mix and setlist are as they were");
         assert_eq!((app.stage_view, app.dock, app.kb_expanded, app.nav_open, app.show_help), screen, "nothing opened behind the screen");
 
@@ -961,6 +1009,134 @@ pub(super) mod tests {
         assert!(app.show_mode.is_none(), "letting go after a full hold leaves");
         frame(&mut app, &ctx, WIDE, vec![]);
         assert_eq!(app.stage_view, StageView::Setlist, "back where Show mode was opened, not closed by the held Esc");
+    }
+
+    #[test]
+    fn arrow_keys_step_the_part_and_song_in_show_mode() {
+        let mut app = gig();
+        app.setlist.songs[0].notes = (1..=40).map(|i| format!("Line {i}")).collect::<Vec<_>>().join("\n");
+        let ctx = egui::Context::default();
+        app.set_show_mode(true);
+        settle(&mut app, &ctx, WIDE);
+
+        // Plain ArrowRight / ArrowLeft step parts across song boundaries.
+        tap(&mut app, &ctx, Key::ArrowRight, Modifiers::NONE);
+        let texts = frame(&mut app, &ctx, WIDE, vec![]);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
+        assert!(texts.iter().any(|(t, _)| t == "Chorus") && texts.iter().any(|(t, _)| t == "Organ"), "ArrowRight steps to Chorus");
+        assert!(!texts.iter().any(|(t, _)| t == "Piano"), "the piano is out of the chorus");
+        assert!((app.rig_mix[1].vol - 0.7).abs() < 1e-6, "the part's level is recalled");
+
+        tap(&mut app, &ctx, Key::ArrowRight, Modifiers::NONE);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "ArrowRight crosses into next song");
+        tap(&mut app, &ctx, Key::ArrowLeft, Modifiers::NONE);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }), "ArrowLeft crosses back into previous song's last part");
+
+        // Up/Down scroll notes without changing active part.
+        tap(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+        assert!(app.show_mode.as_ref().is_some_and(|s| s.notes_scroll_y > 0.0), "ArrowDown scrolls notes");
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }), "ArrowDown does not step");
+
+        // Shift+ArrowRight / Shift+ArrowLeft jump whole songs and reset scroll.
+        tap(&mut app, &ctx, Key::ArrowRight, Modifiers::SHIFT);
+        let texts = frame(&mut app, &ctx, WIDE, vec![]);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }), "Shift+ArrowRight jumps to next song");
+        assert_eq!(app.show_mode.as_ref().map(|s| s.notes_scroll_y), Some(0.0), "song switch resets notes scroll");
+        assert!(texts.iter().any(|(t, _)| t == "Light My Fire"), "next song preview updates");
+
+        tap(&mut app, &ctx, Key::ArrowRight, Modifiers::SHIFT);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 2, part: 0 }));
+        tap(&mut app, &ctx, Key::ArrowLeft, Modifiers::SHIFT);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 1, part: 0 }));
+        tap(&mut app, &ctx, Key::ArrowLeft, Modifiers::SHIFT);
+        frame(&mut app, &ctx, WIDE, vec![]);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }), "Shift+ArrowLeft jumps to song's first part");
+        assert_eq!(app.show_mode.as_ref().map(|s| s.notes_scroll_y), Some(0.0), "returning to song 0 starts at top");
+
+        // Extra modifiers on arrows never step.
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::COMMAND, Modifiers::CTRL | Modifiers::SHIFT, Modifiers::ALT | Modifiers::SHIFT] {
+            tap(&mut app, &ctx, Key::ArrowRight, m);
+            tap(&mut app, &ctx, Key::ArrowLeft, m);
+        }
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }), "modified arrows stay locked");
+
+        // Starting from an inactive setlist shows the arrow hint and starts on ArrowRight.
+        app.step_setlist("clear").unwrap();
+        assert_eq!(app.board().caption, "Setlist not started · → or PageDown starts");
+        tap(&mut app, &ctx, Key::ArrowRight, Modifiers::NONE);
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }));
+    }
+
+    #[test]
+    fn stage_keyboard_controls_space_tap_tempo_and_tuner_work_in_show_mode() {
+        let mut app = gig();
+        let ctx = egui::Context::default();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        app.set_show_mode(true);
+        settle(&mut app, &ctx, WIDE);
+        drain.drain(|_| {});
+
+        // Space toggles master transport (CLICK indicator) and emits TransportPlay / TransportStop.
+        assert!(!app.playing);
+        tap(&mut app, &ctx, Key::Space, Modifiers::NONE);
+        let texts = frame(&mut app, &ctx, WIDE, vec![]);
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(app.playing, "Space starts transport in Show mode");
+        assert!(texts.iter().any(|(t, _)| t == "CLICK"), "Show mode displays CLICK indicator");
+        assert!(cmds.iter().any(|c| matches!(c, Command::TransportPlay)), "{cmds:?}");
+
+        tap(&mut app, &ctx, Key::Space, Modifiers::NONE);
+        let texts = frame(&mut app, &ctx, WIDE, vec![]);
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(!app.playing, "Space stops transport in Show mode");
+        assert!(!texts.iter().any(|(t, _)| t == "CLICK"), "CLICK indicator disappears on stop");
+        assert!(cmds.iter().any(|c| matches!(c, Command::TransportStop)), "{cmds:?}");
+
+        // Modified Space stays locked.
+        for m in [Modifiers::SHIFT, Modifiers::ALT, Modifiers::CTRL] {
+            tap(&mut app, &ctx, Key::Space, m);
+        }
+        assert!(!app.playing, "modified Space does not toggle transport");
+
+        // Shift+T taps tempo without wall-clock races (rule 184).
+        app.bpm = 90.0;
+        app.tap_tempo.reset();
+        let first_tap = app.tap_origin.elapsed().as_secs_f64() - 0.5;
+        assert_eq!(app.tap_tempo.tap(first_tap), None);
+        drain.drain(|_| {});
+        tap(&mut app, &ctx, Key::T, Modifiers::SHIFT);
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(app.tap_flash_t > 0.0, "Shift+T flashes tap tempo");
+        assert!((110.0..=125.0).contains(&app.bpm), "Shift+T updates BPM from interval (~120 BPM), got {}", app.bpm);
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetBpm { bpm } if (110.0..=125.0).contains(bpm))), "{cmds:?}");
+
+        // Ctrl+T toggles the tuner overlay, and a short Esc closes it without leaving Show mode.
+        assert!(!app.tuner_on);
+        tap(&mut app, &ctx, Key::T, Modifiers::COMMAND);
+        let texts = frame(&mut app, &ctx, WIDE, vec![]);
+        assert!(app.tuner_on, "Ctrl+T opens tuner in Show mode");
+        assert!(texts.iter().any(|(t, _)| t == "click to close"), "tuner overlay renders in Show mode");
+
+        tap(&mut app, &ctx, Key::Escape, Modifiers::NONE);
+        assert!(!app.tuner_on, "short Esc closes tuner in Show mode");
+        assert!(app.show_mode.is_some(), "short Esc stays in Show mode");
+
+        tap(&mut app, &ctx, Key::T, Modifiers::COMMAND);
+        assert!(app.tuner_on, "Ctrl+T opens tuner again");
+        tap(&mut app, &ctx, Key::T, Modifiers::COMMAND);
+        assert!(!app.tuner_on, "Ctrl+T closes tuner");
+
+        // Plain T, Ctrl+Shift+T, and Alt+T variants stay locked.
+        let prev_bpm = app.bpm;
+        for m in [Modifiers::NONE, Modifiers::COMMAND | Modifiers::SHIFT, Modifiers::ALT | Modifiers::SHIFT, Modifiers::ALT | Modifiers::COMMAND] {
+            tap(&mut app, &ctx, Key::T, m);
+        }
+        assert!(!app.tuner_on, "plain/Shift/Alt T variants do not open tuner");
+        assert!((app.bpm - prev_bpm).abs() < 1e-6, "non-Shift+T variants do not tap tempo");
     }
 
     #[test]

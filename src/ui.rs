@@ -5668,6 +5668,7 @@ impl DemoApp {
                 (&["double-click"], "a synth to open its editor"),
                 (&["1–9", "←", "→"], "switch the rig in view"),
                 (&["F2"], "Show mode (locked stage screen)"),
+                (&["←", "→", "Shift"], "Show mode: part (Shift: song) · PgUp/Dn · ↑/↓ notes"),
                 (&["F4"], "multi-rig demo"),
                 (&["F5–F7", "Shift"], "starter templates (Shift: the second three)"),
                 (&["F8"], "demo patch"),
@@ -19801,7 +19802,7 @@ impl DemoApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         if theme::primary_button(ui, "Show mode")
-                            .on_hover_text("the locked stage screen (F2): song, next part, next song, levels and Panic · hold Esc to leave")
+                            .on_hover_text("the locked stage screen (F2): song, next part, next song, levels and Panic · ←/→ or PageUp/Dn step parts (Shift: songs), Space click, Shift+T tap, Ctrl+T tuner · hold Esc to leave")
                             .clicked()
                         {
                             enter_show = true;

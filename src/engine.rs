@@ -11294,6 +11294,7 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
             anyhow::ensure!(detected == Some(*profile), "detected profile {detected:?} after loading '{label}', expected {profile:?}");
             format!("profile {} active", profile.name)
         }
+        Load::Factory => "the factory instrument plays its own sound".to_string(),
         Load::VitalPatch(path) => vital_patch_readback(&mut engine, node, path)?,
         Load::Lv2Preset(uri) => {
             let preset = crate::lv2::discover_presets(instrument.id())

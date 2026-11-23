@@ -87,6 +87,9 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   and Leslie, pipe organ stops, synth wheels and X/Y pad, bass neck, wind
   breath, drum pads. **Shift+V** fills the window with it.
   → [Instruments and the on-screen keyboard](docs/GUIDE.md#instruments-and-the-on-screen-keyboard)
+- **Factory sounds, no plugin needed:** a piano, an electric piano and a drum
+  kit are built in, so the first key press sounds even on a bare machine.
+  → [Factory sounds](docs/GUIDE.md#factory-sounds)
 - **Play your guitar** through amp, cabinet and stomp boxes, with a tuner on
   the input. → [Play your guitar](docs/GUIDE.md#play-your-guitar)
 

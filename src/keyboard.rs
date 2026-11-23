@@ -422,6 +422,11 @@ impl<'a> PluginRef<'a> {
 /// The instrument type the catalog gives this plugin: `None` when no card
 /// names it or the card is not an instrument (every URI of a card counts).
 pub fn catalog_type(plugin: PluginRef<'_>) -> Option<KeyboardType> {
+    if let PluginRef::Clap(id) = plugin {
+        if let Some(kind) = crate::factory::kind_of(id) {
+            return Some(kind.keyboard_type());
+        }
+    }
     crate::catalog::CATALOG.iter().find(|e| match plugin {
         PluginRef::Clap(id) => e.clap_id == Some(id),
         PluginRef::Vst3(_) => false,

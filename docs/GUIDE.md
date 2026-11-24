@@ -660,10 +660,9 @@ Agents use `set_midi_clock` with `follow` and `input`.
 
 ### Ableton Link
 
-Not in this release: Link's licence (GPL-2.0-or-later or a proprietary one)
-does not fit kabelsalat's MIT licence, so it is tracked on its own in the
-follow-up issue #452. MIDI Clock In and Out do the same job with
-hardware.
+Not planned: Link's licence (GPL-2.0-or-later or a proprietary one) does not
+fit kabelsalat's MIT licence (#452). MIDI Clock In and Out keep kabelsalat in
+time with hardware and with other software that sends or follows MIDI clock.
 
 ## Play live
 

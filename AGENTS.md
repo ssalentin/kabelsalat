@@ -2107,3 +2107,4 @@ Learned so far (2026-11-15, UI polish pass):
     and the standalone `factorysettings/*.gx` files are whole rigs, not LV2 presets
     (`guitarix-lv2` 0.47.0, `dpkg-deb -x`). The test skips every non-Instrument
     card by `plugin_type` (#132); a new effect card gets no `builtin` search.
+237. **Every JSON type a tool declares has a `coerce_arg` arm, or the tool refuses every valid call:** `set_cues.cues` was declared `["array","null"]` (#468), but `coerce_arg` had no `array` arm, so any cue list answered "must be array or null" and the table test (`the_tool_table_fits_the_argument_checker`) failed on `main`. Declare the type and teach `coerce_arg` its shape (string arrays here; other elements are refused), and test one valid and one invalid call of the tool (`arguments_are_read_as_meant_or_refused`).

@@ -1711,6 +1711,8 @@ fn coerce_arg(schema: &Value, value: Value) -> Result<Value, String> {
         ("boolean", Value::String(s)) => s.trim().parse::<bool>().ok().map(|b| json!(b)),
         ("string", Value::String(_)) => Some(value.clone()),
         ("string", Value::Number(_) | Value::Bool(_)) => Some(json!(value.to_string())),
+        // A list of strings (set_cues.cues); any other element is refused.
+        ("array", Value::Array(items)) if items.iter().all(Value::is_string) => Some(value.clone()),
         _ => None,
     });
     let fitted = fitted.ok_or_else(|| format!("must be {}, got {value}", types.join(" or ")))?;
@@ -2780,6 +2782,12 @@ mod tests {
         assert!(err("set_rig_mix", r#"{"rig":1.5}"#).contains("must be integer"));
         assert!(err("connect", r#"{"from_node":1,"to_node":2,"kind":"usb"}"#).contains("must be one of"));
         assert!(err("set_bpm", "[100]").contains("one JSON object"));
+        // set_cues: a list of lines is read as given, null clears (not given), a bare string or a non-string line is refused.
+        assert_eq!(ok("set_cues", r#"{"song":0,"cues":["pc 1 5","note 1 C3 100"]}"#), json!({"song": 0, "cues": ["pc 1 5", "note 1 C3 100"]}));
+        assert_eq!(ok("set_cues", r#"{"song":0,"cues":[]}"#), json!({"song": 0, "cues": []}), "[] clears");
+        assert_eq!(ok("set_cues", r#"{"song":0,"cues":null}"#), json!({"song": 0}), "null = not given");
+        assert!(err("set_cues", r#"{"song":0,"cues":"pc 1 5"}"#).contains("must be array or null"));
+        assert!(err("set_cues", r#"{"song":0,"cues":["pc 1 5",7]}"#).contains("must be array or null"));
     }
 
     /// The argument checker reads the tool table: a required argument that
@@ -2795,7 +2803,7 @@ mod tests {
                     Value::Array(ts) => ts.iter().map(|t| t.as_str().unwrap().to_string()).collect(),
                     other => panic!("{name}.{key}: type {other}"),
                 };
-                assert!(types.iter().all(|t| ["integer", "number", "boolean", "string", "null"].contains(&t.as_str())), "{name}.{key}: {types:?}");
+                assert!(types.iter().all(|t| ["integer", "number", "boolean", "string", "array", "null"].contains(&t.as_str())), "{name}.{key}: {types:?}");
             }
             for required in tool["function"]["parameters"]["required"].as_array().into_iter().flatten() {
                 assert!(props.contains_key(required.as_str().unwrap()), "{name}: required {required} is not a property");

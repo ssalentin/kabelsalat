@@ -1623,6 +1623,7 @@ mod font_coverage_tests {
             ("ui/window_load.rs", include_str!("ui/window_load.rs")),
             ("ui/quick_add.rs", include_str!("ui/quick_add.rs")),
             ("ui/fx_chain.rs", include_str!("ui/fx_chain.rs")),
+            ("ui/soundcheck_ui.rs", include_str!("ui/soundcheck_ui.rs")),
         ] {
             for (c, line) in literal_symbols(src) {
                 for font in [FontId::proportional(12.0), medium_font(12.0), FontId::monospace(12.0)] {

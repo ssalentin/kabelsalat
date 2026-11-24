@@ -1010,6 +1010,22 @@ After the gig, **export** the full show mixdown, any rig stems and the raw
 inputs, of the whole take or of one song or part, as 24-bit (default), 16-bit
 or 32-bit float WAV into the take's `export` folder, ready for a DAW.
 
+**The Soundcheck view** (Ctrl+K, or the REC chip's right-click menu →
+Soundcheck…) does all of this without an agent. The left column lists your
+takes, newest first, with length, stems, raw inputs and markers. Select one
+and press **Start soundcheck**, or click a marker to start there (its **Loop**
+chip starts it looping). While a take plays you can click a marker to jump,
+click the position bar to seek, toggle a marker's loop, and press **Stop**.
+Because a soundcheck left running at the gig is an easy mistake, the top bar
+shows a **Soundcheck** chip (a click stops it and returns the inputs to the
+stage), the view shows "INPUTS FROM TAKE", and every Audio In unit reads
+"FROM TAKE". **Export…** asks for mixdown, stems and raw inputs, the whole take
+or one marker's section, and 24-bit, 16-bit or float; it shows progress and
+the folder when done. Everything runs through the same tools as below, off the
+UI thread.
+
+![The Soundcheck view while a take plays](shots/soundcheck.png)
+
 The assistant and MCP agents do all of it: `list_takes`, `soundcheck_start`
 (take, marker, loop), `soundcheck_seek`, `soundcheck_loop`, `soundcheck_stop`,
 `soundcheck_status` and `export_take`. `kabelsalat gig-test` records a take

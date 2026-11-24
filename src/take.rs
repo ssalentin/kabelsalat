@@ -440,6 +440,10 @@ pub struct Exported {
     pub mixdown_from_stems: bool,
 }
 
+/// How far the running (or last) export is, in thousandths of its files'
+/// frames. The panel shows it as a bar; `soundcheck_status` reports it.
+pub static EXPORT_PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Write the chosen files of `take`, a second at a time. Runs as long as the
 /// take is long: call it on a worker thread, never the UI or audio thread.
 pub fn export(take: &Take, spec: &ExportSpec) -> Result<Exported, String> {
@@ -496,6 +500,9 @@ pub fn export(take: &Take, spec: &ExportSpec) -> Result<Exported, String> {
     }
     let mut files = Vec::new();
     let (mut sum, mut one, mut bytes) = (Vec::new(), Vec::new(), Vec::new());
+    let total = (jobs.len() as u64 * frames).max(1);
+    let mut done = 0u64;
+    EXPORT_PROGRESS.store(0, std::sync::atomic::Ordering::Relaxed);
     for (name, sources) in &jobs {
         let mut streams = sources.iter().map(|f| WavStream::open(&take.folder.join(f))).collect::<Result<Vec<_>, _>>()?;
         let path = out.join(format!("{}.wav", name.replace(['/', '\\'], "-")));
@@ -516,6 +523,8 @@ pub fn export(take: &Take, spec: &ExportSpec) -> Result<Exported, String> {
             encode(&sum, spec.format, &mut bytes);
             w.write_all(&bytes).map_err(io)?;
             at += n as u64;
+            done += n as u64;
+            EXPORT_PROGRESS.store((done * 1000 / total) as u32, std::sync::atomic::Ordering::Relaxed);
         }
         w.flush().map_err(io)?;
         files.push(path.to_string_lossy().into_owned());
@@ -553,6 +562,16 @@ fn wav_header(sample_rate: u32, format: ExportFormat, data_size: u32) -> [u8; 44
     h[36..40].copy_from_slice(b"data");
     h[40..44].copy_from_slice(&data_size.to_le_bytes());
     h
+}
+
+/// A 32-bit float stereo WAV for tests of what reads takes (the UI's too).
+#[cfg(test)]
+pub(crate) fn write_test_wav(path: &Path, sr: u32, samples: &[f32]) {
+    let mut bytes = wav_header(sr, ExportFormat::Float32, (samples.len() * 4) as u32).to_vec();
+    for s in samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, bytes).unwrap();
 }
 
 /// PCM is rounded and clamped to full scale: a float take can peak above it.

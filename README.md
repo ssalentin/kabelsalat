@@ -178,7 +178,7 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   and port-named show controls across sessions in **Settings → Show**, attach
   WAV backing tracks directly to songs, record the set (raw inputs, stems, MIDI
   and part markers) or save the last two minutes with **Retro**, replay a gig
-  take through the rack as a **Virtual Soundcheck** and export its stems, and
+  take through the rack as a **Virtual Soundcheck** from its own view (Ctrl+K) and export its stems, and
   restart by itself after a crash. → [Pedals](docs/GUIDE.md#run-the-show-from-a-pedal),
   [Permanent settings](docs/GUIDE.md#permanent-settings-and-show-controls),
   [Backing tracks](docs/GUIDE.md#play-along-with-a-backing-track),

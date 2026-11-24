@@ -483,13 +483,20 @@ impl SoundcheckShared {
         }
     }
 
-    /// The take playing, and where.
+    /// A take is loaded: the inputs hear it, not the stage. Cheap enough for
+    /// every UI frame (the top bar asks).
+    pub fn engaged(&self) -> bool {
+        self.state.lock().map(|s| s.take.is_some()).unwrap_or(false)
+    }
+
+    /// The take playing, and where. Reads under the lock without copying the
+    /// take (its events can be many).
     pub fn status(&self) -> Status {
-        let s = self.state.lock().map(|s| s.clone()).unwrap_or_default();
         let pos = self.pos.load(Ordering::Acquire);
         let sr = self.sample_rate.max(1) as f64;
-        let Some(take) = s.take else {
-            return Status { error: s.error, ..Status::default() };
+        let Ok(s) = self.state.lock() else { return Status::default() };
+        let Some(take) = s.take.as_ref() else {
+            return Status { error: s.error.clone(), ..Status::default() };
         };
         let marker = take.marker_at(pos);
         Status {
@@ -512,7 +519,7 @@ impl SoundcheckShared {
             inputs: take.manifest.inputs.iter().take(LANES).map(|i| i.name.clone()).collect(),
             midi_events: take.manifest.midi_events,
             underruns: self.underruns.load(Ordering::Relaxed),
-            error: s.error,
+            error: s.error.clone(),
         }
     }
 
@@ -738,6 +745,23 @@ fn range_of(args: &Value, take: &Take) -> Result<Option<(u64, u64)>, String> {
     }
 }
 
+/// The export now: whether one runs, how far, and the last result.
+#[derive(Clone, Debug, Default)]
+pub struct ExportState {
+    pub running: bool,
+    /// 0.0..=1.0
+    pub progress: f32,
+    pub last: Option<Result<crate::take::Exported, String>>,
+}
+
+pub fn export_state() -> ExportState {
+    ExportState {
+        running: EXPORTING.load(Ordering::Acquire),
+        progress: crate::take::EXPORT_PROGRESS.load(Ordering::Relaxed) as f32 / 1000.0,
+        last: EXPORT.lock().ok().and_then(|e| e.clone()),
+    }
+}
+
 fn status_json(shared: &SoundcheckShared) -> Value {
     let mut v = serde_json::to_value(shared.status()).unwrap_or(Value::Null);
     if let Some(export) = EXPORT.lock().ok().and_then(|e| e.clone()) {
@@ -747,6 +771,7 @@ fn status_json(shared: &SoundcheckShared) -> Value {
         };
     }
     v["exporting"] = json!(EXPORTING.load(Ordering::Acquire));
+    v["export_progress"] = json!(crate::take::EXPORT_PROGRESS.load(Ordering::Relaxed) as f64 / 1000.0);
     v
 }
 
@@ -787,6 +812,9 @@ pub fn tool(name: &str, args: &Value, shared: Option<&Arc<SoundcheckShared>>, di
                 };
                 if EXPORTING.swap(true, Ordering::AcqRel) {
                     return Err("an export is running: soundcheck_status shows when it is done".into());
+                }
+                if let Ok(mut e) = EXPORT.lock() {
+                    *e = None; // the last result is of the last export, not this one
                 }
                 let seconds = spec.range.map_or(take.seconds(), |(a, b)| (b - a) as f64 / take.manifest.sample_rate.max(1) as f64);
                 std::thread::Builder::new()

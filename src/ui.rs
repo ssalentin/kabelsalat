@@ -186,6 +186,7 @@ mod macros_ui;
 mod show_mode;
 mod preshow;
 mod stage_outputs;
+mod soundcheck_ui;
 mod audio_doctor;
 mod plugin_folders;
 mod setlist_files;
@@ -2013,6 +2014,7 @@ fn view_tooltip(view: StageView) -> &'static str {
         StageView::Plugins => "Plugins · key B",
         StageView::Settings => "Settings · key ,",
         StageView::Sessions => "Sessions",
+        StageView::Soundcheck => "Soundcheck · Ctrl+K",
     }
 }
 
@@ -3076,6 +3078,8 @@ enum StageView {
     Sessions,
     Plugins,
     Settings,
+    /// Virtual Soundcheck (#450): takes, transport, markers, export.
+    Soundcheck,
 }
 
 /// A page of the Settings view. The App pages change how kabelsalat plays
@@ -4385,6 +4389,8 @@ struct DemoApp {
     /// The stage output matrix (#399): who plays on which channels of the
     /// audio interface (`ui/stage_outputs.rs`).
     stage_out: stage_outputs::StageOutputs,
+    /// The Soundcheck view (`ui/soundcheck_ui.rs`, #450).
+    soundcheck: soundcheck_ui::SoundcheckPanel,
     /// A local send edit is on its way: the engine's older table waits.
     ui_send_grace: f32,
     /// A send knob being dragged: its send and the fader position so far.
@@ -5075,6 +5081,7 @@ impl DemoApp {
             sends: Vec::new(),
             bus_outs: Vec::new(),
             stage_out: Default::default(),
+            soundcheck: Default::default(),
             ui_send_grace: -1.0,
             send_drag: None,
             mixer_send_rects: Vec::new(),
@@ -19604,6 +19611,8 @@ impl DemoApp {
         let mut add_rig = false;
         let mut clone_rig: Option<usize> = None;
         let mut inline_demo: Option<Command> = None;
+        let mut soundcheck_stop = false;
+        let mut open_soundcheck = false;
         let mut open_matrix_rig: Option<usize> = None;
         let n = self.rig_count();
         if !self.nav_open {
@@ -19659,7 +19668,12 @@ impl DemoApp {
 
                 // Reserve width for transient right-side badges before picking
                 // full wordmark / dock labels so Lock and View never get overlapped.
-                let transient_w = if agent_visible { 136.0 } else { 0.0 }
+                // Virtual Soundcheck on: the inputs play a take (#450).
+                self.sc_refresh_engaged();
+                let sc_on = self.soundcheck.engaged;
+                let sc_lbl = if narrow { "Take" } else if compact { "■ Take" } else { "■ Soundcheck" };
+                let transient_w = if sc_on { 118.0 } else { 0.0 }
+                    + if agent_visible { 136.0 } else { 0.0 }
                     + if self.demo_playing.is_some() { 102.0 } else { 0.0 }
                     + if take_path.is_some() { 130.0 } else { 0.0 }
                     + if show_retro { 58.0 } else { 0.0 };
@@ -19714,8 +19728,9 @@ impl DemoApp {
                     0.0
                 };
                 let right_sep_w = if narrow { 0.0 } else { (1.0 + gap) * 2.0 };
+                let sc_w = if sc_on { theme::chip_button_width(ui, sc_lbl) + gap } else { 0.0 };
                 let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + rec_w + gap
-                    + retro_w + take_w + demo_w + agent_w + right_sep_w + dock_w + 8.0;
+                    + retro_w + take_w + demo_w + sc_w + agent_w + right_sep_w + dock_w + 8.0;
 
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), ROW_H),
@@ -20052,6 +20067,9 @@ impl DemoApp {
                                     if menu.item(self.record_sync, "Sync with transport (Space)") {
                                         self.set_record_sync(!self.record_sync);
                                     }
+                                    if menu.item(false, "Soundcheck… (Ctrl+K)") {
+                                        open_soundcheck = true;
+                                    }
                                     menu.separator();
                                     let (label, can) = retro_save_item(&snap.clone().unwrap_or_default());
                                     if menu.item_enabled(false, can, &label) {
@@ -20089,6 +20107,15 @@ impl DemoApp {
                                     .clicked()
                                 {
                                     self.toggle_take_playback(&path, secs);
+                                }
+                            }
+
+                            if sc_on {
+                                let r = theme::chip_button(ui, sc_lbl, true)
+                                    .on_hover_text("Virtual Soundcheck is on: the inputs play a recorded take, not the stage. Click to stop and go back to the stage.");
+                                ui.painter().rect_stroke(r.rect, theme::RADIUS_CONTROL, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                                if r.clicked() {
+                                    soundcheck_stop = true;
                                 }
                             }
 
@@ -20198,6 +20225,12 @@ impl DemoApp {
             } else if let Err(e) = self.clone_rig(r, None) {
                 self.session_msg = format!("Clone rig failed: {e}");
             }
+        }
+        if soundcheck_stop {
+            self.sc_stop();
+        }
+        if open_soundcheck {
+            self.open_soundcheck();
         }
         if let Some(cmd) = inline_demo {
             if let Some(bus) = &self.bus {
@@ -29342,6 +29375,7 @@ impl DemoApp {
             || self.load_setlist_dialog.is_some()
             || self.rename_rig_dialog.is_some()
             || self.strip_rename.is_some()
+            || self.soundcheck.export_open
             // The quick-add picker owns keys and clicks while it is open (#307).
             || self.quick_add.is_some()
         {
@@ -29502,6 +29536,10 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::Comma) {
                 self.toggle_stage(StageView::Settings);
             }
+            // Virtual Soundcheck (#450).
+            if i.consume_key(Modifiers::COMMAND, Key::K) {
+                self.toggle_stage(StageView::Soundcheck);
+            }
             if self.cc_learn.as_ref().is_some_and(|l| l.capture.is_some())
                 && i.consume_key(Modifiers::NONE, Key::Enter)
             {
@@ -29521,7 +29559,8 @@ impl DemoApp {
                 || self.save_chain_dialog.is_some()
                 || self.load_rig_dialog.is_some()
                 || self.save_setlist_dialog.is_some()
-                || self.load_setlist_dialog.is_some();
+                || self.load_setlist_dialog.is_some()
+                || self.soundcheck.export_open;
             if !(self.popup_open_at_start && !self.show_help)
                 && (!modal_open || self.confirm_delete_rig_preset.is_some())
                 && i.consume_key(Modifiers::NONE, Key::Escape)
@@ -33931,11 +33970,19 @@ impl DemoApp {
             }
             // Tuner readout above the meter: note + cents (no signal → hint); clicking opens the tuner.
             let pitch = self.audio_in_tuners.get(&node).and_then(|(_, _, p)| *p);
-            let text = match pitch {
-                Some(p) => format!("{} {:+.0}¢", crate::audio_in::note_name(p.note), p.cents),
-                None => "TUNE".into(),
+            // Virtual Soundcheck (#450): this input plays a take, not the device.
+            let from_take = self.soundcheck.engaged;
+            let text = if from_take {
+                "FROM TAKE".to_string()
+            } else {
+                match pitch {
+                    Some(p) => format!("{} {:+.0}¢", crate::audio_in::note_name(p.note), p.cents),
+                    None => "TUNE".into(),
+                }
             };
-            let tcol = if self.tuner_on {
+            let tcol = if from_take {
+                theme::ACCENT_BRIGHT
+            } else if self.tuner_on {
                 theme::LIVE_TEAL
             } else if self.audio_in_tuner_rect(unit).is_some_and(|tr| self.face_hovered(painter, unit, tr)) {
                 theme::ACCENT_BRIGHT
@@ -37311,6 +37358,7 @@ impl DemoApp {
                 StageView::Sessions => self.sessions_stage(ui),
                 StageView::Plugins => self.plugins_stage(ui),
                 StageView::Settings => self.settings_stage(ui),
+                StageView::Soundcheck => self.soundcheck_stage(ui),
             }
         } else {
             self.back_controls_rect = Rect::NOTHING;
@@ -37339,6 +37387,7 @@ impl DemoApp {
         self.save_rig_modal(&ctx);
         self.save_chain_modal(&ctx);
         self.load_rig_modal(&ctx);
+        self.soundcheck_modal(&ctx);
         self.save_setlist_modal(&ctx);
         self.load_setlist_modal(&ctx);
         self.param_editor_window(&ctx);
@@ -53084,7 +53133,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 49] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 52] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -53174,6 +53223,9 @@ mod window_size_layout_tests {
             }),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("sessions-installed", &|a| { a.stage_view = StageView::Sessions; template_plugins_installed(a) }),
+            ("soundcheck", &|a| super::soundcheck_ui::tests::seed(a, super::soundcheck_ui::tests::Scene::Empty)),
+            ("soundcheck-takes", &|a| super::soundcheck_ui::tests::seed(a, super::soundcheck_ui::tests::Scene::Ready)),
+            ("soundcheck-playing", &|a| super::soundcheck_ui::tests::seed(a, super::soundcheck_ui::tests::Scene::Playing)),
             ("settings", &|a| a.stage_view = StageView::Settings),
             ("settings-audio-doctor", &|a| {
                 a.stage_view = StageView::Settings;
@@ -53981,7 +54033,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 26] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 30] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("help", &|a| a.show_help = true),
@@ -54047,6 +54099,10 @@ mod offline_shots {
             ("settings-keys", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Keys }),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("sessions-installed", &|a| { a.stage_view = StageView::Sessions; template_plugins_installed(a) }),
+            ("soundcheck", &|a| super::soundcheck_ui::tests::seed(a, super::soundcheck_ui::tests::Scene::Empty)),
+            ("soundcheck-takes", &|a| super::soundcheck_ui::tests::seed(a, super::soundcheck_ui::tests::Scene::Ready)),
+            ("soundcheck-playing", &|a| super::soundcheck_ui::tests::seed(a, super::soundcheck_ui::tests::Scene::Playing)),
+            ("soundcheck-export", &|a| super::soundcheck_ui::tests::seed(a, super::soundcheck_ui::tests::Scene::Export)),
             ("agent", &|a| a.stage_demo_agent(false)),
         ];
         let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();

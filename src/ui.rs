@@ -38471,11 +38471,6 @@ pub(crate) fn preferred_host() -> cpal::Host {
 fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Vec<ClapVoiceMain>)> {
     let mut voices = Vec::new();
     let mut mains = Vec::new();
-    // No Surge XT on this machine: the starter setups play the factory
-    // sounds instead, and the app still starts with sound (#221).
-    if !crate::host::surge_available() {
-        crate::factory::set_fallback(true);
-    }
     for n in Graph::demo_patch().nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })) {
         let (v, m) = match n.kind.voice_plugin_key() {
             Some(id) if crate::factory::kind_of(&id).is_some() => ClapVoice::new_plugin(sample_rate, &id)?,
@@ -38721,6 +38716,14 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     crate::bridge::SAMPLE_RATE.store(sample_rate as u32, std::sync::atomic::Ordering::Relaxed);
     let wanted_buffer = crate::assistant::load_buffer_frames();
     crate::bridge::set_configured_buffer_frames(wanted_buffer);
+    // No Surge XT on this machine: the starter setups play the factory
+    // sounds instead, and the app still starts with sound (#221). Decided
+    // here, in the app's own start, and nowhere a test or bench reaches:
+    // `startup_voices` itself needs Surge unless the rack already names
+    // factory units (rule 183: no process-wide switch flipped by a helper).
+    if !crate::host::surge_available() {
+        crate::factory::set_fallback(true);
+    }
     let (voices, mains) = startup_voices(sample_rate)?;
     // Grab RT-safe param controllers BEFORE the voices move into the engine.
     let controllers: Vec<VoiceController> = voices.iter().map(|(_, v)| v.controller()).collect();
@@ -42365,13 +42368,15 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| *t == format!("Install ({n})")), "the tab counts every card: {texts:?}");
         assert!(texts.iter().any(|t| t == "Install"), "an Install button is painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "Installed"), "installed entries show an Installed badge: {texts:?}");
-        assert!(!texts.iter().any(|t| t.contains('★')), "no stars without a fetched count: {texts:?}");
+        // The "★ Favorites" shelf tab is not a star count.
+        let star_counts = |texts: &[String]| texts.iter().filter(|t| t.contains('★') && !t.starts_with("★ Favorites")).count();
+        assert_eq!(star_counts(&texts), 0, "no stars without a fetched count: {texts:?}");
         app.catalog_stars.insert("pantherb/setBfree", 235);
         app.catalog_stars.insert("surge-synthesizer/surge", 3870);
         let texts = frame(&mut app, &ctx, vec![]);
         assert!(texts.iter().any(|t| t.starts_with("★ 235 · License ")), "setBfree's card shows its stars: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("★ 3.9k · License ")), "Surge's card shows its stars: {texts:?}");
-        assert_eq!(texts.iter().filter(|t| t.contains('★')).count(), 2, "only fetched repos show stars: {texts:?}");
+        assert_eq!(star_counts(&texts), 2, "only fetched repos show stars: {texts:?}");
 
         // The list scrolls past the window: every card is found by its name.
         for e in crate::catalog::CATALOG {

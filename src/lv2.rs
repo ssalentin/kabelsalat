@@ -1715,7 +1715,10 @@ pub(crate) fn discover_with_unloadable_cache_path(
             }
         }
     }
-    let found = with_shared_world_rescan(force_rescan || cache_path.is_some(), |world| unsafe {
+    // Without a cache (tests) the shared world is rebuilt as well: it is
+    // process-wide while the custom folders it reads are the calling test's
+    // own, so a world another thread built would answer with its folders.
+    let found = with_shared_world_rescan(force_rescan || cache_path.is_some() || cfg!(test), |world| unsafe {
         collect_plugins(world)
     })
     .unwrap_or_default();

@@ -32,6 +32,9 @@ pub(super) struct QuickAdd {
     pub(super) rect: Rect,
 }
 
+/// Row keys of saved FX chains start with this; plugin keys never do.
+const CHAIN_KEY: &str = "chain:";
+
 /// What the list shows for one plugin, detached from the scan's borrow.
 struct Row {
     key: String,
@@ -234,6 +237,11 @@ impl DemoApp {
     /// (Shift+Enter) takes the card's other action: a new rig for an
     /// instrument, a master insert for an effect.
     fn quick_add_pick(&mut self, key: &str, alt: bool) {
+        // A saved FX chain (#429) goes into the rig in view, where one effect would.
+        if let Some(name) = key.strip_prefix(CHAIN_KEY) {
+            self.ui_insert_fx_chain(name, self.active_rig as u8, None);
+            return;
+        }
         let act = {
             let all = crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3);
             let Some(e) = all.iter().find(|e| e.has_key(key)) else { return };
@@ -308,6 +316,26 @@ impl DemoApp {
         let page_rows = ((list_h / ROW_H).round() as usize).max(1);
 
         let scanning = !self.plugins_loaded;
+        // Saved FX chains (#429) lead the list when they match the words typed,
+        // in the All and Effects views.
+        let chain_rows: Vec<Row> = if qa.view.is_none() && qa.ty.is_none_or(|t| t == PluginType::Effect) {
+            let words: Vec<String> = qa.query.split_whitespace().map(str::to_lowercase).collect();
+            self.fx_chain_listing().into_iter()
+                .filter(|(name, units)| {
+                    let hay = format!("{} {} fx chain", name.to_lowercase(), units.join(" ").to_lowercase());
+                    words.iter().all(|w| hay.contains(w.as_str()))
+                })
+                .map(|(name, units)| Row {
+                    key: format!("{CHAIN_KEY}{name}"),
+                    name,
+                    badge: format!("FX CHAIN · {} units", units.len()),
+                    badge_col: type_color(PluginType::Effect),
+                    favorite: false,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (rows, total): (Vec<Row>, usize) = {
             let all = crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2, &self.plugins_vst3);
             let hits = quick_search(&all, &qa.query, &self.plugin_shelf, qa.view, qa.ty);
@@ -324,6 +352,8 @@ impl DemoApp {
                 .collect();
             (rows, hits.len())
         };
+        let total = total + chain_rows.len();
+        let rows: Vec<Row> = chain_rows.into_iter().chain(rows).collect();
         if rows.is_empty() {
             qa.sel = 0;
         } else {

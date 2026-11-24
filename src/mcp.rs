@@ -223,6 +223,17 @@ struct SaveRigArgs {
     rig: Option<usize>,
 }
 
+/// Arguments for `save_fx_chain` and `insert_fx_chain`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FxChainArgs {
+    /// Saved FX chain name (see list_fx_chains).
+    name: String,
+    /// Rig index (0-based). Defaults to the rig in view.
+    rig: Option<usize>,
+    /// The strip's source node id (see get_graph); default: the rig's first strip with a linear chain.
+    source: Option<u32>,
+}
+
 /// Arguments for `load_rig`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LoadRigArgs {
@@ -3830,6 +3841,17 @@ impl McpServer {
         }
     }
 
+    /// An FX chain tool (#429): all three edit or read the app's rack.
+    fn fx_chain_bridge(tool: &str, args: &FxChainArgs, state: &Mutex<State>) -> Result<CallToolResult, McpError> {
+        if !matches!(state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err(format!("{tool} needs the running app (kabelsalat mcp --attach): it works on the rack's strips"));
+        }
+        let mut a = json!({"name": args.name});
+        if let Some(r) = args.rig { a["rig"] = json!(r); }
+        if let Some(n) = args.source { a["source"] = json!(n); }
+        Self::ui_bridge_tool(tool, a)
+    }
+
     fn ui_bridge_tool(tool: &str, args: Value) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool_within(tool, args, std::time::Duration::from_secs(5))
     }
@@ -5403,6 +5425,27 @@ impl McpServer {
             result["install_hint"] = json!(crate::catalog::install_hint(&missing));
         }
         ok_json(result)
+    }
+
+    /// Save a strip's insert chain as a named FX chain (#429).
+    #[tool(name = "save_fx_chain", description = "Save a strip's insert chain (its effect units, their knob values, plugin states and the cables between them) as a named FX chain in ~/kabelsalat-fx-chains, to insert into any rig with insert_fx_chain. rig: default the rig in view; source: the strip's source node id (default: the rig's first strip with effects). Needs the running app (kabelsalat mcp --attach).")]
+    fn save_fx_chain(&self, Parameters(args): Parameters<FxChainArgs>) -> Result<CallToolResult, McpError> {
+        Self::fx_chain_bridge("save_fx_chain", &args, &self.state)
+    }
+
+    /// Insert a saved FX chain into a rig (#429).
+    #[tool(name = "insert_fx_chain", description = "Insert a saved FX chain (see list_fx_chains) into a rig: its units, knob values and plugin states come back and the chain is wired into the strip where a single effect would go (before the rig bus). rig: default the rig in view; source: the strip's source node id (default: the rig's first strip with a linear chain). Needs the running app (kabelsalat mcp --attach).")]
+    fn insert_fx_chain(&self, Parameters(args): Parameters<FxChainArgs>) -> Result<CallToolResult, McpError> {
+        Self::fx_chain_bridge("insert_fx_chain", &args, &self.state)
+    }
+
+    /// List saved FX chains (#429).
+    #[tool(name = "list_fx_chains", description = "List the saved FX chains (name and the effects in signal order) in ~/kabelsalat-fx-chains. Needs the running app (kabelsalat mcp --attach).")]
+    fn list_fx_chains(&self) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("list_fx_chains needs the running app (kabelsalat mcp --attach)");
+        }
+        Self::ui_bridge_tool("list_fx_chains", json!({}))
     }
 
     /// List saved single-rig presets.

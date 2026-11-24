@@ -785,7 +785,8 @@ fn system_prompt() -> String {
      an existing rig (units, cables, knobs, synth state, matrix routes, mix) as a new rig; \
      delete_rig removes one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
-     save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
+     save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions; \
+     save_fx_chain/insert_fx_chain/list_fx_chains save a strip's chain of effects and insert it into any rig. \
      - Loudness (\"make it streaming-ready\", \"master to -14\", \"club loud\"): set_master_target \
      (target spotify/youtube/tidal = -14 LUFS, apple = -16, club = -8, off, or lufs=<number>). It \
      trims the level in front of the master limiter from the loudness measured so far and holds \
@@ -1575,6 +1576,21 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"list_rig_presets",
             "description":"List saved single-rig preset names in ~/kabelsalat-rig-presets.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"save_fx_chain",
+            "description":"Save a strip's insert chain (its effect units, knob values, plugin states and the cables between them) as a named FX chain in ~/kabelsalat-fx-chains. rig: 0-based rig index (default: the rig in view); source: the strip's source node id (default: the rig's first strip with effects).",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Chain name (no slashes)"},"rig":{"type":"integer"},"source":{"type":"integer"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"insert_fx_chain",
+            "description":"Insert a saved FX chain (see list_fx_chains) into a rig: units, knob values and plugin states return and the chain is wired into the strip where one effect would go (before the rig bus). rig: 0-based (default: the rig in view); source: the strip's source node id (default: the rig's first strip with a linear chain).",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Saved chain name (see list_fx_chains)"},"rig":{"type":"integer"},"source":{"type":"integer"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_fx_chains",
+            "description":"List saved FX chains: name and the effects in signal order.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{

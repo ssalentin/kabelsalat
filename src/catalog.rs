@@ -614,7 +614,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         plugin_type: crate::plugins::PluginType::Effect,
         instrument: None,
         description: "Guitar amp, cabinets and stompbox effects",
-        about: "A mono guitar amplifier with a tube-modelled preamp, tone stack and power amp, matched cabinet impulses and a pedalboard of stomps (overdrive, fuzz, delay, reverb, wah, tremolo). kabelsalat's Guitar rig template wires an Audio In through the screamer, the amp and a cabinet — the tuner is on the Audio In unit's face.",
+        about: "A mono guitar amplifier with a tube-modelled preamp, tone stack and power amp, matched cabinet impulses and a pedalboard of stomps (overdrive, fuzz, delay, reverb, wah, tremolo). kabelsalat's Guitar rig template wires an Audio In through the screamer, the amp and a cabinet — the tuner is on the Audio In unit's face. An effect suite: it has no sound library (its LV2 bundles ship no presets; the amp settings are dialled in on the face).",
         license: "GPL-2.0-or-later",
         homepage: Some("https://guitarix.org"),
         source: Source::GitHub("brummer10/guitarix"),

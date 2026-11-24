@@ -54,7 +54,7 @@ otherwise, **x86_64** prebuilt release and Arch package runs are still untested
 
 | Card (`id`) | Format | Install | Audio / Engine | State / Session | Plugin GUI | Notes & untested gaps |
 |---|---|---|---|---|---|---|
-| **Guitarix** (`guitarix`) | LV2 | **Works** (`aarch64` Arch) | **Works** (`guitar-rig-test`, `guitarix_amps_process_from_the_first_block`) | **Works** (control ports) | **Untested** (LV2 native GUI untested) | Powers the `⇧F5` Guitar rig (`Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master`). Browser add-to-rig flow in open bench test #177; `x86_64` untested. |
+| **Guitarix** (`guitarix`) | LV2 | **Works** (`aarch64` Arch) | **Works** (`guitar-rig-test`, `guitarix_amps_process_from_the_first_block`); **no sound library** (effect suite: `sound-library-test` skips it, #132) | **Works** (control ports) | **Untested** (LV2 native GUI untested) | Powers the `⇧F5` Guitar rig (`Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master`). Browser add-to-rig flow in open bench test #177; `x86_64` untested. |
 | **Dragonfly Reverb** (`dragonfly-reverb`) | CLAP | **Headless** (`aarch64` Arch via `catalog-install-test`) | **Headless** (Hall reverb: `catalog-install-test` peak 0.564, `analysis-test` `clap_effect`) | **Untested** | **Untested** | Hall tested; Room, Plate and Early Reflections bundles not individually tested. Interactive rig/aux/master use, state, GUI window, `x86_64` untested. |
 | **Airwindows Consolidated** (`airwindows`) | CLAP | **Untested** (`x86_64` release + source; plan/SHA-256 unit-tested) | **Untested** | **Untested** | **Untested** | Added in #197; neither the `x86_64` prebuilt release nor the `aarch64` source build has been installed or run yet. |
 

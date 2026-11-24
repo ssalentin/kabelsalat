@@ -12535,7 +12535,7 @@ pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
         "vitalium" => Some("pad"),
         "aeolus" => Some("flute"),
         "unsampled-piano" => Some("light dry"),
-        "surge-xt" | "yanes" | "odin2" | "floe" | "guitarix" => Some("bass"),
+        "surge-xt" | "yanes" | "odin2" | "floe" => Some("bass"),
         _ => None,
     };
     let clap = crate::host::list_clap_plugins();
@@ -12550,6 +12550,12 @@ pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
             println!("  {:<9} not installed, skipped", entry.name);
             continue;
         };
+        // An effect suite has no sounds to browse (rule 94: Guitarix ships
+        // amp/cab/stomp plugins and standalone rig files, no LV2 presets).
+        if entry.plugin_type != crate::plugins::PluginType::Instrument {
+            println!("  {:<9} an effect, not an instrument: no sound library, skipped", entry.name);
+            continue;
+        }
         let Some(query) = asked(entry.id).or_else(|| builtin(entry.id).map(str::to_string)) else {
             println!("  {:<9} no sound library in kabelsalat yet, skipped", entry.name);
             continue;

@@ -2101,3 +2101,9 @@ Learned so far (2026-11-15, UI polish pass):
     compute the exact group width up front and wrap it in
     `ui.allocate_ui_with_layout(vec2(w, h), Layout::left_to_right(...), ...)`
     (e.g. `theme::segmented_tray_width`).
+231. **A catalog effect is not a sound-library instrument:** `sound-library-test`
+    asked Guitarix (an amp/cab/stomp suite, `plugin_type` Effect) for "bass" presets
+    and failed with "no LV2 presets found": its LV2 bundles ship no `pset:Preset`
+    and the standalone `factorysettings/*.gx` files are whole rigs, not LV2 presets
+    (`guitarix-lv2` 0.47.0, `dpkg-deb -x`). The test skips every non-Instrument
+    card by `plugin_type` (#132); a new effect card gets no `builtin` search.

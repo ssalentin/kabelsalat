@@ -132,6 +132,10 @@ Each line links to its section in the [user guide](docs/GUIDE.md).
   empty rack space for a fuzzy-search picker, with your starred **Favorites**
   and **Recent** plugins on top.
   → [Favorites, recents and quick-add](docs/GUIDE.md#favorites-recents-and-quick-add)
+- **Save a chain of effects and insert it into any rig:** **save chain** on a
+  mixer strip stores its effects, knobs and cables under a name; insert it
+  from the strip's **+ insert**, quick-add or the Plugins view's **FX chains**.
+  → [FX chains](docs/GUIDE.md#fx-chains)
 - **Install 23 tested plugins with one click** (Surge XT, Dexed, Vitalium,
   setBfree, Aeolus, Guitarix, …). → [Catalog](docs/GUIDE.md#install-instruments-from-the-catalog),
   [tested plugins](docs/PLUGINS.md)

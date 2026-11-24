@@ -195,6 +195,7 @@ mod hotplug;
 mod firstrun;
 pub(crate) use hotplug::midi_selftest as hotplug_midi_selftest;
 mod quick_add;
+mod fx_chain;
 use levels::LevelItem;
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -3634,6 +3635,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "set_audio_backend", "list_app_streams", "set_app_stream", "add_rig", "clone_rig", "delete_rig",
     "save_rig", "load_rig", "list_rig_presets", "load_template",
+    "save_fx_chain", "insert_fx_chain", "list_fx_chains",
     "list_instruments", "install_instrument", "play_file", "stop_file", "backing_markers",
     "set_scale", "set_arp",
     "set_strip_mix", "set_node_bypass", "duplicate_node", "reset_node_params", "randomize_node_params",
@@ -3681,6 +3683,7 @@ fn tool_changes_only_system(name: &str) -> bool {
         name,
         "install_instrument"
             | "save_rig"
+            | "save_fx_chain"
             | "save_setlist"
             | "set_setlist_folder"
             | "reset_engine_peaks"
@@ -3995,6 +3998,14 @@ struct DemoApp {
     plugin_shelf: crate::plugins::Shelf,
     /// The Plugins view's Favorites / Recent filter.
     plugin_shelf_view: Option<crate::plugins::ShelfView>,
+    /// Saved FX chains (#429): their folder, the save dialog (strip node, name),
+    /// the Plugins view's list switch, the armed delete and a chain picked in
+    /// the mixer's insert picker (applied after the frame's layout).
+    fx_chains_dir: std::path::PathBuf,
+    save_chain_dialog: Option<(u32, String)>,
+    plugin_chains_view: bool,
+    fx_chain_delete_armed: Option<String>,
+    pending_chain_pick: Option<(u32, String)>,
     /// The quick-add picker over the rack (#307); None = closed.
     quick_add: Option<quick_add::QuickAdd>,
     /// The Install view's instrument / effect filter.
@@ -4847,6 +4858,11 @@ impl DemoApp {
             plugin_format: None,
             plugin_shelf: crate::plugins::Shelf::load(),
             plugin_shelf_view: None,
+            fx_chains_dir: Self::default_fx_chains_dir(),
+            save_chain_dialog: None,
+            plugin_chains_view: false,
+            fx_chain_delete_armed: None,
+            pending_chain_pick: None,
             quick_add: None,
             plugin_catalog_type: None,
             plugin_msg: String::new(),
@@ -12467,6 +12483,15 @@ impl DemoApp {
                     }
                     Err(e) => format!("load_rig failed: {e}"),
                 }
+            }
+            "save_fx_chain" | "insert_fx_chain" | "list_fx_chains" => {
+                let out = self.fx_chain_tool(name, args);
+                if name != "list_fx_chains" {
+                    let n = args.get("name").and_then(|v| v.as_str()).unwrap_or("chain");
+                    if self.graph_pub.is_some() && name == "insert_fx_chain" { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                    self.agent_activity.record(origin, format!("{} → {n}", if name == "save_fx_chain" { "Save chain" } else { "Insert chain" }), vec![], now);
+                }
+                out
             }
             "list_rig_presets" => {
                 let presets = crate::session::list_rig_presets(&self.rig_presets_dir);
@@ -22577,10 +22602,17 @@ impl DemoApp {
     /// remap inside `apply_session` carries knobs, states, rules and strips
     /// to their new node ids.
     fn reload_with_graph(&mut self, g: Graph) -> Result<(), String> {
+        self.reload_with_graph_edit(g, |_| {})
+    }
+
+    /// `reload_with_graph` that lets the caller put values for the graph's
+    /// new nodes into the session first (an inserted FX chain, #429).
+    fn reload_with_graph_edit(&mut self, g: Graph, edit: impl FnOnce(&mut crate::session::Session)) -> Result<(), String> {
         let keep_rig = self.active_rig;
         let keep_mix = self.rig_mix;
         let mut s = self.capture_session("mixer edit").map_err(|e| e.to_string())?;
         s.graph = g;
+        edit(&mut s);
         self.apply_session(&s).map_err(|e| e.to_string())?;
         self.rig_mix = keep_mix;
         self.active_rig = usize::MAX; // force set_active_rig to regroup
@@ -22819,6 +22851,13 @@ impl DemoApp {
                             }
                         }
                     }
+                    let n_chains = crate::session::list_fx_chains(&self.fx_chains_dir).len();
+                    if theme::wrapped_live_toggle_chip(ui, &format!("FX chains ({n_chains})"), self.plugin_chains_view)
+                        .on_hover_text("saved chains of connected effects: insert one into the rig in view")
+                        .clicked()
+                    {
+                        self.plugin_chains_view = !self.plugin_chains_view;
+                    }
                     if theme::wrapped_quiet_filter_chip(ui, "Refresh", false)
                         .on_hover_text("rescan plugins, retrying bundles that failed before")
                         .clicked()
@@ -22897,6 +22936,10 @@ impl DemoApp {
                         let cols = ((avail_w + gap) / 340.0).floor().clamp(1.0, 3.0) as usize;
                         let card_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(200.0);
 
+                        if self.plugin_chains_view {
+                            self.fx_chain_rows(ui, &filter);
+                            return;
+                        }
                         if self.plugin_category == PluginCategory::Install {
                             self.poll_catalog_stars(ui.ctx());
                             let roots_raw = self.catalog_root_paths();
@@ -29293,6 +29336,7 @@ impl DemoApp {
         // must reach them, not the rack's cable shortcuts).
         if self.confirm_delete_rig.is_some()
             || self.save_rig_dialog.is_some()
+            || self.save_chain_dialog.is_some()
             || self.load_rig_dialog.is_some()
             || self.save_setlist_dialog.is_some()
             || self.load_setlist_dialog.is_some()
@@ -29474,6 +29518,7 @@ impl DemoApp {
             let modal_open = self.confirm_delete_rig.is_some()
                 || self.rename_rig_dialog.is_some()
                 || self.save_rig_dialog.is_some()
+                || self.save_chain_dialog.is_some()
                 || self.load_rig_dialog.is_some()
                 || self.save_setlist_dialog.is_some()
                 || self.load_setlist_dialog.is_some();
@@ -30918,6 +30963,10 @@ impl DemoApp {
                 }
             }
         }
+        if let Some((src, name)) = self.pending_chain_pick.take() {
+            let rig = self.units.iter().find(|u| u.node_id == src).map(|u| u.rig).unwrap_or(self.active_rig as u8);
+            self.ui_insert_fx_chain(&name, rig, Some(src));
+        }
         if let Some(e) = self.pending_bus_edit.take() {
             if self.rack_locked {
                 self.notify_rack_locked();
@@ -31819,13 +31868,25 @@ impl DemoApp {
             xresp.on_hover_text("remove this insert (the chain closes up)");
         }
         if theme::chip_button(ui, "+ insert", false)
-            .on_hover_text("add an effect to this strip's chain (built-in or an installed LV2 effect)")
+            .on_hover_text("add an effect to this strip's chain (built-in or an installed LV2 effect), or a saved FX chain")
             .clicked()
         {
             if self.rack_locked {
                 self.notify_rack_locked();
             } else {
                 self.insert_pick = Some(source);
+            }
+        }
+        if let (Some(node), true) = (source, chain.len() >= 2) {
+            if theme::chip_button(ui, "save chain", false)
+                .on_hover_text("save these effects, their knobs and cables as a named FX chain to insert into any rig")
+                .clicked()
+            {
+                if self.rack_locked {
+                    self.notify_rack_locked();
+                } else {
+                    self.save_chain_dialog = Some((node, String::new()));
+                }
             }
         }
     }
@@ -31907,6 +31968,11 @@ impl DemoApp {
     fn insert_picker_ui(&mut self, ctx: &egui::Context, edits: &mut Vec<PendingInsertEdit>) {
         let Some(source) = self.insert_pick else { return };
         let mut chosen: Option<(NodeKind, String)> = None;
+        let mut chain_chosen: Option<String> = None;
+        // Saved FX chains (#429) join a strip's chain, never the master's.
+        let saved_chains: Vec<String> = if source.is_some() {
+            crate::session::list_fx_chains(&self.fx_chains_dir)
+        } else { Vec::new() };
         let mut close = false;
         let screen = self.stage_rect;
         let area = egui::Area::new(egui::Id::unique("insert_picker"))
@@ -31958,6 +32024,21 @@ impl DemoApp {
                                 (DspKind::Eq3, "Eq 3"), (DspKind::Saturation, "Saturation"), (DspKind::Limiter, "Limiter"),
                                 (DspKind::Gain, "Gain"), (DspKind::Pan, "Pan"),
                             ];
+                            let matched_chains: Vec<&String> = saved_chains.iter()
+                                .filter(|c| self.insert_subtype.is_none() && !self.insert_builtin_only
+                                    && matches_query(&[c.as_str(), "fx chain chains saved"], &filter))
+                                .collect();
+                            if !matched_chains.is_empty() {
+                                theme::section_label(ui, "FX chains");
+                                ui.add_space(4.0);
+                                for c in matched_chains {
+                                    shown += 1;
+                                    if theme::chip_button(ui, c, false).on_hover_text("insert this saved chain: its units, knobs and cables").clicked() {
+                                        chain_chosen = Some(c.clone());
+                                    }
+                                }
+                                ui.add_space(6.0);
+                            }
                             let matched_dsp: Vec<(DspKind, &str)> = dsp_items
                                 .into_iter()
                                 .filter(|(k, label)| {
@@ -32074,6 +32155,10 @@ impl DemoApp {
         let inside = area.response.rect.contains(ctx.pointer_hover_pos().unwrap_or_default());
         if ctx.input(|i| i.pointer.primary_clicked()) && !inside { close = true; }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
+        if let (Some(c), Some(src)) = (chain_chosen, source) {
+            self.pending_chain_pick = Some((src, c));
+            close = true;
+        }
         if chosen.is_some() || close {
             self.insert_pick = None;
             self.insert_filter.clear();
@@ -37252,6 +37337,7 @@ impl DemoApp {
         self.delete_rig_modal(&ctx);
         self.rename_rig_modal(&ctx);
         self.save_rig_modal(&ctx);
+        self.save_chain_modal(&ctx);
         self.load_rig_modal(&ctx);
         self.save_setlist_modal(&ctx);
         self.load_setlist_modal(&ctx);

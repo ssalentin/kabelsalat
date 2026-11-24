@@ -61,6 +61,9 @@ pub const PACKAGE_EXT: &str = "ksalat";
 pub const RIG_PRESET_FILE: &str = "rig.json";
 /// Package directory extension for single-rig presets.
 pub const RIG_PRESET_EXT: &str = "ksalat-rig";
+/// A saved FX chain (#429) is a rig preset file whose graph holds only the
+/// chain's effect units; it lives in its own folder under this extension.
+pub const FX_CHAIN_EXT: &str = "ksalat-fxchain";
 /// On-disk format version for single-rig preset manifests.
 pub const RIG_PRESET_FORMAT_VERSION: u32 = 1;
 /// The manifest inside a saved setlist package.
@@ -1315,6 +1318,38 @@ impl RigPreset {
         Ok(())
     }
 
+    /// The effect nodes of a saved FX chain (#429) in signal order: the one
+    /// node nothing feeds first, then each node its audio cable leads to.
+    /// Anything but a single linear run of effects is refused.
+    pub fn fx_chain_order(&self) -> Result<Vec<NodeId>> {
+        let g = &self.session.graph;
+        if g.nodes.is_empty() {
+            bail!("The FX chain holds no effects.");
+        }
+        let audio: Vec<_> = g.edges.iter().filter(|e| e.kind == PortKind::Audio).collect();
+        if g.edges.len() != audio.len() {
+            bail!("An FX chain holds audio cables only.");
+        }
+        let heads: Vec<NodeId> = g.nodes.iter().map(|n| n.id)
+            .filter(|id| !audio.iter().any(|e| e.to.node == *id)).collect();
+        if heads.len() != 1 {
+            bail!("The FX chain is not one linear run of effects.");
+        }
+        let mut order = vec![heads[0]];
+        while let Some(next) = {
+            let cur = *order.last().unwrap();
+            let outs: Vec<NodeId> = audio.iter().filter(|e| e.from.node == cur).map(|e| e.to.node).collect();
+            match outs.as_slice() { [] => None, [one] => Some(*one), _ => bail!("The FX chain branches.") }
+        } {
+            if order.contains(&next) { bail!("The FX chain loops."); }
+            order.push(next);
+        }
+        if order.len() != g.nodes.len() {
+            bail!("The FX chain has units no cable leads to.");
+        }
+        Ok(order)
+    }
+
     pub fn save(&self, package: &Path) -> Result<()> {
         self.validate()?;
         stage_package(package, "rig preset", |staging| {
@@ -1428,14 +1463,46 @@ pub fn rig_presets_dir() -> PathBuf {
     dir
 }
 
+/// Default directory for saved FX chains (#429), beside the rig presets.
+pub fn fx_chains_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = PathBuf::from(home).join("kabelsalat-fx-chains");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+/// The package path of the saved FX chain `name` in `dir`.
+pub fn fx_chain_path(dir: &Path, name: &str) -> Result<PathBuf> {
+    validate_package_path(dir, name, FX_CHAIN_EXT, "FX chain")
+}
+
+/// Sorted names of the saved FX chains in `dir`.
+pub fn list_fx_chains(dir: &Path) -> Vec<String> {
+    list_packages(dir, FX_CHAIN_EXT)
+}
+
+/// Delete a saved FX chain by name.
+pub fn delete_fx_chain(dir: &Path, name: &str) -> Result<()> {
+    let path = fx_chain_path(dir, name)?;
+    if !path.exists() {
+        bail!("FX chain '{name}' does not exist");
+    }
+    fs::remove_dir_all(&path)?;
+    Ok(())
+}
+
 /// Sorted list of saved rig preset names in `dir`.
 pub fn list_rig_presets(dir: &Path) -> Vec<String> {
+    list_packages(dir, RIG_PRESET_EXT)
+}
+
+fn list_packages(dir: &Path, ext: &str) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter_map(|e| {
                     let p = e.path();
-                    if p.extension().is_some_and(|x| x == RIG_PRESET_EXT) {
+                    if p.extension().is_some_and(|x| x == ext) {
                         p.file_stem().map(|s| s.to_string_lossy().into_owned())
                     } else {
                         None

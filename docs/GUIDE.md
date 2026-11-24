@@ -24,6 +24,7 @@ every keyboard shortcut.
   - [Browse and install plugins by type](#browse-and-install-plugins-by-type)
   - [Search your own plugin folders](#search-your-own-plugin-folders)
   - [Favorites, recents and quick-add](#favorites-recents-and-quick-add)
+  - [FX chains](#fx-chains)
   - [VST3 plugins and native plugin GUIs](#vst3-plugins-and-native-plugin-guis)
   - [Install instruments from the catalog](#install-instruments-from-the-catalog)
   - [Plugin crash isolation](#plugin-crash-isolation)
@@ -365,6 +366,28 @@ does not open and says why.
 Agents star plugins with `set_plugin_favorite` and read both shelves with
 `list_plugins` (`shelf: "favorites"` or `"recent"`); they add units with the
 tools they always had (`add_node`, `add_insert`, `add_rig`).
+
+### FX chains
+
+A chain of effects you like (an amp, a delay and a reverb, say) is saved once
+and inserted into any rig. Open the **Mixer**, pick a strip with two or more
+inserts and press **save chain**: name it, and kabelsalat stores the effects in
+signal order with their knob values, plugin states, bypass settings and the
+cables between them, in `~/kabelsalat-fx-chains`.
+
+Insert it where one effect would go, at the end of a strip's chain before the
+rig bus:
+
+- the strip's **+ insert** picker lists saved chains under **FX chains**;
+- quick-add (**Enter**) lists them first, badged **FX CHAIN**, and adds to the
+  rig in view;
+- the Plugins view's **FX chains** chip lists them with **Insert** (into the rig
+  in view) and **Delete** (asks twice).
+
+A rig with no linear strip chain gets the units and their own cables, to patch
+on the back. An insert is one undo step and is refused on a locked rack
+(Ctrl+L). Agents use `save_fx_chain`, `list_fx_chains` and `insert_fx_chain`
+(running app only).
 
 ### VST3 plugins and native plugin GUIs
 

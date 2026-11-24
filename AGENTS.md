@@ -2108,3 +2108,26 @@ Learned so far (2026-11-15, UI polish pass):
     (`guitarix-lv2` 0.47.0, `dpkg-deb -x`). The test skips every non-Instrument
     card by `plugin_type` (#132); a new effect card gets no `builtin` search.
 237. **Every JSON type a tool declares has a `coerce_arg` arm, or the tool refuses every valid call:** `set_cues.cues` was declared `["array","null"]` (#468), but `coerce_arg` had no `array` arm, so any cue list answered "must be array or null" and the table test (`the_tool_table_fits_the_argument_checker`) failed on `main`. Declare the type and teach `coerce_arg` its shape (string arrays here; other elements are refused), and test one valid and one invalid call of the tool (`arguments_are_read_as_meant_or_refused`).
+232. **A helper a test reaches never flips a process-wide switch:** `startup_voices`
+    set the factory-sound fallback (#221) when Surge XT was missing, and every
+    `EvalRig` / `Headless` in the suite calls it, so on a machine without plugins
+    the first such test turned the starter rack into factory units for all later
+    tests (`Factory Piano · Wurli`, layout and scan tests failing only in the
+    full `ui::` run, passing alone) and made the Surge-only tests run instead of
+    skip. The app decides in `build_audio` (never reached by a test);
+    `startup_voices` fails without Surge as before, so `EvalRig::new` is `Err` and
+    those tests return early. Reproduce an order-dependent failure by comparing
+    `ui::` with the single test (rule 183).
+233. **A plugin-folder change drops lilv's shared world, and a scan without a
+    cache rebuilds it:** the app only rescanned correctly because its scan cache
+    stamp forced a world reset; with no cache (tests, an unwritable cache path)
+    the rescan reused the world built before the folder existed, never found its
+    bundles nor lost a removed one, and in the parallel suite a world another
+    test built (with that test's folders) answered instead. `set_plugin_folders`
+    calls `lv2::invalidate_world_cache()` and `discover_with_unloadable_cache_path`
+    resets the world whenever it has no cache
+    (`a_folder_added_in_settings_is_scanned_and_edit_and_remove_follow`).
+234. **A test that counts a glyph excludes the chrome that uses it:** the Plugins
+    stage gained a "★ Favorites" shelf tab, which the catalog test's "no stars
+    without a fetched count" matched. Count star texts through one filter that
+    leaves out the tab (`instrument_catalog_renders_install_cards_in_stage`).

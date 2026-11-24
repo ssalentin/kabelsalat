@@ -58,6 +58,10 @@ impl DemoApp {
     pub(super) fn set_plugin_folders(&mut self, dirs: PluginDirs) -> Result<(), String> {
         let saved = plugin_dirs::save(&dirs);
         plugin_dirs::set(dirs);
+        // lilv read the old folders into its shared world; without a scan
+        // cache (tests, a cache path that cannot be written) the rescan would
+        // reuse that world and never see the new bundles.
+        crate::lv2::invalidate_world_cache();
         self.plugin_folders.exists_at = None;
         // A scan under way read the old folders: its result is dropped.
         self.plugin_scan = None;

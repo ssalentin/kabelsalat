@@ -1,4 +1,0 @@
-### Added
-- **Gig recording (#400):** every REC take now also holds the raw signal of each Audio In, every MIDI message the rack was played with and a marker at each song and part switch, all sample-aligned with the master and the rig stems, plus a `take.json` that names them.
-- **Virtual Soundcheck (#400):** play a recorded take through the live rack: the inputs hear the recording, the MIDI plays the instruments and the setlist follows the recorded part switches, so every knob and fader change is heard at once. Jump to a marker, loop a section, stop to hand the inputs back to the stage. Assistant and MCP tools `list_takes`, `soundcheck_start`, `soundcheck_seek`, `soundcheck_loop`, `soundcheck_stop`, `soundcheck_status`.
-- **Stem export (#400):** `export_take` writes the show mixdown, rig stems and raw inputs of a whole take or one song or part as 24-bit, 16-bit or float WAV.

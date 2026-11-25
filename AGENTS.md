@@ -159,16 +159,24 @@ machine's load. This holds for every agent and subagent.
 What they cannot test is handed to a machine that can, as a GitHub issue,
 and never passed off as tested.**
 
+- **Fully automated only — no manual tests (user, 2026-11-25):** bench tests
+  ONLY contain fully automated runs that an agent can execute unattended on a
+  machine with the required hardware connected. Never write manual steps
+  (unplugging cables, playing a keyboard or pressing pedals by hand, listening
+  by ear, or asking a human to visually inspect the UI) and never use `human`
+  as a need. If something needs real hardware, write an automated command or
+  script (`kabelsalat <self-test>`, IPC/MCP calls, `scripts/shot.sh` + vision
+  review, ALSA/PipeWire loopback); if it cannot be run unattended, do not put
+  manual steps in `## Bench test`.
 - **What this machine can test** is one line in its local setup file
-  (`~/.config/kabelsalat/agents.local.md`), e.g. `bench: audio midi display
-  human`. No file or no such line: none of the four, a headless machine.
+  (`~/.config/kabelsalat/agents.local.md`), e.g. `bench: audio midi display`.
+  No file or no such line: none of the three, a headless machine.
 
   | Need | Means | Examples |
   |---|---|---|
   | `audio` | a real sound card or audio interface | `audio-test`, `audio-in-test`, `monitor-latency-test`, xruns, latency figures |
-  | `midi` | a hardware MIDI device | hot-plug, device binding, a controller's real messages |
-  | `display` | the real app in a desktop session | `scripts/shot.sh`, key injection, plugin editor windows |
-  | `human` | a person who listens, plays or looks | "does it sound right", feel under the fingers |
+  | `midi` | a hardware MIDI device | `hotplug-test`, `clock-test`, automated ALSA port binding/routing checks |
+  | `display` | the real app in a desktop session | `editor-test`, `scripts/shot.sh` + vision review, `wtype` key injection, plugin editor windows |
 
   A headless machine still runs everything else: unit tests, the offline
   engine, self-tests with the plugins it has, `offline_shots` images
@@ -176,10 +184,11 @@ and never passed off as tested.**
 - **Every PR body has a `## Bench test` section** (it is in the PR
   template). Write `none: <reason>` when nothing is left, including when
   this machine has the hardware and you ran the test (its output goes under
-  Evidence). Otherwise write a `Needs:` line with the needs from the table,
-  then the test: exact commands and steps, and under `Expect:` what to see,
-  hear or measure. The reader is an agent or person who never saw your PR,
-  so name the device, the session or template to load, and the numbers.
+  Evidence). Otherwise write a `Needs:` line with the needs from the table
+  (`audio`, `midi`, `display` — never `human`), then the exact automated
+  commands an agent can run unattended, and under `Expect:` what to assert
+  or measure. The reader is an agent that never saw your PR, so name the
+  device, the command, and the pass criteria.
   "Not tested with a physical controller" in the evidence is not a handover
   (#138 merged that way and nobody was told).
 - **The issue opens itself.** When the PR merges, `bench.yml`
@@ -195,12 +204,12 @@ and never passed off as tested.**
   releasing anyway (`-f skip_bench=true`) is the user's call, never an agent's.
 - **Prefer a test the server can run.** Before you write a bench test, ask
   whether the same thing can be checked headless: raw MIDI bytes, the
-  offline engine, a rendered file. A bench test is for what truly needs the
-  device or the person.
+  offline engine, a rendered file. A bench test is for automated checks that
+  truly need the connected hardware or desktop display.
 - **On a machine with the devices,** work the queue with the `bench-session`
   skill (`.claude/skills/bench-session/SKILL.md`): one build of `main`, every
-  open issue the connected devices allow, the output as a comment, close on
-  a pass, a bug labelled `bench-failed` on a fail.
+  open issue the connected devices allow run unattended, the output as a
+  comment, close on a pass, a bug labelled `bench-failed` on a fail.
 
 ## Working on kabelsalat
 

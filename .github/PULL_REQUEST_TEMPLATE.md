@@ -17,9 +17,10 @@ devices. Write either
 
 none: <why nothing needs real hardware, or that you ran it and where>
 
-or the test, so that someone who never saw this PR can run it:
+or the automated test, so that an agent on a machine with the hardware can
+run it unattended (no manual steps):
 
-Needs: audio, midi, display, human   (only those that apply)
-1. Exact steps and commands.
-Expect: what to see, hear or measure.
+Needs: audio, midi, display   (only those that apply)
+1. Exact automated commands.
+Expect: what to assert or measure.
 -->

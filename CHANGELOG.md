@@ -7,6 +7,89 @@ releases may still change behaviour and session files.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-25
+
+### Added
+- **Backing-track markers (#291):** a song's backing track can carry markers, read from the WAV's cue points or set in the app. Jump to a marker, step to the next or previous one, loop a section or stop at its end, each landing on the bar when the track is synced; a marker can switch the song's part. Learnable on a foot switch, available to the assistant and MCP agents (`backing_markers`), drawn on the waveform and in Show mode.
+- **Factory sounds (#221):** a piano, an electric piano and a drum kit are built in and play with no plugin installed. When Surge XT is not found, the starter rigs use them, so the first key press sounds on a bare machine. The samples are CC0 (FreePats); `kabelsalat factory-test` checks them.
+- **Sound within a minute (#287):** the first start plays one quiet test note and opens the keyboard with no dialog; a missing output, a large buffer or missing realtime rights are told in one plain sentence that offers the Audio Doctor. `kabelsalat first-run-test` scripts a first start in an isolated home.
+- **Wired FX-chain presets (#429):** save a strip's chain of effects (units, knobs, plugin states and cables) under a name with **save chain** in the mixer, and insert it into any rig from the strip's **+ insert** picker, quick-add or the Plugins view's **FX chains** list. One undo step, refused on a locked rack. Agents get `save_fx_chain`, `list_fx_chains` and `insert_fx_chain`.
+- **Stage hot-plug resilience (#402):** a lost audio output (interface unplugged, PipeWire or JACK restarted, a stalled stream) is reopened by itself with its backend, output, sample rate and buffer size; JACK output ports another client disconnected are connected back; an audio input comes back when its device does; a stage notice and Show-mode indicator say what happened.
+- **Macros (#289):** one named control drives any number of parameters (plugin parameters, rack knobs, mixer controls), each with its own range, curve and invert. Bind it to a pedal like a knob; `set_macro`, `list_macros` and `list_cc_maps` report every target. Saved with the session and undoable.
+- **Scene morph (#214):** store a rig's knobs as state A and B and fade between them with a MORPH knob or a learned pedal; stepped knobs switch at the middle.
+- **Stage outputs on one interface (#399):** kabelsalat opens every output of a multi-channel interface (PipeWire), and the Mixer's new Stage outputs rows put the master, the click and the backing track, and the output menu of any rig bus or aux bus, on their own stereo pair or mono output with their own level and balance: Front of House on 1–2 without the click, the in-ears on 3–4. Assignments are saved with the session; on a 2-channel output they are kept, each source plays where it would without one, and the pre-show check says so. Agents use `set_output_route` and `get_output_routes`; `kabelsalat stage-out-test` checks it on PipeWire null sinks.
+- **Send scenes per setlist part (#415):** a part can store send levels into aux buses and the bypass and knobs of the buses' effects, recalled on a switch whatever level the rig lives at, so a show-level vocal or guitar rig goes from a dry verse to a wet chorus. Send levels ramp over 5 ms and tails ring on. Setlist: **Save sends** / **Clear sends**; agents and MCP: `set_part_sends`, `scene` in `get_setlist` and `set_setlist_song`.
+- **Stage Sends template (Shift+F8, #415):** a singer's or guitarist's rig (Audio In, tone, limiter) with Hall and Echo buses and a Verse / Chorus / Solo song, each part with its own send scene.
+- **Permanent configuration & MIDI Show controls (#437):**
+  - Added **Settings → Show** with persistent Show mode preferences
+    (`Exit hold time`, `Clock format`, `Song notes & charts`, `Rig meters`,
+    `Start in Show mode`), `ALSA Midi Through`, and permanent MIDI Show
+    controls saved by stable port name (`midi_port_key`) in
+    `~/.config/kabelsalat/config.json`.
+  - Added the **`Show mode`** (`show_mode`) bindable Show action, plus inline
+    manual **Edit** alongside **Learn** (CC, Note, or Program Change, optional
+    MIDI channel filter, and specific hardware port) that preserves offline
+    bindings across hot-plug and USB port re-ordering.
+  - Added persistent preferences in Settings for **Reopen last session** and
+    **Sync recording with transport** (**Session**), **UI scale**,
+    **Rack CPU overlay**, and **System input method (IME)** (**Display**), and
+    **Plugin sandboxing** (**Plugins**).
+  - Added `get_config` and `set_config` tools for the assistant and MCP
+    server, and extended `set_show_control` / `get_show_controls` with
+    `show_mode`, `channel`, `device_port`, and `scope` (`global` | `session`).
+- **Plugin favorites and recents (#307):** star any built-in, CLAP, VST3 or LV2 plugin on its card in the Plugins view; the new **★ Favorites** and **Recent** filters show your starred plugins and the twelve you added last. Both are kept in the config file and are there after a restart.
+- **Quick-add on the rack (#307):** press **Enter** or right-click empty rack space for a fuzzy-search picker that adds an instrument, effect, MIDI FX or utility to the rig in view without leaving the Rack view (Shift+Enter: a new rig, or a master insert). Favorites and recents head the list.
+- **Agents (#307):** `set_plugin_favorite` stars a plugin, and `list_plugins` takes `shelf: "favorites"` or `"recent"`.
+- **Rack zoom (#309):** Ctrl+scroll (or pinch) zooms the rack about the pointer, Ctrl+= / Ctrl+- step, Ctrl+0 resets to 100 % or fits a big rack, Ctrl+Shift+F zooms onto the selected unit. Works on front and back; knobs, jacks and cables stay exact at any zoom.
+- **A/B switch, crossfader and splitter (#308):** two zero-latency built-in routing units in the Plugins browser. *A/B Crossfade* blends or switches two stereo inputs (equal power, linear or A/B switch, MIDI-learnable MIX, click-free over 5 ms); *Splitter* turns one input into two outputs that sum back to it (low/high bands, mid/side or left/right). The assistant and MCP add and wire them too.
+- **Show cues (#401):** every song and part can send MIDI program change, CC and note messages and OSC over UDP when the setlist enters it, from a thread of its own (a foot switch never waits for a UI frame, the audio thread does no I/O); agents use `get_cues` / `set_cues`.
+- **MIDI Clock In (#401):** kabelsalat can follow an external MIDI clock: tempo, Start/Continue/Stop and Song Position Pointer lock the transport, and the song position is held on the sender's through tempo changes; agents use `set_midi_clock` with `follow` and `input`.
+- **Soundcheck view (#450):** a stage view (Ctrl+K, or REC's menu → Soundcheck…) lists your recorded takes newest first with their length, stems, raw inputs and markers. Start a take, click a marker to jump there, loop a section, drag-free seek on the position bar, and stop. While a take plays, the top bar shows a **Soundcheck** chip (one click stops it), the view and every Audio In unit say "FROM TAKE", so a soundcheck left running can't be mistaken for the live stage. **Export…** writes mixdown, stems and raw inputs (whole take or one section, 24-bit, 16-bit or float) with a progress bar; takes are read and exported off the UI thread.
+- **LV2 plugin scan cache and faster sandbox load:** cache scanned LV2 plugin metadata under `$XDG_CACHE_HOME/kabelsalat/lv2-scan.json` (automatically invalidated when bundles or search paths change) and load individual bundles directly inside `plugin-worker`.
+- **Co-hosted sandboxed LV2 GUIs (`instance-access`, `data-access`, meters & Atom/Patch events):** native LV2 GUIs run inside the plugin's sandbox worker process with direct DSP instance/data access, shared URID mapping, live control-output feedback, and bidirectional lock-free Atom event forwarding.
+- **Full LV2 presets and user preset saving:** restore LV2 presets that carry `state:state` files and properties via `lilv`, and save user presets as standard LV2 bundles under `~/.lv2/`.
+- **Quick-add picker page/filter navigation:** support `PageUp`, `PageDown`, `Home`, `End`, and `Tab` / `Shift+Tab` category filter cycling in the quick-add picker.
+- **Your own plugin folders (#414):** Settings → Plugins lists custom CLAP, VST3
+  and LV2 search folders. Add, edit or remove one without touching environment
+  variables; the folders are remembered, every change rescans your plugins in
+  the background, and a folder that is missing right now is marked. The
+  assistant and MCP agents use the same lists (`list_plugin_folders`,
+  `add_plugin_folder`, `remove_plugin_folder`). `CLAP_PATH`, `VST3_PATH` and
+  `LV2_PATH` keep working.
+- **Standalone saved setlists in your own folder:** save and load complete shows as `<name>.ksalat-setlist` packages (songs, parts, sets, levels and show controls together with loaded rigs, plugin states, knobs, mixer strips, sends, bus outputs and MIDI routes). Saved setlists live in `~/kabelsalat-setlists` by default and can be pointed at any folder from the Save/Load dialogs, **Settings → Session → Setlists folder**, `config.json` (`setlists_dir`), `KABELSALAT_SETLISTS_DIR` or `set_setlist_folder`, with controls in the Setlist stage, **Library → Setlists**, the top-bar Session popover, `kabelsalat preshow-check`, and assistant/MCP parity (`save_setlist`, `load_setlist`, `list_setlists`, `set_setlist_folder`).
+- **Show mode keyboard controls:** Step parts with `←`/`→` and songs with `Shift+←`/`Shift+→` (alongside `PageUp`/`PageDown`), toggle click/transport with `Space`, tap tempo with `Shift+T`, and toggle the tuner with `Ctrl+T` (short `Esc` closes it) while editing stays locked.
+- **Gig recording (#400):** every REC take now also holds the raw signal of each Audio In, every MIDI message the rack was played with and a marker at each song and part switch, all sample-aligned with the master and the rig stems, plus a `take.json` that names them.
+- **Virtual Soundcheck (#400):** play a recorded take through the live rack: the inputs hear the recording, the MIDI plays the instruments and the setlist follows the recorded part switches, so every knob and fader change is heard at once. Jump to a marker, loop a section, stop to hand the inputs back to the stage. Assistant and MCP tools `list_takes`, `soundcheck_start`, `soundcheck_seek`, `soundcheck_loop`, `soundcheck_stop`, `soundcheck_status`.
+- **Stem export (#400):** `export_take` writes the show mixdown, rig stems and raw inputs of a whole take or one song or part as 24-bit, 16-bit or float WAV.
+
+### Changed
+- **Send levels never step (#415):** a send changed by a controller, the mixer, an agent or a part switch now ramps over 5 ms instead of jumping in one sample.
+- **Merged Show controls:** Permanent global bindings in `config.json` merge
+  with per-session overrides in `Setlist::controls` and survive loading
+  templates or switching sessions; **Setlist → Show controls** links directly
+  to **Settings → Show** (`Settings →`).
+- **Leaner engine and smaller binary:** the audio engine reads each audio
+  input's ring in one chunk per block instead of sample by sample, takes a
+  source's cable level once per block instead of once per cable, and finds
+  what is wired into each master and bus chain in one pass over the cables.
+  The rendered audio is identical to the sample; the engine uses about 6 %
+  less CPU on a 4-rig rack with 8 audio inputs. HTTPS now goes through rustls
+  on ring instead of aws-lc, which drops a large C library from the build.
+- **Unified Hurricane top bar & navigation:** organized the top bar into calm Left / View / Right zones on a single 1px bottom hairline; replaced nested double borders on View and Dock switchers with single recessed segmented trays; made toolbar icons, the session document pill, and inactive rig pills flat at rest; and subordinated the active rig pill with a left accent spine so it never competes with active workspace tabs.
+- **Consistent tabs, stage headers & card actions:** unified the Left Rail (`RIGS` / `LIBRARY`, `ALL` / `CHANNELS` / `PLUGINS`, `SESSIONS` / `SETLISTS` / `RIGS` / `TEMPLATES`) and Session Popover (`SESSIONS` / `SETLISTS` / `TEMPLATES`) onto quiet charcoal segmented trays; standardized full-stage headers (`stage_header`) and corner radii across Mixer, MIDI Matrix, Setlist, Plugins, Settings, Sessions, docks, popovers, and modals; toned down Plugins filter chips and card `+ Add` actions so solid tomato stays reserved for singular primary CTAs; and replaced repeating bright-cream Setlist toggles with muted teal active chips beside a vertical column divider.
+
+### Fixed
+- **Assistant `set_cues` accepts its cue list (#468):** the argument checker refused every `cues` array with "must be array or null", so the agent could not set a song's cues. Arrays of text lines are now read as meant; a bare text or a non-text line is refused with an error the model can correct.
+- **Guitarix is an effect, not a sound-library instrument (#132):** `sound-library-test` asked the Guitarix amp suite for presets and failed ("no LV2 presets found"). It has none, so the test skips effect cards and says so; the card and docs/PLUGINS.md say the same.
+- **Unplugged keyboards no longer leave notes droning (#402):** keys and the sustain pedal a MIDI device was holding when it was unplugged are released at once.
+- **A passed plugin self-test no longer aborts on exit (#422):** `vst3-test` and `editor-test` with Six Sines (VST3) printed PASS and then died with "terminate called without an active exception". A process that loaded plugin code now leaves without running the plugin libraries' static destructors.
+- **`editor-test` across all plugins under Wayland (#421):** the EGL platform for plugin editors is now fixed before any plugin library is loaded, so Unsampled Piano no longer crashes after other plugins ran first.
+- **LV2 native UI filtering & X11 window handling:** filter out GTK wrapper bridge UIs (`lv2-gtk-ui-bridge` / `lv2-gtk2-ui-bridge`), skip LV2 UIs whose `requiredFeature`s are unsupported, advertise `XdndAware`/`XdndProxy`, forward child `WM_NORMAL_HINTS`, and resize child X11 windows directly when `ui:resize` is absent.
+- **LV2 DSP compliance (`sampleRate`, `urid#unmap`, `resize-port:minimumSize`, multi-atom, `state` path features):** pass the standard `parameters#sampleRate` option alongside `urid#unmap` and `buf-size` options, size atom buffers by `resize-port:minimumSize` with 8-byte alignment, route MIDI to ports declaring `midi:MidiEvent`, pre-check `lv2:requiredFeature`, and pass `state#mapPath`/`makePath`/`freePath`.
+- **Top-bar phantom box & overflow:** measured exact dock tray width before nesting a left-to-right row inside the right-aligned top-bar strip so the dock switcher no longer stretches an empty bordered box across the middle of the bar.
+- **Top-bar REC dot & Settings spacing:** drew the `REC` indicator circle as vector geometry so it never renders a missing-glyph box when symbol fonts are absent, added a hairline separator before the edit-lock button, styled the lock button as a warm amber badge when locked, and removed the empty status gap above Settings pages.
+- **Plugin folders rescan reliably (#414):** adding, editing or removing a custom LV2 folder in Settings → Plugins now drops the cached LV2 world itself, so a folder's plugins appear (and a removed folder's plugins go) without relying on the scan cache.
+
 ## [0.3.1] — 2026-11-23
 
 ### Added
@@ -915,7 +998,8 @@ The first tagged release: a working live rack for Linux.
 - Sessions and starter templates; system-audio capture and WAV backing tracks.
 - Arch/Omarchy packaging (`packaging/PKGBUILD`).
 
-[Unreleased]: https://github.com/ssalentin/kabelsalat/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ssalentin/kabelsalat/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ssalentin/kabelsalat/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/ssalentin/kabelsalat/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ssalentin/kabelsalat/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ssalentin/kabelsalat/compare/v0.1.0...v0.2.0

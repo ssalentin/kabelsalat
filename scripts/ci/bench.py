@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Bench tests: what a headless machine could not test (AGENTS.md, "Bench tests").
 
-Most development runs on servers with no sound card, MIDI device, display or
-listener. Every PR body says what is left to check on a machine that has
-them, under a `## Bench test` heading:
+Most development runs on servers with no sound card, MIDI device or display.
+Every PR body says what automated hardware check is left to run on a machine
+that has them, under a `## Bench test` heading (no manual or human tests):
 
     ## Bench test
-    Needs: midi, human
-    1. Plug in a wind controller, load the Wind template, blow a note.
-    Expect: the filter opens with breath; the note ends when you stop.
+    Needs: midi
+    1. Run `./target/debug/kabelsalat hotplug-test`.
+    Expect: `hotplug-test: OK (audio, midi)`, exit 0.
 
 or `none: <reason>` when nothing is left. When the PR merges, `open` turns
 the section into one issue labelled `bench`; a bench session on a machine
@@ -36,7 +36,6 @@ NEEDS = {
     "audio": "a real sound card or audio interface",
     "midi": "a hardware MIDI device",
     "display": "the real app in a desktop session",
-    "human": "a person who listens, plays or looks",
 }
 LABELS = {
     QUEUE: ("1D76DB", "Waits for a test on a machine with the devices (bench.yml)"),
@@ -231,11 +230,10 @@ Touches `AGENTS.md`, so the human gate holds it.
 WIND = """
 ## Bench test
 <!-- What is left to test on real hardware? -->
-Needs: midi, human
-1. Plug in a wind controller and load a Vital wind patch.
-2. Blow a note.
+Needs: midi
+1. Run `./target/debug/kabelsalat hotplug-test`.
 
-Expect: the filter opens with breath.
+Expect: `hotplug-test: OK (audio, midi)`, exit 0.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 """
@@ -261,14 +259,16 @@ def selftest():
          refused == 1 and "::error::" in said.getvalue() and "none: <reason>" in said.getvalue()),
         ("#138 as merged still leaves an issue to settle",
          untold[1] == ["bench", "midi"] and "no `## Bench test` section" in untold[2]),
-        ("steps and needs are read", parse(wind)["needs"] == ["midi", "human"]),
+        ("steps and needs are read", parse(wind)["needs"] == ["midi"]),
         ("the comment and the footer stay out of the steps",
          "What is left" not in body and "Generated with" not in body
-         and "Expect: the filter opens with breath." in body),
+         and "Expect: `hotplug-test: OK (audio, midi)`, exit 0." in body),
         ("the issue names the PR and the merge commit",
          title == "Bench test for #138: Breath from wind controllers" and "8ea336c5b" in body),
         ("needs and the PR's area become labels",
-         labels == ["bench", "bench:midi", "bench:human", "midi"]),
+         labels == ["bench", "bench:midi", "midi"]),
+        ("manual/human need is refused",
+         "human" in parse("## Bench test\nNeeds: midi, human\nplay")["problem"]),
         ("a section in the middle ends at the next heading",
          parse("## Bench test\nNeeds: audio\nplay\n\n## Verification\nran it")["steps"] == "play"),
         ("CRLF bodies parse (the web editor sends them)",
